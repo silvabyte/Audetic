@@ -16,3 +16,5 @@ Thumbs.db
 # Whispy specific
 *.wav
 /tmp/
+
+release/releases/*

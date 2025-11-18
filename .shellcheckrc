@@ -1,0 +1,22 @@
+# ShellCheck configuration for Arcata project
+# https://github.com/koalaman/shellcheck/wiki/Directive
+
+# Default shell dialect
+shell=bash
+
+# Disable specific style checks that are too verbose
+disable=SC2250  # Prefer braces around variable references (style - optional)
+disable=SC2292  # Prefer [[ ]] over [ ] in Bash (style - optional)
+disable=SC2310  # Function invoked in 'if' condition (info - expected with set -e)
+
+# Enable optional checks
+enable=all
+
+# Severity threshold (error, warning, info, style)
+# Only show warnings and above (style and info suggestions are optional)
+severity=style
+
+# Source path for finding sourced files
+# source-path=SCRIPTDIR
+
+

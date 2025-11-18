@@ -1,8 +1,3 @@
-[audio]
-device = "default"
-sample_rate = 16000
-channels = 1
-
 [whisper]
 # Provider selection (defaults to auto-detection if not specified)
 # Uncomment and set provider to explicitly choose:
@@ -27,24 +22,16 @@ language = "en"             # Language code (en, es, fr, de, etc.)
 # api_endpoint = "https://api.openai.com/v1/audio/transcriptions"  # Optional
 
 [ui]
-indicator_position = "top-right"
-indicator_size = 20
-show_notifications = true
-layer_shell_anchor = "top | right"
-layer_shell_margin = 10
 notification_color = "rgb(ff1744)"  # Hyprland notification color
 
 [ui.waybar]
 idle_text = "󰑊"                # Icon shown when idle (ready to record) - Nerd Font
 recording_text = "󰻃"           # Icon shown when recording - Nerd Font
-processing_text = "󰦖"          # Icon shown when processing - Nerd Font
 idle_tooltip = "Press Super+R to record"
 recording_tooltip = "Recording... Press Super+R to stop"
-processing_tooltip = "Processing transcription..."
 
 [wayland]
 input_method = "wtype"
-use_hyprland_ipc = true
 
 [behavior]
 auto_paste = true

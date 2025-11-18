@@ -1,3 +1,5 @@
+include makefiles/shell.mk
+
 .PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix
 
 # Default target

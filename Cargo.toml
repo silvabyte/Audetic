@@ -23,11 +23,6 @@ tokio = { version = "1.35", features = ["full"] }
 cpal = "0.15"
 hound = "3.5"
 
-# Wayland integration
-wayland-client = "0.31"
-wayland-protocols = { version = "0.31", features = ["client"] }
-smithay-client-toolkit = "0.18"
-
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -38,9 +33,6 @@ anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# System notifications
-notify-rust = "4.10"
 
 # Clipboard
 arboard = "3.3"

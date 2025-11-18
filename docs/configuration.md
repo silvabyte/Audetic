@@ -23,11 +23,6 @@ Audetic will create a default configuration file on first run if none exists.
 Here's a full configuration file with all available options:
 
 ```toml
-[audio]
-device = "default"              # Audio input device name
-sample_rate = 16000             # Sample rate in Hz (8000, 16000, 44100, 48000)
-channels = 1                    # Number of audio channels (1 = mono, 2 = stereo)
-
 [whisper]
 provider = "openai-api"         # Transcription provider (see Providers section)
 api_key = "sk-your-api-key-here" # API key for API providers
@@ -38,23 +33,16 @@ model_path = "/path/to/model.bin"  # Custom model file path (optional)
 api_endpoint = "https://api.openai.com/v1/audio/transcriptions"  # Custom API endpoint (optional)
 
 [ui]
-indicator_position = "top-right"  # Visual indicator position
-indicator_size = 20             # Indicator size in pixels
-show_notifications = true       # Show desktop notifications
-layer_shell_anchor = "top | right"  # Wayland layer shell anchor
-layer_shell_margin = 10         # Margin from screen edge in pixels
+notification_color = "rgb(ff1744)"  # Hyprland notification color
 
 [ui.waybar]
 idle_text = "󰑊"                # Icon shown when idle (ready to record)
 recording_text = "󰻃"           # Icon shown when recording
-processing_text = "󰦖"          # Icon shown when processing transcription
 idle_tooltip = "Press Super+R to record"                    # Tooltip for idle state
 recording_tooltip = "Recording... Press Super+R to stop"     # Tooltip for recording state
-processing_tooltip = "Processing transcription..."           # Tooltip for processing state
 
 [wayland]
 input_method = "wtype"          # Text injection method
-use_hyprland_ipc = true         # Use Hyprland IPC for better integration
 
 [behavior]
 auto_paste = true               # Automatically paste transcribed text
@@ -64,21 +52,6 @@ audio_feedback = true           # Play audio feedback sounds
 ```
 
 ## Configuration Sections
-
-### [audio] - Audio Input Settings
-
-Controls how Audetic captures audio from your microphone.
-
-| Option | Type | Default | Description |
-|--------|------|---------|-------------|
-| `device` | string | `"default"` | Audio input device name. Use `"default"` for system default, or specific device name |
-| `sample_rate` | number | `16000` | Audio sample rate in Hz. Common values: 8000, 16000, 44100, 48000 |
-| `channels` | number | `1` | Number of audio channels. 1 = mono (recommended), 2 = stereo |
-
-**Tips:**
-- 16000 Hz sample rate provides the best balance of quality and performance for speech
-- Mono (1 channel) is sufficient for speech recognition and reduces file size
-- To list available audio devices: `arecord -l` (on Linux)
 
 ### [whisper] - Transcription Settings
 
@@ -144,11 +117,7 @@ Controls visual indicators and desktop notifications.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `indicator_position` | string | `"top-right"` | Screen position: `"top-left"`, `"top-right"`, `"bottom-left"`, `"bottom-right"` |
-| `indicator_size` | number | `20` | Visual indicator size in pixels |
-| `show_notifications` | bool | `true` | Show desktop notifications for transcription results |
-| `layer_shell_anchor` | string | `"top \| right"` | Wayland layer shell anchor points |
-| `layer_shell_margin` | number | `10` | Distance from screen edge in pixels |
+| `notification_color` | string | `"rgb(ff1744)"` | Hyprland notification color for `hyprctl notify` |
 
 #### [ui.waybar] - Waybar Integration
 
@@ -158,10 +127,8 @@ Customize icons and tooltips for Waybar status display. See [Waybar Integration]
 |--------|------|---------|-------------|
 | `idle_text` | string | `"󰑊"` | Icon shown when idle (ready to record) - Nerd Font icon |
 | `recording_text` | string | `"󰻃"` | Icon shown when actively recording - Nerd Font icon |
-| `processing_text` | string | `"󰦖"` | Icon shown when processing transcription - Nerd Font icon |
 | `idle_tooltip` | string | `"Press Super+R to record"` | Tooltip text when hovering over idle state |
 | `recording_tooltip` | string | `"Recording... Press Super+R to stop"` | Tooltip text when hovering during recording |
-| `processing_tooltip` | string | `"Processing transcription..."` | Tooltip text when processing audio |
 
 **Icon Tips:**
 - Uses Nerd Font icons for consistency with other Waybar modules
@@ -176,7 +143,6 @@ Configures integration with Wayland desktop environments.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `input_method` | string | `"wtype"` | Text injection method: `"wtype"`, `"clipboard"` |
-| `use_hyprland_ipc` | bool | `true` | Use Hyprland IPC for better window management integration |
 
 **Text Injection Methods:**
 - `"wtype"` - Direct text typing (fast, works in most apps)
@@ -242,10 +208,6 @@ language = "auto"  # Automatically detect language
 
 ### For Low-Resource Systems
 ```toml
-[audio]
-sample_rate = 16000  # Lower sample rate
-channels = 1         # Mono audio
-
 [whisper]
 provider = "openai-cli"
 model = "tiny"       # Smallest, fastest model
@@ -257,10 +219,6 @@ delete_audio_files = true  # Clean up temp files
 
 ### For High Accuracy Transcription
 ```toml
-[audio]
-sample_rate = 48000  # Higher quality audio
-channels = 1
-
 [whisper]
 provider = "openai-cli"
 model = "large-v3"   # Most accurate model

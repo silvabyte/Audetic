@@ -6,19 +6,10 @@ use tracing::info;
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    pub audio: AudioConfig,
     pub whisper: WhisperConfig,
     pub ui: UiConfig,
     pub wayland: WaylandConfig,
     pub behavior: BehaviorConfig,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AudioConfig {
-    pub device: String,
-    pub sample_rate: u32,
-    pub channels: u16,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -36,11 +27,6 @@ pub struct WhisperConfig {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
-    pub indicator_position: String,
-    pub indicator_size: u32,
-    pub show_notifications: bool,
-    pub layer_shell_anchor: String,
-    pub layer_shell_margin: u32,
     pub notification_color: String,
     pub waybar: WaybarConfig,
 }
@@ -50,17 +36,14 @@ pub struct UiConfig {
 pub struct WaybarConfig {
     pub idle_text: String,
     pub recording_text: String,
-    pub processing_text: String,
     pub idle_tooltip: String,
     pub recording_tooltip: String,
-    pub processing_tooltip: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WaylandConfig {
     pub input_method: String,
-    pub use_hyprland_ipc: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -75,16 +58,6 @@ pub struct BehaviorConfig {
 
 fn default_audio_feedback() -> bool {
     true
-}
-
-impl Default for AudioConfig {
-    fn default() -> Self {
-        Self {
-            device: "default".to_string(),
-            sample_rate: 16000,
-            channels: 1,
-        }
-    }
 }
 
 impl Default for WhisperConfig {
@@ -104,11 +77,6 @@ impl Default for WhisperConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            indicator_position: "top-right".to_string(),
-            indicator_size: 20,
-            show_notifications: true,
-            layer_shell_anchor: "top | right".to_string(),
-            layer_shell_margin: 10,
             notification_color: "rgb(ff1744)".to_string(),
             waybar: WaybarConfig::default(),
         }
@@ -120,10 +88,8 @@ impl Default for WaybarConfig {
         Self {
             idle_text: "󰑊".to_string(),       // Nerd Font circle with dot (idle)
             recording_text: "󰻃".to_string(),  // Nerd Font record button (recording)
-            processing_text: "󰦖".to_string(), // Nerd Font loading/processing icon
             idle_tooltip: "Press Super+R to record".to_string(),
             recording_tooltip: "Recording... Press Super+R to stop".to_string(),
-            processing_tooltip: "Processing transcription...".to_string(),
         }
     }
 }
@@ -132,7 +98,6 @@ impl Default for WaylandConfig {
     fn default() -> Self {
         Self {
             input_method: "wtype".to_string(),
-            use_hyprland_ipc: true,
         }
     }
 }

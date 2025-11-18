@@ -34,7 +34,6 @@ The endpoint returns JSON with different icons for each state:
 
 - **Idle**: `󰑊` (circle with dot)
 - **Recording**: `󰻃` (record button)  
-- **Processing**: `󰦖` (spinner)
 
 Example response:
 ```json
@@ -53,10 +52,8 @@ Customize icons and tooltips in your Audetic config (`~/.config/audetic/config.t
 [ui.waybar]
 idle_text = "󰍬"                # Use microphone icon
 recording_text = "●"            # Use simple filled circle  
-processing_text = "⏳"          # Use hourglass emoji
 idle_tooltip = "Click to record"
 recording_tooltip = "Recording..."
-processing_tooltip = "Processing..."
 ```
 
 CSS styling (optional):

@@ -149,11 +149,6 @@ Audetic will create a default config on first run, or you can create one manuall
 ### For Optimized Whisper.cpp
 
 ```toml
-[audio]
-device = "default"
-sample_rate = 16000
-channels = 1
-
 [whisper]
 model = "large-v3-turbo"
 language = "en"
@@ -161,15 +156,10 @@ command_path = "/home/user/.local/share/audetic/whisper/build/bin/whisper-cli"
 model_path = "/home/user/.local/share/audetic/whisper/models/ggml-large-v3-turbo-q5_1.bin"
 
 [ui]
-indicator_position = "top-right"
-indicator_size = 20
-show_notifications = true
-layer_shell_anchor = "top | right"
-layer_shell_margin = 10
+notification_color = "rgb(ff1744)"
 
 [wayland]
 input_method = "ydotool"
-use_hyprland_ipc = true
 
 [behavior]
 auto_paste = true
@@ -181,24 +171,16 @@ audio_feedback = true
 ### For OpenAI Whisper
 
 ```toml
-[audio]
-device = "default"
-sample_rate = 16000
-channels = 1
-
 [whisper]
 model = "base"
 language = "en"
 # command_path is auto-detected if whisper is in PATH
 
 [ui]
-indicator_position = "top-right"
-indicator_size = 20
-show_notifications = true
+notification_color = "rgb(ff1744)"
 
 [wayland]
 input_method = "ydotool"
-use_hyprland_ipc = true
 
 [behavior]
 auto_paste = true
@@ -299,7 +281,6 @@ systemctl --user enable --now audetic.service
 ```toml
 [wayland]
 input_method = "ydotool"
-use_hyprland_ipc = false
 ```
 
 ### 3. Create GNOME Keyboard Shortcut
@@ -328,7 +309,7 @@ use_hyprland_ipc = false
 ### Recording doesn't work
 - Check microphone permissions
 - Verify audio device: `arecord -l`
-- Test with different device in config
+- Ensure the desired input device is set as the system default (Audetic uses whatever CPAL reports as default)
 
 ### Text injection fails
 - Verify ydotool service: `systemctl --user status ydotool.service`
