@@ -1,6 +1,5 @@
 <div align="center">
-  <img src="./assets/audetic_icon_light.svg" alt="Audetic Icon" height="80"/>
-  <img src="./assets/audetic_logo_light.svg" alt="Audetic Logo" height="40"/>
+  <img src="./assets/banner.png" alt="Audetic Icon" height="80"/>
 
   <br/>
   <br/>
