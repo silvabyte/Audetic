@@ -29,7 +29,7 @@ use crate::ui::Indicator;
 
 #[derive(Parser)]
 #[command(name = "audetic")]
-#[command(about = "Voice transcription tool for Wayland/Hyprland", long_about = None)]
+#[command(about = "Voice to text for Hyprland", long_about = None)]
 struct Args {
     #[arg(short, long)]
     config: Option<PathBuf>,
@@ -115,6 +115,8 @@ async fn main() -> Result<()> {
             error!("API server failed: {}", e);
         }
     });
+
+    //TODO: spawn auto-update service
 
     info!("Audetic is ready!");
     info!("Add this to your Hyprland config:");

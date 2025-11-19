@@ -148,6 +148,7 @@ impl RecordingMachine {
 
                 Ok(RecordingPhase::Processing)
             }
+            //NOTE: this could be annoying
             Transition::Busy(phase) => {
                 warn!(
                     "RecordingMachine: toggle requested while busy in {:?}",
