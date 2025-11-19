@@ -63,8 +63,9 @@ detect_os() {
     elif [ -f /etc/fedora-release ]; then
       echo "fedora"
     elif [ -f /etc/os-release ]; then
+      # shellcheck source=/dev/null
       . /etc/os-release
-      echo "$ID"
+      echo "${ID:-unknown}"
     else
       echo "unknown"
     fi
@@ -75,13 +76,6 @@ detect_os() {
 
 # Get the directory where the script is located
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AUDETIC_DIR="$SCRIPT_DIR"
-
-# Configuration variables
-WHISPER_DIR="$HOME/.local/share/audetic/whisper"
-CONFIG_DIR="$HOME/.config/audetic"
-INSTALL_DIR="/usr/local/bin"
-SOURCE_BACKUP_DIR="$HOME/.local/share/audetic/source"
 
 # Detect OS
 OS=$(detect_os)

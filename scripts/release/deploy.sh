@@ -54,7 +54,7 @@ validate_version() {
   [[ "$VERSION" =~ $semver_re ]] || die "VERSION must be semantic (got: $VERSION)"
   local current="0.0.0"
   if [[ -f release/cli/version ]]; then
-    current="$(cat release/cli/version | tr -d ' \n')"
+    current="$(tr -d ' \n' < release/cli/version)"
   fi
   local highest
   highest="$(printf '%s\n' "$current" "$VERSION" | sort -V | tail -n1)"
@@ -260,7 +260,7 @@ publish_assets() {
   fi
   if command -v godeploy >/dev/null 2>&1; then
     log info "Publishing via godeploy"
-    godeploy deploy
+    godeploy deploy --clear-cache
   else
     log warn "godeploy not installed. Skipping publish."
   fi

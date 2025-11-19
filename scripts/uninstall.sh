@@ -146,7 +146,7 @@ fi
 
 # Confirmation prompt
 if [ "$FORCE" = false ]; then
-  printf "${YELLOW}Do you want to continue? [y/N]${NC} "
+  printf "%sDo you want to continue? [y/N]%s " "${YELLOW}" "${NC}"
   read -r response
   if [[ ! "$response" =~ ^[Yy]$ ]]; then
     print_warning "Uninstallation cancelled"
@@ -237,7 +237,8 @@ if [ -d "$SOURCE_BACKUP_DIR" ]; then
 fi
 
 # Step 7: Clean up data directory if empty
-if [ -d "$DATA_DIR" ] && [ -z "$(ls -A "$DATA_DIR" 2>/dev/null)" ]; then
+dir_contents=$(ls -A "$DATA_DIR" 2>/dev/null || true)
+if [ -d "$DATA_DIR" ] && [ -z "$dir_contents" ]; then
   print_step "Removing empty data directory..."
   if rmdir "$DATA_DIR"; then
     print_success "Data directory removed"

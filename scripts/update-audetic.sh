@@ -212,7 +212,7 @@ if [ "$AUDETIC_UPDATE_AVAILABLE" = true ] || [ "$FORCE_UPDATE" = true ]; then
 fi
 
 # Update whisper if requested
-if [ "$UPDATE_WHISPER" = true ] && [ "${WHISPER_UPDATE_AVAILABLE:-false}" = true -o "$FORCE_UPDATE" = true ]; then
+if [ "$UPDATE_WHISPER" = true ] && { [ "${WHISPER_UPDATE_AVAILABLE:-false}" = true ] || [ "$FORCE_UPDATE" = true ]; }; then
   print_step "Updating whisper.cpp..."
   cd "$WHISPER_DIR"
 

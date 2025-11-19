@@ -29,7 +29,6 @@ DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/audetic"
 BIN_DIR="$INSTALL_PREFIX/bin"
 STATE_FILE="$CONFIG_DIR/update_state.json"
 SERVICE_NAME="audetic.service"
-UPDATER_SERVICE_NAME="audetic-updater.service"
 
 REPO_RAW_BASE="${AUDETIC_GITHUB_RAW:-https://raw.githubusercontent.com/silvabyte/Audetic/main}"
 
@@ -256,7 +255,8 @@ verify_signature() {
     return 0
   fi
   require_cmd minisign
-  local sig_file="$TMP_ROOT/$(basename "$signature_path")"
+  local sig_file
+  sig_file="$TMP_ROOT/$(basename "$signature_path")"
   curl -fsSL "$sig_url" -o "$sig_file" || die "Unable to download signature: $sig_url"
   minisign -Vm "$file" -P "$MINISIGN_PUBKEY" -x "$sig_file" >/dev/null 2>&1 || die "Signature verification failed"
 }
@@ -420,12 +420,13 @@ log info "Channel       : $CHANNEL"
 log info "Version       : $VERSION"
 log info "Install prefix: $INSTALL_PREFIX"
 log info "Target        : $TARGET_TRIPLE"
-log info "Mode          : $([[ $SYSTEM_MODE == true ]] && echo system || echo user)"
+mode_type=$([[ $SYSTEM_MODE == true ]] && echo system || echo user)
+log info "Mode          : $mode_type"
 
 MANIFEST_PATH="$(download_manifest "$VERSION")"
 TARGET_METADATA="$(extract_target_metadata "$MANIFEST_PATH" "$TARGET_TRIPLE" || true)"
 [[ -z "$TARGET_METADATA" ]] && die "Target $TARGET_TRIPLE not available in manifest"
-IFS="|" read -r ARCHIVE_NAME EXPECTED_SHA SIGNATURE_PATH TARGET_SIZE <<<"$TARGET_METADATA"
+IFS="|" read -r ARCHIVE_NAME EXPECTED_SHA SIGNATURE_PATH _ <<<"$TARGET_METADATA"
 [[ -z "$ARCHIVE_NAME" || -z "$EXPECTED_SHA" ]] && die "Manifest missing archive or checksum for $TARGET_TRIPLE"
 
 ARCHIVE_URL="$BASE_URL/cli/releases/$VERSION/$ARCHIVE_NAME"
@@ -494,7 +495,8 @@ write_update_state "$VERSION"
 
 log success "Audetic $VERSION installed successfully"
 log info "Binary location: $BIN_DIR/audetic"
-log info "Service mode   : $([[ $SYSTEM_MODE == true ]] && echo system || echo user)"
+service_mode=$([[ $SYSTEM_MODE == true ]] && echo system || echo user)
+log info "Service mode   : $service_mode"
 
 if $NO_START; then
   log warn "Service start skipped (--no-start). Run 'systemctl --user start $SERVICE_NAME' when ready."

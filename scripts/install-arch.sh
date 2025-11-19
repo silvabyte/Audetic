@@ -97,7 +97,8 @@ SOURCE_BACKUP_DIR="$HOME/.local/share/audetic/source"
 
 # Check if running on Arch Linux
 if [ ! -f /etc/arch-release ]; then
-  print_error "This script is designed for Arch Linux. Detected: $(cat /etc/os-release | grep '^NAME=' | cut -d'=' -f2)"
+  os_name=$(grep '^NAME=' /etc/os-release | cut -d'=' -f2)
+  print_error "This script is designed for Arch Linux. Detected: $os_name"
   exit 1
 fi
 
@@ -203,7 +204,8 @@ elif [ "$FORCE_REBUILD" = true ]; then
   print_step "Force rebuild requested, building Audetic..."
 else
   # Check if source files are newer than binary
-  if [ -n "$(find src -newer target/release/audetic -print -quit 2>/dev/null)" ]; then
+  newer_files=$(find src -newer target/release/audetic -print -quit 2>/dev/null || true)
+  if [ -n "$newer_files" ]; then
     BUILD_NEEDED=true
     print_step "Source files changed, rebuilding Audetic..."
   else
@@ -314,6 +316,9 @@ print_success "Configuration created at $CONFIG_DIR/config.toml"
 print_step "Creating systemd user service..."
 mkdir -p ~/.config/systemd/user
 
+# Get number of CPU threads for whisper
+num_threads=$(nproc)
+
 cat >~/.config/systemd/user/audetic.service <<EOF
 [Unit]
 Description=Audetic Voice Transcription Service
@@ -334,7 +339,7 @@ MemorySwapMax=12G
 # CPU settings - let whisper use multiple cores
 # Remove CPUQuota to allow full CPU usage
 # Set thread count for whisper (adjust based on your CPU)
-Environment="OMP_NUM_THREADS=$(nproc)"
+Environment="OMP_NUM_THREADS=$num_threads"
 
 [Install]
 WantedBy=default.target
@@ -349,27 +354,27 @@ echo
 print_warning "Next steps:"
 echo
 printf "1. Start Audetic service:\n"
-printf "   ${GREEN}make start${NC}\n"
+printf "   %bmake start%b\n" "${GREEN}" "${NC}"
 echo
 printf "2. Add this keybind to your Hyprland config (~/.config/hypr/hyprland.conf):\n"
-printf "   ${GREEN}bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle${NC}\n"
+printf "   %bbindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle%b\n" "${GREEN}" "${NC}"
 printf "   or for Omarchy:\n"
-printf "   ${GREEN}bindd = SUPER, R, Audetic, exec, \$terminal -e curl -X POST http://127.0.0.1:3737/toggle${NC}\n"
+printf "   %bbindd = SUPER, R, Audetic, exec, \$terminal -e curl -X POST http://127.0.0.1:3737/toggle%b\n" "${GREEN}" "${NC}"
 echo
 printf "3. Check service status:\n"
-printf "   ${GREEN}make status${NC}\n"
+printf "   %bmake status%b\n" "${GREEN}" "${NC}"
 echo
 printf "4. View logs if needed:\n"
-printf "   ${GREEN}make logs${NC}\n"
+printf "   %bmake logs%b\n" "${GREEN}" "${NC}"
 echo
 printf "5. Common development commands:\n"
-printf "   ${GREEN}make help${NC}      # Show all available commands\n"
-printf "   ${GREEN}make restart${NC}   # Restart the service\n"
-printf "   ${GREEN}make build${NC}     # Rebuild Audetic\n"
+printf "   %bmake help%b      # Show all available commands\n" "${GREEN}" "${NC}"
+printf "   %bmake restart%b   # Restart the service\n" "${GREEN}" "${NC}"
+printf "   %bmake build%b     # Rebuild Audetic\n" "${GREEN}" "${NC}"
 echo
 printf "6. Update Audetic anytime with:\n"
-printf "   ${GREEN}make update${NC}     # Update Audetic only\n"
-printf "   ${GREEN}make update-all${NC} # Update both Audetic and whisper.cpp\n"
-printf "   Note: If 'audetic-update' command not found, run: ${GREEN}hash -r${NC}\n"
+printf "   %bmake update%b     # Update Audetic only\n" "${GREEN}" "${NC}"
+printf "   %bmake update-all%b # Update both Audetic and whisper.cpp\n" "${GREEN}" "${NC}"
+printf "   Note: If 'audetic-update' command not found, run: %bhash -r%b\n" "${GREEN}" "${NC}"
 echo
 print_success "Audetic is ready to use! Press Super+R to start recording."
