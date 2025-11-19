@@ -30,12 +30,17 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 
+use crate::normalizer::TranscriptionNormalizer;
+
 pub trait TranscriptionProvider: Send + Sync {
     /// Human-readable name for this provider
     fn name(&self) -> &'static str;
     
     /// Check if this provider is available/configured properly
     fn is_available(&self) -> bool;
+
+    /// Return the normalizer used for this provider's raw output
+    fn normalizer(&self) -> Result<Box<dyn TranscriptionNormalizer>>;
     
     /// Transcribe an audio file
     fn transcribe<'a>(
@@ -56,10 +61,42 @@ pub trait TranscriptionProvider: Send + Sync {
 - For CLI providers: Check if binary exists and is accessible
 - Should be fast (no network calls)
 
+**`normalizer()`** - Creates the provider’s transcription normalizer
+- Return a boxed type implementing `TranscriptionNormalizer`
+- Keep the implementation in the same module as the provider so maintenance stays localized
+- Expensive setup (regex compilation, etc.) can happen inside the normalizer constructor
+
 **`transcribe()`** - Core transcription functionality
 - Takes audio file path and language code
 - Returns async result with transcribed text
 - Should handle errors gracefully with context
+
+## Provider-Scoped Normalizers
+
+Every provider owns the logic for cleaning up its raw output. Keep the normalizer struct, implementation, and tests in the same module as the provider. This makes it easy for contributors to add or adjust a provider without touching unrelated files.
+
+Example pattern:
+
+```rust
+struct SuperSpeechNormalizer;
+
+impl TranscriptionNormalizer for SuperSpeechNormalizer {
+    fn normalize(&self, raw_output: &str) -> String {
+        raw_output
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn name(&self) -> &'static str {
+        "SuperSpeechNormalizer"
+    }
+}
+```
+
+Then, inside `impl TranscriptionProvider for SuperSpeechProvider`, return `Ok(Box::new(SuperSpeechNormalizer))` from `normalizer()`.
 
 ## Step-by-Step Implementation
 
@@ -78,6 +115,7 @@ use std::path::Path;
 use std::pin::Pin;
 use tracing::{debug, error, info};
 
+use crate::normalizer::TranscriptionNormalizer;
 use crate::transcription::providers::TranscriptionProvider;
 
 #[derive(Debug, Deserialize)]
@@ -124,6 +162,10 @@ impl TranscriptionProvider for SuperSpeechProvider {
 
     fn is_available(&self) -> bool {
         !self.api_key.is_empty()
+    }
+
+    fn normalizer(&self) -> Result<Box<dyn TranscriptionNormalizer>> {
+        Ok(Box::new(SuperSpeechNormalizer::new()))
     }
 
     fn transcribe<'a>(
@@ -217,6 +259,24 @@ impl TranscriptionProvider for SuperSpeechProvider {
 
             Ok(text)
         })
+    }
+}
+
+struct SuperSpeechNormalizer;
+
+impl SuperSpeechNormalizer {
+    fn new() -> Self {
+        Self
+    }
+}
+
+impl TranscriptionNormalizer for SuperSpeechNormalizer {
+    fn normalize(&self, raw_output: &str) -> String {
+        raw_output.trim().to_string()
+    }
+
+    fn name(&self) -> &'static str {
+        "SuperSpeechNormalizer"
     }
 }
 ```
