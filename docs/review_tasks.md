@@ -8,20 +8,14 @@
 
 ## High Priority
 
-- [ ] **Fix config save path bug**  
-  `src/config/mod.rs` – ensure `Config::save` writes to the CLI-specified file instead of always targeting `~/.config/audetic/config.toml`; add regression test covering custom paths.
+- [x] **Fix config save path bug**  
+  ✅ CLI overrides were removed, so `Config::load`/`save` always target the standard `~/.config/audetic/config.toml`, eliminating the mismatch.
 
-- [ ] **Honor audio settings from config**  
-  Thread `Config.audio` into `AudioStreamManager::new`, select the requested device/sample rate/channels (or closest supported) using CPAL, and surface errors when negotiation fails.
+- [x] **Implement full recording state machine**  
+  ✅ Recording management now uses the `RecordingPhase` enum and is wired through `/status`, so the legacy boolean flow is gone.
 
-- [ ] **Restore clipboard preservation guarantees**  
-  When `behavior.preserve_clipboard` is enabled, store previous contents, reapply them after injection/paste, and treat `wl-copy` failures as errors so the caller can recover.
-
-- [ ] **Implement full recording state machine**  
-  Replace the boolean `recording` flag with an enum (`Idle | Recording | Processing | Error`), expose it via `/status?style=waybar`, and drop mutex guards before any `.await` to keep the API responsive (custom processing indicators can be reintroduced later if needed).
-
-- [ ] **Normalize OpenAI API output correctly**  
-  Extend `WhisperTranscriber::is_openai_whisper` (or add a provider capability flag) so both CLI and API providers use the `OpenAIWhisperNormalizer` path.
+- [x] **Normalize OpenAI API output correctly**  
+  ✅ Providers now vend their own `TranscriptionNormalizer` implementations, so both OpenAI paths share the same normalizer without brittle string checks.
 
 - [ ] **Offload blocking processes from async tasks**  
   Switch whisper CLI/whisper.cpp invocations and clipboard/text-injection helpers to `tokio::process::Command` or `spawn_blocking` to avoid stalling the runtime during long recordings.
@@ -59,8 +53,8 @@
 - [ ] **Push blocking commands onto dedicated executors**  
   Wrap every shell-based helper (clipboard, indicators, providers) with `tokio::process::Command` or `spawn_blocking` so `main.rs` can respond to new API events while transcription or notifications run.
 
-- [ ] **Introduce provider/normalizer capabilities**  
-  Replace the string comparisons in `WhisperTranscriber` with trait-based capability flags so `TranscriptionService` can request the right normalizer without hard-coding provider names.
+- [x] **Introduce provider/normalizer capabilities**  
+  ✅ `TranscriptionProvider` includes a `normalizer()` hook, letting each provider co-locate its normalization logic and removing enum-based switching in the service layer.
 
 - [ ] **Deduplicate provider configuration building**  
   Add a `ProviderConfig::from_whisper_config(&Config)` helper so both explicit and auto-detected provider paths share one construction and new config fields can be threaded uniformly.
