@@ -1,130 +1,96 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-mod api;
-mod audio;
-mod clipboard;
-mod config;
-mod normalizer;
-mod text_injection;
-mod transcription;
-mod ui;
-
-use anyhow::Result;
-use clap::Parser;
-use std::sync::Arc;
-use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info};
+use anyhow::{anyhow, Result};
+use audetic::app;
+use audetic::update::{UpdateConfig, UpdateEngine, UpdateOptions};
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-use crate::api::{ApiCommand, ApiServer};
-use crate::audio::{
-    AudioStreamManager, BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle,
-};
-use crate::clipboard::ClipboardManager;
-use crate::config::Config;
-use crate::text_injection::TextInjector;
-use crate::transcription::{ProviderConfig, Transcriber, TranscriptionService};
-use crate::ui::Indicator;
-
-#[derive(Parser)]
+#[derive(Parser, Debug)]
 #[command(name = "audetic")]
 #[command(about = "Voice to text for Hyprland", long_about = None)]
-struct Args {
-    #[arg(short, long)]
+struct Cli {
+    #[arg(short, long, global = true)]
     verbose: bool,
+
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+enum CliCommand {
+    /// Manage updates (manual install/check/enable/disable)
+    Update(UpdateCliArgs),
+    /// Print version information
+    Version,
+}
+
+#[derive(ClapArgs, Debug)]
+struct UpdateCliArgs {
+    /// Only check for updates, do not download/install
+    #[arg(long)]
+    check: bool,
+    /// Force installation even if versions appear identical
+    #[arg(long)]
+    force: bool,
+    /// Override release channel (default: stable)
+    #[arg(long)]
+    channel: Option<String>,
+    /// Enable automatic background updates
+    #[arg(long)]
+    enable: bool,
+    /// Disable automatic background updates
+    #[arg(long)]
+    disable: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
-    let log_level = if args.verbose { "debug" } else { "info" };
+    let cli = Cli::parse();
+    let log_level = if cli.verbose { "debug" } else { "info" };
     let env_filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
-    info!("Starting Audetic");
+    match cli.command {
+        Some(CliCommand::Version) => {
+            println!("Audetic {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some(CliCommand::Update(args)) => {
+            handle_update_command(args).await?;
+            return Ok(());
+        }
+        None => {}
+    }
 
-    let config = Config::load()?;
+    app::run_service().await
+}
 
-    // Initialize components
-    let (tx, mut rx) = mpsc::channel::<ApiCommand>(10);
+async fn handle_update_command(args: UpdateCliArgs) -> Result<()> {
+    if args.enable && args.disable {
+        return Err(anyhow!(
+            "Cannot enable and disable auto-update at the same time"
+        ));
+    }
 
-    let audio_recorder = Arc::new(Mutex::new(AudioStreamManager::new()?));
+    let config = UpdateConfig::detect(args.channel.clone())?;
+    let engine = UpdateEngine::new(config)?;
+    let report = engine
+        .run_manual(UpdateOptions {
+            channel: args.channel,
+            check_only: args.check,
+            force: args.force,
+            enable_auto_update: args.enable,
+            disable_auto_update: args.disable,
+        })
+        .await?;
 
-    // Build whisper transcriber
-    let whisper = if let Some(provider) = &config.whisper.provider {
-        let provider_config = ProviderConfig {
-            model: config.whisper.model.clone(),
-            model_path: config.whisper.model_path.clone(),
-            language: config.whisper.language.clone(),
-            command_path: config.whisper.command_path.clone(),
-            api_endpoint: config.whisper.api_endpoint.clone(),
-            api_key: config.whisper.api_key.clone(),
-        };
-        Transcriber::with_provider(provider, provider_config)?
+    println!("{}", report.message);
+    if let Some(remote) = report.remote_version.as_deref() {
+        println!("Current: {} | Remote: {}", report.current_version, remote);
     } else {
-        // Auto-detect provider when no provider specified
-        let provider_config = ProviderConfig {
-            model: config.whisper.model.clone(),
-            model_path: config.whisper.model_path.clone(),
-            language: config.whisper.language.clone(),
-            command_path: config.whisper.command_path.clone(),
-            api_endpoint: config.whisper.api_endpoint.clone(),
-            api_key: config.whisper.api_key.clone(),
-        };
-        Transcriber::auto_detect(provider_config)?
-    };
-
-    // Compose transcription service with whisper and normalizer
-    let transcription_service = Arc::new(TranscriptionService::new(whisper)?);
-
-    let text_injector = TextInjector::new(Some(&config.wayland.input_method))?;
-    let clipboard = ClipboardManager::new()?.with_preserve(config.behavior.preserve_clipboard);
-
-    let indicator =
-        Indicator::from_config(&config.ui).with_audio_feedback(config.behavior.audio_feedback);
-
-    let status_handle = RecordingStatusHandle::default();
-    let recording_machine = RecordingMachine::new(
-        audio_recorder.clone(),
-        transcription_service,
-        indicator,
-        text_injector,
-        clipboard,
-        BehaviorOptions {
-            auto_paste: config.behavior.auto_paste,
-            delete_audio_files: config.behavior.delete_audio_files,
-        },
-        status_handle.clone(),
-    );
-
-    // Create and start API server
-    let api_server = ApiServer::new(tx, status_handle.clone(), &config);
-
-    // Start API server in background
-    tokio::spawn(async move {
-        if let Err(e) = api_server.start().await {
-            error!("API server failed: {}", e);
-        }
-    });
-
-    //TODO: spawn auto-update service
-
-    info!("Audetic is ready!");
-    info!("Add this to your Hyprland config:");
-    info!("bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle");
-    info!("Or test manually: curl -X POST http://127.0.0.1:3737/toggle");
-
-    // Main event loop
-    while let Some(command) = rx.recv().await {
-        match command {
-            ApiCommand::ToggleRecording => match recording_machine.toggle().await {
-                Ok(RecordingPhase::Recording) => info!("Recording started"),
-                Ok(RecordingPhase::Processing) => info!("Recording stopped, processing audio"),
-                Ok(phase) => info!("RecordingMachine is currently {:?}", phase),
-                Err(e) => error!("Failed to toggle recording: {}", e),
-            },
-        }
+        println!("Current: {}", report.current_version);
     }
 
     Ok(())

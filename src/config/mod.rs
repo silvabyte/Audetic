@@ -1,3 +1,4 @@
+use crate::global;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -150,8 +151,6 @@ impl Config {
     }
 
     fn config_path() -> Result<PathBuf> {
-        let config_dir = dirs::config_dir().context("Failed to determine config directory")?;
-
-        Ok(config_dir.join("audetic").join("config.toml"))
+        global::config_file()
     }
 }

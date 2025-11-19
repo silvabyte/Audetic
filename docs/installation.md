@@ -4,37 +4,41 @@ Complete installation instructions for different operating systems and environme
 
 ## Quick Install (Recommended)
 
-### Arch Linux + Omarchy
-
-For users running Omarchy on Arch Linux, use the automated installer:
+Audetic now ships verified binaries for Linux and macOS. Install or reinstall the service with one command—no Rust toolchain, git clone, or manual builds required:
 
 ```bash
-git clone https://github.com/silvabyte/Audetic.git
-cd Audetic
-make install
+curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
 ```
 
-This installer:
-- Installs all system dependencies (Rust, ydotool, wtype, wl-clipboard, etc.)
-- Builds optimized Whisper.cpp with large-v3-turbo model
-- Compiles and installs Audetic
-- Creates systemd user service
-- Sets up update mechanism
-- Creates proper configuration
+The installer:
 
-**Installation Options:**
-```bash
-make install              # Normal install with smart detection
-make install -- --clean   # Fresh install from scratch
-make install -- --skip-whisper  # Update only Audetic
-make install -- --rebuild       # Force rebuild Audetic
+- Detects your OS/architecture and selects the matching artifact.
+- Verifies SHA-256 (and optional signatures) before extracting.
+- Installs the `audetic` binary into `/usr/local/bin` (or a custom prefix).
+- Drops the systemd user unit plus config scaffolding under `~/.config/audetic`.
+- Seeds `update_state.json` so the built-in auto-updater can take over.
+- Is idempotent—rerun anytime to repair, reinstall, or switch channels.
+
+### Useful flags
+
+```
+latest.sh --prefix "$HOME/.local"   # install without sudo
+latest.sh --system                  # install as a system-level service
+latest.sh --channel beta            # jump to another release channel
+latest.sh --clean                   # remove previous binaries/services before reinstalling
+latest.sh --dry-run                 # fetch & verify artifacts without touching the system
+latest.sh --uninstall [--clean]     # remove Audetic (optionally purge config/cache)
 ```
 
-**Post-installation steps:**
-1. `make start` - Enable and start the service
-2. Add to Hyprland config: `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle`
+After install:
+1. The installer automatically enables/starts the systemd **user** service (unless `--no-start` was set). Use `systemctl --user status audetic.service` to confirm.
+2. Add a keybind in Hyprland (or your compositor) that calls `curl -X POST http://127.0.0.1:3737/toggle`.
+3. Edit `~/.config/audetic/config.toml` if you need custom providers, models, or behavior tweaks.
 
 ## Manual Installation
+
+> **When should I use this?**  
+> Only when you need to hack on Audetic itself or build for a platform that doesn't have pre-built binaries yet. Everyone else should stick with the `latest.sh` installer above.
 
 ### Prerequisites
 
@@ -328,29 +332,41 @@ input_method = "ydotool"
 
 ## Updating
 
-The automated installer sets up an update mechanism:
+Audetic now includes two parallel update paths:
+
+1. **Background auto-updater**: runs inside the daemon, checks `https://install.audetic.ai/cli/version` every few hours, downloads new binaries into `~/.local/share/audetic/updates`, swaps them atomically, and restarts the service (unless `AUDETIC_DISABLE_AUTO_RESTART=1` is set). Auto-updates respect `~/.config/audetic/update_state.json` and can be disabled.
+
+2. **Manual CLI control** via the built-in subcommand:
 
 ```bash
-audetic-update                    # Update Audetic only
-audetic-update --whisper          # Update both Audetic and Whisper
-audetic-update --check            # Check for available updates
-audetic-update --force            # Force update even if up-to-date
+# Show current vs remote version without installing
+audetic update --check
+
+# Force an immediate install (even if versions appear equal)
+audetic update --force
+
+# Switch channels for subsequent checks
+audetic update --channel beta
+
+# Toggle background updates
+audetic update --disable
+audetic update --enable
+```
+
+Because `latest.sh` is idempotent, you can also rerun it at any time to jump to a specific channel or repair a broken install:
+
+```bash
+curl -fsSL https://install.audetic.ai/cli/latest.sh | bash -s -- --channel beta --clean
 ```
 
 ## Uninstalling
 
+The installer doubles as the uninstaller:
+
 ```bash
-# Stop and disable service
-systemctl --user stop audetic.service
-systemctl --user disable audetic.service
-
-# Remove files
-sudo rm /usr/local/bin/audetic
-sudo rm /usr/local/bin/audetic-update
-rm -rf ~/.config/audetic
-rm -rf ~/.local/share/audetic
-rm ~/.config/systemd/user/audetic.service
-
-# Reload systemd
-systemctl --user daemon-reload
+curl -fsSL https://install.audetic.ai/cli/latest.sh | bash -s -- --uninstall
 ```
+
+Add `--clean` if you also want to purge `~/.config/audetic` and caches under `~/.local/share/audetic`.
+
+Manual teardown remains the same as before (stop the systemd service, delete the binary, remove config directories) if you prefer to handle it yourself.

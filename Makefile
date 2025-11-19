@@ -1,6 +1,16 @@
 include makefiles/shell.mk
 
-.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix
+VERSION ?=
+CHANNEL ?= stable
+TARGETS ?= linux-x86_64-gnu
+ALLOW_DIRTY ?= 0
+DRY_RUN ?= 0
+SKIP_TESTS ?= 0
+SKIP_TAG ?= 0
+USE_CROSS ?= 0
+EXTRA_FEATURES ?=
+
+.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix deploy
 
 # Default target
 help:
@@ -24,6 +34,7 @@ help:
 	@echo "  make status    - Check service status"
 	@echo ""
 	@echo "  make clean     - Clean build artifacts"
+	@echo "  make deploy    - Build/package/publish release artifacts (env: VERSION, TARGETS, CHANNEL, DRY_RUN=1, SKIP_TESTS=1, ALLOW_DIRTY=1, USE_CROSS=1)"
 
 # Build commands
 build:
@@ -48,6 +59,18 @@ fmt:
 fix:
 	cargo fmt
 	cargo fix --allow-dirty --allow-staged
+
+deploy:
+	@VERSION=$(VERSION) \
+	 CHANNEL=$(CHANNEL) \
+	 TARGETS="$(TARGETS)" \
+	 ALLOW_DIRTY=$(ALLOW_DIRTY) \
+	 DRY_RUN=$(DRY_RUN) \
+	 SKIP_TESTS=$(SKIP_TESTS) \
+	 SKIP_TAG=$(SKIP_TAG) \
+	 USE_CROSS=$(USE_CROSS) \
+	 EXTRA_FEATURES="$(EXTRA_FEATURES)" \
+	 ./scripts/release/deploy.sh
 
 # Installation and service management
 install:

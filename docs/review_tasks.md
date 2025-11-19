@@ -17,6 +17,11 @@
 - [x] **Normalize OpenAI API output correctly**  
   ✅ Providers now vend their own `TranscriptionNormalizer` implementations, so both OpenAI paths share the same normalizer without brittle string checks.
 
+- [ ] **Harden the binary installer + auto-updater**  
+  - Add CI coverage that runs `release/cli/latest.sh --dry-run` for every supported target so broken URLs/manifests are caught before publishing.  
+  - Exercise the Rust `UpdateManager` against a mocked install endpoint to verify checksum enforcement, staging behavior, and restart flow.  
+  - Document the release artifact manifest schema so future providers can add new targets without reverse-engineering the current JSON.
+
 - [ ] **Offload blocking processes from async tasks**  
   Switch whisper CLI/whisper.cpp invocations and clipboard/text-injection helpers to `tokio::process::Command` or `spawn_blocking` to avoid stalling the runtime during long recordings.
 
