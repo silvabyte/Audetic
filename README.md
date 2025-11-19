@@ -11,21 +11,25 @@
 
 **[View Documentation](./docs/index.md)** - Detailed guides and configuration
 
-## Quick Install (Omarchy + Arch Linux)
+## Quick Install (Recommended)
+
+Audetic ships pre-built, signed binaries. Install or repair the service—no Rust or git required:
 
 ```bash
-git clone https://github.com/silvabyte/Audetic.git
-cd Audetic
-make install
+curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
 ```
 
-This automatically installs dependencies, builds Audetic with optimized Whisper, sets up services, and configures keybinds.
+Highlights:
+- Detects OS/arch, downloads the matching artifact, and verifies SHA-256 (plus optional signature).
+- Installs `audetic` into `/usr/local/bin` (or a custom `--prefix`).
+- Sets up the user systemd service + default config under `~/.config/audetic/`.
+- Idempotent: rerun anytime with flags like `--clean`, `--channel beta`, `--dry-run`, or `--uninstall`.
 
 **After installation:**
 
-1. Start the service: `make start`
-2. Add to Hyprland config: `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle`
-3. Press Super+R to start recording!
+1. Confirm the service: `systemctl --user status audetic.service`
+2. Add a keybind in Hyprland (or your compositor): `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle`
+3. Press the keybind to start/stop recording!
 
 ## Features
 
@@ -38,7 +42,7 @@ This automatically installs dependencies, builds Audetic with optimized Whisper,
 
 ## Manual Installation
 
-For other distributions or custom setups, see the [Installation Guide](./docs/installation.md).
+Need to hack on Audetic or build for an unsupported platform? Follow the [Installation Guide](./docs/installation.md) for the full toolchain-based workflow (Rust, Whisper builds, etc.).
 
 ## Configuration
 
@@ -71,11 +75,17 @@ make clean      # Clean build artifacts
 
 ## Updates
 
+Audetic includes an auto-updater plus manual controls:
+
 ```bash
-audetic-update                    # Update Audetic
-audetic-update --whisper          # Update both Audetic and Whisper
-audetic-update --check            # Check for updates
+audetic update --check        # Compare installed vs remote without installing
+audetic update --force        # Force install immediately
+audetic update --channel beta # Switch release channels
+audetic update --disable      # Turn off background updates
+audetic update --enable       # Re-enable background updates
 ```
+
+The daemon periodically polls `https://install.audetic.ai/cli/version`, downloads new binaries into `~/.local/share/audetic/updates`, verifies checksums, and swaps them atomically. Set `AUDETIC_DISABLE_AUTO_UPDATE=1` to opt out.
 
 ## License
 

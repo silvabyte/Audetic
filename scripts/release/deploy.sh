@@ -45,7 +45,7 @@ ensure_command() {
   command -v "$cmd" >/dev/null 2>&1 || die "Missing required command: $cmd"
 }
 
-semver_re='^[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+)?$'
+semver_re='^[0-9]+\.[0-9]+\.[0-9]+([+-][0-9A-Za-z._-]+)?$'
 
 validate_version() {
   [[ -z "$VERSION" ]] && die "VERSION is required (e.g. make deploy VERSION=0.2.0)"
