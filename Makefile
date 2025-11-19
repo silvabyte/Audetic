@@ -9,6 +9,7 @@ SKIP_TESTS ?= 0
 SKIP_TAG ?= 0
 USE_CROSS ?= 0
 EXTRA_FEATURES ?=
+AUTO_COMMIT ?= 1
 
 .PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix deploy
 

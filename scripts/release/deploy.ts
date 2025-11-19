@@ -126,7 +126,9 @@ type TargetFailure = {
 function flag(name: string, fallback: boolean): boolean {
 	const value = env[name];
 	if (value === undefined) return fallback;
-	return ["1", "true", "yes", "on"].includes(value.toLowerCase());
+	const normalized = value.trim().toLowerCase();
+	if (!normalized) return fallback;
+	return ["1", "true", "yes", "on"].includes(normalized);
 }
 
 function parseTargets(raw: string): string[] {
