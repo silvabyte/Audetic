@@ -1,5 +1,5 @@
 use crate::update::{UpdateConfig, UpdateEngine, UpdateOptions};
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::io;
 use std::process::Command;
@@ -74,20 +74,15 @@ pub async fn handle_update_command(args: UpdateCliArgs) -> Result<()> {
             .remote_version
             .as_deref()
             .unwrap_or("the newly installed version");
-        match restart_user_service_if_running() {
-            Ok(true) => {
+        match restart_user_service() {
+            Ok(()) => {
                 println!("Audetic service restarted via systemd user service.");
-            }
-            Ok(false) => {
-                println!(
-                    "Update installed. Restart Audetic manually (e.g. `systemctl --user restart audetic.service`) to begin running {}.",
-                    remote
-                );
             }
             Err(err) => {
                 eprintln!("Failed to restart Audetic automatically: {err}");
                 println!(
-                    "Please restart the Audetic service manually (e.g. `systemctl --user restart audetic.service`)."
+                    "Please restart the Audetic service manually (e.g. `systemctl --user restart audetic.service`) to begin running {}.",
+                    remote
                 );
             }
         }
@@ -96,40 +91,22 @@ pub async fn handle_update_command(args: UpdateCliArgs) -> Result<()> {
     Ok(())
 }
 
-fn restart_user_service_if_running() -> Result<bool> {
-    let is_active = match Command::new("systemctl")
-        .arg("--user")
-        .arg("is-active")
-        .arg("audetic.service")
-        .status()
-    {
-        Ok(status) => status.success(),
-        Err(err) => {
-            if err.kind() == io::ErrorKind::NotFound {
-                return Ok(false);
-            }
-            return Err(anyhow!(
-                "Failed to check audetic.service status via systemctl: {err}"
-            ));
-        }
-    };
-
-    if !is_active {
-        return Ok(false);
-    }
-
-    let restart_status = Command::new("systemctl")
+fn restart_user_service() -> Result<()> {
+    match Command::new("systemctl")
         .arg("--user")
         .arg("restart")
         .arg("audetic.service")
         .status()
-        .with_context(|| "Failed to invoke systemctl --user restart audetic.service")?;
-
-    if restart_status.success() {
-        Ok(true)
-    } else {
-        Err(anyhow!(
-            "systemctl reported failure restarting audetic.service (exit status: {restart_status})"
-        ))
+    {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(anyhow!(
+            "systemctl reported failure restarting audetic.service (exit status: {status})"
+        )),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(anyhow!(
+            "systemctl binary not found in PATH, cannot restart audetic.service automatically"
+        )),
+        Err(err) => Err(anyhow!(
+            "Failed to invoke systemctl --user restart audetic.service: {err}"
+        )),
     }
 }
