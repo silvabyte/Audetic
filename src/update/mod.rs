@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::fs::File;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::fs;
@@ -398,6 +400,27 @@ impl UpdateEngine {
     }
 
     fn install_binary(&self, staged: &Path, version: &str) -> Result<()> {
+        match self.install_binary_unprivileged(staged, version) {
+            Ok(()) => Ok(()),
+            Err(err) if is_permission_denied(&err) => {
+                let target_path = &self.inner.config.binary_path;
+                println!(
+                    "Audetic needs elevated privileges to update {}.",
+                    target_path.display()
+                );
+                println!("You may be prompted for your password.");
+                info!(
+                    "Falling back to sudo installation for {}",
+                    target_path.display()
+                );
+                self.install_binary_with_sudo(staged, version)
+                    .context("Failed to install binary using sudo")
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn install_binary_unprivileged(&self, staged: &Path, version: &str) -> Result<()> {
         let target_path = &self.inner.config.binary_path;
         let parent = target_path
             .parent()
@@ -426,6 +449,72 @@ impl UpdateEngine {
         }
         std::fs::rename(&tmp_path, target_path)
             .with_context(|| format!("Failed to replace {}", target_path.display()))?;
+        Ok(())
+    }
+
+    fn install_binary_with_sudo(&self, staged: &Path, version: &str) -> Result<()> {
+        if !sudo_available() {
+            return Err(anyhow!(
+                "sudo is not available. Please run `audetic update` with elevated permissions."
+            ));
+        }
+        let target_path = &self.inner.config.binary_path;
+        let parent = target_path
+            .parent()
+            .context("Binary path missing parent directory")?;
+        let tmp_path = parent.join(format!("{BIN_NAME}-{version}.tmp"));
+        let backup_path = parent.join(format!(
+            "{BIN_NAME}-{}.bak",
+            self.inner.config.current_version
+        ));
+
+        run_sudo_command(
+            {
+                let mut cmd = Command::new("sudo");
+                cmd.arg("rm").arg("-f").arg(&tmp_path);
+                cmd
+            },
+            "remove temporary update binary",
+        )?;
+
+        run_sudo_command(
+            {
+                let mut cmd = Command::new("sudo");
+                cmd.arg("install")
+                    .arg("-m")
+                    .arg("755")
+                    .arg(staged)
+                    .arg(&tmp_path);
+                cmd
+            },
+            "stage updated binary",
+        )?;
+
+        if target_path.exists() {
+            if let Err(err) = run_sudo_command(
+                {
+                    let mut cmd = Command::new("sudo");
+                    cmd.arg("cp").arg(target_path).arg(&backup_path);
+                    cmd
+                },
+                "backup existing binary",
+            ) {
+                warn!(
+                    "Failed to create sudo-backed backup at {}: {err:?}",
+                    backup_path.display()
+                );
+            }
+        }
+
+        run_sudo_command(
+            {
+                let mut cmd = Command::new("sudo");
+                cmd.arg("mv").arg(&tmp_path).arg(target_path);
+                cmd
+            },
+            "activate updated binary",
+        )?;
+
         Ok(())
     }
 
@@ -685,4 +774,39 @@ fn unix_timestamp() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or_default()
+}
+
+fn sudo_available() -> bool {
+    Command::new("sudo")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn is_permission_denied(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause.downcast_ref::<io::Error>().map_or(false, |io_err| {
+            io_err.kind() == io::ErrorKind::PermissionDenied
+        })
+    })
+}
+
+fn run_sudo_command(mut command: Command, description: &str) -> Result<()> {
+    let status = command
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| format!("Failed to run sudo to {description}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "sudo command failed while attempting to {description} (status: {})",
+            status
+        ))
+    }
 }
