@@ -6,7 +6,7 @@ use std::process::Command;
 use tracing::{error, info};
 use which::which;
 
-use crate::whisper::provider::TranscriptionProvider;
+use super::TranscriptionProvider;
 
 pub struct OpenAIWhisperCliProvider {
     command_path: PathBuf,

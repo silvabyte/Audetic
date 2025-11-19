@@ -6,7 +6,7 @@ use std::path::Path;
 use std::pin::Pin;
 use tracing::{debug, error, info};
 
-use crate::whisper::provider::TranscriptionProvider;
+use super::TranscriptionProvider;
 
 #[derive(Debug, Deserialize)]
 struct TranscriptionResponse {

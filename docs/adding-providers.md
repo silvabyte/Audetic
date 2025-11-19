@@ -67,7 +67,7 @@ Let's walk through adding a fictional "SuperSpeech API" provider:
 
 ### 1. Create the Provider Module
 
-Create `src/whisper/providers/superspeech_api.rs`:
+Create `src/transcription/providers/superspeech_api.rs`:
 
 ```rust
 use anyhow::{Context, Result};
@@ -78,7 +78,7 @@ use std::path::Path;
 use std::pin::Pin;
 use tracing::{debug, error, info};
 
-use crate::whisper::provider::TranscriptionProvider;
+use crate::transcription::providers::TranscriptionProvider;
 
 #[derive(Debug, Deserialize)]
 struct SuperSpeechResponse {
@@ -223,7 +223,7 @@ impl TranscriptionProvider for SuperSpeechProvider {
 
 ### 2. Update the Providers Module
 
-Add your provider to `src/whisper/providers/mod.rs`:
+Add your provider to `src/transcription/providers/mod.rs`:
 
 ```rust
 pub mod openai_api;
@@ -239,7 +239,7 @@ pub use superspeech_api::SuperSpeechProvider;  // Add this line
 
 ### 3. Register the Provider
 
-Update `src/whisper/mod.rs` to include your provider:
+Update `src/transcription/mod.rs` to include your provider:
 
 ```rust
 // Add to imports
@@ -349,7 +349,7 @@ fn auto_detect_provider(custom_path: Option<String>) -> Result<Box<dyn Transcrip
 
 ### 1. Unit Tests
 
-Create tests in `src/whisper/providers/superspeech_api.rs`:
+Create tests in `src/transcription/providers/superspeech_api.rs`:
 
 ```rust
 #[cfg(test)]
@@ -388,7 +388,7 @@ Test with a real API key:
 ```rust
 // In src/bin/ create test_superspeech.rs
 use anyhow::Result;
-use audetic::whisper::{WhisperTranscriber, ProviderConfig};
+use audetic::transcription::{WhisperTranscriber, ProviderConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -555,9 +555,9 @@ When contributing a new provider:
 
 ## Getting Help
 
-- **Study existing providers** in `src/whisper/providers/`
-- **Check the trait definition** in `src/whisper/provider.rs`
-- **Review configuration handling** in `src/whisper/mod.rs`
+- **Study existing providers** in `src/transcription/providers/`
+- **Check the trait definition** in `src/transcription/providers/mod.rs`
+- **Review configuration handling** in `src/transcription/mod.rs`
 - **Ask questions** in GitHub issues or discussions
 
 Happy coding! 🚀

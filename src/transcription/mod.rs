@@ -1,56 +1,126 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::PathBuf;
-use tracing::{debug, info};
+use tracing::{info, warn};
 
-use crate::normalizer::Normalizer;
-use crate::whisper::WhisperTranscriber;
+mod transcription_service;
 
-/// Service that orchestrates transcription and normalization
-pub struct TranscriptionService {
-    whisper: WhisperTranscriber,
-    normalizer: Normalizer,
+pub mod providers;
+
+pub use providers::{
+    OpenAIProvider, OpenAIWhisperCliProvider, TranscriptionProvider, WhisperCppProvider,
+};
+
+pub use transcription_service::TranscriptionService;
+
+pub struct WhisperTranscriber {
+    provider: Box<dyn TranscriptionProvider>,
+    language: String,
 }
 
-impl TranscriptionService {
-    /// Create a new transcription service with the provided whisper transcriber
-    pub fn new(whisper: WhisperTranscriber) -> Result<Self> {
-        let normalizer = Normalizer::create(whisper.is_openai_whisper())?;
+impl WhisperTranscriber {
+    pub fn auto_detect(config: ProviderConfig) -> Result<Self> {
+        let language = config.language.unwrap_or_else(|| "en".to_string());
+        let provider = Self::auto_detect_provider(config.command_path)?;
 
-        Ok(Self {
-            whisper,
-            normalizer,
-        })
+        Ok(Self { provider, language })
     }
 
-    /// Transcribe audio file and return normalized text
+    pub fn with_provider(provider_name: &str, config: ProviderConfig) -> Result<Self> {
+        let language = config.language.clone().unwrap_or_else(|| "en".to_string());
+
+        let provider: Box<dyn TranscriptionProvider> = match provider_name {
+            "openai-api" => {
+                let api_key = config
+                    .api_key
+                    .context("api_key is required for OpenAI API provider")?;
+
+                let model = config.model.unwrap_or_else(|| "whisper-1".to_string());
+                Box::new(OpenAIProvider::new(api_key, config.api_endpoint, model)?)
+            }
+            "openai-cli" => {
+                let model = config.model.unwrap_or_else(|| "base".to_string());
+                Box::new(OpenAIWhisperCliProvider::new(config.command_path, model)?)
+            }
+            "whisper-cpp" => {
+                let model = config.model.unwrap_or_else(|| "base".to_string());
+                Box::new(WhisperCppProvider::new(
+                    config.command_path,
+                    model,
+                    config.model_path,
+                )?)
+            }
+            _ => {
+                warn!("Unknown provider '{}', using auto-detection", provider_name);
+                Self::auto_detect_provider(config.command_path)?
+            }
+        };
+
+        info!("Using {} for transcription", provider.name());
+
+        Ok(Self { provider, language })
+    }
+
+    fn auto_detect_provider(custom_path: Option<String>) -> Result<Box<dyn TranscriptionProvider>> {
+        info!("Auto-detecting transcription provider...");
+
+        // Note: OpenAI API requires explicit configuration with api_key
+        // Auto-detection skips API providers that need authentication
+
+        if let Ok(provider) = OpenAIWhisperCliProvider::new(custom_path.clone(), "base".to_string())
+        {
+            if provider.is_available() {
+                info!("Auto-detected: OpenAI Whisper CLI");
+                return Ok(Box::new(provider));
+            }
+        }
+
+        if let Ok(provider) = WhisperCppProvider::new(custom_path, "base".to_string(), None) {
+            if provider.is_available() {
+                info!("Auto-detected: whisper.cpp");
+                return Ok(Box::new(provider));
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "No transcription provider available. Install whisper-cpp, openai-whisper, or configure OpenAI API with api_key"
+        ))
+    }
+
     pub async fn transcribe(&self, audio_path: &PathBuf) -> Result<String> {
-        info!("Starting transcription pipeline for: {:?}", audio_path);
-
-        // Step 1: Get raw transcription from whisper
-        debug!("Getting raw transcription from whisper");
-        let raw_transcription = self.whisper.transcribe(audio_path).await?;
-
-        // Step 2: Normalize the transcription
-        debug!("Normalizing transcription output");
-        let normalized = self.normalizer.run(&raw_transcription);
-
         info!(
-            "Transcription pipeline complete: {} chars -> {} chars",
-            raw_transcription.len(),
-            normalized.len()
+            "Transcribing audio file: {:?} with {}",
+            audio_path,
+            self.provider.name()
         );
+        self.provider
+            .transcribe(audio_path.as_path(), &self.language)
+            .await
+    }
 
-        Ok(normalized)
+    pub fn is_openai_whisper(&self) -> bool {
+        self.provider.name() == "OpenAI Whisper CLI"
     }
 }
 
-#[cfg(test)]
-mod tests {
-    // use super::*;
+#[derive(Debug, Clone)]
+pub struct ProviderConfig {
+    pub model: Option<String>,
+    pub model_path: Option<String>,
+    pub language: Option<String>,
+    pub command_path: Option<String>,
+    pub api_endpoint: Option<String>,
+    pub api_key: Option<String>,
+}
 
-    #[tokio::test]
-    async fn test_transcription_service_creation() {
-        //TODO: implement this
-        // NOTE:: This would require mocking WhisperTranscriber
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            model: None,
+            model_path: None,
+            language: Some("en".to_string()),
+            command_path: None,
+            api_endpoint: None,
+            api_key: None,
+        }
     }
 }

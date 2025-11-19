@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 use tracing::{error, info, warn};
 use which::which;
 
-use crate::whisper::provider::TranscriptionProvider;
+use super::TranscriptionProvider;
 
 pub struct WhisperCppProvider {
     command_path: PathBuf,

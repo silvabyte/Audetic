@@ -8,7 +8,6 @@ mod normalizer;
 mod text_injection;
 mod transcription;
 mod ui;
-mod whisper;
 
 use anyhow::Result;
 use clap::Parser;
@@ -25,9 +24,8 @@ use crate::audio::{
 use crate::clipboard::ClipboardManager;
 use crate::config::Config;
 use crate::text_injection::TextInjector;
-use crate::transcription::TranscriptionService;
+use crate::transcription::{ProviderConfig, TranscriptionService, WhisperTranscriber};
 use crate::ui::Indicator;
-use crate::whisper::WhisperTranscriber;
 
 #[derive(Parser)]
 #[command(name = "audetic")]
@@ -63,7 +61,7 @@ async fn main() -> Result<()> {
 
     // Build whisper transcriber
     let whisper = if let Some(provider) = &config.whisper.provider {
-        let provider_config = whisper::ProviderConfig {
+        let provider_config = ProviderConfig {
             model: config.whisper.model.clone(),
             model_path: config.whisper.model_path.clone(),
             language: config.whisper.language.clone(),
@@ -74,7 +72,7 @@ async fn main() -> Result<()> {
         WhisperTranscriber::with_provider(provider, provider_config)?
     } else {
         // Auto-detect provider when no provider specified
-        let provider_config = whisper::ProviderConfig {
+        let provider_config = ProviderConfig {
             model: config.whisper.model.clone(),
             model_path: config.whisper.model_path.clone(),
             language: config.whisper.language.clone(),
