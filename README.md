@@ -5,7 +5,7 @@ Voice to Text application for Wayland/Hyprland. Press a keybind to toggle record
 
 ## Quick Install (Recommended)
 
-Audetic ships pre-built, signed binaries. Install or repair the service—no Rust or git required:
+Audetic ships pre-built, signed binaries.
 
 ```bash
 curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
@@ -13,7 +13,7 @@ curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
 
 **After installation:**
 
-1. Confirm the service: `systemctl --user status audetic.service`
+1. Confirm the service: `audetic` - streams the logs
 2. Add a keybind in Hyprland (or your compositor): `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle`
 3. Press the keybind to start/stop recording!
 

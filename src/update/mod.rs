@@ -19,7 +19,7 @@ use walkdir::WalkDir;
 const DEFAULT_BASE_URL: &str = "https://install.audetic.ai";
 const DEFAULT_CHANNEL: &str = "stable";
 const BIN_NAME: &str = "audetic";
-const UPDATE_INTERVAL_HOURS: u64 = 6;
+const UPDATE_INTERVAL_HOURS: u64 = 1;
 
 #[derive(Clone)]
 pub struct UpdateConfig {
