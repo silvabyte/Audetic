@@ -8,11 +8,10 @@ The minimal configuration to get started:
 
 ```toml
 [whisper]
-# Auto-detection (recommended) - Audetic will automatically choose the best provider
+provider = "audetic-api"
 language = "en"
 
-# For OpenAI API access, add your key to config:
-# provider = "openai-api"
+# Set your provider-specific credentials:
 # api_key = "sk-your-api-key-here"
 ```
 
@@ -59,7 +58,7 @@ Configures speech-to-text transcription providers and models.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `provider` | string | auto-detect | Transcription provider: `"openai-api"`, `"openai-cli"`, `"whisper-cpp"`, or omit for auto-detection |
+| `provider` | string | `"audetic-api"` | Transcription provider: `"audetic-api"`, `"openai-api"`, `"openai-cli"`, `"whisper-cpp"` |
 | `api_key` | string | none | API key for API-based providers (required for openai-api) |
 | `model` | string | `"base"` | Model name (provider-specific, see Providers section) |
 | `language` | string | `"en"` | Language code (ISO 639-1 format) |
@@ -90,11 +89,7 @@ Audetic supports multiple transcription providers:
 - **Status:** Experimental
 - **Cost:** Free (local processing)
 
-**Auto-Detection** (omit `provider`)
-- Audetic automatically selects the best available provider:
-  1. OpenAI Whisper CLI (if installed)
-  2. whisper.cpp (fallback)
-- Note: API providers require explicit configuration with api_key
+Auto-selection is no longer supported—set `provider` explicitly to control which engine is used.
 
 #### Language Codes
 

@@ -47,23 +47,18 @@ struct ErrorDetail {
 
 pub struct AudeticProvider {
     client: reqwest::Client,
-    api_key: String,
     endpoint: String,
 }
 
 impl AudeticProvider {
-    pub fn new(api_key: String, endpoint: Option<String>) -> Result<Self> {
+    pub fn new(endpoint: Option<String>) -> Result<Self> {
         let client = reqwest::Client::new();
         let endpoint = endpoint
             .unwrap_or_else(|| "https://audio.audetic.link/api/v1/transcriptions".to_string());
 
         info!("Initialized Audetic provider with endpoint: {}", endpoint);
 
-        Ok(Self {
-            client,
-            api_key,
-            endpoint,
-        })
+        Ok(Self { client, endpoint })
     }
 }
 
@@ -73,7 +68,7 @@ impl TranscriptionProvider for AudeticProvider {
     }
 
     fn is_available(&self) -> bool {
-        !self.api_key.is_empty()
+        true
     }
 
     fn transcribe<'a>(
@@ -97,7 +92,6 @@ impl TranscriptionProvider for AudeticProvider {
             let response = self
                 .client
                 .post(&self.endpoint)
-                .header("Authorization", format!("Bearer {}", self.api_key))
                 .json(&body)
                 .send()
                 .await

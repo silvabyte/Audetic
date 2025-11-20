@@ -1,9 +1,7 @@
 [whisper]
-# Provider selection (defaults to auto-detection if not specified)
-# Uncomment and set provider to explicitly choose:
-# provider = "whisper-cpp"    # Local whisper.cpp (built during install)
-# provider = "openai-cli"     # Local OpenAI Whisper CLI 
-# provider = "openai-api"     # OpenAI API (requires api_key)
+# Provider selection (required)
+# Supported values: "audetic-api" (default), "openai-api", "openai-cli", "whisper-cpp"
+provider = "audetic-api"
 
 # Common settings
 model = "base"              # Model size: tiny, base, small, medium, large-v3, large-v3-turbo

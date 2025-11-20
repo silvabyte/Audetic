@@ -7,11 +7,13 @@ This guide shows developers how to add new third-party transcription providers t
 Audetic uses a trait-based provider system where each transcription service implements the `TranscriptionProvider` trait. This allows for clean abstraction and easy extensibility.
 
 **Current providers:**
+
 - **OpenAI API** - Cloud-based OpenAI Whisper API
 - **OpenAI CLI** - Local OpenAI Whisper CLI tool  
 - **whisper.cpp** - Local whisper.cpp implementation
 
 **Potential new providers:**
+
 - Azure OpenAI Service
 - Google Speech-to-Text
 - Amazon Transcribe
@@ -54,19 +56,23 @@ pub trait TranscriptionProvider: Send + Sync {
 ### Method Details
 
 **`name()`** - Returns a human-readable name for logging and user feedback
+
 - Examples: `"Google Speech-to-Text"`, `"Azure OpenAI"`, `"AssemblyAI"`
 
 **`is_available()`** - Quick check if the provider can be used
+
 - For API providers: Check if API key/credentials are configured
 - For CLI providers: Check if binary exists and is accessible
 - Should be fast (no network calls)
 
 **`normalizer()`** - Creates the provider’s transcription normalizer
+
 - Return a boxed type implementing `TranscriptionNormalizer`
 - Keep the implementation in the same module as the provider so maintenance stays localized
 - Expensive setup (regex compilation, etc.) can happen inside the normalizer constructor
 
 **`transcribe()`** - Core transcription functionality
+
 - Takes audio file path and language code
 - Returns async result with transcribed text
 - Should handle errors gracefully with context
@@ -330,9 +336,7 @@ pub fn with_provider(provider_name: &str, config: ProviderConfig) -> Result<Self
                 model,
             )?)
         }
-        _ => {
-            // existing auto-detection code...
-        }
+        _ => bail!("Unknown provider"),
     };
 
     // rest of function...
@@ -371,38 +375,6 @@ Update `example_config.toml` with a commented example:
 # provider = "superspeech-api"  # SuperSpeech API provider
 # api_key = "ss-your-key"      # Your SuperSpeech API key
 # model = "premium"            # SuperSpeech model
-```
-
-### 6. Optional: Add to Auto-Detection
-
-If your provider should be part of auto-detection (for non-API providers), add it to the `auto_detect_provider()` function:
-
-```rust
-fn auto_detect_provider(custom_path: Option<String>) -> Result<Box<dyn TranscriptionProvider>> {
-    info!("Auto-detecting transcription provider...");
-
-    // Note: API providers require explicit configuration
-    
-    if let Ok(provider) = OpenAIWhisperCliProvider::new(custom_path.clone(), "base".to_string()) {
-        if provider.is_available() {
-            info!("Auto-detected: OpenAI Whisper CLI");
-            return Ok(Box::new(provider));
-        }
-    }
-
-    if let Ok(provider) = WhisperCppProvider::new(custom_path, "base".to_string(), None) {
-        if provider.is_available() {
-            info!("Auto-detected: whisper.cpp");
-            return Ok(Box::new(provider));
-        }
-    }
-
-    // Add here for CLI-based providers that should be auto-detected
-    
-    Err(anyhow::anyhow!(
-        "No transcription provider available. Install whisper-cpp, openai-whisper, or configure API provider"
-    ))
-}
 ```
 
 ## Testing Your Provider
@@ -621,3 +593,4 @@ When contributing a new provider:
 - **Ask questions** in GitHub issues or discussions
 
 Happy coding! 🚀
+

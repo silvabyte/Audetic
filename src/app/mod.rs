@@ -9,7 +9,7 @@ use crate::text_io::TextIoService;
 use crate::transcription::{ProviderConfig, Transcriber, TranscriptionService};
 use crate::ui::Indicator;
 use crate::update::{UpdateConfig, UpdateEngine};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
@@ -76,6 +76,12 @@ pub async fn run_service() -> Result<()> {
 }
 
 fn build_transcriber(config: &Config) -> Result<Transcriber> {
+    let provider = config
+        .whisper
+        .provider
+        .as_deref()
+        .ok_or_else(|| anyhow!("No transcription provider configured. Set [whisper].provider in ~/.config/audetic/config.toml"))?;
+
     let provider_config = ProviderConfig {
         model: config.whisper.model.clone(),
         model_path: config.whisper.model_path.clone(),
@@ -85,11 +91,7 @@ fn build_transcriber(config: &Config) -> Result<Transcriber> {
         api_key: config.whisper.api_key.clone(),
     };
 
-    if let Some(provider) = &config.whisper.provider {
-        Transcriber::with_provider(provider, provider_config)
-    } else {
-        Transcriber::auto_detect(provider_config)
-    }
+    Transcriber::with_provider(provider, provider_config)
 }
 
 fn spawn_update_manager() {

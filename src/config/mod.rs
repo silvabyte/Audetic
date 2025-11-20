@@ -68,8 +68,8 @@ impl Default for WhisperConfig {
             language: Some("en".to_string()),
             command_path: None,
             model_path: None,
-            api_endpoint: Some("https://api.openai.com/v1/audio/transcriptions".to_string()),
-            provider: None,
+            api_endpoint: None,
+            provider: Some("audetic-api".to_string()),
             api_key: None,
         }
     }

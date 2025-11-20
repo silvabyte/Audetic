@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::normalizer::TranscriptionNormalizer;
 
@@ -9,7 +9,8 @@ mod transcription_service;
 pub mod providers;
 
 pub use providers::{
-    OpenAIProvider, OpenAIWhisperCliProvider, TranscriptionProvider, WhisperCppProvider,
+    AudeticProvider, OpenAIProvider, OpenAIWhisperCliProvider, TranscriptionProvider,
+    WhisperCppProvider,
 };
 
 pub use transcription_service::TranscriptionService;
@@ -20,17 +21,14 @@ pub struct Transcriber {
 }
 
 impl Transcriber {
-    pub fn auto_detect(config: ProviderConfig) -> Result<Self> {
-        let language = config.language.unwrap_or_else(|| "en".to_string());
-        let provider = Self::auto_detect_provider(config.command_path)?;
-
-        Ok(Self { provider, language })
-    }
-
     pub fn with_provider(provider_name: &str, config: ProviderConfig) -> Result<Self> {
         let language = config.language.clone().unwrap_or_else(|| "en".to_string());
 
         let provider: Box<dyn TranscriptionProvider> = match provider_name {
+            "audetic-api" => {
+
+                Box::new(AudeticProvider::new(config.api_endpoint)?)
+            }
             "openai-api" => {
                 let api_key = config
                     .api_key
@@ -51,41 +49,15 @@ impl Transcriber {
                     config.model_path,
                 )?)
             }
-            _ => {
-                warn!("Unknown provider '{}', using auto-detection", provider_name);
-                Self::auto_detect_provider(config.command_path)?
-            }
+            _ => bail!(
+                "Unknown transcription provider '{}'. Supported providers: audetic-api, openai-api, openai-cli, whisper-cpp",
+                provider_name
+            ),
         };
 
         info!("Using {} for transcription", provider.name());
 
         Ok(Self { provider, language })
-    }
-
-    fn auto_detect_provider(custom_path: Option<String>) -> Result<Box<dyn TranscriptionProvider>> {
-        info!("Auto-detecting transcription provider...");
-
-        // Note: OpenAI API requires explicit configuration with api_key
-        // Auto-detection skips API providers that need authentication
-
-        if let Ok(provider) = OpenAIWhisperCliProvider::new(custom_path.clone(), "base".to_string())
-        {
-            if provider.is_available() {
-                info!("Auto-detected: OpenAI Whisper CLI");
-                return Ok(Box::new(provider));
-            }
-        }
-
-        if let Ok(provider) = WhisperCppProvider::new(custom_path, "base".to_string(), None) {
-            if provider.is_available() {
-                info!("Auto-detected: whisper.cpp");
-                return Ok(Box::new(provider));
-            }
-        }
-
-        Err(anyhow::anyhow!(
-            "No transcription provider available. Install whisper-cpp, openai-whisper, or configure OpenAI API with api_key"
-        ))
     }
 
     pub async fn transcribe(&self, audio_path: &PathBuf) -> Result<String> {
