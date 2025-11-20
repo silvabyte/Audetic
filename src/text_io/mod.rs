@@ -13,14 +13,23 @@ pub struct TextIoService {
 }
 
 struct TextIoInner {
-    clipboard: Mutex<Clipboard>,
+    clipboard: Mutex<Option<Clipboard>>,
     preserve_previous: bool,
     injection_method: InjectionMethod,
 }
 
 impl TextIoService {
     pub fn new(preferred_method: Option<&str>, preserve_previous: bool) -> Result<Self> {
-        let clipboard = Clipboard::new()?;
+        let clipboard = match Clipboard::new() {
+            Ok(cb) => Some(cb),
+            Err(err) => {
+                warn!(
+                    "System clipboard backend unavailable ({}); falling back to CLI-only mode",
+                    err
+                );
+                None
+            }
+        };
         let injection_method = InjectionMethod::detect(preferred_method);
 
         Ok(Self {
@@ -45,21 +54,34 @@ impl TextIoService {
         debug!("Text to copy: {}", text);
 
         let preserve_previous = self.inner.preserve_previous;
-        let mut clipboard = self.inner.clipboard.lock().await;
-        let previous = if preserve_previous {
-            clipboard.get_text().ok()
-        } else {
-            None
-        };
+        let mut previous: Option<String> = None;
+        let mut used_native = false;
 
-        let primary_result = clipboard.set_text(text);
-        drop(clipboard);
+        {
+            let mut clipboard_guard = self.inner.clipboard.lock().await;
+            if let Some(clipboard) = clipboard_guard.as_mut() {
+                if preserve_previous {
+                    previous = clipboard.get_text().ok();
+                }
 
-        if let Err(err) = primary_result {
-            warn!(
-                "Primary clipboard backend failed ({}), falling back to system tools",
-                err
-            );
+                match clipboard.set_text(text) {
+                    Ok(_) => {
+                        used_native = true;
+                    }
+                    Err(err) => {
+                        warn!(
+                            "Primary clipboard backend failed ({}), disabling until restart",
+                            err
+                        );
+                        *clipboard_guard = None;
+                    }
+                }
+            } else {
+                debug!("Native clipboard backend unavailable; using system clipboard tools");
+            }
+        }
+
+        if !used_native {
             self.copy_with_system_backends(text).await?;
         }
 

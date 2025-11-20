@@ -34,7 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Clipboard
-arboard = "3.3"
+arboard = { version = "3.3", features = ["wayland-data-control"] }
 
 # CLI args
 clap = { version = "4.4", features = ["derive"] }
