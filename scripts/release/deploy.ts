@@ -100,6 +100,7 @@ if (!config.dryRun) {
 	if (failures.length === 0) {
 		await publishAssets();
 		await tagRelease(version);
+		await format();
 		await commitAndPush(version);
 	} else {
 		console.warn("Skipping publish/tag because some targets failed.");
@@ -424,6 +425,16 @@ async function tagRelease(version: string) {
 	}
 	await $`git tag -a ${`v${version}`} -m ${`Audetic ${version}`}`;
 	await $`git push origin ${`v${version}`}`;
+}
+
+async function format() {
+	if (config.dryRun) {
+		console.log("==> [dry-run] skip format");
+		return;
+	}
+
+	console.log("==> formating release files");
+	await $`bun fmt`;
 }
 
 async function commitAndPush(version: string) {
