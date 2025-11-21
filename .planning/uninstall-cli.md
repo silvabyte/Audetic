@@ -30,21 +30,23 @@
 
 ## Implementation plan
 1. **Shared uninstall inventory (path abstraction)**  
-   - Extend `global` (or introduce an `install_layout` helper) that bundles: binary path (from `UpdateConfig::detect`), update wrapper (`audetic-update`), user/system unit path, config dir, data dir, whisper dir, update dirs/files, temp glob, and optional source backup.  
+   - Extend `global` (or introduce an `install_layout` helper) that bundles: binary path (from `UpdateConfig::detect`), update wrapper (`audetic-update`), user/system unit path, config dir, data dir, whisper dir, sqlite history database (`~/.local/share/audetic/audetic.db`), update dirs/files, temp glob, and optional source backup.  
    - Add detection helpers that mirror `scripts/uninstall.sh`’s `ITEMS_TO_REMOVE` array so CLI, `latest.sh`, and any future Bash fallback stay synchronized. This helper should also expose the `systemctl` command/flags we plan to run.
 2. **Rust CLI additions**  
    - Update `CliCommand` with `Uninstall(UninstallCliArgs)` plus struct definitions in `src/cli/mod.rs`. Wire `main.rs` to dispatch to `handle_uninstall_command`.  
    - Implement `handle_uninstall_command` in a new module (e.g., `src/cli/uninstall.rs`) that:
      - Calls the inventory helper to discover artefacts, prints the table, and respects `--dry-run`.  
      - Stops + disables the service (`systemctl --user/system ...`) with warnings if `systemctl` is missing or fails (parity with script).  
-     - Removes the unit file and runs `systemctl daemon-reload` in the correct scope.  
-     - Deletes the binary and `audetic-update`, reusing the sudo fallback logic we already wrote in `update::run_sudo_command` when permissions require elevation.  
-     - Cleans config/data directories unless `--keep-config`; within `data`, purge Whisper + updates selectively based on `--keep-models` / `--keep-updates`.  
+      - Removes the unit file and runs `systemctl daemon-reload` in the correct scope.  
+      - Deletes the binary and `audetic-update`, reusing the sudo fallback logic we already wrote in `update::run_sudo_command` when permissions require elevation.  
+      - Prompts the user (unless `--force`) about deleting the sqlite database before touching it so history can be preserved independently of `--keep-config`; `--dry-run` reports both outcomes for automated coverage.  
+      - Cleans config/data directories unless `--keep-config`; within `data`, purge Whisper + updates selectively based on `--keep-models` / `--keep-updates`.  
      - Deletes `update_state.json`, `update.lock`, staged `updates/`, `.bak` binaries, and `/tmp/audetic_*.wav` (as `scripts/uninstall.sh` already attempts).  
      - Prints success/failure messages mirroring the Bash script’s UX.  
    - Provide a thin shim so `scripts/uninstall.sh` can eventually exec `audetic uninstall "$@"` once the Rust flow ships (long term: deprecate the shell script).
 3. **Installer + automation alignment**  
    - Update `release/cli/latest.sh perform_uninstall` to prefer running the Rust CLI (`$BIN_DIR/audetic uninstall --force ...`) with flags derived from the installer arguments (`--system`, `--clean`). If the binary is missing, fall back to today’s inline Bash removal.  
+   - Remove uninstall responsibilities from `scripts/install.sh`; instead of offering `--clean` destructive removal, have it instruct users to run `audetic uninstall` (optionally with `--clean`/`--keep-*`) before reinstalling.  
    - Keep `scripts/uninstall.sh` for a release or two but have it detect the Rust binary and delegate to `audetic uninstall` (so `make uninstall` exercises the same code path).  
    - Ensure `make deploy` bundles any new uninstall templates (if we add ones for systemd/system) and that `latest.sh` copies them so the CLI can rely on consistent unit paths.
 4. **Docs + README updates**  
