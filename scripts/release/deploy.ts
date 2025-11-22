@@ -10,13 +10,19 @@ import { $ } from "bun";
 const ROOT_DIR = path.resolve(import.meta.dir, "../../");
 const RELEASE_DIR = path.join(ROOT_DIR, "release", "cli");
 const RELEASES_ROOT = path.join(RELEASE_DIR, "releases");
-const VERSION_FILE = path.join(RELEASE_DIR, "version");
 const CARGO_TOML = path.join(ROOT_DIR, "Cargo.toml");
 const CARGO_LOCK = path.join(ROOT_DIR, "Cargo.lock");
 const SERVICE_FILE = path.join(ROOT_DIR, "audetic.service");
 const EXAMPLE_CONFIG = path.join(ROOT_DIR, "example_config.toml");
 
 $.cwd(ROOT_DIR);
+
+function getVersionFilePath(channel: string): string {
+	if (channel === "stable") {
+		return path.join(RELEASE_DIR, "version");
+	}
+	return path.join(RELEASE_DIR, `version-${channel}`);
+}
 
 const TARGET_LOOKUP: Record<string, string> = {
 	"linux-x86_64-gnu": "x86_64-unknown-linux-gnu",
@@ -164,7 +170,8 @@ async function resolveVersion(): Promise<string> {
 		return env.VERSION.trim();
 	}
 
-	const versionFile = await readFileOrNull(VERSION_FILE);
+	const versionFilePath = getVersionFilePath(config.channel);
+	const versionFile = await readFileOrNull(versionFilePath);
 	const manifestVersion = await readCargoVersion();
 	const base = versionFile ?? manifestVersion ?? "0.0.0";
 
@@ -227,12 +234,15 @@ function bumpVersion(value: string, strategy: string): string {
 
 async function syncVersions(version: string) {
 	console.log("==> Syncing project metadata");
+	const versionFile = getVersionFilePath(config.channel);
+
 	if (config.dryRun) {
-		console.log(` [dry-run] would write version ${version}`);
+		console.log(` [dry-run] would write version ${version} to ${path.basename(versionFile)}`);
 		return;
 	}
 
-	await Bun.write(VERSION_FILE, `${version}\n`);
+	console.log(` Writing version ${version} to ${path.basename(versionFile)}`);
+	await Bun.write(versionFile, `${version}\n`);
 	await updateTomlVersion(CARGO_TOML, version);
 
 	const lockContents = await readFileOrNull(CARGO_LOCK);
