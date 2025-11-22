@@ -3,6 +3,7 @@ pub mod app;
 pub mod audio;
 pub mod cli;
 pub mod config;
+pub mod db;
 pub mod global;
 pub mod normalizer;
 pub mod text_io;

@@ -1,5 +1,7 @@
+use crate::db::{self, WorkflowData};
 use crate::update::{UpdateConfig, UpdateEngine, UpdateOptions};
 use anyhow::{anyhow, Result};
+use arboard::Clipboard;
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::io;
 use std::process::Command;
@@ -27,6 +29,8 @@ pub enum CliCommand {
     Version,
     /// Inspect or configure transcription providers
     Provider(ProviderCliArgs),
+    /// Search and view transcription history
+    History(HistoryCliArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -62,6 +66,25 @@ pub enum ProviderCommand {
     Configure,
     /// Validate the configured provider without recording audio
     Test,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct HistoryCliArgs {
+    /// Search query to filter transcriptions by text content
+    #[arg(short, long)]
+    pub query: Option<String>,
+    /// Filter by start date (YYYY-MM-DD format)
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Filter by end date (YYYY-MM-DD format)
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Maximum number of results to show
+    #[arg(short, long, default_value = "20")]
+    pub limit: usize,
+    /// ID of specific workflow to copy to clipboard
+    #[arg(short, long)]
+    pub copy: Option<i64>,
 }
 
 pub async fn handle_update_command(args: UpdateCliArgs) -> Result<()> {
@@ -131,4 +154,72 @@ fn restart_user_service() -> Result<()> {
             "Failed to invoke systemctl --user restart audetic.service: {err}"
         )),
     }
+}
+
+pub fn handle_history_command(args: HistoryCliArgs) -> Result<()> {
+    let conn = db::init_db()?;
+
+    // If copy flag is provided, copy that specific workflow to clipboard
+    if let Some(id) = args.copy {
+        let workflows = db::search_workflows(&conn, None, None, None, 1000)?;
+
+        if let Some(workflow) = workflows.iter().find(|w| w.id == Some(id)) {
+            let text = match &workflow.data {
+                WorkflowData::VoiceToText(data) => &data.text,
+            };
+
+            let mut clipboard = Clipboard::new()
+                .map_err(|e| anyhow!("Failed to initialize clipboard: {}", e))?;
+            clipboard
+                .set_text(text)
+                .map_err(|e| anyhow!("Failed to copy to clipboard: {}", e))?;
+
+            println!("Copied transcription #{} to clipboard ({} chars)", id, text.len());
+            return Ok(());
+        } else {
+            return Err(anyhow!("Workflow with ID {} not found", id));
+        }
+    }
+
+    // Otherwise, search and display results
+    let workflows = db::search_workflows(
+        &conn,
+        args.query.as_deref(),
+        args.from.as_deref(),
+        args.to.as_deref(),
+        args.limit,
+    )?;
+
+    if workflows.is_empty() {
+        println!("No transcriptions found matching your criteria.");
+        return Ok(());
+    }
+
+    println!("Found {} transcription(s):\n", workflows.len());
+
+    for workflow in workflows {
+        let id = workflow.id.unwrap_or(0);
+        let created_at = workflow.created_at.as_deref().unwrap_or("Unknown");
+        let text = match &workflow.data {
+            WorkflowData::VoiceToText(data) => &data.text,
+        };
+
+        // Truncate long text for display
+        let display_text = if text.len() > 100 {
+            format!("{}...", &text[..100])
+        } else {
+            text.to_string()
+        };
+
+        println!("ID: {}", id);
+        println!("Date: {}", created_at);
+        println!("Text: {}", display_text);
+        println!("---");
+    }
+
+    println!(
+        "\nTo copy a transcription to clipboard, use: audetic history --copy <ID>"
+    );
+
+    Ok(())
 }

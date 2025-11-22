@@ -6,6 +6,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 
 use crate::audio::AudioStreamManager;
+use crate::db::{self, VoiceToTextData, Workflow, WorkflowData, WorkflowType};
 use crate::text_io::TextIoService;
 use crate::transcription::TranscriptionService;
 use crate::ui::Indicator;
@@ -238,6 +239,15 @@ impl RecordingMachine {
                     if let Err(e) = indicator.show_complete(&text).await {
                         warn!("Failed to show completion indicator: {}", e);
                     }
+
+                    // Save transcription to database
+                    let text_clone = text.clone();
+                    let temp_path_clone = temp_path.clone();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(e) = save_to_database(&text_clone, &temp_path_clone) {
+                            warn!("Failed to save transcription to database: {}", e);
+                        }
+                    });
                 }
             }
             Err(e) => {
@@ -263,4 +273,26 @@ impl RecordingMachine {
             .as_millis();
         PathBuf::from(format!("/tmp/audetic_{timestamp}.wav"))
     }
+}
+
+fn save_to_database(text: &str, audio_path: &PathBuf) -> Result<()> {
+    let conn = db::init_db()?;
+
+    let workflow_data = WorkflowData::VoiceToText(VoiceToTextData {
+        text: text.to_string(),
+        audio_path: audio_path.to_string_lossy().to_string(),
+    });
+
+    let workflow = Workflow::new(WorkflowType::VoiceToText, workflow_data);
+
+    let id = db::insert_workflow(&conn, &workflow)?;
+    debug!("Saved transcription to database with ID: {}", id);
+
+    // Prune old workflows if count exceeds 10,000
+    let pruned = db::prune_old_workflows(&conn, 10_000)?;
+    if pruned > 0 {
+        info!("Pruned {} old transcriptions from database", pruned);
+    }
+
+    Ok(())
 }

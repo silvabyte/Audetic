@@ -34,3 +34,7 @@ pub fn update_state_file() -> Result<PathBuf> {
 pub fn update_lock_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("update.lock"))
 }
+
+pub fn db_file() -> Result<PathBuf> {
+    Ok(data_dir()?.join("audetic.db"))
+}

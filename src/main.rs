@@ -3,7 +3,7 @@
 use anyhow::Result;
 use audetic::{
     app,
-    cli::{handle_provider_command, handle_update_command, Cli, CliCommand},
+    cli::{handle_history_command, handle_provider_command, handle_update_command, Cli, CliCommand},
 };
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
@@ -27,6 +27,10 @@ async fn main() -> Result<()> {
         }
         Some(CliCommand::Provider(args)) => {
             handle_provider_command(args)?;
+            return Ok(());
+        }
+        Some(CliCommand::History(args)) => {
+            handle_history_command(args)?;
             return Ok(());
         }
         None => {}
