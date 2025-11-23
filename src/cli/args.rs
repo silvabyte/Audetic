@@ -21,6 +21,8 @@ pub enum CliCommand {
     Provider(ProviderCliArgs),
     /// Search and view transcription history
     History(HistoryCliArgs),
+    /// View application and transcription logs
+    Logs(LogsCliArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -75,4 +77,11 @@ pub struct HistoryCliArgs {
     /// ID of specific workflow to copy to clipboard
     #[arg(short, long)]
     pub copy: Option<i64>,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct LogsCliArgs {
+    /// Number of log entries to show
+    #[arg(short = 'n', long, default_value = "30")]
+    pub lines: usize,
 }

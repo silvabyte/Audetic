@@ -245,7 +245,7 @@ impl RecordingMachine {
                     let temp_path_clone = temp_path.clone();
                     tokio::task::spawn_blocking(move || {
                         if let Err(e) = save_to_database(&text_clone, &temp_path_clone) {
-                            warn!("Failed to save transcription to database: {}", e);
+                            error!("Failed to save transcription to database: {:?}", e);
                         }
                     });
                 }
