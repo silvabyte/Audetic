@@ -312,42 +312,31 @@ EOF
 
 print_success "Configuration created at $CONFIG_DIR/config.toml"
 
-# Step 6: Create systemd user service
-print_step "Creating systemd user service..."
+# Step 6: Install systemd user service
+print_step "Installing systemd user service..."
 mkdir -p ~/.config/systemd/user
 
-cat >~/.config/systemd/user/audetic.service <<EOF
-[Unit]
-Description=Audetic Voice Transcription Service
-Documentation=https://github.com/silvabyte/Audetic
-After=graphical-session.target
+# Try to get service file from repo first, fall back to downloading from GitHub
+SERVICE_SOURCE=""
+if [ -f "$AUDETIC_DIR/audetic.service" ]; then
+  SERVICE_SOURCE="$AUDETIC_DIR/audetic.service"
+  print_step "Using service file from local repository"
+else
+  print_warning "Service file not found in repo, downloading from GitHub..."
+  SERVICE_SOURCE="/tmp/audetic.service.$$"
+  if ! curl -fsSL "https://raw.githubusercontent.com/silvabyte/Audetic/main/audetic.service" -o "$SERVICE_SOURCE"; then
+    print_error "Failed to download service file from GitHub"
+    rm -f "$SERVICE_SOURCE"
+    exit 1
+  fi
+fi
 
-[Service]
-Type=simple
-ExecStart=$INSTALL_DIR/audetic
-Restart=always
-RestartSec=5
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-Environment="RUST_LOG=info"
-
-# Security and resource limits
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.config/audetic %h/.local/share/audetic %t
-# Whisper models require significant memory (3-5GB for larger models)
-MemoryMax=6G
-CPUQuota=80%
-
-[Install]
-WantedBy=default.target
-EOF
+cp "$SERVICE_SOURCE" ~/.config/systemd/user/audetic.service
+# Clean up if we downloaded it
+[ "$SERVICE_SOURCE" != "$AUDETIC_DIR/audetic.service" ] && rm -f "$SERVICE_SOURCE"
 
 systemctl --user daemon-reload
-print_success "Systemd service created"
+print_success "Systemd service installed"
 
 # Step 7: Print Hyprland keybind instructions
 print_step "Installation complete!"
