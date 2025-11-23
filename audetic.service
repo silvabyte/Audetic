@@ -18,7 +18,7 @@ Environment="RUST_LOG=info"
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/audetic %t
+ReadWritePaths=%h/.config/audetic %h/.local/share/audetic %t
 # Whisper models require significant memory (3-5GB for larger models)
 MemoryMax=6G
 CPUQuota=80%
