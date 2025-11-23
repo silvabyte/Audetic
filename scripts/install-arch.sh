@@ -312,21 +312,42 @@ EOF
 
 print_success "Configuration created at $CONFIG_DIR/config.toml"
 
-# Step 6: Install systemd user service
-print_step "Installing systemd user service..."
+# Step 6: Create systemd user service
+print_step "Creating systemd user service..."
 mkdir -p ~/.config/systemd/user
 
-# Copy the service file from the repository
-if [ -f "$AUDETIC_DIR/audetic.service" ]; then
-  cp "$AUDETIC_DIR/audetic.service" ~/.config/systemd/user/audetic.service
-  print_success "Systemd service installed from repository template"
-else
-  print_error "Service file not found at $AUDETIC_DIR/audetic.service"
-  exit 1
-fi
+cat >~/.config/systemd/user/audetic.service <<EOF
+[Unit]
+Description=Audetic Voice Transcription Service
+Documentation=https://github.com/silvabyte/Audetic
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=$INSTALL_DIR/audetic
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+Environment="RUST_LOG=info"
+
+# Security and resource limits
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/audetic %h/.local/share/audetic %t
+# Whisper models require significant memory (3-5GB for larger models)
+MemoryMax=6G
+CPUQuota=80%
+
+[Install]
+WantedBy=default.target
+EOF
 
 systemctl --user daemon-reload
-print_success "Systemd service configured"
+print_success "Systemd service created"
 
 # Step 7: Print Hyprland keybind instructions
 print_step "Installation complete!"
