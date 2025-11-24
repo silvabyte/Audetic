@@ -362,9 +362,9 @@ Return ONLY the markdown content, no explanations or extra text.`;
 	try {
 		console.log("==> Calling opencode to generate release notes...");
 
-		// Call opencode run with the prompt using claude-opus-4-5 (the big pickle model)
+		// Call opencode run with the prompt using Big Pickle
 		const result =
-			await $`opencode run --model anthropic/claude-opus-4-5 --format json ${prompt}`.text();
+			await $`opencode run --model opencode/big-pickle --format json ${prompt}`.text();
 
 		// Parse the JSON output to extract the generated content
 		const lines = result.trim().split("\n");
