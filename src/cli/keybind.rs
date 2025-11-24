@@ -1,13 +1,13 @@
 //! CLI handler for keybinding management.
 
 use crate::cli::{KeybindCliArgs, KeybindCommand};
-use crate::keybind::{
-    check_conflicts, discover_config, find_audetic_bindings, parse_bindings,
-    write_binding, BackupManager, KeybindStatus, Modifiers, ProposedBinding,
-    AUDETIC_SECTION_MARKER, DEFAULT_KEY, FALLBACK_MODIFIERS,
-};
 use crate::keybind::discovery::get_all_config_files;
 use crate::keybind::writer::remove_binding;
+use crate::keybind::{
+    check_conflicts, discover_config, find_audetic_bindings, parse_bindings, write_binding,
+    BackupManager, KeybindStatus, Modifiers, ProposedBinding, AUDETIC_SECTION_MARKER, DEFAULT_KEY,
+    FALLBACK_MODIFIERS,
+};
 use anyhow::{anyhow, Result};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Select};
 use std::io::{self, IsTerminal};
@@ -61,7 +61,11 @@ fn handle_interactive() -> Result<()> {
         println!("Existing Audetic keybinding found:");
         for binding in &existing {
             println!("  {} -> {}", binding.display_key(), binding.command);
-            println!("  Location: {}:{}", binding.source.file.display(), binding.source.line);
+            println!(
+                "  Location: {}:{}",
+                binding.source.file.display(),
+                binding.source.line
+            );
         }
         println!();
 
@@ -89,12 +93,11 @@ fn handle_interactive() -> Result<()> {
     if conflict_result.has_conflicts() {
         println!("Conflict detected!");
         for conflict in &conflict_result.conflicts {
-            let desc = conflict.description.as_deref().unwrap_or("(no description)");
-            println!(
-                "  {} is already bound to: {}",
-                conflict.display_key(),
-                desc
-            );
+            let desc = conflict
+                .description
+                .as_deref()
+                .unwrap_or("(no description)");
+            println!("  {} is already bound to: {}", conflict.display_key(), desc);
             println!("    Command: {}", conflict.command);
             println!(
                 "    Location: {}:{}",
@@ -109,10 +112,7 @@ fn handle_interactive() -> Result<()> {
         let fallback_conflicts = check_conflicts(&fallback, &all_bindings);
 
         let options = if fallback_conflicts.has_conflicts() {
-            vec![
-                "Enter custom keybinding",
-                "Skip (configure manually later)",
-            ]
+            vec!["Enter custom keybinding", "Skip (configure manually later)"]
         } else {
             vec![
                 format!("Use alternative: {}", fallback.display_key()).leak(),
@@ -202,9 +202,9 @@ fn handle_interactive() -> Result<()> {
 /// Handle the install subcommand
 fn handle_install(key: Option<String>, dry_run: bool) -> Result<()> {
     let discovery = discover_config()?;
-    let config_path = discovery.writable_config().ok_or_else(|| {
-        anyhow!("No Hyprland configuration found")
-    })?;
+    let config_path = discovery
+        .writable_config()
+        .ok_or_else(|| anyhow!("No Hyprland configuration found"))?;
 
     // Parse the key if provided, otherwise use default
     let proposed = if let Some(key_str) = key {
@@ -260,12 +260,15 @@ fn handle_install(key: Option<String>, dry_run: bool) -> Result<()> {
 /// Handle the uninstall subcommand
 fn handle_uninstall(dry_run: bool) -> Result<()> {
     let discovery = discover_config()?;
-    let config_path = discovery.writable_config().ok_or_else(|| {
-        anyhow!("No Hyprland configuration found")
-    })?;
+    let config_path = discovery
+        .writable_config()
+        .ok_or_else(|| anyhow!("No Hyprland configuration found"))?;
 
     if dry_run {
-        println!("Dry run - would remove Audetic keybinding from {}", config_path.display());
+        println!(
+            "Dry run - would remove Audetic keybinding from {}",
+            config_path.display()
+        );
         return Ok(());
     }
 
@@ -295,7 +298,10 @@ fn handle_status() -> Result<()> {
     println!();
 
     match status {
-        KeybindStatus::Installed { binding, config_path } => {
+        KeybindStatus::Installed {
+            binding,
+            config_path,
+        } => {
             println!("Status: INSTALLED");
             println!();
             println!("Keybinding: {}", binding.display_key());
@@ -303,7 +309,11 @@ fn handle_status() -> Result<()> {
                 println!("Description: {}", desc);
             }
             println!("Command: {}", binding.command);
-            println!("Location: {}:{}", config_path.display(), binding.source.line);
+            println!(
+                "Location: {}:{}",
+                config_path.display(),
+                binding.source.line
+            );
         }
         KeybindStatus::NotInstalled { config_path } => {
             println!("Status: NOT INSTALLED");
@@ -375,7 +385,7 @@ fn prompt_custom_keybinding(theme: &ColorfulTheme) -> Result<ProposedBinding> {
         .default("R".to_string())
         .interact_text()?;
 
-    let modifiers = Modifiers::from_str(&modifiers_str);
+    let modifiers = Modifiers::parse(&modifiers_str);
     let key = key.trim().to_uppercase();
 
     Ok(ProposedBinding {
@@ -392,7 +402,7 @@ fn parse_key_string(s: &str) -> Result<ProposedBinding> {
     // "SUPER+R"
     // "SUPER, R"
 
-    let normalized = s.replace('+', " ").replace(',', " ");
+    let normalized = s.replace(['+', ','], " ");
     let parts: Vec<&str> = normalized.split_whitespace().collect();
 
     if parts.is_empty() {

@@ -84,12 +84,13 @@ impl ConflictCheckResult {
 }
 
 /// Check if a proposed binding conflicts with existing bindings
-pub fn check_conflicts(proposed: &ProposedBinding, bindings: &[HyprBinding]) -> ConflictCheckResult {
+pub fn check_conflicts(
+    proposed: &ProposedBinding,
+    bindings: &[HyprBinding],
+) -> ConflictCheckResult {
     let conflicts: Vec<HyprBinding> = bindings
         .iter()
-        .filter(|b| {
-            b.key.eq_ignore_ascii_case(&proposed.key) && b.modifiers == proposed.modifiers
-        })
+        .filter(|b| b.key.eq_ignore_ascii_case(&proposed.key) && b.modifiers == proposed.modifiers)
         .cloned()
         .collect();
 

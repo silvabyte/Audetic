@@ -31,7 +31,10 @@ pub fn handle_logs_command(args: LogsCliArgs) -> Result<()> {
         println!("Could not fetch application logs: {}", error);
     }
 
-    println!("\n=== Transcription History (last {} entries) ===\n", args.lines);
+    println!(
+        "\n=== Transcription History (last {} entries) ===\n",
+        args.lines
+    );
 
     // Fetch transcription history from database
     let conn = db::init_db()?;
@@ -55,7 +58,10 @@ pub fn handle_logs_command(args: LogsCliArgs) -> Result<()> {
                 text.to_string()
             };
 
-            println!("[{}] {} | {:?} | \"{}\"", id, created_at, workflow_type, display_text);
+            println!(
+                "[{}] {} | {:?} | \"{}\"",
+                id, created_at, workflow_type, display_text
+            );
         }
     }
 

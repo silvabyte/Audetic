@@ -13,7 +13,7 @@ pub struct Config {
     pub behavior: BehaviorConfig,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct WhisperConfig {
     pub model: Option<String>,
