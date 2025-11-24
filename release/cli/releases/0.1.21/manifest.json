@@ -1,0 +1,13 @@
+{
+	"version": "0.1.21",
+	"channel": "beta",
+	"release_date": "2025-11-24T23:35:18.797Z",
+	"notes_url": "https://install.audetic.ai/cli/releases/0.1.21/notes.md",
+	"targets": {
+		"linux-x86_64-gnu": {
+			"archive": "audetic-0.1.21-linux-x86_64-gnu.tar.gz",
+			"sha256": "54d3fe2f8bafc7051879d69f0bf8aa19321a59a8141f2c607a8b8abf3969fa7b",
+			"size": 4784729
+		}
+	}
+}

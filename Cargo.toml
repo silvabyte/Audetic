@@ -1,6 +1,6 @@
 [package]
 name = "audetic"
-version = "0.1.14"
+version = "0.1.21"
 edition = "2021"
 authors = ["Mat Silva"]
 description = "Voice To Text Application for Wayland/Hyprland"
@@ -62,3 +62,4 @@ tar = "0.4"
 walkdir = "2.5"
 fs2 = "0.4"
 rusqlite = "0.37.0"
+chrono = "0.4"
