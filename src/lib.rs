@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod global;
+pub mod keybind;
 pub mod normalizer;
 pub mod text_io;
 pub mod transcription;
