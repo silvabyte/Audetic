@@ -4,7 +4,8 @@ use anyhow::Result;
 use audetic::{
     app,
     cli::{
-        handle_history_command, handle_logs_command, handle_provider_command, handle_update_command, Cli, CliCommand,
+        handle_history_command, handle_keybind_command, handle_logs_command,
+        handle_provider_command, handle_update_command, Cli, CliCommand,
     },
 };
 use clap::Parser;
@@ -37,6 +38,10 @@ async fn main() -> Result<()> {
         }
         Some(CliCommand::Logs(args)) => {
             handle_logs_command(args)?;
+            return Ok(());
+        }
+        Some(CliCommand::Keybind(args)) => {
+            handle_keybind_command(args)?;
             return Ok(());
         }
         None => {}

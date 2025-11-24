@@ -23,6 +23,8 @@ pub enum CliCommand {
     History(HistoryCliArgs),
     /// View application and transcription logs
     Logs(LogsCliArgs),
+    /// Manage Hyprland keybindings for Audetic
+    Keybind(KeybindCliArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -84,4 +86,31 @@ pub struct LogsCliArgs {
     /// Number of log entries to show
     #[arg(short = 'n', long, default_value = "30")]
     pub lines: usize,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct KeybindCliArgs {
+    #[command(subcommand)]
+    pub command: Option<KeybindCommand>,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum KeybindCommand {
+    /// Install Audetic keybinding (default: SUPER+R)
+    Install {
+        /// Custom keybinding (e.g., "SUPER SHIFT, R" or "SUPER+T")
+        #[arg(short, long)]
+        key: Option<String>,
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove Audetic keybinding from config
+    Uninstall {
+        /// Preview changes without applying
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show current keybinding status
+    Status,
 }
