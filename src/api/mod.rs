@@ -11,7 +11,7 @@
 pub mod error;
 pub mod routes;
 
-use crate::audio::{RecordingPhase, RecordingStatus, RecordingStatusHandle};
+use crate::audio::{JobOptions, RecordingPhase, RecordingStatus, RecordingStatusHandle};
 use crate::config::{Config, WaybarConfig};
 use anyhow::Result;
 use axum::{
@@ -21,15 +21,29 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tower::ServiceBuilder;
 use tracing::{error, info};
 
+/// Request body for the toggle recording endpoint.
+/// All fields are optional - if not provided, defaults are used from config.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ToggleRequest {
+    /// Whether to copy the transcription to clipboard (default: true)
+    #[serde(default)]
+    pub copy_to_clipboard: Option<bool>,
+    /// Whether to auto-paste/inject text into the focused app (default: from config)
+    #[serde(default)]
+    pub auto_paste: Option<bool>,
+}
+
 #[derive(Clone)]
 pub enum ApiCommand {
-    ToggleRecording,
+    /// Toggle recording with optional per-job options
+    ToggleRecording(Option<JobOptions>),
 }
 
 #[derive(Clone)]
@@ -117,11 +131,34 @@ async fn version() -> Json<Value> {
     }))
 }
 
-async fn toggle_recording(State(state): State<AppState>) -> Result<Json<Value>, StatusCode> {
-    match state.tx.send(ApiCommand::ToggleRecording).await {
-        Ok(_) => {
-            info!("Toggle recording command received via API");
+async fn toggle_recording(
+    State(state): State<AppState>,
+    body: Option<Json<ToggleRequest>>,
+) -> Result<Json<Value>, StatusCode> {
+    // Parse optional job options from request body
+    let job_options = body.and_then(|Json(req)| {
+        // Only create JobOptions if at least one field was specified
+        if req.copy_to_clipboard.is_some() || req.auto_paste.is_some() {
+            Some(JobOptions {
+                copy_to_clipboard: req.copy_to_clipboard.unwrap_or(true),
+                auto_paste: req.auto_paste.unwrap_or(true),
+            })
+        } else {
+            None
+        }
+    });
 
+    info!(
+        "Toggle recording command received via API with options: {:?}",
+        job_options
+    );
+
+    match state
+        .tx
+        .send(ApiCommand::ToggleRecording(job_options))
+        .await
+    {
+        Ok(_) => {
             // Small delay to allow the status to be updated
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 

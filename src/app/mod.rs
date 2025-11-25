@@ -62,30 +62,32 @@ pub async fn run_service() -> Result<()> {
 
     while let Some(command) = rx.recv().await {
         match command {
-            ApiCommand::ToggleRecording => match recording_machine.toggle().await {
-                Ok(ToggleResult {
-                    phase: RecordingPhase::Recording,
-                    job_id,
-                }) => {
-                    info!("Recording started with job_id={:?}", job_id);
+            ApiCommand::ToggleRecording(job_options) => {
+                match recording_machine.toggle(job_options).await {
+                    Ok(ToggleResult {
+                        phase: RecordingPhase::Recording,
+                        job_id,
+                    }) => {
+                        info!("Recording started with job_id={:?}", job_id);
+                    }
+                    Ok(ToggleResult {
+                        phase: RecordingPhase::Processing,
+                        job_id,
+                    }) => {
+                        info!(
+                            "Recording stopped, processing audio for job_id={:?}",
+                            job_id
+                        );
+                    }
+                    Ok(ToggleResult { phase, job_id }) => {
+                        info!(
+                            "RecordingMachine is currently {:?} (job_id={:?})",
+                            phase, job_id
+                        );
+                    }
+                    Err(e) => error!("Failed to toggle recording: {}", e),
                 }
-                Ok(ToggleResult {
-                    phase: RecordingPhase::Processing,
-                    job_id,
-                }) => {
-                    info!(
-                        "Recording stopped, processing audio for job_id={:?}",
-                        job_id
-                    );
-                }
-                Ok(ToggleResult { phase, job_id }) => {
-                    info!(
-                        "RecordingMachine is currently {:?} (job_id={:?})",
-                        phase, job_id
-                    );
-                }
-                Err(e) => error!("Failed to toggle recording: {}", e),
-            },
+            }
         }
     }
 

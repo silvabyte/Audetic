@@ -51,6 +51,8 @@ pub struct RecordingStatus {
     pub phase: RecordingPhase,
     /// Current job ID (set when recording starts)
     pub current_job_id: Option<String>,
+    /// Current job options (set when recording starts)
+    pub current_job_options: Option<JobOptions>,
     /// Last successfully completed job
     pub last_completed_job: Option<CompletedJob>,
     pub last_error: Option<String>,
@@ -61,6 +63,7 @@ impl Default for RecordingStatus {
         Self {
             phase: RecordingPhase::Idle,
             current_job_id: None,
+            current_job_options: None,
             last_completed_job: None,
             last_error: None,
         }
@@ -83,10 +86,11 @@ impl RecordingStatusHandle {
         status.last_error = last_error;
     }
 
-    pub async fn start_job(&self, job_id: String) {
+    pub async fn start_job(&self, job_id: String, options: JobOptions) {
         let mut status = self.inner.lock().await;
         status.phase = RecordingPhase::Recording;
         status.current_job_id = Some(job_id);
+        status.current_job_options = Some(options);
         status.last_error = None;
     }
 
@@ -94,6 +98,7 @@ impl RecordingStatusHandle {
         let mut status = self.inner.lock().await;
         status.phase = RecordingPhase::Idle;
         status.current_job_id = None;
+        status.current_job_options = None;
         status.last_completed_job = Some(completed_job);
         status.last_error = None;
     }
@@ -102,6 +107,7 @@ impl RecordingStatusHandle {
         let mut status = self.inner.lock().await;
         status.phase = RecordingPhase::Error;
         status.current_job_id = None;
+        status.current_job_options = None;
         status.last_error = Some(error);
     }
 
@@ -114,6 +120,10 @@ impl RecordingStatusHandle {
     pub async fn get_current_job_id(&self) -> Option<String> {
         self.inner.lock().await.current_job_id.clone()
     }
+
+    pub async fn get_current_job_options(&self) -> Option<JobOptions> {
+        self.inner.lock().await.current_job_options
+    }
 }
 
 /// Result of a toggle operation, containing phase and job information.
@@ -125,10 +135,40 @@ pub struct ToggleResult {
     pub job_id: Option<String>,
 }
 
+/// Per-job options that can override default behavior.
+/// These are set when starting a recording via the API.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct JobOptions {
+    /// Whether to copy the transcription to clipboard (default: true)
+    pub copy_to_clipboard: bool,
+    /// Whether to auto-paste/inject text into the focused app (default: from config)
+    pub auto_paste: bool,
+}
+
+impl Default for JobOptions {
+    fn default() -> Self {
+        Self {
+            copy_to_clipboard: true,
+            auto_paste: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct BehaviorOptions {
     pub auto_paste: bool,
     pub delete_audio_files: bool,
+}
+
+/// Context for running a transcription processing task.
+struct ProcessingContext {
+    transcription: Arc<TranscriptionService>,
+    indicator: Indicator,
+    text_io: TextIoService,
+    job_options: JobOptions,
+    temp_path: PathBuf,
+    job_id: Option<String>,
+    delete_audio_files: bool,
 }
 
 pub struct RecordingMachine {
@@ -164,7 +204,11 @@ impl RecordingMachine {
     /// Returns a `ToggleResult` containing:
     /// - `phase`: The new recording phase
     /// - `job_id`: The job UUID (only set when starting a new recording)
-    pub async fn toggle(&self) -> Result<ToggleResult> {
+    ///
+    /// # Arguments
+    /// * `options` - Optional per-job options to override default behavior.
+    ///   If None, uses defaults from config (auto_paste from config, copy_to_clipboard=true).
+    pub async fn toggle(&self, options: Option<JobOptions>) -> Result<ToggleResult> {
         enum Transition {
             StartRecording,
             StopRecording,
@@ -182,9 +226,16 @@ impl RecordingMachine {
             Transition::StartRecording => {
                 // Generate a new job ID for this recording session
                 let job_id = Uuid::new_v4().to_string();
+
+                // Use provided options or create defaults from config
+                let job_options = options.unwrap_or(JobOptions {
+                    copy_to_clipboard: true,
+                    auto_paste: self.behavior.auto_paste,
+                });
+
                 info!(
-                    "RecordingMachine: starting recording with job_id={}",
-                    job_id
+                    "RecordingMachine: starting recording with job_id={}, options={:?}",
+                    job_id, job_options
                 );
 
                 if let Err(e) = self.start_recording().await {
@@ -197,7 +248,7 @@ impl RecordingMachine {
                     return Err(e);
                 }
 
-                self.status.start_job(job_id.clone()).await;
+                self.status.start_job(job_id.clone(), job_options).await;
                 Ok(ToggleResult {
                     phase: RecordingPhase::Recording,
                     job_id: Some(job_id),
@@ -205,13 +256,18 @@ impl RecordingMachine {
             }
             Transition::StopRecording => {
                 let job_id = current.current_job_id.clone();
+                // Job options should always be set when recording started, fall back to defaults if not
+                let job_options = current.current_job_options.unwrap_or(JobOptions {
+                    copy_to_clipboard: true,
+                    auto_paste: self.behavior.auto_paste,
+                });
                 info!(
-                    "RecordingMachine: stopping recording and processing job_id={:?}",
-                    job_id
+                    "RecordingMachine: stopping recording and processing job_id={:?}, options={:?}",
+                    job_id, job_options
                 );
                 self.status.set_processing().await;
 
-                if let Err(e) = self.begin_processing(job_id.clone()).await {
+                if let Err(e) = self.begin_processing(job_id.clone(), job_options).await {
                     error!("Failed to start processing task: {}", e);
                     self.status.fail_job(e.to_string()).await;
                     let _ = self
@@ -249,7 +305,11 @@ impl RecordingMachine {
         recorder.start_recording().await
     }
 
-    async fn begin_processing(&self, job_id: Option<String>) -> Result<()> {
+    async fn begin_processing(
+        &self,
+        job_id: Option<String>,
+        job_options: JobOptions,
+    ) -> Result<()> {
         let temp_path = Self::temp_audio_path();
 
         {
@@ -263,22 +323,20 @@ impl RecordingMachine {
         }
         let indicator_for_error = self.indicator.clone();
 
-        let transcription = Arc::clone(&self.transcription);
-        let text_io = self.text_io.clone();
-        let behavior = self.behavior;
         let status = self.status.clone();
 
+        let ctx = ProcessingContext {
+            transcription: Arc::clone(&self.transcription),
+            indicator: indicator_for_task,
+            text_io: self.text_io.clone(),
+            job_options,
+            temp_path,
+            job_id,
+            delete_audio_files: self.behavior.delete_audio_files,
+        };
+
         tokio::spawn(async move {
-            let result = RecordingMachine::run_processing_task(
-                transcription,
-                indicator_for_task,
-                text_io,
-                behavior,
-                temp_path,
-                job_id,
-                status.clone(),
-            )
-            .await;
+            let result = RecordingMachine::run_processing_task(ctx).await;
 
             match result {
                 Ok(completed_job) => {
@@ -304,42 +362,41 @@ impl RecordingMachine {
 
     /// Run the transcription processing task.
     /// Returns `Ok(Some(CompletedJob))` on success, `Ok(None)` if no speech detected.
-    async fn run_processing_task(
-        transcription: Arc<TranscriptionService>,
-        indicator: Indicator,
-        text_io: TextIoService,
-        behavior: BehaviorOptions,
-        temp_path: PathBuf,
-        job_id: Option<String>,
-        _status: RecordingStatusHandle,
-    ) -> Result<Option<CompletedJob>> {
-        let completed_job = match transcription.transcribe(&temp_path).await {
+    async fn run_processing_task(ctx: ProcessingContext) -> Result<Option<CompletedJob>> {
+        let completed_job = match ctx.transcription.transcribe(&ctx.temp_path).await {
             Ok(text) => {
                 if text.trim().is_empty() {
                     warn!("No speech detected in recording");
-                    let _ = indicator.show_error("No speech detected").await;
+                    let _ = ctx.indicator.show_error("No speech detected").await;
                     None
                 } else {
                     info!("Transcription complete: {} chars", text.len());
-                    if let Err(e) = text_io.copy_to_clipboard(&text).await {
-                        error!("Failed to copy to clipboard: {}", e);
-                    }
 
-                    if behavior.auto_paste {
-                        if let Err(e) = text_io.inject_text(&text).await {
-                            error!("Failed to inject text: {}", e);
-                            let _ = text_io.paste_from_clipboard().await;
+                    // Use job_options to control clipboard/paste behavior
+                    if ctx.job_options.copy_to_clipboard {
+                        if let Err(e) = ctx.text_io.copy_to_clipboard(&text).await {
+                            error!("Failed to copy to clipboard: {}", e);
                         }
                     }
 
-                    if let Err(e) = indicator.show_complete(&text).await {
+                    if ctx.job_options.auto_paste {
+                        if let Err(e) = ctx.text_io.inject_text(&text).await {
+                            error!("Failed to inject text: {}", e);
+                            // Only try paste fallback if we copied to clipboard
+                            if ctx.job_options.copy_to_clipboard {
+                                let _ = ctx.text_io.paste_from_clipboard().await;
+                            }
+                        }
+                    }
+
+                    if let Err(e) = ctx.indicator.show_complete(&text).await {
                         warn!("Failed to show completion indicator: {}", e);
                     }
 
                     // Save transcription to database and get the history ID
                     let text_for_db = text.clone();
-                    let temp_path_for_db = temp_path.clone();
-                    let job_id_for_db = job_id.clone();
+                    let temp_path_for_db = ctx.temp_path.clone();
+                    let job_id_for_db = ctx.job_id.clone();
 
                     let db_result = tokio::task::spawn_blocking(move || {
                         save_to_database(&text_for_db, &temp_path_for_db)
@@ -349,7 +406,7 @@ impl RecordingMachine {
                     match db_result {
                         Ok(Ok(history_id)) => {
                             let completed = CompletedJob {
-                                job_id: job_id.unwrap_or_else(|| "unknown".to_string()),
+                                job_id: ctx.job_id.unwrap_or_else(|| "unknown".to_string()),
                                 history_id,
                                 text,
                                 created_at: chrono::Utc::now().to_rfc3339(),
@@ -378,11 +435,14 @@ impl RecordingMachine {
             }
         };
 
-        if behavior.delete_audio_files {
-            if let Err(e) = tokio::fs::remove_file(&temp_path).await {
-                warn!("Failed to delete temp audio file {:?}: {}", temp_path, e);
+        if ctx.delete_audio_files {
+            if let Err(e) = tokio::fs::remove_file(&ctx.temp_path).await {
+                warn!(
+                    "Failed to delete temp audio file {:?}: {}",
+                    ctx.temp_path, e
+                );
             } else {
-                debug!("Deleted temp audio file {:?}", temp_path);
+                debug!("Deleted temp audio file {:?}", ctx.temp_path);
             }
         }
 
@@ -450,6 +510,7 @@ mod tests {
         let status = RecordingStatus::default();
         assert_eq!(status.phase, RecordingPhase::Idle);
         assert!(status.current_job_id.is_none());
+        assert!(status.current_job_options.is_none());
         assert!(status.last_completed_job.is_none());
         assert!(status.last_error.is_none());
     }
@@ -457,38 +518,67 @@ mod tests {
     #[tokio::test]
     async fn test_status_handle_start_job() {
         let handle = RecordingStatusHandle::default();
-        
-        // Start a job
-        handle.start_job("test-job-123".to_string()).await;
-        
+
+        // Start a job with default options
+        let options = JobOptions::default();
+        handle.start_job("test-job-123".to_string(), options).await;
+
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Recording);
         assert_eq!(status.current_job_id, Some("test-job-123".to_string()));
+        assert!(status.current_job_options.is_some());
         assert!(status.last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_status_handle_start_job_with_custom_options() {
+        let handle = RecordingStatusHandle::default();
+
+        // Start a job with custom options (no clipboard, no auto-paste)
+        let options = JobOptions {
+            copy_to_clipboard: false,
+            auto_paste: false,
+        };
+        handle
+            .start_job("test-job-custom".to_string(), options)
+            .await;
+
+        let status = handle.get().await;
+        assert_eq!(status.phase, RecordingPhase::Recording);
+        assert_eq!(status.current_job_id, Some("test-job-custom".to_string()));
+
+        let job_options = status.current_job_options.unwrap();
+        assert!(!job_options.copy_to_clipboard);
+        assert!(!job_options.auto_paste);
     }
 
     #[tokio::test]
     async fn test_status_handle_set_processing() {
         let handle = RecordingStatusHandle::default();
-        
+
         // Start a job then transition to processing
-        handle.start_job("test-job-456".to_string()).await;
+        handle
+            .start_job("test-job-456".to_string(), JobOptions::default())
+            .await;
         handle.set_processing().await;
-        
+
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Processing);
-        // Job ID should be preserved during processing
+        // Job ID and options should be preserved during processing
         assert_eq!(status.current_job_id, Some("test-job-456".to_string()));
+        assert!(status.current_job_options.is_some());
     }
 
     #[tokio::test]
     async fn test_status_handle_complete_job() {
         let handle = RecordingStatusHandle::default();
-        
+
         // Start and complete a job
-        handle.start_job("test-job-789".to_string()).await;
+        handle
+            .start_job("test-job-789".to_string(), JobOptions::default())
+            .await;
         handle.set_processing().await;
-        
+
         let completed = CompletedJob {
             job_id: "test-job-789".to_string(),
             history_id: 42,
@@ -496,11 +586,12 @@ mod tests {
             created_at: "2025-01-15T10:30:00Z".to_string(),
         };
         handle.complete_job(completed).await;
-        
+
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Idle);
         assert!(status.current_job_id.is_none()); // Cleared after completion
-        
+        assert!(status.current_job_options.is_none()); // Cleared after completion
+
         let last_job = status.last_completed_job.unwrap();
         assert_eq!(last_job.job_id, "test-job-789");
         assert_eq!(last_job.history_id, 42);
@@ -510,37 +601,42 @@ mod tests {
     #[tokio::test]
     async fn test_status_handle_fail_job() {
         let handle = RecordingStatusHandle::default();
-        
+
         // Start a job then fail it
-        handle.start_job("test-job-fail".to_string()).await;
+        handle
+            .start_job("test-job-fail".to_string(), JobOptions::default())
+            .await;
         handle.fail_job("Something went wrong".to_string()).await;
-        
+
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Error);
         assert!(status.current_job_id.is_none()); // Cleared on failure
+        assert!(status.current_job_options.is_none()); // Cleared on failure
         assert_eq!(status.last_error, Some("Something went wrong".to_string()));
     }
 
     #[tokio::test]
     async fn test_status_handle_job_lifecycle() {
         let handle = RecordingStatusHandle::default();
-        
+
         // Full lifecycle: idle -> recording -> processing -> idle (with completed job)
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Idle);
-        
+
         // Start recording
-        handle.start_job("lifecycle-test".to_string()).await;
+        handle
+            .start_job("lifecycle-test".to_string(), JobOptions::default())
+            .await;
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Recording);
         assert_eq!(status.current_job_id, Some("lifecycle-test".to_string()));
-        
+
         // Start processing
         handle.set_processing().await;
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Processing);
         assert_eq!(status.current_job_id, Some("lifecycle-test".to_string()));
-        
+
         // Complete
         let completed = CompletedJob {
             job_id: "lifecycle-test".to_string(),
@@ -549,7 +645,7 @@ mod tests {
             created_at: "2025-01-15T12:00:00Z".to_string(),
         };
         handle.complete_job(completed).await;
-        
+
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Idle);
         assert!(status.current_job_id.is_none());
@@ -560,7 +656,7 @@ mod tests {
     #[tokio::test]
     async fn test_completed_job_persists_across_new_jobs() {
         let handle = RecordingStatusHandle::default();
-        
+
         // Complete first job
         let first_job = CompletedJob {
             job_id: "first-job".to_string(),
@@ -569,14 +665,40 @@ mod tests {
             created_at: "2025-01-15T10:00:00Z".to_string(),
         };
         handle.complete_job(first_job).await;
-        
+
         // Start a new job - last_completed_job should still be available
-        handle.start_job("second-job".to_string()).await;
-        
+        handle
+            .start_job("second-job".to_string(), JobOptions::default())
+            .await;
+
         let status = handle.get().await;
         assert_eq!(status.current_job_id, Some("second-job".to_string()));
         assert!(status.last_completed_job.is_some());
         assert_eq!(status.last_completed_job.unwrap().job_id, "first-job");
+    }
+
+    #[test]
+    fn test_job_options_default() {
+        let options = JobOptions::default();
+        assert!(options.copy_to_clipboard);
+        assert!(options.auto_paste);
+    }
+
+    #[test]
+    fn test_job_options_serialization() {
+        let options = JobOptions {
+            copy_to_clipboard: false,
+            auto_paste: true,
+        };
+
+        let json = serde_json::to_string(&options).unwrap();
+        assert!(json.contains("\"copy_to_clipboard\":false"));
+        assert!(json.contains("\"auto_paste\":true"));
+
+        // Test deserialization
+        let parsed: JobOptions = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.copy_to_clipboard);
+        assert!(parsed.auto_paste);
     }
 
     #[test]
@@ -585,11 +707,11 @@ mod tests {
             phase: RecordingPhase::Recording,
             job_id: Some("abc-123".to_string()),
         };
-        
+
         let json = serde_json::to_string(&result).unwrap();
         assert!(json.contains("\"phase\":\"recording\""));
         assert!(json.contains("\"job_id\":\"abc-123\""));
-        
+
         // Test deserialization
         let parsed: ToggleResult = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.phase, RecordingPhase::Recording);
@@ -604,12 +726,12 @@ mod tests {
             text: "Hello world".to_string(),
             created_at: "2025-01-15T10:30:00Z".to_string(),
         };
-        
+
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains("\"job_id\":\"test-uuid\""));
         assert!(json.contains("\"history_id\":42"));
         assert!(json.contains("\"text\":\"Hello world\""));
-        
+
         // Test round-trip
         let parsed: CompletedJob = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.job_id, "test-uuid");
