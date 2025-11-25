@@ -58,10 +58,9 @@ lint:
 	cargo clippy --all-targets --all-features -- -D warnings
 
 fmt:
-	cargo fmt -- --check
+	cargo fmt
 
 fix:
-	cargo fmt
 	cargo fix --allow-dirty --allow-staged
 
 deploy:

@@ -81,7 +81,10 @@ fn find_section_end(section: &str) -> usize {
             } else if trimmed.starts_with('#') && !trimmed.contains("Audetic") {
                 // New comment section starts
                 break;
-            } else if trimmed.starts_with("bind") || trimmed.contains("audetic") || trimmed.to_lowercase().contains("audetic") {
+            } else if trimmed.starts_with("bind")
+                || trimmed.contains("audetic")
+                || trimmed.to_lowercase().contains("audetic")
+            {
                 // Part of our section
                 last_content_end += line.len() + 1;
             } else if trimmed.starts_with("bind") {

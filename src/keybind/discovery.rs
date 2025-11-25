@@ -25,9 +25,7 @@ pub struct ConfigDiscovery {
 impl ConfigDiscovery {
     /// Get the best file to write bindings to
     pub fn writable_config(&self) -> Option<&PathBuf> {
-        self.bindings_file
-            .as_ref()
-            .or(self.main_config.as_ref())
+        self.bindings_file.as_ref().or(self.main_config.as_ref())
     }
 }
 
@@ -47,10 +45,7 @@ pub fn discover_config() -> Result<ConfigDiscovery> {
         debug!("Checking for config at: {:?}", full_path);
 
         if full_path.exists() {
-            let filename = full_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("");
+            let filename = full_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
 
             match filename {
                 "bindings.conf" | "keybinds.conf" => {
@@ -68,7 +63,8 @@ pub fn discover_config() -> Result<ConfigDiscovery> {
                                 // Check if this is a bindings file
                                 let src_filename =
                                     src.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                                if src_filename.contains("bind") && discovery.bindings_file.is_none()
+                                if src_filename.contains("bind")
+                                    && discovery.bindings_file.is_none()
                                 {
                                     discovery.bindings_file = Some(src.clone());
                                 }

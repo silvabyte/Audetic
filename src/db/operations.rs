@@ -36,8 +36,8 @@ pub fn get_recent_workflows(conn: &Connection, limit: usize) -> Result<Vec<Workf
             // Reconstruct the WorkflowData from the database fields
             let data = WorkflowData::VoiceToText(VoiceToTextData { text, audio_path });
 
-            let workflow_type_enum = WorkflowType::from_str(&workflow_type)
-                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let workflow_type_enum =
+                WorkflowType::parse(&workflow_type).map_err(|_| rusqlite::Error::InvalidQuery)?;
 
             Ok(Workflow {
                 id: Some(id),
@@ -127,8 +127,8 @@ pub fn search_workflows(
 
             let data = WorkflowData::VoiceToText(VoiceToTextData { text, audio_path });
 
-            let workflow_type_enum = WorkflowType::from_str(&workflow_type)
-                .map_err(|_| rusqlite::Error::InvalidQuery)?;
+            let workflow_type_enum =
+                WorkflowType::parse(&workflow_type).map_err(|_| rusqlite::Error::InvalidQuery)?;
 
             Ok(Workflow {
                 id: Some(id),

@@ -339,3 +339,46 @@ const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[
         use_stdin: true,
     },
 ];
+
+/// Copy text to clipboard using system clipboard tools (synchronous version).
+///
+/// Uses wl-copy (Wayland), xclip, or xsel (X11) for persistent clipboard
+/// storage that survives after the process exits.
+///
+/// This is a standalone function for use in synchronous contexts (e.g., CLI commands).
+pub fn copy_to_clipboard_sync(text: &str) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+
+    for backend in CLIPBOARD_BACKENDS {
+        if which(backend.copy_cmd).is_err() {
+            continue;
+        }
+
+        let mut child = match Command::new(backend.copy_cmd)
+            .args(backend.copy_args)
+            .stdin(Stdio::piped())
+            .spawn()
+        {
+            Ok(child) => child,
+            Err(_) => continue,
+        };
+
+        if let Some(stdin) = child.stdin.as_mut() {
+            if stdin.write_all(text.as_bytes()).is_err() {
+                continue;
+            }
+        }
+
+        if let Ok(status) = child.wait() {
+            if status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "No clipboard tool available. Please install wl-copy (Wayland), xclip, or xsel (X11)."
+    ))
+}
