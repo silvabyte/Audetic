@@ -20,7 +20,7 @@ pub enum WorkflowType {
 }
 
 impl WorkflowType {
-    pub fn from_str(s: &str) -> Result<WorkflowType> {
+    pub fn parse(s: &str) -> Result<WorkflowType> {
         match s {
             "VoiceToText" => Ok(WorkflowType::VoiceToText),
             _ => anyhow::bail!("Invalid workflow type: {}", s),
@@ -58,7 +58,7 @@ impl Workflow {
     ) -> Result<Workflow> {
         Ok(Workflow {
             id: Some(id),
-            workflow_type: WorkflowType::from_str(&workflow_type)?,
+            workflow_type: WorkflowType::parse(&workflow_type)?,
             data: serde_json::from_str(&json)?,
             created_at: Some(created_at),
         })

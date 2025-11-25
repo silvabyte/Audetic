@@ -13,7 +13,7 @@ pub enum Modifier {
 }
 
 impl Modifier {
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.to_uppercase().as_str() {
             "SUPER" | "$MAINMOD" | "MOD" => Some(Modifier::Super),
             "SHIFT" => Some(Modifier::Shift),
@@ -40,16 +40,13 @@ impl fmt::Display for Modifier {
 pub struct Modifiers(pub Vec<Modifier>);
 
 impl Modifiers {
-    pub fn from_str(s: &str) -> Self {
-        let mods: Vec<Modifier> = s
-            .split_whitespace()
-            .filter_map(Modifier::from_str)
-            .collect();
+    pub fn parse(s: &str) -> Self {
+        let mods: Vec<Modifier> = s.split_whitespace().filter_map(Modifier::parse).collect();
         Modifiers(mods)
     }
 
     pub fn from_strs(strs: &[&str]) -> Self {
-        let mods: Vec<Modifier> = strs.iter().filter_map(|s| Modifier::from_str(s)).collect();
+        let mods: Vec<Modifier> = strs.iter().filter_map(|s| Modifier::parse(s)).collect();
         Modifiers(mods)
     }
 
@@ -178,17 +175,15 @@ pub fn parse_bindings_from_content(content: &str, source_path: &Path) -> Vec<Hyp
 /// Parse a single bind line
 fn parse_bind_line(line: &str, source_path: &Path, line_num: usize) -> Option<HyprBinding> {
     // Match bind variants: bind, bindd, bindr, bindl, bindld, etc.
-    let bind_prefixes = [
-        "bindld", "bindd", "bindr", "bindl", "bind",
-    ];
+    let bind_prefixes = ["bindld", "bindd", "bindr", "bindl", "bind"];
 
     for prefix in bind_prefixes {
         if line.to_lowercase().starts_with(prefix) {
             let rest = &line[prefix.len()..].trim_start();
 
             // Should start with = or whitespace then =
-            let after_eq = if rest.starts_with('=') {
-                rest[1..].trim_start()
+            let after_eq = if let Some(stripped) = rest.strip_prefix('=') {
+                stripped.trim_start()
             } else {
                 continue;
             };
@@ -216,31 +211,34 @@ fn parse_bind_parts(
     }
 
     let bind_type = BindType::from_str(bind_type_str);
-    let modifiers = Modifiers::from_str(parts[0]);
+    let modifiers = Modifiers::parse(parts[0]);
     let key = parts[1].to_string();
 
     // For bindd, the 3rd part is description, 4th is dispatcher, 5th is command
     // For bind, the 3rd part is dispatcher, 4th is command
-    let (description, dispatcher, command) = if bind_type == BindType::Bindd
-        || bind_type == BindType::Bindld
-    {
-        if parts.len() >= 5 {
-            (
-                Some(parts[2].to_string()),
-                parts[3].to_string(),
-                parts[4].to_string(),
-            )
-        } else if parts.len() == 4 {
-            // Might be missing command or description
-            (Some(parts[2].to_string()), parts[3].to_string(), String::new())
+    let (description, dispatcher, command) =
+        if bind_type == BindType::Bindd || bind_type == BindType::Bindld {
+            if parts.len() >= 5 {
+                (
+                    Some(parts[2].to_string()),
+                    parts[3].to_string(),
+                    parts[4].to_string(),
+                )
+            } else if parts.len() == 4 {
+                // Might be missing command or description
+                (
+                    Some(parts[2].to_string()),
+                    parts[3].to_string(),
+                    String::new(),
+                )
+            } else {
+                return None;
+            }
+        } else if parts.len() >= 4 {
+            (None, parts[2].to_string(), parts[3].to_string())
         } else {
             return None;
-        }
-    } else if parts.len() >= 4 {
-        (None, parts[2].to_string(), parts[3].to_string())
-    } else {
-        return None;
-    };
+        };
 
     Some(HyprBinding {
         bind_type,
@@ -275,7 +273,8 @@ mod tests {
 
     #[test]
     fn test_parse_bindd_with_description() {
-        let line = "bindd = SUPER SHIFT, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle";
+        let line =
+            "bindd = SUPER SHIFT, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle";
         let binding = parse_bind_line(line, Path::new("/test"), 1).unwrap();
 
         assert_eq!(binding.bind_type, BindType::Bindd);

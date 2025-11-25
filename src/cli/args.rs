@@ -49,7 +49,7 @@ pub struct UpdateCliArgs {
 #[derive(ClapArgs, Debug)]
 pub struct ProviderCliArgs {
     #[command(subcommand)]
-    pub command: ProviderCommand,
+    pub command: Option<ProviderCommand>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -57,9 +57,25 @@ pub enum ProviderCommand {
     /// Show the current transcription provider configuration
     Show,
     /// Run the interactive provider configuration wizard
-    Configure,
-    /// Validate the configured provider without recording audio
-    Test,
+    Configure {
+        /// Preview changes without saving to config file
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Test the configured provider with a sample transcription
+    Test {
+        /// Path to audio file to test with (records brief sample if not provided)
+        #[arg(short, long)]
+        file: Option<String>,
+    },
+    /// Show provider status and readiness
+    Status,
+    /// Reset provider configuration to defaults
+    Reset {
+        /// Skip confirmation prompt
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 #[derive(ClapArgs, Debug)]

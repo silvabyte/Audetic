@@ -143,10 +143,7 @@ impl UpdateEngine {
 
         // Load state to get the saved channel if no channel is provided in opts
         let state = self.load_state().await?;
-        let channel = opts
-            .channel
-            .clone()
-            .unwrap_or(state.channel);
+        let channel = opts.channel.clone().unwrap_or(state.channel);
 
         let mode = if opts.check_only {
             UpdateMode::CheckOnly
@@ -606,7 +603,7 @@ impl UpdateMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateReport {
     pub current_version: String,
     pub remote_version: Option<String>,

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
@@ -275,7 +275,7 @@ impl RecordingMachine {
     }
 }
 
-fn save_to_database(text: &str, audio_path: &PathBuf) -> Result<()> {
+fn save_to_database(text: &str, audio_path: &Path) -> Result<()> {
     let conn = db::init_db()?;
 
     let workflow_data = WorkflowData::VoiceToText(VoiceToTextData {
