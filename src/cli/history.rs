@@ -4,8 +4,8 @@
 //! Core business logic is delegated to the `history` module.
 
 use crate::history::{self, SearchParams};
-use anyhow::{anyhow, Result};
-use arboard::Clipboard;
+use crate::text_io::copy_to_clipboard_sync;
+use anyhow::Result;
 use dialoguer::FuzzySelect;
 
 use super::args::HistoryCliArgs;
@@ -30,11 +30,7 @@ pub fn handle_history_command(args: HistoryCliArgs) -> Result<()> {
 fn handle_copy_by_id(id: i64) -> Result<()> {
     let text = history::get_text_by_id(id)?;
 
-    let mut clipboard =
-        Clipboard::new().map_err(|e| anyhow!("Failed to initialize clipboard: {}", e))?;
-    clipboard
-        .set_text(&text)
-        .map_err(|e| anyhow!("Failed to copy to clipboard: {}", e))?;
+    copy_to_clipboard_sync(&text)?;
 
     println!(
         "Copied transcription #{} to clipboard ({} chars)",
@@ -79,11 +75,7 @@ fn handle_interactive_mode(limit: usize) -> Result<()> {
     if let Some(index) = selection {
         let entry = &entries[index];
 
-        let mut clipboard =
-            Clipboard::new().map_err(|e| anyhow!("Failed to initialize clipboard: {}", e))?;
-        clipboard
-            .set_text(&entry.text)
-            .map_err(|e| anyhow!("Failed to copy to clipboard: {}", e))?;
+        copy_to_clipboard_sync(&entry.text)?;
 
         println!("\n✓ Copied to clipboard ({} chars)", entry.text.len());
         println!("\nFull text:");
