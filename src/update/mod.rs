@@ -603,7 +603,7 @@ impl UpdateMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateReport {
     pub current_version: String,
     pub remote_version: Option<String>,

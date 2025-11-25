@@ -1,3 +1,16 @@
+//! REST API server for Audetic.
+//!
+//! Provides HTTP endpoints for:
+//! - Recording control (toggle, status)
+//! - Transcription history
+//! - Keybinding management
+//! - Provider configuration
+//! - Update management
+//! - Application logs
+
+pub mod error;
+pub mod routes;
+
 use crate::audio::{RecordingPhase, RecordingStatus, RecordingStatusHandle};
 use crate::config::{Config, WaybarConfig};
 use anyhow::Result;
@@ -49,18 +62,39 @@ impl ApiServer {
 
     pub async fn start(self) -> Result<()> {
         let app = Router::new()
+            // Root and recording endpoints (with state)
             .route("/", get(status))
             .route("/toggle", post(toggle_recording))
             .route("/status", get(recording_status))
-            .layer(ServiceBuilder::new())
-            .with_state(self.state);
+            .with_state(self.state)
+            // Stateless API routes
+            .nest("/history", routes::history::router())
+            .nest("/keybind", routes::keybind::router())
+            .nest("/logs", routes::logs::router())
+            .nest("/provider", routes::provider::router())
+            .nest("/update", routes::update::router())
+            .route("/version", get(version))
+            .layer(ServiceBuilder::new());
 
         let listener = tokio::net::TcpListener::bind(&format!("127.0.0.1:{}", self.port)).await?;
 
         info!("API server listening on http://127.0.0.1:{}", self.port);
         info!("Endpoints:");
-        info!("  POST /toggle - Toggle recording");
-        info!("  GET /status  - Get recording status");
+        info!("  GET  /              - Service info");
+        info!("  POST /toggle        - Toggle recording");
+        info!("  GET  /status        - Get recording status");
+        info!("  GET  /version       - Get version info");
+        info!("  GET  /history       - List transcription history");
+        info!("  GET  /history/:id   - Get single transcription");
+        info!("  GET  /keybind/status - Get keybinding status");
+        info!("  POST /keybind/install - Install keybinding");
+        info!("  DELETE /keybind     - Uninstall keybinding");
+        info!("  GET  /logs          - Get application logs");
+        info!("  GET  /provider      - Get provider config");
+        info!("  GET  /provider/status - Get provider status");
+        info!("  GET  /update/check  - Check for updates");
+        info!("  POST /update/install - Install update");
+        info!("  PUT  /update/auto   - Toggle auto-update");
 
         axum::serve(listener, app).await?;
 
@@ -73,6 +107,13 @@ async fn status() -> Json<Value> {
         "service": "audetic",
         "version": env!("CARGO_PKG_VERSION"),
         "status": "running"
+    }))
+}
+
+async fn version() -> Json<Value> {
+    Json(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "name": "audetic"
     }))
 }
 
@@ -129,7 +170,7 @@ fn generate_waybar_response(status: &RecordingStatus, config: &WaybarConfig) -> 
             "Processing transcription".to_string(),
         ),
         RecordingPhase::Error => (
-            "".to_string(),
+            "".to_string(),
             "audetic-error".to_string(),
             status
                 .last_error
