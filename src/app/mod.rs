@@ -3,6 +3,7 @@
 use crate::api::{ApiCommand, ApiServer};
 use crate::audio::{
     AudioStreamManager, BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle,
+    ToggleResult,
 };
 use crate::config::Config;
 use crate::text_io::TextIoService;
@@ -62,11 +63,27 @@ pub async fn run_service() -> Result<()> {
     while let Some(command) = rx.recv().await {
         match command {
             ApiCommand::ToggleRecording => match recording_machine.toggle().await {
-                Ok(RecordingPhase::Recording) => info!("Recording started"),
-                Ok(RecordingPhase::Processing) => {
-                    info!("Recording stopped, processing audio");
+                Ok(ToggleResult {
+                    phase: RecordingPhase::Recording,
+                    job_id,
+                }) => {
+                    info!("Recording started with job_id={:?}", job_id);
                 }
-                Ok(phase) => info!("RecordingMachine is currently {:?}", phase),
+                Ok(ToggleResult {
+                    phase: RecordingPhase::Processing,
+                    job_id,
+                }) => {
+                    info!(
+                        "Recording stopped, processing audio for job_id={:?}",
+                        job_id
+                    );
+                }
+                Ok(ToggleResult { phase, job_id }) => {
+                    info!(
+                        "RecordingMachine is currently {:?} (job_id={:?})",
+                        phase, job_id
+                    );
+                }
                 Err(e) => error!("Failed to toggle recording: {}", e),
             },
         }

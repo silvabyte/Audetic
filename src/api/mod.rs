@@ -121,9 +121,18 @@ async fn toggle_recording(State(state): State<AppState>) -> Result<Json<Value>, 
     match state.tx.send(ApiCommand::ToggleRecording).await {
         Ok(_) => {
             info!("Toggle recording command received via API");
+
+            // Small delay to allow the status to be updated
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+            // Get the current status to return job information
+            let status = state.status.get().await;
+
             Ok(Json(json!({
                 "success": true,
-                "message": "Recording toggled"
+                "phase": status.phase.as_str(),
+                "job_id": status.current_job_id,
+                "message": format!("Recording {}", status.phase.as_str())
             })))
         }
         Err(e) => {
@@ -144,10 +153,22 @@ async fn recording_status(
         return Json(generate_waybar_response(&status, &state.waybar_config));
     }
 
-    // Default JSON response
+    // Build last_completed_job object if available
+    let last_completed_job = status.last_completed_job.as_ref().map(|job| {
+        json!({
+            "job_id": job.job_id,
+            "history_id": job.history_id,
+            "text": job.text,
+            "created_at": job.created_at
+        })
+    });
+
+    // Default JSON response with full job context
     Json(json!({
         "recording": status.phase == RecordingPhase::Recording,
         "phase": status.phase.as_str(),
+        "job_id": status.current_job_id,
+        "last_completed_job": last_completed_job,
         "last_error": status.last_error,
     }))
 }
