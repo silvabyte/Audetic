@@ -272,37 +272,37 @@ fn handle_status() -> Result<()> {
             println!("Model:     {}", model.as_deref().unwrap_or("<default>"));
             println!("Language:  {}", language.as_deref().unwrap_or("<default>"));
 
-                // Show provider-specific config
-                match provider.as_str() {
-                    "audetic-api" => {
-                        println!(
-                            "Endpoint:  {}",
-                            whisper.api_endpoint.as_deref().unwrap_or("<default>")
-                        );
-                    }
-                    "assembly-ai" => {
-                        println!("API Key:   {}", mask_secret(&whisper.api_key));
-                        println!(
-                            "Base URL:  {}",
-                            whisper.api_endpoint.as_deref().unwrap_or("<default>")
-                        );
-                    }
-                    "openai-api" => {
-                        println!("API Key:   {}", mask_secret(&whisper.api_key));
-                        println!(
-                            "Endpoint:  {}",
-                            whisper.api_endpoint.as_deref().unwrap_or("<default>")
-                        );
-                    }
-                    "openai-cli" => {
-                        println!("Command:   {}", display_value(&whisper.command_path));
-                    }
-                    "whisper-cpp" => {
-                        println!("Command:   {}", display_value(&whisper.command_path));
-                        println!("Model:     {}", display_value(&whisper.model_path));
-                    }
-                    _ => {}
+            // Show provider-specific config
+            match provider.as_str() {
+                "audetic-api" => {
+                    println!(
+                        "Endpoint:  {}",
+                        whisper.api_endpoint.as_deref().unwrap_or("<default>")
+                    );
                 }
+                "assembly-ai" => {
+                    println!("API Key:   {}", mask_secret(&whisper.api_key));
+                    println!(
+                        "Base URL:  {}",
+                        whisper.api_endpoint.as_deref().unwrap_or("<default>")
+                    );
+                }
+                "openai-api" => {
+                    println!("API Key:   {}", mask_secret(&whisper.api_key));
+                    println!(
+                        "Endpoint:  {}",
+                        whisper.api_endpoint.as_deref().unwrap_or("<default>")
+                    );
+                }
+                "openai-cli" => {
+                    println!("Command:   {}", display_value(&whisper.command_path));
+                }
+                "whisper-cpp" => {
+                    println!("Command:   {}", display_value(&whisper.command_path));
+                    println!("Model:     {}", display_value(&whisper.model_path));
+                }
+                _ => {}
+            }
 
             println!();
             println!("Health: Ready for transcription");
