@@ -142,6 +142,7 @@ fn handle_configure(dry_run: bool) -> Result<()> {
 
     match selection {
         ProviderSelection::AudeticApi => configure_audetic_api(&theme, &mut config.whisper)?,
+        ProviderSelection::AssemblyAi => configure_assembly_ai(&theme, &mut config.whisper)?,
         ProviderSelection::OpenAiApi => configure_openai_api(&theme, &mut config.whisper)?,
         ProviderSelection::OpenAiCli => configure_openai_cli(&theme, &mut config.whisper)?,
         ProviderSelection::WhisperCpp => configure_whisper_cpp(&theme, &mut config.whisper)?,
@@ -271,30 +272,37 @@ fn handle_status() -> Result<()> {
             println!("Model:     {}", model.as_deref().unwrap_or("<default>"));
             println!("Language:  {}", language.as_deref().unwrap_or("<default>"));
 
-            // Show provider-specific config
-            match provider.as_str() {
-                "audetic-api" => {
-                    println!(
-                        "Endpoint:  {}",
-                        whisper.api_endpoint.as_deref().unwrap_or("<default>")
-                    );
+                // Show provider-specific config
+                match provider.as_str() {
+                    "audetic-api" => {
+                        println!(
+                            "Endpoint:  {}",
+                            whisper.api_endpoint.as_deref().unwrap_or("<default>")
+                        );
+                    }
+                    "assembly-ai" => {
+                        println!("API Key:   {}", mask_secret(&whisper.api_key));
+                        println!(
+                            "Base URL:  {}",
+                            whisper.api_endpoint.as_deref().unwrap_or("<default>")
+                        );
+                    }
+                    "openai-api" => {
+                        println!("API Key:   {}", mask_secret(&whisper.api_key));
+                        println!(
+                            "Endpoint:  {}",
+                            whisper.api_endpoint.as_deref().unwrap_or("<default>")
+                        );
+                    }
+                    "openai-cli" => {
+                        println!("Command:   {}", display_value(&whisper.command_path));
+                    }
+                    "whisper-cpp" => {
+                        println!("Command:   {}", display_value(&whisper.command_path));
+                        println!("Model:     {}", display_value(&whisper.model_path));
+                    }
+                    _ => {}
                 }
-                "openai-api" => {
-                    println!("API Key:   {}", mask_secret(&whisper.api_key));
-                    println!(
-                        "Endpoint:  {}",
-                        whisper.api_endpoint.as_deref().unwrap_or("<default>")
-                    );
-                }
-                "openai-cli" => {
-                    println!("Command:   {}", display_value(&whisper.command_path));
-                }
-                "whisper-cpp" => {
-                    println!("Command:   {}", display_value(&whisper.command_path));
-                    println!("Model:     {}", display_value(&whisper.model_path));
-                }
-                _ => {}
-            }
 
             println!();
             println!("Health: Ready for transcription");
@@ -499,6 +507,31 @@ fn configure_audetic_api(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> 
     Ok(())
 }
 
+fn configure_assembly_ai(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> Result<()> {
+    whisper.command_path = None;
+    whisper.model_path = None;
+
+    let api_key = prompt_secret(theme, "AssemblyAI API key", whisper.api_key.as_ref())?;
+    whisper.api_key = Some(api_key);
+
+    let endpoint_default = whisper
+        .api_endpoint
+        .clone()
+        .unwrap_or_else(|| "https://api.assemblyai.com/v2".to_string());
+    whisper.api_endpoint = Some(prompt_string_with_default(
+        theme,
+        "API base URL",
+        &endpoint_default,
+    )?);
+
+    // AssemblyAI doesn't use a model parameter like OpenAI
+    whisper.model = None;
+
+    prompt_language_choice(theme, whisper, "en")?;
+
+    Ok(())
+}
+
 fn configure_openai_api(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> Result<()> {
     whisper.command_path = None;
     whisper.model_path = None;
@@ -604,6 +637,7 @@ fn prompt_provider_selection(
             "audetic-api",
             "Audetic Cloud API (default, no setup required)",
         ),
+        ("assembly-ai", "AssemblyAI API (requires API key)"),
         ("openai-api", "OpenAI Whisper API (requires API key)"),
         (
             "openai-cli",
@@ -794,6 +828,7 @@ fn mask_secret(value: &Option<String>) -> String {
 #[derive(Debug, Clone, Copy)]
 enum ProviderSelection {
     AudeticApi,
+    AssemblyAi,
     OpenAiApi,
     OpenAiCli,
     WhisperCpp,
@@ -803,6 +838,7 @@ impl ProviderSelection {
     fn as_str(&self) -> &'static str {
         match self {
             ProviderSelection::AudeticApi => "audetic-api",
+            ProviderSelection::AssemblyAi => "assembly-ai",
             ProviderSelection::OpenAiApi => "openai-api",
             ProviderSelection::OpenAiCli => "openai-cli",
             ProviderSelection::WhisperCpp => "whisper-cpp",
@@ -812,8 +848,9 @@ impl ProviderSelection {
     fn from_index(index: usize) -> Self {
         match index {
             0 => ProviderSelection::AudeticApi,
-            1 => ProviderSelection::OpenAiApi,
-            2 => ProviderSelection::OpenAiCli,
+            1 => ProviderSelection::AssemblyAi,
+            2 => ProviderSelection::OpenAiApi,
+            3 => ProviderSelection::OpenAiCli,
             _ => ProviderSelection::WhisperCpp,
         }
     }

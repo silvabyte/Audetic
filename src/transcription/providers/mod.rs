@@ -5,11 +5,13 @@ use std::pin::Pin;
 
 use crate::normalizer::TranscriptionNormalizer;
 
+pub mod assembly_api;
 pub mod audetic_api;
 pub mod openai_api;
 pub mod openai_cli;
 pub mod whisper_cpp;
 
+pub use assembly_api::AssemblyAIProvider;
 pub use audetic_api::AudeticProvider;
 pub use openai_api::OpenAIProvider;
 pub use openai_cli::OpenAIWhisperCliProvider;

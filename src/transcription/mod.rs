@@ -11,8 +11,8 @@ mod transcription_service;
 pub mod providers;
 
 pub use providers::{
-    AudeticProvider, OpenAIProvider, OpenAIWhisperCliProvider, TranscriptionProvider,
-    WhisperCppProvider,
+    AssemblyAIProvider, AudeticProvider, OpenAIProvider, OpenAIWhisperCliProvider,
+    TranscriptionProvider, WhisperCppProvider,
 };
 
 pub use transcription_service::TranscriptionService;
@@ -27,9 +27,13 @@ impl Transcriber {
         let language = config.language.clone().unwrap_or_else(|| "en".to_string());
 
         let provider: Box<dyn TranscriptionProvider> = match provider_name {
-            "audetic-api" => {
+            "audetic-api" => Box::new(AudeticProvider::new(config.api_endpoint)?),
+            "assembly-ai" => {
+                let api_key = config
+                    .api_key
+                    .context("api_key is required for AssemblyAI provider")?;
 
-                Box::new(AudeticProvider::new(config.api_endpoint)?)
+                Box::new(AssemblyAIProvider::new(api_key, config.api_endpoint)?)
             }
             "openai-api" => {
                 let api_key = config
@@ -52,7 +56,7 @@ impl Transcriber {
                 )?)
             }
             _ => bail!(
-                "Unknown transcription provider '{}'. Supported providers: audetic-api, openai-api, openai-cli, whisper-cpp",
+                "Unknown transcription provider '{}'. Supported providers: audetic-api, assembly-ai, openai-api, openai-cli, whisper-cpp",
                 provider_name
             ),
         };
@@ -186,6 +190,13 @@ pub fn get_provider_status_from_config(whisper: &WhisperConfig) -> Result<Provid
 pub fn validate_provider_config(provider: &str, whisper: &WhisperConfig) -> Option<String> {
     match provider {
         "audetic-api" => None, // No additional config required
+        "assembly-ai" => {
+            if whisper.api_key.is_none() {
+                Some("API key required for AssemblyAI".to_string())
+            } else {
+                None
+            }
+        }
         "openai-api" => {
             if whisper.api_key.is_none() {
                 Some("API key required for OpenAI API".to_string())
