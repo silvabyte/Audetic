@@ -30,7 +30,7 @@ See the [Configuration Guide](./configuration.md#provider-cli-helpers) for detai
 
 ### Development
 
-- [**Adding Providers**](./adding-providers.md) - Complete guide for developers to add new transcription providers
+- [**Adding Providers**](./adding-providers/README.md) - Step-by-step guide for adding new transcription providers
 
 Audetic includes a Makefile for common development tasks:
 
