@@ -1,0 +1,29 @@
+{
+	"name": "inference-server-manager",
+	"private": true,
+	"version": "0.1.0",
+	"type": "module",
+	"module": "src/index.ts",
+	"scripts": {
+		"dev": "bun run --watch src/index.ts",
+		"start": "bun run src/index.ts",
+		"test": "bun test",
+		"typecheck": "tsc --noEmit"
+	},
+	"dependencies": {
+		"@elysiajs/openapi": "catalog:",
+		"elysia": "catalog:",
+		"json5": "catalog:",
+		"lodash.merge": "catalog:",
+		"pino": "catalog:",
+		"pino-pretty": "catalog:",
+		"pino-roll": "catalog:",
+		"xdg-basedir": "catalog:"
+	},
+	"devDependencies": {
+		"@types/bun": "catalog:",
+		"@types/lodash.merge": "catalog:dev",
+		"@types/node": "catalog:",
+		"typescript": "catalog:"
+	}
+}
