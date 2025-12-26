@@ -1,0 +1,10 @@
+{
+  "appId": "ai.audetic.mobile",
+  "appName": "mobile",
+  "webDir": "dist",
+  "plugins": {
+    "SplashScreen": {
+      "launchAutoHide": false
+    }
+  }
+}
