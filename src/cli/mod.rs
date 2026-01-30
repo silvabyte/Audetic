@@ -1,5 +1,5 @@
 mod args;
-mod compression;
+pub mod compression;
 mod history;
 mod jobs_client;
 mod keybind;
