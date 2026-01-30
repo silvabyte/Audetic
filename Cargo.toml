@@ -64,3 +64,6 @@ fs2 = "0.4"
 rusqlite = "0.37.0"
 chrono = "0.4"
 uuid = { version = "1.18.1", features = ["v4"] }
+
+# Progress indicators
+indicatif = "0.17"

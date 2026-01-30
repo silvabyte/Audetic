@@ -35,6 +35,45 @@ audetic provider configure   # interactive wizard (requires a TTY)
 audetic provider test        # validate the stored provider
 ```
 
+## Transcribe Media Files
+
+Transcribe audio or video files using the audetic cloud transcription service:
+
+```bash
+# Basic transcription (output to stdout)
+audetic transcribe recording.mp4
+
+# Specify language and output file
+audetic transcribe meeting.mkv -l en -o meeting.txt
+
+# JSON output with timestamps
+audetic transcribe podcast.mp3 -f json --timestamps -o podcast.json
+
+# SRT subtitle format
+audetic transcribe video.mp4 -f srt -o subtitles.srt
+
+# Copy result to clipboard
+audetic transcribe voice-memo.m4a --copy
+
+# Use custom API endpoint
+audetic transcribe audio.wav --api-url http://localhost:3141/api/v1/jobs
+```
+
+**Supported formats:**
+
+- Audio: wav, mp3, m4a, flac, ogg, opus
+- Video: mp4, mkv, webm, avi, mov
+
+**Options:**
+
+- `-l, --language <LANG>` - Language code (e.g., 'en', 'es', or 'auto' for detection)
+- `-o, --output <FILE>` - Write transcription to file (default: stdout)
+- `-f, --format <FORMAT>` - Output format: text (default), json, srt
+- `--timestamps` - Include timestamps in text output
+- `--no-progress` - Disable progress indicator
+- `-c, --copy` - Copy result to clipboard
+- `--api-url <URL>` - Override transcription API URL
+
 ## Updates
 
 Audetic includes an auto-updater plus manual controls:
