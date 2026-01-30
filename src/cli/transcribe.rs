@@ -5,11 +5,14 @@
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::cli::args::{OutputFormat, TranscribeCliArgs};
+use crate::cli::compression::{
+    cleanup_temp_file, compress_for_transcription, exceeds_size_limit, get_file_size,
+};
 use crate::cli::jobs_client::{Job, JobsClient, TranscriptionResult};
 use crate::config::Config;
 
@@ -24,7 +27,10 @@ pub async fn handle_transcribe_command(args: TranscribeCliArgs) -> Result<()> {
     // 1. Validate file exists and is supported format
     validate_file(&args.file)?;
 
-    // 2. Determine API URL
+    // 2. Check file size and compress if needed
+    let (file_to_upload, temp_file) = prepare_file_for_upload(&args.file, args.no_compress)?;
+
+    // 3. Determine API URL
     let config = Config::load()?;
     let base_url = args
         .api_url
@@ -39,7 +45,7 @@ pub async fn handle_transcribe_command(args: TranscribeCliArgs) -> Result<()> {
 
     let client = JobsClient::new(&base_url);
 
-    // 3. Submit job with progress indicator
+    // 4. Submit job with progress indicator
     let show_progress = !args.no_progress;
     let pb = if show_progress {
         let pb = create_progress_bar();
@@ -55,18 +61,23 @@ pub async fn handle_transcribe_command(args: TranscribeCliArgs) -> Result<()> {
         .or(config.whisper.language.as_deref());
 
     let job_id = client
-        .submit_job(&args.file, language, args.timestamps)
+        .submit_job(&file_to_upload, language, args.timestamps)
         .await
         .context("Failed to submit transcription job")?;
 
-    // 4. Poll for completion
+    // 5. Poll for completion
     let job = poll_until_complete(&client, &job_id, pb.as_ref()).await?;
+
+    // 6. Clean up temp file if one was created
+    if let Some(temp) = temp_file {
+        cleanup_temp_file(&temp);
+    }
 
     if let Some(pb) = pb {
         pb.finish_with_message("Complete");
     }
 
-    // 5. Handle result
+    // 7. Handle result
     if job.status == "failed" {
         bail!(
             "Transcription failed: {}",
@@ -78,7 +89,7 @@ pub async fn handle_transcribe_command(args: TranscribeCliArgs) -> Result<()> {
         .result
         .ok_or_else(|| anyhow::anyhow!("Job completed but no result available"))?;
 
-    // 6. Format and output
+    // 8. Format and output
     let output_text = format_output(&result, &args.format, args.timestamps);
 
     if let Some(output_path) = &args.output {
@@ -118,6 +129,45 @@ fn validate_file(path: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Prepare file for upload, compressing if needed.
+///
+/// Returns (file_to_upload, Option<temp_file_path>).
+/// If compression was performed, temp_file_path will be Some and should be cleaned up after upload.
+fn prepare_file_for_upload(path: &Path, no_compress: bool) -> Result<(PathBuf, Option<PathBuf>)> {
+    if exceeds_size_limit(path)? {
+        if no_compress {
+            let size_mb = get_file_size(path)? as f64 / 1_000_000.0;
+            bail!(
+                "File exceeds 100MB limit ({:.1}MB). Remove --no-compress flag to enable automatic compression.",
+                size_mb
+            );
+        }
+
+        let size_mb = get_file_size(path)? as f64 / 1_000_000.0;
+        eprintln!(
+            "File exceeds 100MB ({:.1}MB), compressing for upload...",
+            size_mb
+        );
+
+        let compressed = compress_for_transcription(path)?;
+        let compressed_size_mb = get_file_size(&compressed)? as f64 / 1_000_000.0;
+        eprintln!("Compressed to {:.1}MB", compressed_size_mb);
+
+        // Verify compressed file is under limit
+        if exceeds_size_limit(&compressed)? {
+            cleanup_temp_file(&compressed);
+            bail!(
+                "Compressed file still exceeds 100MB limit ({:.1}MB). Try a shorter recording or lower quality source.",
+                compressed_size_mb
+            );
+        }
+
+        Ok((compressed.clone(), Some(compressed)))
+    } else {
+        Ok((path.to_path_buf(), None))
+    }
 }
 
 /// Derive the jobs URL from a transcriptions endpoint.

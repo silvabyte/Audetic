@@ -134,6 +134,10 @@ pub enum KeybindCommand {
     Status,
 }
 
+/// Transcribe audio or video files to text.
+///
+/// Files larger than 100MB are automatically compressed before upload.
+/// Use --no-compress to disable this behavior (upload will fail if file is too large).
 #[derive(ClapArgs, Debug)]
 pub struct TranscribeCliArgs {
     /// Path to audio or video file to transcribe
@@ -166,6 +170,10 @@ pub struct TranscribeCliArgs {
     /// Override transcription API base URL
     #[arg(long)]
     pub api_url: Option<String>,
+
+    /// Skip automatic compression for large files (>100MB)
+    #[arg(long)]
+    pub no_compress: bool,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
