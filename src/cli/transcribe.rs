@@ -11,7 +11,7 @@ use tokio::time::sleep;
 
 use crate::cli::args::{OutputFormat, TranscribeCliArgs};
 use crate::cli::compression::{
-    cleanup_temp_file, compress_for_transcription, exceeds_size_limit, get_file_size,
+    cleanup_temp_file, compress_for_transcription, get_file_size, is_already_compressed,
 };
 use crate::cli::jobs_client::{Job, JobsClient, TranscriptionResult};
 use crate::config::Config;
@@ -136,38 +136,25 @@ fn validate_file(path: &Path) -> Result<()> {
 /// Returns (file_to_upload, Option<temp_file_path>).
 /// If compression was performed, temp_file_path will be Some and should be cleaned up after upload.
 fn prepare_file_for_upload(path: &Path, no_compress: bool) -> Result<(PathBuf, Option<PathBuf>)> {
-    if exceeds_size_limit(path)? {
-        if no_compress {
-            let size_mb = get_file_size(path)? as f64 / 1_000_000.0;
-            bail!(
-                "File exceeds 100MB limit ({:.1}MB). Remove --no-compress flag to enable automatic compression.",
-                size_mb
-            );
-        }
-
-        let size_mb = get_file_size(path)? as f64 / 1_000_000.0;
-        eprintln!(
-            "File exceeds 100MB ({:.1}MB), compressing for upload...",
-            size_mb
-        );
-
-        let compressed = compress_for_transcription(path)?;
-        let compressed_size_mb = get_file_size(&compressed)? as f64 / 1_000_000.0;
-        eprintln!("Compressed to {:.1}MB", compressed_size_mb);
-
-        // Verify compressed file is under limit
-        if exceeds_size_limit(&compressed)? {
-            cleanup_temp_file(&compressed);
-            bail!(
-                "Compressed file still exceeds 100MB limit ({:.1}MB). Try a shorter recording or lower quality source.",
-                compressed_size_mb
-            );
-        }
-
-        Ok((compressed.clone(), Some(compressed)))
-    } else {
-        Ok((path.to_path_buf(), None))
+    // Skip compression if file is already in the target format
+    if is_already_compressed(path) {
+        return Ok((path.to_path_buf(), None));
     }
+
+    // Skip compression if user passed --no-compress
+    if no_compress {
+        return Ok((path.to_path_buf(), None));
+    }
+
+    // Compress to opus
+    let size_mb = get_file_size(path)? as f64 / 1_000_000.0;
+    eprintln!("Compressing to opus for upload ({:.1}MB)...", size_mb);
+
+    let compressed = compress_for_transcription(path)?;
+    let compressed_size_mb = get_file_size(&compressed)? as f64 / 1_000_000.0;
+    eprintln!("Compressed to {:.1}MB", compressed_size_mb);
+
+    Ok((compressed.clone(), Some(compressed)))
 }
 
 /// Derive the jobs URL from a transcriptions endpoint.
@@ -399,6 +386,32 @@ mod tests {
             format_output(&result, &OutputFormat::Text, false),
             "Hello world"
         );
+    }
+
+    #[test]
+    fn test_prepare_opus_file_skips_compression() {
+        let path = PathBuf::from("/tmp/test_skip_compress.opus");
+        std::fs::write(&path, b"fake opus data").unwrap();
+
+        let (upload_path, temp_file) = prepare_file_for_upload(&path, false).unwrap();
+
+        assert_eq!(upload_path, path);
+        assert!(temp_file.is_none());
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn test_prepare_no_compress_flag_skips_compression() {
+        let path = PathBuf::from("/tmp/test_no_compress_flag.wav");
+        std::fs::write(&path, b"fake wav data").unwrap();
+
+        let (upload_path, temp_file) = prepare_file_for_upload(&path, true).unwrap();
+
+        assert_eq!(upload_path, path);
+        assert!(temp_file.is_none());
+
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

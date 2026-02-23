@@ -1,19 +1,20 @@
 //! Media file compression utilities for transcription.
 //!
-//! Provides file size validation and FFmpeg-based compression to ensure
-//! media files are under the API's 100MB limit.
+//! Provides FFmpeg-based compression to opus format for efficient upload
+//! and transcription.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Maximum file size in bytes (100MB)
-const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
-
-/// Check if file exceeds the size limit.
-pub fn exceeds_size_limit(path: &Path) -> Result<bool> {
-    let metadata = std::fs::metadata(path).context("Failed to read file metadata")?;
-    Ok(metadata.len() > MAX_FILE_SIZE)
+/// Check if a file is already in the compressed target format (opus).
+///
+/// Files already in opus format don't need re-encoding.
+pub fn is_already_compressed(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("opus"))
+        .unwrap_or(false)
 }
 
 /// Get file size in bytes.
@@ -41,7 +42,7 @@ pub fn compress_for_transcription(input: &Path) -> Result<PathBuf> {
     // Check FFmpeg is available
     if !check_ffmpeg_available() {
         bail!(
-            "FFmpeg is required to compress large files but was not found.\n\
+            "FFmpeg is required for audio compression but was not found.\n\
              Install FFmpeg:\n\
              - macOS: brew install ffmpeg\n\
              - Ubuntu/Debian: sudo apt install ffmpeg\n\
@@ -101,13 +102,6 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
-    fn test_exceeds_size_limit_small_file() {
-        let mut file = NamedTempFile::new().unwrap();
-        file.write_all(b"small content").unwrap();
-        assert!(!exceeds_size_limit(file.path()).unwrap());
-    }
-
-    #[test]
     fn test_check_ffmpeg_available() {
         // This test documents behavior - will pass if FFmpeg installed
         let available = check_ffmpeg_available();
@@ -116,9 +110,12 @@ mod tests {
     }
 
     #[test]
-    fn test_exceeds_size_limit_missing_file() {
-        let result = exceeds_size_limit(Path::new("/nonexistent/file.wav"));
-        assert!(result.is_err());
+    fn test_is_already_compressed() {
+        assert!(is_already_compressed(Path::new("test.opus")));
+        assert!(is_already_compressed(Path::new("test.OPUS")));
+        assert!(!is_already_compressed(Path::new("test.wav")));
+        assert!(!is_already_compressed(Path::new("test.mp3")));
+        assert!(!is_already_compressed(Path::new("test")));
     }
 
     #[test]

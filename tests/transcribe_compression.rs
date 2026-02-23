@@ -67,33 +67,37 @@ fn test_compression_produces_smaller_file() {
 }
 
 #[test]
-fn test_exceeds_size_limit_with_large_file() {
-    let input = Path::new("tests/fixtures/large_video.mp4");
-    if !input.exists() {
-        eprintln!("Skipping: Test fixture not found");
-        return;
-    }
-
-    use audetic::cli::compression::exceeds_size_limit;
-    assert!(
-        exceeds_size_limit(input).unwrap(),
-        "Large video should exceed size limit"
-    );
+fn test_is_already_compressed_opus() {
+    use audetic::cli::compression::is_already_compressed;
+    assert!(is_already_compressed(Path::new("test.opus")));
+    assert!(is_already_compressed(Path::new("test.OPUS")));
+    assert!(!is_already_compressed(Path::new("test.wav")));
+    assert!(!is_already_compressed(Path::new("test.mp3")));
+    assert!(!is_already_compressed(Path::new("test.mp4")));
+    assert!(!is_already_compressed(Path::new("test")));
 }
 
 #[test]
-fn test_small_file_does_not_exceed_limit() {
-    let input = Path::new("tests/fixtures/test.wav");
-    if !input.exists() {
-        eprintln!("Skipping: Test fixture not found");
+fn test_compression_works_on_small_file() {
+    if !ffmpeg_available() {
+        eprintln!("Skipping: FFmpeg not installed");
         return;
     }
 
-    use audetic::cli::compression::exceeds_size_limit;
-    assert!(
-        !exceeds_size_limit(input).unwrap(),
-        "Small file should not exceed limit"
-    );
+    let input = Path::new("tests/fixtures/test.wav");
+    if !input.exists() {
+        eprintln!("Skipping: Test fixture not found at tests/fixtures/test.wav");
+        return;
+    }
+
+    use audetic::cli::compression::{cleanup_temp_file, compress_for_transcription};
+
+    let output = compress_for_transcription(input).unwrap();
+
+    assert!(output.exists(), "Output file should exist");
+    assert_eq!(output.extension().unwrap(), "opus");
+
+    cleanup_temp_file(&output);
 }
 
 #[test]
