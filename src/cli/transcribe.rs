@@ -4,7 +4,6 @@
 
 use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -13,11 +12,9 @@ use crate::cli::args::{OutputFormat, TranscribeCliArgs};
 use crate::cli::compression::{
     cleanup_temp_file, compress_for_transcription, get_file_size, is_already_compressed,
 };
-use crate::cli::jobs_client::{Job, JobsClient, TranscriptionResult};
+use crate::cli::jobs_client::{mime_type_for_extension, status, Job, JobsClient, TranscriptionResult};
 use crate::config::Config;
-
-const SUPPORTED_AUDIO: &[&str] = &["wav", "mp3", "m4a", "flac", "ogg", "opus"];
-const SUPPORTED_VIDEO: &[&str] = &["mp4", "mkv", "webm", "avi", "mov"];
+use crate::text_io::copy_to_clipboard_sync;
 const POLL_INTERVAL_MS: u64 = 1000;
 const MAX_POLL_ATTEMPTS: u32 = 1800; // 30 minutes at 1s intervals
 const DEFAULT_API_URL: &str = "https://audio.audetic.link/api/v1/jobs";
@@ -78,7 +75,7 @@ pub async fn handle_transcribe_command(args: TranscribeCliArgs) -> Result<()> {
     }
 
     // 7. Handle result
-    if job.status == "failed" {
+    if job.status == status::FAILED {
         bail!(
             "Transcription failed: {}",
             job.error.unwrap_or_else(|| "Unknown error".to_string())
@@ -100,7 +97,7 @@ pub async fn handle_transcribe_command(args: TranscribeCliArgs) -> Result<()> {
     }
 
     if args.copy {
-        copy_to_clipboard(&output_text)?;
+        copy_to_clipboard_sync(&output_text)?;
         eprintln!("Copied to clipboard");
     }
 
@@ -119,12 +116,10 @@ fn validate_file(path: &Path) -> Result<()> {
         .map(|e| e.to_lowercase())
         .unwrap_or_default();
 
-    if !SUPPORTED_AUDIO.contains(&ext.as_str()) && !SUPPORTED_VIDEO.contains(&ext.as_str()) {
+    if mime_type_for_extension(&ext).is_none() {
         bail!(
-            "Unsupported format: .{}\nSupported audio: {}\nSupported video: {}",
+            "Unsupported format: .{}\nSupported formats: wav, mp3, m4a, flac, ogg, opus, mp4, mkv, webm, avi, mov",
             ext,
-            SUPPORTED_AUDIO.join(", "),
-            SUPPORTED_VIDEO.join(", ")
         );
     }
 
@@ -135,14 +130,14 @@ fn validate_file(path: &Path) -> Result<()> {
 ///
 /// Returns (file_to_upload, Option<temp_file_path>).
 /// If compression was performed, temp_file_path will be Some and should be cleaned up after upload.
-fn prepare_file_for_upload(path: &Path, no_compress: bool) -> Result<(PathBuf, Option<PathBuf>)> {
+fn prepare_file_for_upload(path: &Path, skip_compression: bool) -> Result<(PathBuf, Option<PathBuf>)> {
     // Skip compression if file is already in the target format
     if is_already_compressed(path) {
         return Ok((path.to_path_buf(), None));
     }
 
     // Skip compression if user passed --no-compress
-    if no_compress {
+    if skip_compression {
         return Ok((path.to_path_buf(), None));
     }
 
@@ -198,9 +193,9 @@ async fn poll_until_complete(
                 pb.set_message(msg.clone());
             } else {
                 let msg = match status.status.as_str() {
-                    "pending" => "Waiting...",
-                    "extracting_audio" => "Extracting audio...",
-                    "transcribing" => "Transcribing...",
+                    status::PENDING => "Waiting...",
+                    status::EXTRACTING_AUDIO => "Extracting audio...",
+                    status::TRANSCRIBING => "Transcribing...",
                     _ => "",
                 };
                 pb.set_message(msg);
@@ -208,10 +203,10 @@ async fn poll_until_complete(
         }
 
         match status.status.as_str() {
-            "completed" | "failed" => {
+            status::COMPLETED | status::FAILED => {
                 return client.get_job(job_id).await;
             }
-            "cancelled" => {
+            status::CANCELLED => {
                 bail!("Job was cancelled");
             }
             _ => {
@@ -283,21 +278,6 @@ fn format_srt_time(seconds: f64) -> String {
     let secs = (seconds % 60.0) as u32;
     let millis = ((seconds % 1.0) * 1000.0) as u32;
     format!("{:02}:{:02}:{:02},{:03}", hours, minutes, secs, millis)
-}
-
-/// Copy text to clipboard using wl-copy.
-fn copy_to_clipboard(text: &str) -> Result<()> {
-    let mut child = std::process::Command::new("wl-copy")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("Failed to run wl-copy (is wl-clipboard installed?)")?;
-
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(text.as_bytes())?;
-    }
-
-    child.wait()?;
-    Ok(())
 }
 
 #[cfg(test)]
