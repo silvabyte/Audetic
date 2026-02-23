@@ -1,19 +1,19 @@
 //! Media file compression utilities for transcription.
 //!
-//! Provides FFmpeg-based compression to opus format for efficient upload
+//! Provides FFmpeg-based compression to mp3 format for efficient upload
 //! and transcription.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Check if a file is already in the compressed target format (opus).
+/// Check if a file is already in a compressed audio format suitable for upload.
 ///
-/// Files already in opus format don't need re-encoding.
+/// Files already in mp3 or opus format don't need re-encoding.
 pub fn is_already_compressed(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("opus"))
+        .map(|e| e.eq_ignore_ascii_case("mp3") || e.eq_ignore_ascii_case("opus"))
         .unwrap_or(false)
 }
 
@@ -32,10 +32,10 @@ pub fn check_ffmpeg_available() -> bool {
         .unwrap_or(false)
 }
 
-/// Compress media file to Opus format for transcription.
+/// Compress media file to MP3 format for transcription.
 ///
-/// Uses FFmpeg to extract audio from video files and compress to Opus format,
-/// which provides excellent quality for speech at low bitrates.
+/// Uses FFmpeg to extract audio from video files and compress to MP3 format,
+/// which is universally supported by transcription APIs.
 ///
 /// Returns path to compressed temp file.
 pub fn compress_for_transcription(input: &Path) -> Result<PathBuf> {
@@ -57,21 +57,19 @@ pub fn compress_for_transcription(input: &Path) -> Result<PathBuf> {
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("audio");
-    let output = temp_dir.join(format!("{}_compressed.opus", filename));
+    let output = temp_dir.join(format!("{}_compressed.mp3", filename));
 
     // Run FFmpeg compression
     // -i: input file
     // -vn: extract audio only (ignore video)
-    // -codec:a libopus: use Opus codec
-    // -b:a 48k: 48kbps bitrate (good for speech)
-    // -vbr on: variable bitrate for better quality
+    // -codec:a libmp3lame: use MP3 codec (universally supported)
+    // -b:a 64k: 64kbps bitrate (good for speech)
     // -y: overwrite output without asking
     let status = Command::new("ffmpeg")
         .args(["-i", input.to_str().unwrap()])
         .args(["-vn"])
-        .args(["-codec:a", "libopus"])
-        .args(["-b:a", "48k"])
-        .args(["-vbr", "on"])
+        .args(["-codec:a", "libmp3lame"])
+        .args(["-b:a", "64k"])
         .args(["-y"])
         .arg(&output)
         .output()
@@ -111,10 +109,12 @@ mod tests {
 
     #[test]
     fn test_is_already_compressed() {
+        assert!(is_already_compressed(Path::new("test.mp3")));
+        assert!(is_already_compressed(Path::new("test.MP3")));
         assert!(is_already_compressed(Path::new("test.opus")));
         assert!(is_already_compressed(Path::new("test.OPUS")));
         assert!(!is_already_compressed(Path::new("test.wav")));
-        assert!(!is_already_compressed(Path::new("test.mp3")));
+        assert!(!is_already_compressed(Path::new("test.mp4")));
         assert!(!is_already_compressed(Path::new("test")));
     }
 

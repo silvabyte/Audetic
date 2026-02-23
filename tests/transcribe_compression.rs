@@ -59,20 +59,21 @@ fn test_compression_produces_smaller_file() {
         output_size / 1024 / 1024
     );
 
-    // Verify it's an Opus file
-    assert_eq!(output.extension().unwrap(), "opus");
+    // Verify it's an MP3 file
+    assert_eq!(output.extension().unwrap(), "mp3");
 
     cleanup_temp_file(&output);
     assert!(!output.exists(), "Cleanup should remove temp file");
 }
 
 #[test]
-fn test_is_already_compressed_opus() {
+fn test_is_already_compressed() {
     use audetic::cli::compression::is_already_compressed;
+    assert!(is_already_compressed(Path::new("test.mp3")));
+    assert!(is_already_compressed(Path::new("test.MP3")));
     assert!(is_already_compressed(Path::new("test.opus")));
     assert!(is_already_compressed(Path::new("test.OPUS")));
     assert!(!is_already_compressed(Path::new("test.wav")));
-    assert!(!is_already_compressed(Path::new("test.mp3")));
     assert!(!is_already_compressed(Path::new("test.mp4")));
     assert!(!is_already_compressed(Path::new("test")));
 }
@@ -95,7 +96,7 @@ fn test_compression_works_on_small_file() {
     let output = compress_for_transcription(input).unwrap();
 
     assert!(output.exists(), "Output file should exist");
-    assert_eq!(output.extension().unwrap(), "opus");
+    assert_eq!(output.extension().unwrap(), "mp3");
 
     cleanup_temp_file(&output);
 }

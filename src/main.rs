@@ -17,7 +17,10 @@ async fn main() -> Result<()> {
     let log_level = if cli.verbose { "debug" } else { "info" };
     let env_filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     match cli.command {
         Some(CliCommand::Version) => {

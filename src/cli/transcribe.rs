@@ -146,9 +146,9 @@ fn prepare_file_for_upload(path: &Path, no_compress: bool) -> Result<(PathBuf, O
         return Ok((path.to_path_buf(), None));
     }
 
-    // Compress to opus
+    // Compress to mp3
     let size_mb = get_file_size(path)? as f64 / 1_000_000.0;
-    eprintln!("Compressing to opus for upload ({:.1}MB)...", size_mb);
+    eprintln!("Compressing to mp3 for upload ({:.1}MB)...", size_mb);
 
     let compressed = compress_for_transcription(path)?;
     let compressed_size_mb = get_file_size(&compressed)? as f64 / 1_000_000.0;
@@ -245,21 +245,20 @@ fn format_output(result: &TranscriptionResult, format: &OutputFormat, timestamps
 
 /// Format result as text with timestamps.
 fn format_text_with_timestamps(result: &TranscriptionResult) -> String {
-    if let Some(segments) = &result.segments {
-        segments
+    match &result.segments {
+        Some(segments) if !segments.is_empty() => segments
             .iter()
             .map(|s| format!("[{:.2} - {:.2}] {}", s.start, s.end, s.text))
             .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        result.text.clone()
+            .join("\n"),
+        _ => result.text.clone(),
     }
 }
 
 /// Format result as SRT subtitles.
 fn format_as_srt(result: &TranscriptionResult) -> String {
-    if let Some(segments) = &result.segments {
-        segments
+    match &result.segments {
+        Some(segments) if !segments.is_empty() => segments
             .iter()
             .enumerate()
             .map(|(i, s)| {
@@ -272,9 +271,8 @@ fn format_as_srt(result: &TranscriptionResult) -> String {
                 )
             })
             .collect::<Vec<_>>()
-            .join("\n")
-    } else {
-        format!("1\n00:00:00,000 --> 00:00:00,000\n{}\n", result.text)
+            .join("\n"),
+        _ => format!("1\n00:00:00,000 --> 00:00:00,000\n{}\n", result.text),
     }
 }
 
