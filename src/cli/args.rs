@@ -136,7 +136,7 @@ pub enum KeybindCommand {
 
 /// Transcribe audio or video files to text.
 ///
-/// Files are automatically compressed to opus format before upload.
+/// Files are automatically compressed to mp3 format before upload.
 /// Use --no-compress to send the file in its original format.
 #[derive(ClapArgs, Debug)]
 pub struct TranscribeCliArgs {

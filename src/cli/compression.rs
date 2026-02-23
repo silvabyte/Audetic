@@ -9,7 +9,7 @@ use std::process::Command;
 
 /// Check if a file is already in a compressed audio format suitable for upload.
 ///
-/// Files already in mp3 or opus format don't need re-encoding.
+/// Files already in a compressed audio format (mp3, opus) are sent as-is.
 pub fn is_already_compressed(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())

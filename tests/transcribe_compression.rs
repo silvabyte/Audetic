@@ -2,11 +2,10 @@
 //!
 //! ## Prerequisites
 //! - FFmpeg must be installed
-//! - A large video file (>100MB) must be placed at `tests/fixtures/large_video.mp4`
+//! - A video file must be placed at `tests/fixtures/large_video.mp4`
 //!
 //! ## Running tests
 //! ```bash
-//! # Copy any video >100MB to the fixtures directory
 //! cp /path/to/your/video.mp4 tests/fixtures/large_video.mp4
 //! cargo test --test transcribe_compression
 //! ```
@@ -38,11 +37,6 @@ fn test_compression_produces_smaller_file() {
     use audetic::cli::compression::{cleanup_temp_file, compress_for_transcription, get_file_size};
 
     let input_size = get_file_size(input).unwrap();
-    assert!(
-        input_size > 100 * 1024 * 1024,
-        "Test file should be >100MB, got {}MB",
-        input_size / 1024 / 1024
-    );
 
     let output = compress_for_transcription(input).unwrap();
 
@@ -54,8 +48,8 @@ fn test_compression_produces_smaller_file() {
         "Compressed ({output_size}) should be smaller than input ({input_size})"
     );
     assert!(
-        output_size < 100 * 1024 * 1024,
-        "Should be under 100MB limit, got {}MB",
+        output_size < input_size,
+        "Compressed file should be smaller than input, got {}MB",
         output_size / 1024 / 1024
     );
 

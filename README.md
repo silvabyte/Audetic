@@ -64,6 +64,9 @@ audetic transcribe audio.wav --api-url http://localhost:3141/api/v1/jobs
 - Audio: wav, mp3, m4a, flac, ogg, opus
 - Video: mp4, mkv, webm, avi, mov
 
+Files are automatically compressed to MP3 before upload for efficient transfer.
+Files already in MP3 or Opus format are sent as-is. Use `--no-compress` to skip.
+
 **Options:**
 
 - `-l, --language <LANG>` - Language code (e.g., 'en', 'es', or 'auto' for detection)
@@ -72,6 +75,7 @@ audetic transcribe audio.wav --api-url http://localhost:3141/api/v1/jobs
 - `--timestamps` - Include timestamps in text output
 - `--no-progress` - Disable progress indicator
 - `-c, --copy` - Copy result to clipboard
+- `--no-compress` - Skip compression (send file in original format)
 - `--api-url <URL>` - Override transcription API URL
 
 ## Updates
