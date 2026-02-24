@@ -1,13 +1,13 @@
 {
 	"version": "0.1.20",
-	"channel": "beta",
-	"release_date": "2025-11-24T20:59:20.241Z",
+	"channel": "stable",
+	"release_date": "2026-02-24T21:01:45.890Z",
 	"notes_url": "https://install.audetic.ai/cli/releases/0.1.20/notes.md",
 	"targets": {
 		"linux-x86_64-gnu": {
 			"archive": "audetic-0.1.20-linux-x86_64-gnu.tar.gz",
-			"sha256": "7db7dafed5a7d4528192a0dcf0070dcf6b76f7722a6e922caf161c41ec96718f",
-			"size": 4681142
+			"sha256": "ae86d997fc3d1c2dac9a9e3064c1d77dfcb9c489db570cf2c8104fceaff12e34",
+			"size": 5466156
 		}
 	}
 }
