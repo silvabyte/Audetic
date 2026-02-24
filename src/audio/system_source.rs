@@ -1,69 +1,55 @@
 //! System audio capture (what others say on Zoom/Meet/etc.).
 //!
-//! Captures audio from PipeWire/PulseAudio monitor sources, which represent
-//! the system's audio output (speakers/headphones) as an input device.
-//!
-//! Strategy:
-//! 1. Try cpal: enumerate input devices, find one with "Monitor" in the name
-//! 2. Fallback: spawn `pw-record` targeting the default output monitor
-//! 3. Graceful degradation: if nothing works, return empty samples with a warning
+//! Captures audio from PipeWire monitor sources by spawning `pw-cat --record`
+//! and reading raw f32 PCM samples from its stdout.
 
-use anyhow::{Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use anyhow::Result;
+use std::io::Read as _;
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
+use which::which;
 
 use super::audio_source::AudioSource;
 
 pub struct SystemAudioSource {
-    capture: Option<SystemCapture>,
+    child: Option<Child>,
+    reader_thread: Option<std::thread::JoinHandle<()>>,
     samples: Arc<Mutex<Vec<f32>>>,
     active: bool,
     target_sample_rate: u32,
 }
 
-enum SystemCapture {
-    Cpal {
-        stream: cpal::Stream,
-        actual_sample_rate: u32,
-    },
-}
-
 impl SystemAudioSource {
-    /// Create a new system audio source.
-    ///
-    /// # Arguments
-    /// * `sample_rate` - Target sample rate for captured audio
     pub fn new(sample_rate: u32) -> Self {
         Self {
-            capture: None,
+            child: None,
+            reader_thread: None,
             samples: Arc::new(Mutex::new(Vec::new())),
             active: false,
             target_sample_rate: sample_rate,
         }
     }
 
-    /// Find a PipeWire/PulseAudio monitor source via cpal.
-    fn find_monitor_device() -> Option<(cpal::Device, u32)> {
-        let host = cpal::default_host();
+    /// Get the default PipeWire monitor source name via pactl.
+    fn get_monitor_source() -> Option<String> {
+        let output = Command::new("pactl")
+            .args(["get-default-sink"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
 
-        for device in host.input_devices().ok()? {
-            if let Ok(name) = device.name() {
-                let name_lower = name.to_lowercase();
-                if name_lower.contains("monitor") {
-                    if let Ok(default_config) = device.default_input_config() {
-                        let sample_rate = default_config.sample_rate().0;
-                        info!(
-                            "Found system audio monitor: {} ({}Hz)",
-                            name, sample_rate
-                        );
-                        return Some((device, sample_rate));
-                    }
-                }
-            }
+        if !output.status.success() {
+            return None;
         }
 
-        None
+        let sink = String::from_utf8(output.stdout).ok()?.trim().to_string();
+        if sink.is_empty() {
+            return None;
+        }
+
+        Some(format!("{}.monitor", sink))
     }
 }
 
@@ -80,50 +66,79 @@ impl AudioSource for SystemAudioSource {
             samples.shrink_to_fit();
         }
 
-        // Try to find and use a monitor source
-        if let Some((device, actual_sample_rate)) = Self::find_monitor_device() {
-            let config = cpal::StreamConfig {
-                channels: 1,
-                sample_rate: cpal::SampleRate(actual_sample_rate),
-                buffer_size: cpal::BufferSize::Default,
-            };
-
-            let samples_clone = self.samples.clone();
-            let err_fn = |err| error!("System audio stream error: {}", err);
-
-            match device.build_input_stream(
-                &config,
-                move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    if let Ok(mut samples) = samples_clone.lock() {
-                        samples.extend_from_slice(data);
-                    }
-                },
-                err_fn,
-                None,
-            ) {
-                Ok(stream) => {
-                    stream.play().context("Failed to start system audio stream")?;
-                    self.capture = Some(SystemCapture::Cpal {
-                        stream,
-                        actual_sample_rate,
-                    });
-                    self.active = true;
-                    info!("System audio capture started via monitor source");
-                    return Ok(());
-                }
-                Err(e) => {
-                    warn!("Failed to build system audio stream: {}", e);
-                }
-            }
+        // Check pw-cat is available
+        if which("pw-cat").is_err() {
+            warn!(
+                "pw-cat not found. Meeting will record mic only. \
+                 Install PipeWire to capture system audio."
+            );
+            self.active = true;
+            return Ok(());
         }
 
-        // No monitor source found — proceed without system audio
-        warn!(
-            "No system audio monitor source found. \
-             Meeting will record mic only. \
-             Ensure PipeWire is running and a monitor source is available."
-        );
+        // Get monitor source name
+        let monitor = match Self::get_monitor_source() {
+            Some(m) => {
+                info!("Using PipeWire monitor source: {}", m);
+                m
+            }
+            None => {
+                warn!(
+                    "Could not determine default audio sink. \
+                     Meeting will record mic only."
+                );
+                self.active = true;
+                return Ok(());
+            }
+        };
+
+        // Spawn pw-cat to capture system audio
+        let child = match Command::new("pw-cat")
+            .args([
+                "--record",
+                "--target",
+                &monitor,
+                "--rate",
+                &self.target_sample_rate.to_string(),
+                "--channels",
+                "1",
+                "--format",
+                "f32",
+                "-", // write to stdout
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("Failed to spawn pw-cat: {}. Meeting will record mic only.", e);
+                self.active = true;
+                return Ok(());
+            }
+        };
+
+        let mut child = child;
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                warn!("Failed to capture pw-cat stdout. Meeting will record mic only.");
+                let _ = child.kill();
+                self.active = true;
+                return Ok(());
+            }
+        };
+
+        // Spawn reader thread to consume stdout
+        let samples_clone = self.samples.clone();
+        let reader_thread = std::thread::spawn(move || {
+            Self::read_samples(stdout, samples_clone);
+        });
+
+        self.child = Some(child);
+        self.reader_thread = Some(reader_thread);
         self.active = true;
+        info!("System audio capture started via pw-cat");
         Ok(())
     }
 
@@ -132,14 +147,16 @@ impl AudioSource for SystemAudioSource {
             return Err(anyhow::anyhow!("System audio source not recording"));
         }
 
-        // Drop capture to stop recording
-        if let Some(capture) = self.capture.take() {
-            match capture {
-                SystemCapture::Cpal { stream, .. } => {
-                    debug!("Stopping system audio cpal stream");
-                    drop(stream);
-                }
-            }
+        // Kill the pw-cat process
+        if let Some(mut child) = self.child.take() {
+            debug!("Killing pw-cat process");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        // Wait for reader thread to finish (it exits on EOF after kill)
+        if let Some(thread) = self.reader_thread.take() {
+            let _ = thread.join();
         }
 
         self.active = false;
@@ -164,14 +181,85 @@ impl AudioSource for SystemAudioSource {
     }
 
     fn sample_rate(&self) -> u32 {
-        // Return actual sample rate if we have an active cpal capture
-        if let Some(SystemCapture::Cpal {
-            actual_sample_rate, ..
-        }) = &self.capture
-        {
-            return *actual_sample_rate;
-        }
         self.target_sample_rate
+    }
+}
+
+impl SystemAudioSource {
+    /// Read f32 samples from pw-cat stdout into the shared buffer.
+    ///
+    /// pw-cat writes a 24-byte AU header followed by raw f32 LE PCM.
+    /// We detect the AU magic to skip the header; if absent, treat
+    /// the entire stream as raw f32 data.
+    fn read_samples(
+        mut stdout: std::process::ChildStdout,
+        samples: Arc<Mutex<Vec<f32>>>,
+    ) {
+        // Try to read AU header magic (4 bytes: 0x2e736e64 big-endian, aka ".snd")
+        let mut magic = [0u8; 4];
+        if stdout.read_exact(&mut magic).is_err() {
+            warn!("pw-cat stdout closed before any data");
+            return;
+        }
+
+        // AU magic is ".snd" = 0x2e736e64 in big-endian
+        let is_au = magic == [0x2e, 0x73, 0x6e, 0x64];
+
+        if is_au {
+            // Read data offset (bytes 4-8, big-endian u32)
+            let mut offset_bytes = [0u8; 4];
+            if stdout.read_exact(&mut offset_bytes).is_err() {
+                warn!("pw-cat stdout closed reading AU header offset");
+                return;
+            }
+            let data_offset = u32::from_be_bytes(offset_bytes) as usize;
+
+            // Skip remaining header bytes (we already read 8)
+            if data_offset > 8 {
+                let remaining = data_offset - 8;
+                let mut skip = vec![0u8; remaining];
+                if stdout.read_exact(&mut skip).is_err() {
+                    warn!("pw-cat stdout closed skipping AU header");
+                    return;
+                }
+            }
+            debug!("Skipped AU header ({} bytes)", data_offset);
+        } else {
+            // No AU header — the 4 bytes we read are the start of a sample
+            let sample = f32::from_le_bytes(magic);
+            if let Ok(mut guard) = samples.lock() {
+                guard.push(sample);
+            }
+        }
+
+        // Read f32 LE samples in chunks
+        let mut buf = [0u8; 4096];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break, // EOF
+                Ok(n) => {
+                    // Process complete f32 samples (4 bytes each)
+                    let complete = n - (n % 4);
+                    if complete > 0 {
+                        let mut new_samples = Vec::with_capacity(complete / 4);
+                        for chunk in buf[..complete].chunks_exact(4) {
+                            new_samples.push(f32::from_le_bytes([
+                                chunk[0], chunk[1], chunk[2], chunk[3],
+                            ]));
+                        }
+                        if let Ok(mut guard) = samples.lock() {
+                            guard.extend_from_slice(&new_samples);
+                        }
+                    }
+                    // Note: trailing bytes (n % 4 != 0) are discarded.
+                    // This is fine — pw-cat writes complete samples.
+                }
+                Err(e) => {
+                    debug!("pw-cat stdout read error (expected on kill): {}", e);
+                    break;
+                }
+            }
+        }
     }
 }
 
