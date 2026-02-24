@@ -23,6 +23,7 @@ pub use routes::recording::{ApiCommand, RecordingState, ToggleRequest};
 pub struct ApiServer {
     port: u16,
     recording_state: RecordingState,
+    meeting_state: Option<routes::meetings::MeetingState>,
 }
 
 impl ApiServer {
@@ -38,11 +39,23 @@ impl ApiServer {
                 status,
                 waybar_config: config.ui.waybar.clone(),
             },
+            meeting_state: None,
         }
     }
 
+    pub fn with_meeting_state(
+        mut self,
+        meeting_status: crate::meeting::MeetingStatusHandle,
+    ) -> Self {
+        self.meeting_state = Some(routes::meetings::MeetingState {
+            tx: self.recording_state.tx.clone(),
+            status: meeting_status,
+        });
+        self
+    }
+
     pub async fn start(self) -> Result<()> {
-        let app = Router::new()
+        let mut app = Router::new()
             // Root and version endpoints
             .route("/", get(status))
             .route("/version", get(version))
@@ -53,8 +66,15 @@ impl ApiServer {
             .nest("/keybind", routes::keybind::router())
             .nest("/logs", routes::logs::router())
             .nest("/provider", routes::provider::router())
-            .nest("/update", routes::update::router())
-            .layer(ServiceBuilder::new());
+            .nest("/update", routes::update::router());
+
+        // Meeting routes (optional — only if meeting state is wired)
+        let has_meeting = self.meeting_state.is_some();
+        if let Some(meeting_state) = self.meeting_state {
+            app = app.merge(routes::meetings::router(meeting_state));
+        }
+
+        let app = app.layer(ServiceBuilder::new());
 
         let listener = tokio::net::TcpListener::bind(&format!("127.0.0.1:{}", self.port)).await?;
 
@@ -75,6 +95,14 @@ impl ApiServer {
         info!("  GET  /update/check  - Check for updates");
         info!("  POST /update/install - Install update");
         info!("  PUT  /update/auto   - Toggle auto-update");
+        if has_meeting {
+            info!("  POST /meetings/start  - Start meeting recording");
+            info!("  POST /meetings/stop   - Stop meeting recording");
+            info!("  POST /meetings/toggle - Toggle meeting recording");
+            info!("  GET  /meetings/status - Meeting recording status");
+            info!("  GET  /meetings        - List meetings");
+            info!("  GET  /meetings/:id    - Get meeting details");
+        }
 
         axum::serve(listener, app).await?;
 

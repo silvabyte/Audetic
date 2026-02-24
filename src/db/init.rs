@@ -36,5 +36,36 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create index on created_at")?;
 
+    // Meetings table
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meetings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            status TEXT NOT NULL DEFAULT 'recording',
+            audio_path TEXT NOT NULL,
+            transcript_path TEXT,
+            transcript_text TEXT,
+            duration_seconds INTEGER,
+            started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .context("Failed to create meetings table")?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at DESC)",
+        [],
+    )
+    .context("Failed to create meetings started_at index")?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status)",
+        [],
+    )
+    .context("Failed to create meetings status index")?;
+
     Ok(())
 }

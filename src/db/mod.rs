@@ -1,4 +1,5 @@
 mod init;
+pub mod meetings;
 mod operations;
 mod schemas;
 

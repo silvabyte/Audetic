@@ -2,18 +2,24 @@
 
 use crate::api::{ApiCommand, ApiServer};
 use crate::audio::{
-    AudioStreamManager, BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle,
-    ToggleResult,
+    mic_source::MicAudioSource, system_source::SystemAudioSource, AudioStreamManager,
+    BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle, ToggleResult,
 };
 use crate::config::Config;
+use crate::meeting::{MeetingMachine, MeetingStatusHandle, ShellCommandHook};
 use crate::text_io::TextIoService;
+use crate::transcription::job_service::RemoteTranscriptionJobService;
 use crate::transcription::{ProviderConfig, Transcriber, TranscriptionService};
 use crate::ui::Indicator;
 use crate::update::{UpdateConfig, UpdateEngine};
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{mpsc, Mutex};
 use tracing::{error, info, warn};
+
+const DEFAULT_JOBS_API_URL: &str = "https://audio.audetic.link/api/v1/jobs";
+const MEETING_TRANSCRIPTION_TIMEOUT_SECS: u64 = 7200; // 2 hours
 
 pub async fn run_service() -> Result<()> {
     info!("Starting Audetic service");
@@ -46,7 +52,13 @@ pub async fn run_service() -> Result<()> {
         status_handle.clone(),
     );
 
-    let api_server = ApiServer::new(tx, status_handle.clone(), &config);
+    // Meeting pipeline (independent from recording pipeline)
+    let meeting_status = MeetingStatusHandle::default();
+    let mut meeting_machine = build_meeting_machine(&config, meeting_status.clone());
+
+    let api_server = ApiServer::new(tx, status_handle.clone(), &config)
+        .with_meeting_state(meeting_status.clone());
+
     tokio::spawn(async move {
         if let Err(e) = api_server.start().await {
             error!("API server failed: {}", e);
@@ -58,6 +70,7 @@ pub async fn run_service() -> Result<()> {
     info!("Audetic is ready!");
     info!("Add this to your Hyprland config:");
     info!("bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle");
+    info!("bindd = SUPER SHIFT, R, Audetic Meeting, exec, curl -X POST http://127.0.0.1:3737/meetings/toggle");
     info!("Or test manually: curl -X POST http://127.0.0.1:3737/toggle");
 
     while let Some(command) = rx.recv().await {
@@ -88,10 +101,106 @@ pub async fn run_service() -> Result<()> {
                     Err(e) => error!("Failed to toggle recording: {}", e),
                 }
             }
+            ApiCommand::MeetingStart(options) => {
+                match meeting_machine.start(options).await {
+                    Ok(result) => {
+                        info!(
+                            "Meeting {} started: {:?}",
+                            result.meeting_id, result.audio_path
+                        );
+                    }
+                    Err(e) => error!("Failed to start meeting: {}", e),
+                }
+            }
+            ApiCommand::MeetingStop => {
+                match meeting_machine.stop().await {
+                    Ok(result) => {
+                        info!(
+                            "Meeting {} stopped ({}s)",
+                            result.meeting_id, result.duration_seconds
+                        );
+                    }
+                    Err(e) => error!("Failed to stop meeting: {}", e),
+                }
+            }
+            ApiCommand::MeetingToggle(options) => {
+                match meeting_machine.toggle(options).await {
+                    Ok(outcome) => match outcome {
+                        crate::meeting::ToggleOutcome::Started(r) => {
+                            info!("Meeting {} started via toggle", r.meeting_id);
+                        }
+                        crate::meeting::ToggleOutcome::Stopped(r) => {
+                            info!("Meeting {} stopped via toggle ({}s)", r.meeting_id, r.duration_seconds);
+                        }
+                    },
+                    Err(e) => error!("Failed to toggle meeting: {}", e),
+                }
+            }
         }
     }
 
     Ok(())
+}
+
+fn build_meeting_machine(config: &Config, status: MeetingStatusHandle) -> MeetingMachine {
+    let mic_source = MicAudioSource::new(16000)
+        .map(|s| Box::new(s) as Box<dyn crate::audio::audio_source::AudioSource>)
+        .unwrap_or_else(|e| {
+            warn!("Failed to create meeting mic source: {}. Using fallback.", e);
+            Box::new(NullAudioSource)
+        });
+
+    let system_source = Box::new(SystemAudioSource::new(16000));
+
+    // Determine jobs API URL
+    let jobs_url = config
+        .whisper
+        .api_endpoint
+        .as_ref()
+        .map(|e| {
+            if e.ends_with("/transcriptions") {
+                e.replace("/transcriptions", "/jobs")
+            } else {
+                format!("{}/jobs", e.trim_end_matches('/'))
+            }
+        })
+        .unwrap_or_else(|| DEFAULT_JOBS_API_URL.to_string());
+
+    let transcription = Box::new(RemoteTranscriptionJobService::new(
+        &jobs_url,
+        Duration::from_secs(MEETING_TRANSCRIPTION_TIMEOUT_SECS),
+    ));
+
+    // Post-meeting hook (optional)
+    let hook: Option<Box<dyn crate::meeting::PostMeetingHook>> =
+        if !config.meeting.post_command.is_empty() {
+            Some(Box::new(ShellCommandHook::new(
+                config.meeting.post_command.clone(),
+                config.meeting.post_command_timeout_seconds,
+            )))
+        } else {
+            None
+        };
+
+    MeetingMachine::new(mic_source, system_source, transcription, hook, status)
+}
+
+/// Fallback audio source that produces no samples (for when mic init fails).
+struct NullAudioSource;
+
+impl crate::audio::audio_source::AudioSource for NullAudioSource {
+    fn start(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn stop(&mut self) -> anyhow::Result<Vec<f32>> {
+        Ok(Vec::new())
+    }
+    fn is_active(&self) -> bool {
+        false
+    }
+    fn sample_rate(&self) -> u32 {
+        16000
+    }
 }
 
 fn build_transcriber(config: &Config) -> Result<Transcriber> {

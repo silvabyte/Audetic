@@ -1,13 +1,14 @@
 //! HTTP client for the transcription-manager jobs API.
 //!
 //! Provides methods for submitting files for transcription, polling status,
-//! and retrieving results.
+//! and retrieving results. Supports both in-memory and streaming file uploads.
 
 use anyhow::{Context, Result};
 use reqwest::multipart::{Form, Part};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tokio::fs;
+use tokio_util::io::ReaderStream;
 
 /// Client for interacting with the jobs API.
 pub struct JobsClient {
@@ -124,7 +125,8 @@ impl JobsClient {
         }
     }
 
-    /// Submit a file for transcription, returns the job ID.
+    /// Submit a file for transcription by reading it entirely into memory.
+    /// Suitable for small files (< 50MB). For large files, use `submit_job_streaming`.
     pub async fn submit_job(
         &self,
         file_path: &Path,
@@ -165,6 +167,76 @@ impl JobsClient {
             .send()
             .await
             .context("Failed to submit job")?;
+
+        let status = response.status();
+        let body = response.text().await?;
+
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "Job submission failed ({}): {}",
+                status,
+                body
+            ));
+        }
+
+        let result: SubmitJobResponse =
+            serde_json::from_str(&body).context("Failed to parse job submission response")?;
+
+        Ok(result.job_id)
+    }
+
+    /// Submit a file for transcription using streaming upload.
+    /// Suitable for large files (meetings, long recordings) that shouldn't be
+    /// loaded entirely into memory.
+    pub async fn submit_job_streaming(
+        &self,
+        file_path: &Path,
+        language: Option<&str>,
+        timestamps: bool,
+    ) -> Result<String> {
+        let file = tokio::fs::File::open(file_path)
+            .await
+            .context("Failed to open file for streaming upload")?;
+
+        let file_size = file
+            .metadata()
+            .await
+            .context("Failed to read file metadata")?
+            .len();
+
+        let filename = file_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("audio")
+            .to_string();
+
+        let mime_type = file_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .and_then(mime_type_for_extension)
+            .unwrap_or("application/octet-stream");
+
+        let stream = ReaderStream::new(file);
+        let body = reqwest::Body::wrap_stream(stream);
+
+        let part = Part::stream_with_length(body, file_size)
+            .file_name(filename)
+            .mime_str(mime_type)?;
+
+        let mut form = Form::new().part("file", part);
+
+        if let Some(lang) = language {
+            form = form.text("language", lang.to_string());
+        }
+        form = form.text("timestamps", timestamps.to_string());
+
+        let response = self
+            .client
+            .post(&self.base_url)
+            .multipart(form)
+            .send()
+            .await
+            .context("Failed to submit streaming job")?;
 
         let status = response.status();
         let body = response.text().await?;
@@ -341,7 +413,10 @@ mod tests {
         let resp: JobResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.job.status, "failed");
         assert!(resp.job.result.is_none());
-        assert_eq!(resp.job.error, Some("Transcription engine error".to_string()));
+        assert_eq!(
+            resp.job.error,
+            Some("Transcription engine error".to_string())
+        );
     }
 
     #[test]

@@ -11,6 +11,28 @@ pub struct Config {
     pub ui: UiConfig,
     pub wayland: WaylandConfig,
     pub behavior: BehaviorConfig,
+    pub meeting: MeetingConfig,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MeetingConfig {
+    /// Shell command to run after meeting transcription completes.
+    /// Receives transcript text via stdin.
+    /// Env vars: AUDETIC_MEETING_ID, AUDETIC_MEETING_TITLE,
+    /// AUDETIC_AUDIO_PATH, AUDETIC_TRANSCRIPT_PATH, AUDETIC_DURATION_SECONDS
+    pub post_command: String,
+    /// Timeout in seconds for the post_command (default: 3600 = 1 hour)
+    pub post_command_timeout_seconds: u64,
+}
+
+impl Default for MeetingConfig {
+    fn default() -> Self {
+        Self {
+            post_command: String::new(),
+            post_command_timeout_seconds: 3600,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

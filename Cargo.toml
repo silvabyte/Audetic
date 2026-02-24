@@ -13,7 +13,10 @@ path = "src/main.rs"
 [dependencies]
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 
+# Async trait support
+async-trait = "0.1"
 
 # Audio recording
 cpal = "0.15"
@@ -54,7 +57,7 @@ axum = "0.7"
 tower = "0.4"
 
 # HTTP client for OpenAI API
-reqwest = { version = "0.11", features = ["json", "multipart"] }
+reqwest = { version = "0.11", features = ["json", "multipart", "stream"] }
 semver = "1.0"
 sha2 = "0.10"
 flate2 = "1.0"

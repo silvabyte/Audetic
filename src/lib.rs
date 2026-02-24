@@ -8,6 +8,7 @@ pub mod global;
 pub mod history;
 pub mod keybind;
 pub mod logs;
+pub mod meeting;
 pub mod normalizer;
 pub mod text_io;
 pub mod transcription;

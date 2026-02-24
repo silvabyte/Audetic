@@ -34,6 +34,12 @@ pub struct ToggleRequest {
 pub enum ApiCommand {
     /// Toggle recording with optional per-job options
     ToggleRecording(Option<JobOptions>),
+    /// Start meeting recording
+    MeetingStart(Option<crate::meeting::MeetingStartOptions>),
+    /// Stop meeting recording
+    MeetingStop,
+    /// Toggle meeting recording
+    MeetingToggle(Option<crate::meeting::MeetingStartOptions>),
 }
 
 #[derive(Clone)]

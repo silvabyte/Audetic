@@ -8,6 +8,8 @@ use crate::normalizer::TranscriptionNormalizer;
 
 mod transcription_service;
 
+pub mod job_service;
+pub mod jobs_client;
 pub mod providers;
 
 pub use providers::{

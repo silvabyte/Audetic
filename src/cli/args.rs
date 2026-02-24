@@ -28,6 +28,39 @@ pub enum CliCommand {
     Keybind(KeybindCliArgs),
     /// Transcribe a local audio or video file
     Transcribe(TranscribeCliArgs),
+    /// Record and transcribe meetings
+    Meeting(MeetingCliArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct MeetingCliArgs {
+    #[command(subcommand)]
+    pub command: MeetingCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum MeetingCommand {
+    /// Start recording a meeting
+    Start {
+        /// Optional meeting title
+        #[arg(short, long)]
+        title: Option<String>,
+    },
+    /// Stop recording the current meeting
+    Stop,
+    /// Show current meeting recording status
+    Status,
+    /// List recorded meetings
+    List {
+        /// Maximum number of results to show
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    /// Show details of a specific meeting
+    Show {
+        /// Meeting ID
+        id: i64,
+    },
 }
 
 #[derive(ClapArgs, Debug)]

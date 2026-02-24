@@ -12,7 +12,7 @@ use crate::cli::args::{OutputFormat, TranscribeCliArgs};
 use crate::cli::compression::{
     cleanup_temp_file, compress_for_transcription, get_file_size, is_already_compressed,
 };
-use crate::cli::jobs_client::{mime_type_for_extension, status, Job, JobsClient, TranscriptionResult};
+use crate::transcription::jobs_client::{mime_type_for_extension, status, Job, JobsClient, TranscriptionResult};
 use crate::config::Config;
 use crate::text_io::copy_to_clipboard_sync;
 const POLL_INTERVAL_MS: u64 = 1000;
