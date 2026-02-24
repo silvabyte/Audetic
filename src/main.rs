@@ -5,7 +5,7 @@ use audetic::{
     app,
     cli::{
         handle_history_command, handle_keybind_command, handle_logs_command,
-        handle_provider_command, handle_update_command, Cli, CliCommand,
+        handle_provider_command, handle_transcribe_command, handle_update_command, Cli, CliCommand,
     },
 };
 use clap::Parser;
@@ -17,7 +17,10 @@ async fn main() -> Result<()> {
     let log_level = if cli.verbose { "debug" } else { "info" };
     let env_filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     match cli.command {
         Some(CliCommand::Version) => {
@@ -42,6 +45,10 @@ async fn main() -> Result<()> {
         }
         Some(CliCommand::Keybind(args)) => {
             handle_keybind_command(args)?;
+            return Ok(());
+        }
+        Some(CliCommand::Transcribe(args)) => {
+            handle_transcribe_command(args).await?;
             return Ok(());
         }
         None => {}

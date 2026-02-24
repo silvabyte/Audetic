@@ -1,4 +1,5 @@
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(name = "audetic")]
@@ -25,6 +26,8 @@ pub enum CliCommand {
     Logs(LogsCliArgs),
     /// Manage Hyprland keybindings for Audetic
     Keybind(KeybindCliArgs),
+    /// Transcribe a local audio or video file
+    Transcribe(TranscribeCliArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -129,4 +132,53 @@ pub enum KeybindCommand {
     },
     /// Show current keybinding status
     Status,
+}
+
+/// Transcribe audio or video files to text.
+///
+/// Files are automatically compressed to mp3 format before upload.
+/// Use --no-compress to send the file in its original format.
+#[derive(ClapArgs, Debug)]
+pub struct TranscribeCliArgs {
+    /// Path to audio or video file to transcribe
+    pub file: PathBuf,
+
+    /// Language code (e.g., 'en', 'es', 'auto')
+    #[arg(short, long)]
+    pub language: Option<String>,
+
+    /// Write transcription to file (default: stdout)
+    #[arg(short, long)]
+    pub output: Option<PathBuf>,
+
+    /// Output format: text, json, srt
+    #[arg(short, long, default_value = "text")]
+    pub format: OutputFormat,
+
+    /// Include timestamps in output
+    #[arg(long)]
+    pub timestamps: bool,
+
+    /// Disable progress indicator
+    #[arg(long)]
+    pub no_progress: bool,
+
+    /// Copy result to clipboard
+    #[arg(short, long)]
+    pub copy: bool,
+
+    /// Override transcription API base URL
+    #[arg(long)]
+    pub api_url: Option<String>,
+
+    /// Skip compression (send file in original format)
+    #[arg(long)]
+    pub no_compress: bool,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub enum OutputFormat {
+    Text,
+    Json,
+    Srt,
 }

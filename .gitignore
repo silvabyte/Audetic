@@ -14,8 +14,10 @@ Cargo.lock
 Thumbs.db
 
 # Whispy specific
-*.wav
 /tmp/
+
+# Large test fixtures (not committed)
+tests/fixtures/large_video.mp4
 
 # Release artifacts (keep manifests/notes tracked)
 /release/cli/releases/**/*.tar.gz
