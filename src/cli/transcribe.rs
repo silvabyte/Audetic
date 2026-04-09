@@ -12,9 +12,11 @@ use crate::cli::args::{OutputFormat, TranscribeCliArgs};
 use crate::cli::compression::{
     cleanup_temp_file, compress_for_transcription, get_file_size, is_already_compressed,
 };
-use crate::transcription::jobs_client::{mime_type_for_extension, status, Job, JobsClient, TranscriptionResult};
 use crate::config::Config;
 use crate::text_io::copy_to_clipboard_sync;
+use crate::transcription::jobs_client::{
+    mime_type_for_extension, status, Job, JobsClient, TranscriptionResult,
+};
 const POLL_INTERVAL_MS: u64 = 1000;
 const MAX_POLL_ATTEMPTS: u32 = 1800; // 30 minutes at 1s intervals
 const DEFAULT_API_URL: &str = "https://audio.audetic.link/api/v1/jobs";
@@ -130,7 +132,10 @@ fn validate_file(path: &Path) -> Result<()> {
 ///
 /// Returns (file_to_upload, Option<temp_file_path>).
 /// If compression was performed, temp_file_path will be Some and should be cleaned up after upload.
-fn prepare_file_for_upload(path: &Path, skip_compression: bool) -> Result<(PathBuf, Option<PathBuf>)> {
+fn prepare_file_for_upload(
+    path: &Path,
+    skip_compression: bool,
+) -> Result<(PathBuf, Option<PathBuf>)> {
     // Skip compression if file is already in the target format
     if is_already_compressed(path) {
         return Ok((path.to_path_buf(), None));

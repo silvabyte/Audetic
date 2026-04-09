@@ -54,8 +54,7 @@ pub async fn run_service() -> Result<()> {
 
     // Meeting pipeline (independent from recording pipeline)
     let meeting_status = MeetingStatusHandle::default();
-    let mut meeting_machine =
-        build_meeting_machine(&config, indicator, meeting_status.clone());
+    let mut meeting_machine = build_meeting_machine(&config, indicator, meeting_status.clone());
 
     let api_server = ApiServer::new(tx, status_handle.clone(), &config)
         .with_meeting_state(meeting_status.clone());
@@ -118,10 +117,7 @@ pub async fn run_service() -> Result<()> {
             ApiCommand::MeetingStop { reply } => {
                 let result = meeting_machine.stop().await;
                 match &result {
-                    Ok(r) => info!(
-                        "Meeting {} stopped ({}s)",
-                        r.meeting_id, r.duration_seconds
-                    ),
+                    Ok(r) => info!("Meeting {} stopped ({}s)", r.meeting_id, r.duration_seconds),
                     Err(e) => error!("Failed to stop meeting: {}", e),
                 }
                 let _ = reply.send(result);
@@ -169,7 +165,10 @@ fn build_meeting_machine(
     let mic_source = MicAudioSource::new(16000)
         .map(|s| Box::new(s) as Box<dyn crate::audio::audio_source::AudioSource>)
         .unwrap_or_else(|e| {
-            warn!("Failed to create meeting mic source: {}. Using fallback.", e);
+            warn!(
+                "Failed to create meeting mic source: {}. Using fallback.",
+                e
+            );
             Box::new(NullAudioSource)
         });
 

@@ -46,10 +46,7 @@ impl AudioMixer {
         }
 
         // Normalize if any samples exceed [-1.0, 1.0]
-        let max_abs = mixed
-            .iter()
-            .map(|s| s.abs())
-            .fold(0.0f32, f32::max);
+        let max_abs = mixed.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
 
         if max_abs > 1.0 {
             for sample in &mut mixed {

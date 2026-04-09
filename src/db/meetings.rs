@@ -74,12 +74,7 @@ impl MeetingRepository {
     }
 
     /// Mark meeting as failed with error and persist the recorded duration.
-    pub fn fail(
-        conn: &Connection,
-        id: i64,
-        error: &str,
-        duration_seconds: i64,
-    ) -> Result<()> {
+    pub fn fail(conn: &Connection, id: i64, error: &str, duration_seconds: i64) -> Result<()> {
         conn.execute(
             "UPDATE meetings SET status = ?1, error = ?2, duration_seconds = ?3, \
              completed_at = CURRENT_TIMESTAMP WHERE id = ?4",
@@ -225,14 +220,8 @@ mod tests {
         let conn = setup_db();
         let id = MeetingRepository::insert(&conn, Some("Meeting"), "/tmp/test.wav").unwrap();
 
-        MeetingRepository::complete(
-            &conn,
-            id,
-            "/tmp/test.txt",
-            "Hello world transcript",
-            3600,
-        )
-        .unwrap();
+        MeetingRepository::complete(&conn, id, "/tmp/test.txt", "Hello world transcript", 3600)
+            .unwrap();
 
         let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
         assert_eq!(meeting.status, "completed");

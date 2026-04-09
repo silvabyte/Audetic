@@ -156,8 +156,10 @@ mod tests {
 
     #[test]
     fn test_remote_service_creation() {
-        let service =
-            RemoteTranscriptionJobService::new("https://example.com/api/v1/jobs", Duration::from_secs(7200));
+        let service = RemoteTranscriptionJobService::new(
+            "https://example.com/api/v1/jobs",
+            Duration::from_secs(7200),
+        );
         assert_eq!(service.timeout, Duration::from_secs(7200));
         assert_eq!(service.poll_interval, Duration::from_secs(2));
     }

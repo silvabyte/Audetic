@@ -151,10 +151,8 @@ fn build_test_machine(
     transcription: Arc<dyn TranscriptionJobService>,
     hook: Option<Arc<dyn PostMeetingHook>>,
 ) -> (MeetingMachine, MeetingStatusHandle) {
-    let mic: Box<dyn AudioSource> =
-        Box::new(MockAudioSource::new(mic_samples, 16000));
-    let system: Box<dyn AudioSource> =
-        Box::new(MockAudioSource::new(system_samples, 16000));
+    let mic: Box<dyn AudioSource> = Box::new(MockAudioSource::new(mic_samples, 16000));
+    let system: Box<dyn AudioSource> = Box::new(MockAudioSource::new(system_samples, 16000));
     let indicator = Indicator::new().with_audio_feedback(false);
     let status = MeetingStatusHandle::default();
 
@@ -199,12 +197,8 @@ async fn wait_for_terminal(status: &MeetingStatusHandle, timeout: Duration) -> M
 #[tokio::test]
 async fn test_meeting_stop_when_idle_errors() {
     let (transcription, _count) = MockTranscription::ok("ignored");
-    let (mut machine, _status) = build_test_machine(
-        Vec::new(),
-        Vec::new(),
-        Arc::new(transcription),
-        None,
-    );
+    let (mut machine, _status) =
+        build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription), None);
 
     let result = machine.stop().await;
     assert!(
@@ -230,7 +224,10 @@ async fn test_meeting_start_while_recording_errors() {
         None,
     );
 
-    let first = machine.start(None).await.expect("first start should succeed");
+    let first = machine
+        .start(None)
+        .await
+        .expect("first start should succeed");
 
     let second = machine.start(None).await;
     assert!(second.is_err(), "second start must return Err");
@@ -281,12 +278,8 @@ async fn test_meeting_cancel_during_recording() {
 #[tokio::test]
 async fn test_meeting_cancel_when_idle_errors() {
     let (transcription, _count) = MockTranscription::ok("ignored");
-    let (mut machine, _status) = build_test_machine(
-        Vec::new(),
-        Vec::new(),
-        Arc::new(transcription),
-        None,
-    );
+    let (mut machine, _status) =
+        build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription), None);
 
     let result = machine.cancel().await;
     assert!(result.is_err());
@@ -347,7 +340,12 @@ async fn test_meeting_transcription_failure() {
     let _stop = machine.stop().await.expect("stop");
 
     let phase = wait_for_terminal(&status, Duration::from_secs(5)).await;
-    assert_eq!(phase, MeetingPhase::Error, "expected Error, got {:?}", phase);
+    assert_eq!(
+        phase,
+        MeetingPhase::Error,
+        "expected Error, got {:?}",
+        phase
+    );
 
     let state = status.get().await;
     assert!(

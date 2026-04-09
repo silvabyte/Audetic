@@ -123,11 +123,7 @@ impl MeetingMachine {
         // Insert meeting record in DB
         let meeting_id = {
             let conn = db::init_db()?;
-            MeetingRepository::insert(
-                &conn,
-                opts.title.as_deref(),
-                &audio_path.to_string_lossy(),
-            )?
+            MeetingRepository::insert(&conn, opts.title.as_deref(), &audio_path.to_string_lossy())?
         };
 
         // Start audio sources — track which ones actually came up.
@@ -330,7 +326,10 @@ impl MeetingMachine {
         // stop, but we may in the future), clean it up.
         if audio_path.exists() {
             if let Err(e) = std::fs::remove_file(&audio_path) {
-                warn!("Failed to remove partial meeting WAV {:?}: {}", audio_path, e);
+                warn!(
+                    "Failed to remove partial meeting WAV {:?}: {}",
+                    audio_path, e
+                );
             }
         }
 
@@ -354,10 +353,7 @@ impl MeetingMachine {
     }
 
     /// Toggle meeting recording.
-    pub async fn toggle(
-        &mut self,
-        options: Option<MeetingStartOptions>,
-    ) -> Result<ToggleOutcome> {
+    pub async fn toggle(&mut self, options: Option<MeetingStartOptions>) -> Result<ToggleOutcome> {
         let state = self.status.get().await;
         match state.phase {
             MeetingPhase::Recording => {
@@ -394,7 +390,11 @@ impl MeetingMachine {
         }
         writer.finalize()?;
 
-        info!("Meeting audio saved: {:?} ({} samples)", path, samples.len());
+        info!(
+            "Meeting audio saved: {:?} ({} samples)",
+            path,
+            samples.len()
+        );
         Ok(())
     }
 
@@ -464,14 +464,13 @@ async fn run_processing_task(ctx: ProcessContext) {
     // Phase: Transcribing
     ctx.status.set_phase(MeetingPhase::Transcribing).await;
     if let Ok(conn) = db::init_db() {
-        let _ = MeetingRepository::update_status(
-            &conn,
-            ctx.meeting_id,
-            MeetingPhase::Transcribing,
-        );
+        let _ = MeetingRepository::update_status(&conn, ctx.meeting_id, MeetingPhase::Transcribing);
     }
 
-    let transcription_result = ctx.transcription.submit_and_poll(&compressed_path, None).await;
+    let transcription_result = ctx
+        .transcription
+        .submit_and_poll(&compressed_path, None)
+        .await;
 
     match transcription_result {
         Ok(result) => {

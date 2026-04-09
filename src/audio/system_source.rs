@@ -116,7 +116,10 @@ impl AudioSource for SystemAudioSource {
         {
             Ok(c) => c,
             Err(e) => {
-                warn!("Failed to spawn pw-cat: {}. Meeting will record mic only.", e);
+                warn!(
+                    "Failed to spawn pw-cat: {}. Meeting will record mic only.",
+                    e
+                );
                 self.active = true;
                 return Ok(());
             }
@@ -173,10 +176,7 @@ impl AudioSource for SystemAudioSource {
             s
         };
 
-        info!(
-            "System audio stopped, {} samples captured",
-            samples.len()
-        );
+        info!("System audio stopped, {} samples captured", samples.len());
         Ok(samples)
     }
 
@@ -197,10 +197,7 @@ impl SystemAudioSource {
     /// the end of a read that don't complete a 4-byte sample are discarded
     /// (pw-cat writes complete samples, so this only affects the final chunk
     /// after the process is killed).
-    fn read_samples(
-        mut stdout: std::process::ChildStdout,
-        samples: Arc<Mutex<Vec<f32>>>,
-    ) {
+    fn read_samples(mut stdout: std::process::ChildStdout, samples: Arc<Mutex<Vec<f32>>>) {
         let mut buf = [0u8; 4096];
         let mut leftover: [u8; 4] = [0; 4];
         let mut leftover_len: usize = 0;
@@ -218,16 +215,13 @@ impl SystemAudioSource {
                         let needed = 4 - leftover_len;
                         if n >= needed {
                             let mut sample_bytes = [0u8; 4];
-                            sample_bytes[..leftover_len]
-                                .copy_from_slice(&leftover[..leftover_len]);
-                            sample_bytes[leftover_len..]
-                                .copy_from_slice(&buf[..needed]);
+                            sample_bytes[..leftover_len].copy_from_slice(&leftover[..leftover_len]);
+                            sample_bytes[leftover_len..].copy_from_slice(&buf[..needed]);
                             new_samples.push(f32::from_le_bytes(sample_bytes));
                             cursor = needed;
                             leftover_len = 0;
                         } else {
-                            leftover[leftover_len..leftover_len + n]
-                                .copy_from_slice(&buf[..n]);
+                            leftover[leftover_len..leftover_len + n].copy_from_slice(&buf[..n]);
                             leftover_len += n;
                             continue;
                         }
@@ -236,9 +230,8 @@ impl SystemAudioSource {
                     let remaining = n - cursor;
                     let complete = remaining - (remaining % 4);
                     for chunk in buf[cursor..cursor + complete].chunks_exact(4) {
-                        new_samples.push(f32::from_le_bytes([
-                            chunk[0], chunk[1], chunk[2], chunk[3],
-                        ]));
+                        new_samples
+                            .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
                     }
 
                     // Save any trailing bytes that don't complete a sample

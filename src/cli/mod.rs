@@ -10,9 +10,8 @@ mod update;
 
 // Re-export public API
 pub use args::{
-    Cli, CliCommand, HistoryCliArgs, KeybindCliArgs, KeybindCommand, LogsCliArgs,
-    MeetingCliArgs, OutputFormat, ProviderCliArgs, ProviderCommand, TranscribeCliArgs,
-    UpdateCliArgs,
+    Cli, CliCommand, HistoryCliArgs, KeybindCliArgs, KeybindCommand, LogsCliArgs, MeetingCliArgs,
+    OutputFormat, ProviderCliArgs, ProviderCommand, TranscribeCliArgs, UpdateCliArgs,
 };
 pub use history::handle_history_command;
 pub use keybind::handle_keybind_command;

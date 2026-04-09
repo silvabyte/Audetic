@@ -167,7 +167,11 @@ mod tests {
     async fn test_status_handle_start_recording() {
         let handle = MeetingStatusHandle::default();
         handle
-            .start_recording(1, Some("Standup".to_string()), PathBuf::from("/tmp/test.wav"))
+            .start_recording(
+                1,
+                Some("Standup".to_string()),
+                PathBuf::from("/tmp/test.wav"),
+            )
             .await;
 
         let state = handle.get().await;

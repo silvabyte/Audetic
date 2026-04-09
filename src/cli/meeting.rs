@@ -37,11 +37,7 @@ async fn json_or_error(response: reqwest::Response, op: &str) -> Result<Value> {
     if !status.is_success() {
         let msg = serde_json::from_str::<Value>(&text)
             .ok()
-            .and_then(|v| {
-                v.get("message")
-                    .and_then(|m| m.as_str())
-                    .map(String::from)
-            })
+            .and_then(|v| v.get("message").and_then(|m| m.as_str()).map(String::from))
             .unwrap_or_else(|| format!("{} failed (HTTP {})", op, status));
         bail!(msg);
     }
@@ -71,7 +67,10 @@ async fn start_meeting(title: Option<String>) -> Result<()> {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
 
-    println!("Meeting recording started (id: {}, {})", meeting_id, capture);
+    println!(
+        "Meeting recording started (id: {}, {})",
+        meeting_id, capture
+    );
 
     if let Some(path) = json.get("audio_path").and_then(|v| v.as_str()) {
         println!("Audio: {}", path);
@@ -98,7 +97,9 @@ async fn stop_meeting() -> Result<()> {
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
     );
-    println!("Transcription running in background. Run 'audetic meeting status' to watch progress.");
+    println!(
+        "Transcription running in background. Run 'audetic meeting status' to watch progress."
+    );
 
     Ok(())
 }
@@ -159,16 +160,16 @@ async fn show_status() -> Result<()> {
         "recording" => {
             let minutes = duration / 60;
             let seconds = duration % 60;
-            println!("Meeting: {} (recording, {:02}:{:02})", title, minutes, seconds);
+            println!(
+                "Meeting: {} (recording, {:02}:{:02})",
+                title, minutes, seconds
+            );
             if let Some(path) = audio_path {
                 println!("Audio: {}", path);
             }
         }
         "compressing" => {
-            println!(
-                "Meeting #{}: compressing audio...",
-                meeting_id.unwrap_or(0)
-            );
+            println!("Meeting #{}: compressing audio...", meeting_id.unwrap_or(0));
         }
         "transcribing" => {
             println!("Meeting #{}: transcribing...", meeting_id.unwrap_or(0));
@@ -187,11 +188,7 @@ async fn show_status() -> Result<()> {
         }
         "error" => {
             let err = last_error.unwrap_or("unknown error");
-            println!(
-                "Meeting #{}: error — {}",
-                meeting_id.unwrap_or(0),
-                err
-            );
+            println!("Meeting #{}: error — {}", meeting_id.unwrap_or(0), err);
         }
         other => {
             println!("Meeting status: {}", other);

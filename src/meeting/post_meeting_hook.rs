@@ -71,12 +71,18 @@ impl PostMeetingHook for ShellCommandHook {
                 hook_env::MEETING_TITLE,
                 result.title.as_deref().unwrap_or(""),
             )
-            .env(hook_env::AUDIO_PATH, result.audio_path.to_string_lossy().as_ref())
+            .env(
+                hook_env::AUDIO_PATH,
+                result.audio_path.to_string_lossy().as_ref(),
+            )
             .env(
                 hook_env::TRANSCRIPT_PATH,
                 result.transcript_path.to_string_lossy().as_ref(),
             )
-            .env(hook_env::DURATION_SECONDS, result.duration_seconds.to_string())
+            .env(
+                hook_env::DURATION_SECONDS,
+                result.duration_seconds.to_string(),
+            )
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())

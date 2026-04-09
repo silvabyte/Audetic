@@ -352,7 +352,8 @@ mod tests {
     // Deserialization tests
     #[test]
     fn test_deserialize_submit_response() {
-        let json = r#"{"success":true,"jobId":"job-123","status":"pending","message":"Job created"}"#;
+        let json =
+            r#"{"success":true,"jobId":"job-123","status":"pending","message":"Job created"}"#;
         let resp: SubmitJobResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.job_id, "job-123");
         assert_eq!(resp.status, "pending");
