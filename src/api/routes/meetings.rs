@@ -3,6 +3,7 @@
 //! Provides HTTP endpoints for:
 //! - Starting meeting recording (POST /meetings/start)
 //! - Stopping meeting recording (POST /meetings/stop)
+//! - Cancelling meeting recording (POST /meetings/cancel)
 //! - Toggling meeting recording (POST /meetings/toggle)
 //! - Getting meeting status (GET /meetings/status)
 //! - Listing meetings (GET /meetings)
@@ -12,13 +13,13 @@ use crate::meeting::{MeetingPhase, MeetingStartOptions, MeetingStatusHandle};
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    response::Json,
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 
 use super::recording::ApiCommand;
@@ -40,6 +41,7 @@ pub fn router(state: MeetingState) -> Router {
     Router::new()
         .route("/meetings/start", post(start_meeting))
         .route("/meetings/stop", post(stop_meeting))
+        .route("/meetings/cancel", post(cancel_meeting))
         .route("/meetings/toggle", post(toggle_meeting))
         .route("/meetings/status", get(meeting_status))
         .route("/meetings", get(list_meetings))
@@ -47,91 +49,156 @@ pub fn router(state: MeetingState) -> Router {
         .with_state(state)
 }
 
-async fn start_meeting(
-    State(state): State<MeetingState>,
-    body: Option<Json<MeetingStartRequest>>,
-) -> Result<Json<Value>, StatusCode> {
-    let options = body.map(|Json(req)| MeetingStartOptions { title: req.title });
+/// Convert an anyhow error from the meeting machine into a client-friendly
+/// HTTP response. Conflict-style errors (already recording / not recording)
+/// map to 409; everything else is 500.
+fn error_response(err: anyhow::Error, context: &str) -> Response {
+    let msg = err.to_string();
+    let status_code = if msg.contains("already in progress")
+        || msg.contains("No meeting recording in progress")
+        || msg.contains("No meeting recording in progress to cancel")
+    {
+        StatusCode::CONFLICT
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
 
-    info!("Meeting start command received via API");
+    error!("{}: {}", context, msg);
+    (
+        status_code,
+        Json(json!({
+            "success": false,
+            "message": msg,
+        })),
+    )
+        .into_response()
+}
 
-    match state.tx.send(ApiCommand::MeetingStart(options)).await {
-        Ok(_) => {
-            // Wait a bit for the machine to process
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+/// Helper: send an ApiCommand and await the machine's reply. Returns a 500
+/// if the dispatch loop has hung up.
+async fn dispatch<T>(
+    tx: &mpsc::Sender<ApiCommand>,
+    reply: oneshot::Receiver<anyhow::Result<T>>,
+    command: ApiCommand,
+    op: &str,
+) -> Result<T, Response> {
+    if let Err(e) = tx.send(command).await {
+        error!("Failed to dispatch {}: {}", op, e);
+        return Err(error_response(
+            anyhow::anyhow!("event loop unavailable: {e}"),
+            op,
+        ));
+    }
 
-            let status = state.status.get().await;
-            Ok(Json(json!({
-                "success": true,
-                "meeting_id": status.meeting_id,
-                "message": "Meeting recording started",
-                "audio_path": status.audio_path.map(|p| p.to_string_lossy().to_string()),
-            })))
-        }
+    match reply.await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(e)) => Err(error_response(e, op)),
         Err(e) => {
-            error!("Failed to send meeting start command: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+            error!("{} reply channel closed: {}", op, e);
+            Err(error_response(
+                anyhow::anyhow!("reply channel closed: {e}"),
+                op,
+            ))
         }
     }
 }
 
-async fn stop_meeting(
+async fn start_meeting(
     State(state): State<MeetingState>,
-) -> Result<Json<Value>, StatusCode> {
+    body: Option<Json<MeetingStartRequest>>,
+) -> Response {
+    info!("Meeting start command received via API");
+
+    let options = body.map(|Json(req)| MeetingStartOptions { title: req.title });
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let command = ApiCommand::MeetingStart {
+        options,
+        reply: reply_tx,
+    };
+
+    match dispatch(&state.tx, reply_rx, command, "start meeting").await {
+        Ok(result) => Json(json!({
+            "success": true,
+            "meeting_id": result.meeting_id,
+            "audio_path": result.audio_path.to_string_lossy(),
+            "capture_state": result.capture_state.as_str(),
+            "message": format!("Meeting recording started ({})", result.capture_state.as_str()),
+        }))
+        .into_response(),
+        Err(resp) => resp,
+    }
+}
+
+async fn stop_meeting(State(state): State<MeetingState>) -> Response {
     info!("Meeting stop command received via API");
 
-    match state.tx.send(ApiCommand::MeetingStop).await {
-        Ok(_) => {
-            // Wait a bit for the machine to process
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let command = ApiCommand::MeetingStop { reply: reply_tx };
 
-            let status = state.status.get().await;
-            Ok(Json(json!({
-                "success": true,
-                "meeting_id": status.meeting_id,
-                "message": "Meeting recording stopped, transcription started",
-                "duration_seconds": status.duration_seconds(),
-            })))
-        }
-        Err(e) => {
-            error!("Failed to send meeting stop command: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+    match dispatch(&state.tx, reply_rx, command, "stop meeting").await {
+        Ok(result) => Json(json!({
+            "success": true,
+            "meeting_id": result.meeting_id,
+            "duration_seconds": result.duration_seconds,
+            "message": "Meeting recording stopped, transcription started in background",
+        }))
+        .into_response(),
+        Err(resp) => resp,
+    }
+}
+
+async fn cancel_meeting(State(state): State<MeetingState>) -> Response {
+    info!("Meeting cancel command received via API");
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let command = ApiCommand::MeetingCancel { reply: reply_tx };
+
+    match dispatch(&state.tx, reply_rx, command, "cancel meeting").await {
+        Ok(result) => Json(json!({
+            "success": true,
+            "meeting_id": result.meeting_id,
+            "duration_seconds": result.duration_seconds,
+            "message": "Meeting recording cancelled",
+        }))
+        .into_response(),
+        Err(resp) => resp,
     }
 }
 
 async fn toggle_meeting(
     State(state): State<MeetingState>,
     body: Option<Json<MeetingStartRequest>>,
-) -> Result<Json<Value>, StatusCode> {
-    let options = body.map(|Json(req)| MeetingStartOptions { title: req.title });
-
+) -> Response {
     info!("Meeting toggle command received via API");
 
-    match state.tx.send(ApiCommand::MeetingToggle(options)).await {
-        Ok(_) => {
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    let options = body.map(|Json(req)| MeetingStartOptions { title: req.title });
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let command = ApiCommand::MeetingToggle {
+        options,
+        reply: reply_tx,
+    };
 
-            let status = state.status.get().await;
-            let is_recording = status.phase == MeetingPhase::Recording;
-
-            Ok(Json(json!({
+    match dispatch(&state.tx, reply_rx, command, "toggle meeting").await {
+        Ok(outcome) => match outcome {
+            crate::meeting::ToggleOutcome::Started(r) => Json(json!({
                 "success": true,
-                "meeting_id": status.meeting_id,
-                "phase": status.phase.as_str(),
-                "message": if is_recording {
-                    "Meeting recording started"
-                } else {
-                    "Meeting recording stopped, transcription started"
-                },
-                "duration_seconds": status.duration_seconds(),
-                "audio_path": status.audio_path.map(|p| p.to_string_lossy().to_string()),
-            })))
-        }
-        Err(e) => {
-            error!("Failed to send meeting toggle command: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
-        }
+                "meeting_id": r.meeting_id,
+                "phase": "recording",
+                "audio_path": r.audio_path.to_string_lossy(),
+                "capture_state": r.capture_state.as_str(),
+                "message": format!("Meeting recording started ({})", r.capture_state.as_str()),
+            }))
+            .into_response(),
+            crate::meeting::ToggleOutcome::Stopped(r) => Json(json!({
+                "success": true,
+                "meeting_id": r.meeting_id,
+                "phase": "compressing",
+                "duration_seconds": r.duration_seconds,
+                "message": "Meeting recording stopped, transcription started in background",
+            }))
+            .into_response(),
+        },
+        Err(resp) => resp,
     }
 }
 
@@ -217,14 +284,27 @@ async fn list_meetings(
 async fn get_meeting(
     Path(id): Path<i64>,
     State(_state): State<MeetingState>,
-) -> Result<Json<Value>, StatusCode> {
+) -> Result<Json<Value>, Response> {
     let meeting = tokio::task::spawn_blocking(move || {
         let conn = crate::db::init_db()?;
         crate::db::meetings::MeetingRepository::get(&conn, id)
     })
     .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .map_err(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": "db task panicked" })),
+        )
+            .into_response()
+    })?
+    .map_err(|e| {
+        error!("failed to read meeting {}: {}", id, e);
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "success": false, "message": e.to_string() })),
+        )
+            .into_response()
+    })?;
 
     match meeting {
         Some(m) => Ok(Json(json!({
@@ -240,6 +320,13 @@ async fn get_meeting(
             "error": m.error,
             "created_at": m.created_at,
         }))),
-        None => Err(StatusCode::NOT_FOUND),
+        None => Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "message": format!("Meeting {} not found", id),
+            })),
+        )
+            .into_response()),
     }
 }

@@ -16,6 +16,7 @@ pub enum MeetingPhase {
     RunningHook,
     Completed,
     Error,
+    Cancelled,
 }
 
 impl MeetingPhase {
@@ -28,6 +29,7 @@ impl MeetingPhase {
             Self::RunningHook => "running_hook",
             Self::Completed => "completed",
             Self::Error => "error",
+            Self::Cancelled => "cancelled",
         }
     }
 }
@@ -117,6 +119,11 @@ impl MeetingStatusHandle {
     pub async fn complete(&self) {
         let mut state = self.inner.lock().await;
         state.phase = MeetingPhase::Completed;
+    }
+
+    pub async fn cancelled(&self) {
+        let mut state = self.inner.lock().await;
+        state.phase = MeetingPhase::Cancelled;
     }
 }
 

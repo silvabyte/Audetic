@@ -30,16 +30,36 @@ pub struct ToggleRequest {
     pub auto_paste: Option<bool>,
 }
 
-#[derive(Clone)]
+/// Commands dispatched from the HTTP layer to the main event loop.
+///
+/// `ToggleRecording` is fire-and-forget — the recording pipeline is driven by
+/// a keybinding where immediate return is a feature, and errors self-correct
+/// on the next keypress.
+///
+/// The meeting variants carry a `tokio::sync::oneshot` reply channel so the
+/// HTTP handler can `.await` the machine's actual `Result` and surface proper
+/// status codes / error messages to the CLI.
 pub enum ApiCommand {
     /// Toggle recording with optional per-job options
     ToggleRecording(Option<JobOptions>),
     /// Start meeting recording
-    MeetingStart(Option<crate::meeting::MeetingStartOptions>),
+    MeetingStart {
+        options: Option<crate::meeting::MeetingStartOptions>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStartResult>>,
+    },
     /// Stop meeting recording
-    MeetingStop,
+    MeetingStop {
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
+    },
+    /// Cancel the in-progress meeting recording without transcribing
+    MeetingCancel {
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
+    },
     /// Toggle meeting recording
-    MeetingToggle(Option<crate::meeting::MeetingStartOptions>),
+    MeetingToggle {
+        options: Option<crate::meeting::MeetingStartOptions>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::ToggleOutcome>>,
+    },
 }
 
 #[derive(Clone)]

@@ -43,7 +43,7 @@ pub async fn run_service() -> Result<()> {
     let recording_machine = RecordingMachine::new(
         audio_recorder.clone(),
         transcription_service,
-        indicator,
+        indicator.clone(),
         text_io,
         BehaviorOptions {
             auto_paste: config.behavior.auto_paste,
@@ -54,7 +54,8 @@ pub async fn run_service() -> Result<()> {
 
     // Meeting pipeline (independent from recording pipeline)
     let meeting_status = MeetingStatusHandle::default();
-    let mut meeting_machine = build_meeting_machine(&config, meeting_status.clone());
+    let mut meeting_machine =
+        build_meeting_machine(&config, indicator, meeting_status.clone());
 
     let api_server = ApiServer::new(tx, status_handle.clone(), &config)
         .with_meeting_state(meeting_status.clone());
@@ -101,40 +102,58 @@ pub async fn run_service() -> Result<()> {
                     Err(e) => error!("Failed to toggle recording: {}", e),
                 }
             }
-            ApiCommand::MeetingStart(options) => {
-                match meeting_machine.start(options).await {
-                    Ok(result) => {
-                        info!(
-                            "Meeting {} started: {:?}",
-                            result.meeting_id, result.audio_path
-                        );
-                    }
+            ApiCommand::MeetingStart { options, reply } => {
+                let result = meeting_machine.start(options).await;
+                match &result {
+                    Ok(r) => info!(
+                        "Meeting {} started: {:?} ({})",
+                        r.meeting_id,
+                        r.audio_path,
+                        r.capture_state.as_str()
+                    ),
                     Err(e) => error!("Failed to start meeting: {}", e),
                 }
+                let _ = reply.send(result);
             }
-            ApiCommand::MeetingStop => {
-                match meeting_machine.stop().await {
-                    Ok(result) => {
-                        info!(
-                            "Meeting {} stopped ({}s)",
-                            result.meeting_id, result.duration_seconds
-                        );
-                    }
+            ApiCommand::MeetingStop { reply } => {
+                let result = meeting_machine.stop().await;
+                match &result {
+                    Ok(r) => info!(
+                        "Meeting {} stopped ({}s)",
+                        r.meeting_id, r.duration_seconds
+                    ),
                     Err(e) => error!("Failed to stop meeting: {}", e),
                 }
+                let _ = reply.send(result);
             }
-            ApiCommand::MeetingToggle(options) => {
-                match meeting_machine.toggle(options).await {
+            ApiCommand::MeetingCancel { reply } => {
+                let result = meeting_machine.cancel().await;
+                match &result {
+                    Ok(r) => info!(
+                        "Meeting {} cancelled ({}s)",
+                        r.meeting_id, r.duration_seconds
+                    ),
+                    Err(e) => error!("Failed to cancel meeting: {}", e),
+                }
+                let _ = reply.send(result);
+            }
+            ApiCommand::MeetingToggle { options, reply } => {
+                let result = meeting_machine.toggle(options).await;
+                match &result {
                     Ok(outcome) => match outcome {
                         crate::meeting::ToggleOutcome::Started(r) => {
                             info!("Meeting {} started via toggle", r.meeting_id);
                         }
                         crate::meeting::ToggleOutcome::Stopped(r) => {
-                            info!("Meeting {} stopped via toggle ({}s)", r.meeting_id, r.duration_seconds);
+                            info!(
+                                "Meeting {} stopped via toggle ({}s)",
+                                r.meeting_id, r.duration_seconds
+                            );
                         }
                     },
                     Err(e) => error!("Failed to toggle meeting: {}", e),
                 }
+                let _ = reply.send(result);
             }
         }
     }
@@ -142,7 +161,11 @@ pub async fn run_service() -> Result<()> {
     Ok(())
 }
 
-fn build_meeting_machine(config: &Config, status: MeetingStatusHandle) -> MeetingMachine {
+fn build_meeting_machine(
+    config: &Config,
+    indicator: Indicator,
+    status: MeetingStatusHandle,
+) -> MeetingMachine {
     let mic_source = MicAudioSource::new(16000)
         .map(|s| Box::new(s) as Box<dyn crate::audio::audio_source::AudioSource>)
         .unwrap_or_else(|e| {
@@ -166,15 +189,16 @@ fn build_meeting_machine(config: &Config, status: MeetingStatusHandle) -> Meetin
         })
         .unwrap_or_else(|| DEFAULT_JOBS_API_URL.to_string());
 
-    let transcription = Box::new(RemoteTranscriptionJobService::new(
-        &jobs_url,
-        Duration::from_secs(MEETING_TRANSCRIPTION_TIMEOUT_SECS),
-    ));
+    let transcription: Arc<dyn crate::transcription::job_service::TranscriptionJobService> =
+        Arc::new(RemoteTranscriptionJobService::new(
+            &jobs_url,
+            Duration::from_secs(MEETING_TRANSCRIPTION_TIMEOUT_SECS),
+        ));
 
     // Post-meeting hook (optional)
-    let hook: Option<Box<dyn crate::meeting::PostMeetingHook>> =
+    let hook: Option<Arc<dyn crate::meeting::PostMeetingHook>> =
         if !config.meeting.post_command.is_empty() {
-            Some(Box::new(ShellCommandHook::new(
+            Some(Arc::new(ShellCommandHook::new(
                 config.meeting.post_command.clone(),
                 config.meeting.post_command_timeout_seconds,
             )))
@@ -182,7 +206,14 @@ fn build_meeting_machine(config: &Config, status: MeetingStatusHandle) -> Meetin
             None
         };
 
-    MeetingMachine::new(mic_source, system_source, transcription, hook, status)
+    MeetingMachine::new(
+        mic_source,
+        system_source,
+        transcription,
+        hook,
+        indicator,
+        status,
+    )
 }
 
 /// Fallback audio source that produces no samples (for when mic init fails).

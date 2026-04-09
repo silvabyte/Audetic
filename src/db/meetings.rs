@@ -73,13 +73,30 @@ impl MeetingRepository {
         Ok(())
     }
 
-    /// Mark meeting as failed with error.
-    pub fn fail(conn: &Connection, id: i64, error: &str) -> Result<()> {
+    /// Mark meeting as failed with error and persist the recorded duration.
+    pub fn fail(
+        conn: &Connection,
+        id: i64,
+        error: &str,
+        duration_seconds: i64,
+    ) -> Result<()> {
         conn.execute(
-            "UPDATE meetings SET status = ?1, error = ?2, completed_at = CURRENT_TIMESTAMP WHERE id = ?3",
-            params![MeetingPhase::Error.as_str(), error, id],
+            "UPDATE meetings SET status = ?1, error = ?2, duration_seconds = ?3, \
+             completed_at = CURRENT_TIMESTAMP WHERE id = ?4",
+            params![MeetingPhase::Error.as_str(), error, duration_seconds, id],
         )
         .context("Failed to mark meeting as failed")?;
+        Ok(())
+    }
+
+    /// Mark meeting as cancelled with the recorded duration.
+    pub fn cancel(conn: &Connection, id: i64, duration_seconds: i64) -> Result<()> {
+        conn.execute(
+            "UPDATE meetings SET status = ?1, duration_seconds = ?2, \
+             completed_at = CURRENT_TIMESTAMP WHERE id = ?3",
+            params![MeetingPhase::Cancelled.as_str(), duration_seconds, id],
+        )
+        .context("Failed to mark meeting as cancelled")?;
         Ok(())
     }
 
@@ -233,11 +250,26 @@ mod tests {
         let conn = setup_db();
         let id = MeetingRepository::insert(&conn, None, "/tmp/test.wav").unwrap();
 
-        MeetingRepository::fail(&conn, id, "Transcription timeout").unwrap();
+        MeetingRepository::fail(&conn, id, "Transcription timeout", 47).unwrap();
 
         let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
         assert_eq!(meeting.status, "error");
         assert_eq!(meeting.error, Some("Transcription timeout".to_string()));
+        assert_eq!(meeting.duration_seconds, Some(47));
+        assert!(meeting.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_cancel_meeting() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, Some("Test"), "/tmp/test.wav").unwrap();
+
+        MeetingRepository::cancel(&conn, id, 12).unwrap();
+
+        let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        assert_eq!(meeting.status, "cancelled");
+        assert_eq!(meeting.duration_seconds, Some(12));
+        assert!(meeting.completed_at.is_some());
     }
 
     #[test]

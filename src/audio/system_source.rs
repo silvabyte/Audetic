@@ -92,10 +92,14 @@ impl AudioSource for SystemAudioSource {
             }
         };
 
-        // Spawn pw-cat to capture system audio
+        // Spawn pw-cat to capture system audio.
+        // `--raw` is critical: without it pw-cat writes a RIFF/WAV container by default,
+        // which would get parsed as audio samples and inject NaN into the stream,
+        // crashing libmp3lame's compression step downstream.
         let child = match Command::new("pw-cat")
             .args([
                 "--record",
+                "--raw",
                 "--target",
                 &monitor,
                 "--rate",
@@ -186,73 +190,68 @@ impl AudioSource for SystemAudioSource {
 }
 
 impl SystemAudioSource {
-    /// Read f32 samples from pw-cat stdout into the shared buffer.
+    /// Read f32 LE samples from pw-cat stdout into the shared buffer.
     ///
-    /// pw-cat writes a 24-byte AU header followed by raw f32 LE PCM.
-    /// We detect the AU magic to skip the header; if absent, treat
-    /// the entire stream as raw f32 data.
+    /// Requires pw-cat to be spawned with `--raw` so stdout contains raw
+    /// little-endian f32 PCM with no container header. Trailing bytes at
+    /// the end of a read that don't complete a 4-byte sample are discarded
+    /// (pw-cat writes complete samples, so this only affects the final chunk
+    /// after the process is killed).
     fn read_samples(
         mut stdout: std::process::ChildStdout,
         samples: Arc<Mutex<Vec<f32>>>,
     ) {
-        // Try to read AU header magic (4 bytes: 0x2e736e64 big-endian, aka ".snd")
-        let mut magic = [0u8; 4];
-        if stdout.read_exact(&mut magic).is_err() {
-            warn!("pw-cat stdout closed before any data");
-            return;
-        }
-
-        // AU magic is ".snd" = 0x2e736e64 in big-endian
-        let is_au = magic == [0x2e, 0x73, 0x6e, 0x64];
-
-        if is_au {
-            // Read data offset (bytes 4-8, big-endian u32)
-            let mut offset_bytes = [0u8; 4];
-            if stdout.read_exact(&mut offset_bytes).is_err() {
-                warn!("pw-cat stdout closed reading AU header offset");
-                return;
-            }
-            let data_offset = u32::from_be_bytes(offset_bytes) as usize;
-
-            // Skip remaining header bytes (we already read 8)
-            if data_offset > 8 {
-                let remaining = data_offset - 8;
-                let mut skip = vec![0u8; remaining];
-                if stdout.read_exact(&mut skip).is_err() {
-                    warn!("pw-cat stdout closed skipping AU header");
-                    return;
-                }
-            }
-            debug!("Skipped AU header ({} bytes)", data_offset);
-        } else {
-            // No AU header — the 4 bytes we read are the start of a sample
-            let sample = f32::from_le_bytes(magic);
-            if let Ok(mut guard) = samples.lock() {
-                guard.push(sample);
-            }
-        }
-
-        // Read f32 LE samples in chunks
         let mut buf = [0u8; 4096];
+        let mut leftover: [u8; 4] = [0; 4];
+        let mut leftover_len: usize = 0;
+
         loop {
             match stdout.read(&mut buf) {
                 Ok(0) => break, // EOF
                 Ok(n) => {
-                    // Process complete f32 samples (4 bytes each)
-                    let complete = n - (n % 4);
-                    if complete > 0 {
-                        let mut new_samples = Vec::with_capacity(complete / 4);
-                        for chunk in buf[..complete].chunks_exact(4) {
-                            new_samples.push(f32::from_le_bytes([
-                                chunk[0], chunk[1], chunk[2], chunk[3],
-                            ]));
-                        }
-                        if let Ok(mut guard) = samples.lock() {
-                            guard.extend_from_slice(&new_samples);
+                    // Combine any leftover bytes from the previous read with the new chunk
+                    // before decoding, so reads that split a sample don't drop bytes.
+                    let mut new_samples: Vec<f32> = Vec::with_capacity((leftover_len + n) / 4);
+                    let mut cursor = 0usize;
+
+                    if leftover_len > 0 {
+                        let needed = 4 - leftover_len;
+                        if n >= needed {
+                            let mut sample_bytes = [0u8; 4];
+                            sample_bytes[..leftover_len]
+                                .copy_from_slice(&leftover[..leftover_len]);
+                            sample_bytes[leftover_len..]
+                                .copy_from_slice(&buf[..needed]);
+                            new_samples.push(f32::from_le_bytes(sample_bytes));
+                            cursor = needed;
+                            leftover_len = 0;
+                        } else {
+                            leftover[leftover_len..leftover_len + n]
+                                .copy_from_slice(&buf[..n]);
+                            leftover_len += n;
+                            continue;
                         }
                     }
-                    // Note: trailing bytes (n % 4 != 0) are discarded.
-                    // This is fine — pw-cat writes complete samples.
+
+                    let remaining = n - cursor;
+                    let complete = remaining - (remaining % 4);
+                    for chunk in buf[cursor..cursor + complete].chunks_exact(4) {
+                        new_samples.push(f32::from_le_bytes([
+                            chunk[0], chunk[1], chunk[2], chunk[3],
+                        ]));
+                    }
+
+                    // Save any trailing bytes that don't complete a sample
+                    let trailing = remaining - complete;
+                    if trailing > 0 {
+                        leftover[..trailing]
+                            .copy_from_slice(&buf[cursor + complete..cursor + complete + trailing]);
+                        leftover_len = trailing;
+                    }
+
+                    if let Ok(mut guard) = samples.lock() {
+                        guard.extend_from_slice(&new_samples);
+                    }
                 }
                 Err(e) => {
                     debug!("pw-cat stdout read error (expected on kill): {}", e);

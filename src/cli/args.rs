@@ -48,6 +48,8 @@ pub enum MeetingCommand {
     },
     /// Stop recording the current meeting
     Stop,
+    /// Cancel the in-progress meeting without transcribing
+    Cancel,
     /// Show current meeting recording status
     Status,
     /// List recorded meetings
