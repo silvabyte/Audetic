@@ -261,7 +261,7 @@ async function updateTomlVersion(
 	const contents = await Bun.file(filePath).text();
 	const regex = anchor
 		? new RegExp(`(${anchor}[\\s\\S]*?version = ")([^"]+)(")`)
-		: /(\[package\][\s\S]*?^version\s*=\s*")([^"]+)(")/m;
+		: /((?:\[workspace\.package\]|\[package\])[\s\S]*?^version\s*=\s*")([^"]+)(")/m;
 	const next = contents.replace(regex, `$1${version}$3`);
 	await Bun.write(filePath, next);
 }

@@ -101,7 +101,7 @@ mod tests {
     #[test]
     fn test_mix_single_source() {
         let source = vec![0.5, -0.3, 0.1];
-        let result = AudioMixer::mix(&[source.clone()]);
+        let result = AudioMixer::mix(std::slice::from_ref(&source));
         assert_eq!(result, source);
     }
 

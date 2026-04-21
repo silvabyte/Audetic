@@ -1,0 +1,75 @@
+[package]
+name = "audetic"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "audetic"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Async trait support
+async-trait = "0.1"
+
+# Audio recording
+cpal = "0.15"
+hound = "3.5"
+
+# Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Encoding
+base64 = "0.22.1"
+
+# Logging and errors
+anyhow = "1.0"
+thiserror = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Clipboard
+arboard = { version = "3.3", features = ["wayland-data-control"] }
+
+# CLI args
+clap = { version = "4.4", features = ["derive"] }
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
+
+# Path handling
+dirs = "5.0"
+
+# Process management
+which = "6.0"
+
+# Text processing
+regex = "1.10"
+
+# HTTP server
+axum = "0.7"
+tower = "0.4"
+
+# HTTP client for OpenAI API
+reqwest = { version = "0.11", features = ["json", "multipart", "stream"] }
+semver = "1.0"
+sha2 = "0.10"
+flate2 = "1.0"
+tar = "0.4"
+walkdir = "2.5"
+fs2 = "0.4"
+rusqlite = "0.37.0"
+chrono = "0.4"
+uuid = { version = "1.18.1", features = ["v4"] }
+
+# Progress indicators
+indicatif = "0.17"
+
+# Temp file handling
+tempfile = "3"
