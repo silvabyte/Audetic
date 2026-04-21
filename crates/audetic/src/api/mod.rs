@@ -7,7 +7,9 @@
 //! - Provider configuration
 //! - Update management
 //! - Application logs
+//! - OpenAPI spec (/openapi.json)
 
+pub mod docs;
 pub mod error;
 pub mod routes;
 
@@ -17,6 +19,7 @@ use axum::{response::Json, routing::get, Router};
 use serde_json::{json, Value};
 use tower::ServiceBuilder;
 use tracing::info;
+use utoipa::OpenApi;
 
 pub use routes::recording::{ApiCommand, RecordingState, ToggleRequest};
 
@@ -59,6 +62,8 @@ impl ApiServer {
             // Root and version endpoints
             .route("/", get(status))
             .route("/version", get(version))
+            // OpenAPI spec
+            .route("/openapi.json", get(openapi_spec))
             // Recording control endpoints
             .nest("", routes::recording::router(self.recording_state))
             // Other API routes
@@ -123,4 +128,10 @@ async fn version() -> Json<Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "name": "audetic"
     }))
+}
+
+/// Serve the OpenAPI 3.x document for the daemon's HTTP API.
+async fn openapi_spec() -> Json<Value> {
+    let spec = docs::ApiDoc::openapi();
+    Json(serde_json::to_value(spec).unwrap_or(Value::Null))
 }

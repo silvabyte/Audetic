@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use tracing::info;
+use utoipa::ToSchema;
 
 use crate::config::{Config, WhisperConfig};
 use crate::normalizer::TranscriptionNormalizer;
@@ -125,7 +126,7 @@ impl From<&WhisperConfig> for ProviderConfig {
 // ============================================================================
 
 /// Status of the transcription provider
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ProviderStatus {
     /// Provider is configured and ready
@@ -288,7 +289,7 @@ pub async fn test_provider_with_config(
 }
 
 /// Get a summary of the current provider configuration.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProviderInfo {
     pub provider: Option<String>,
     pub model: Option<String>,

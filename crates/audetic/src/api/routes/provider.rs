@@ -12,13 +12,29 @@ pub fn router() -> Router {
 }
 
 /// GET /provider - Get provider configuration.
-async fn get_config() -> ApiResult<Json<ProviderInfo>> {
+#[utoipa::path(
+    get,
+    path = "/provider",
+    tag = "provider",
+    responses(
+        (status = 200, description = "Current provider configuration", body = ProviderInfo),
+    ),
+)]
+pub async fn get_config() -> ApiResult<Json<ProviderInfo>> {
     let info = get_provider_info().map_err(ApiError::from)?;
     Ok(Json(info))
 }
 
 /// GET /provider/status - Get provider status and health.
-async fn get_status() -> ApiResult<Json<ProviderStatus>> {
+#[utoipa::path(
+    get,
+    path = "/provider/status",
+    tag = "provider",
+    responses(
+        (status = 200, description = "Provider availability", body = ProviderStatus),
+    ),
+)]
+pub async fn get_status() -> ApiResult<Json<ProviderStatus>> {
     let status = get_provider_status().map_err(ApiError::from)?;
     Ok(Json(status))
 }

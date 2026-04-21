@@ -9,9 +9,10 @@ use axum::{
     Router,
 };
 use serde::Deserialize;
+use utoipa::IntoParams;
 
 /// Query parameters for history search.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, IntoParams)]
 pub struct HistoryQueryParams {
     /// Search query
     pub q: Option<String>,
@@ -31,7 +32,16 @@ pub fn router() -> Router {
 }
 
 /// GET /history - List transcription history.
-async fn list_history(
+#[utoipa::path(
+    get,
+    path = "/history",
+    tag = "history",
+    params(HistoryQueryParams),
+    responses(
+        (status = 200, description = "Transcription entries matching the query", body = Vec<HistoryEntry>),
+    ),
+)]
+pub async fn list_history(
     Query(params): Query<HistoryQueryParams>,
 ) -> ApiResult<Json<Vec<HistoryEntry>>> {
     let search_params = SearchParams {
@@ -46,7 +56,19 @@ async fn list_history(
 }
 
 /// GET /history/:id - Get a single transcription.
-async fn get_history_by_id(Path(id): Path<i64>) -> ApiResult<Json<HistoryEntry>> {
+#[utoipa::path(
+    get,
+    path = "/history/{id}",
+    tag = "history",
+    params(
+        ("id" = i64, Path, description = "Transcription history id"),
+    ),
+    responses(
+        (status = 200, description = "Transcription entry", body = HistoryEntry),
+        (status = 404, description = "Not found"),
+    ),
+)]
+pub async fn get_history_by_id(Path(id): Path<i64>) -> ApiResult<Json<HistoryEntry>> {
     let entry = history::get_by_id(id)
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found(format!("Transcription {} not found", id)))?;

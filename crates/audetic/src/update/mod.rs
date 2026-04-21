@@ -603,7 +603,7 @@ impl UpdateMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct UpdateReport {
     pub current_version: String,
     pub remote_version: Option<String>,

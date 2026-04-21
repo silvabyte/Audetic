@@ -7,9 +7,10 @@ use crate::history::{self, HistoryEntry};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::process::Command;
+use utoipa::ToSchema;
 
 /// Combined logs result containing both app logs and transcription history.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct LogsResult {
     /// Application logs from systemd journal
     pub app_logs: Vec<String>,

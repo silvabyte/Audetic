@@ -7,11 +7,11 @@ use axum::{
     routing::{get, post, put},
     Router,
 };
-use serde::Deserialize;
-use serde_json::{json, Value};
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Request body for update install.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Default, ToSchema)]
 pub struct UpdateInstallRequest {
     /// Channel override (e.g., "stable", "beta")
     pub channel: Option<String>,
@@ -20,10 +20,18 @@ pub struct UpdateInstallRequest {
 }
 
 /// Request body for auto-update toggle.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct AutoUpdateRequest {
     /// Enable or disable auto-update
     pub enabled: bool,
+}
+
+/// Response body for the auto-update toggle endpoint.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AutoUpdateResponse {
+    pub success: bool,
+    pub auto_update: bool,
+    pub message: String,
 }
 
 /// Create the update router.
@@ -35,7 +43,15 @@ pub fn router() -> Router {
 }
 
 /// GET /update/check - Check for available updates.
-async fn check_update() -> ApiResult<Json<UpdateReport>> {
+#[utoipa::path(
+    get,
+    path = "/update/check",
+    tag = "update",
+    responses(
+        (status = 200, description = "Current vs available version info", body = UpdateReport),
+    ),
+)]
+pub async fn check_update() -> ApiResult<Json<UpdateReport>> {
     let config = UpdateConfig::detect(None).map_err(ApiError::from)?;
     let engine = UpdateEngine::new(config).map_err(ApiError::from)?;
 
@@ -54,7 +70,16 @@ async fn check_update() -> ApiResult<Json<UpdateReport>> {
 }
 
 /// POST /update/install - Install an update.
-async fn install_update(
+#[utoipa::path(
+    post,
+    path = "/update/install",
+    tag = "update",
+    request_body = UpdateInstallRequest,
+    responses(
+        (status = 200, description = "Result of the install attempt", body = UpdateReport),
+    ),
+)]
+pub async fn install_update(
     Json(request): Json<UpdateInstallRequest>,
 ) -> ApiResult<Json<UpdateReport>> {
     let config = UpdateConfig::detect(request.channel.clone()).map_err(ApiError::from)?;
@@ -75,7 +100,18 @@ async fn install_update(
 }
 
 /// PUT /update/auto - Enable or disable auto-update.
-async fn set_auto_update(Json(request): Json<AutoUpdateRequest>) -> ApiResult<Json<Value>> {
+#[utoipa::path(
+    put,
+    path = "/update/auto",
+    tag = "update",
+    request_body = AutoUpdateRequest,
+    responses(
+        (status = 200, description = "Auto-update flag after the change", body = AutoUpdateResponse),
+    ),
+)]
+pub async fn set_auto_update(
+    Json(request): Json<AutoUpdateRequest>,
+) -> ApiResult<Json<AutoUpdateResponse>> {
     let config = UpdateConfig::detect(None).map_err(ApiError::from)?;
     let engine = UpdateEngine::new(config).map_err(ApiError::from)?;
 
@@ -84,13 +120,13 @@ async fn set_auto_update(Json(request): Json<AutoUpdateRequest>) -> ApiResult<Js
         .await
         .map_err(ApiError::from)?;
 
-    Ok(Json(json!({
-        "success": true,
-        "auto_update": state.auto_update,
-        "message": if state.auto_update {
-            "Auto-update enabled"
+    Ok(Json(AutoUpdateResponse {
+        success: true,
+        auto_update: state.auto_update,
+        message: if state.auto_update {
+            "Auto-update enabled".to_string()
         } else {
-            "Auto-update disabled"
+            "Auto-update disabled".to_string()
         },
-    })))
+    }))
 }

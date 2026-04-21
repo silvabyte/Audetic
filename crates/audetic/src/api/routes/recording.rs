@@ -13,14 +13,16 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::{error, info};
+use utoipa::ToSchema;
 
 /// Request body for the toggle recording endpoint.
 /// All fields are optional - if not provided, defaults are used from config.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct ToggleRequest {
     /// Whether to copy the transcription to clipboard (default: true)
     #[serde(default)]
@@ -28,6 +30,34 @@ pub struct ToggleRequest {
     /// Whether to auto-paste/inject text into the focused app (default: from config)
     #[serde(default)]
     pub auto_paste: Option<bool>,
+}
+
+/// Response body for POST /toggle.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ToggleResponse {
+    pub success: bool,
+    pub phase: String,
+    pub job_id: Option<String>,
+    pub message: String,
+}
+
+/// The `last_completed_job` nested block inside `RecordingStatusResponse`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CompletedJobSummary {
+    pub job_id: String,
+    pub history_id: Option<i64>,
+    pub text: String,
+    pub created_at: String,
+}
+
+/// Default (non-waybar) response for GET /status.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RecordingStatusResponse {
+    pub recording: bool,
+    pub phase: String,
+    pub job_id: Option<String>,
+    pub last_completed_job: Option<CompletedJobSummary>,
+    pub last_error: Option<String>,
 }
 
 /// Commands dispatched from the HTTP layer to the main event loop.
@@ -78,21 +108,20 @@ pub fn router(state: RecordingState) -> Router {
 }
 
 /// Toggles recording on or off with optional per-job options.
-///
-/// # Request Body
-/// Optional JSON with fields:
-/// - `copy_to_clipboard`: bool - Copy transcription to clipboard
-/// - `auto_paste`: bool - Auto-paste/inject text into focused app
-///
-/// # Response
-/// Returns JSON with recording status and current job information.
-async fn toggle_recording(
+#[utoipa::path(
+    post,
+    path = "/toggle",
+    tag = "recording",
+    request_body(content = ToggleRequest, description = "Optional per-job overrides"),
+    responses(
+        (status = 200, description = "Toggle dispatched; reflects immediate phase", body = ToggleResponse),
+    ),
+)]
+pub async fn toggle_recording(
     State(state): State<RecordingState>,
     body: Option<Json<ToggleRequest>>,
-) -> Result<Json<Value>, StatusCode> {
-    // Parse optional job options from request body
+) -> Result<Json<ToggleResponse>, StatusCode> {
     let job_options = body.and_then(|Json(req)| {
-        // Only create JobOptions if at least one field was specified
         if req.copy_to_clipboard.is_some() || req.auto_paste.is_some() {
             Some(JobOptions {
                 copy_to_clipboard: req.copy_to_clipboard.unwrap_or(true),
@@ -114,18 +143,16 @@ async fn toggle_recording(
         .await
     {
         Ok(_) => {
-            // Small delay to allow the status to be updated
             tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-            // Get the current status to return job information
             let status = state.status.get().await;
 
-            Ok(Json(json!({
-                "success": true,
-                "phase": status.phase.as_str(),
-                "job_id": status.current_job_id,
-                "message": format!("Recording {}", status.phase.as_str())
-            })))
+            Ok(Json(ToggleResponse {
+                success: true,
+                phase: status.phase.as_str().to_string(),
+                job_id: status.current_job_id.clone(),
+                message: format!("Recording {}", status.phase.as_str()),
+            }))
         }
         Err(e) => {
             error!("Failed to send toggle command: {}", e);
@@ -136,24 +163,28 @@ async fn toggle_recording(
 
 /// Gets the current recording status.
 ///
-/// # Query Parameters
-/// - `style=waybar` - Returns response formatted for Waybar integration
-///
-/// # Response
-/// Returns JSON with current recording phase, job ID, and last completed job info.
-/// When `style=waybar` is specified, returns Waybar-formatted response with text, class, and tooltip.
-async fn recording_status(
+/// Pass `?style=waybar` for a Waybar-formatted `{text, class, tooltip}` payload.
+#[utoipa::path(
+    get,
+    path = "/status",
+    tag = "recording",
+    params(
+        ("style" = Option<String>, Query, description = "Set to `waybar` for Waybar-formatted response"),
+    ),
+    responses(
+        (status = 200, description = "Recording status (default JSON shape)", body = RecordingStatusResponse),
+    ),
+)]
+pub async fn recording_status(
     Query(params): Query<HashMap<String, String>>,
     State(state): State<RecordingState>,
 ) -> Json<Value> {
     let status = state.status.get().await;
 
-    // Check if waybar style is requested
     if params.get("style") == Some(&"waybar".to_string()) {
         return Json(generate_waybar_response(&status, &state.waybar_config));
     }
 
-    // Build last_completed_job object if available
     let last_completed_job = status.last_completed_job.as_ref().map(|job| {
         json!({
             "job_id": job.job_id,
@@ -163,7 +194,6 @@ async fn recording_status(
         })
     });
 
-    // Default JSON response with full job context
     Json(json!({
         "recording": status.phase == RecordingPhase::Recording,
         "phase": status.phase.as_str(),
@@ -173,13 +203,6 @@ async fn recording_status(
     }))
 }
 
-/// Generates a response formatted for Waybar integration.
-///
-/// Maps recording phases to appropriate Waybar display elements:
-/// - Idle: Shows configured idle text and tooltip
-/// - Recording: Shows configured recording text and tooltip
-/// - Processing: Shows processing icon
-/// - Error: Shows error icon with error message
 fn generate_waybar_response(status: &RecordingStatus, config: &WaybarConfig) -> Value {
     let (text, class, tooltip) = match status.phase {
         RecordingPhase::Idle => (

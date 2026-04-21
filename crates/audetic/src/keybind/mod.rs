@@ -32,6 +32,7 @@ use anyhow::{anyhow, Result};
 use discovery::get_all_config_files;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use utoipa::ToSchema;
 
 /// Default keybinding configuration for Audetic
 pub const DEFAULT_KEY: &str = "R";
@@ -134,13 +135,15 @@ pub fn find_audetic_bindings(bindings: &[HyprBinding]) -> Vec<&HyprBinding> {
 }
 
 /// Status of Audetic keybinding installation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum KeybindStatus {
     /// Audetic keybinding is installed
     Installed {
         #[serde(skip)]
+        #[schema(value_type = ())]
         binding: Box<Option<HyprBinding>>,
+        #[schema(value_type = String)]
         config_path: PathBuf,
         /// Display string for the keybinding (e.g., "SUPER + R")
         display_key: String,
@@ -148,30 +151,37 @@ pub enum KeybindStatus {
         command: String,
     },
     /// No Audetic keybinding found
-    NotInstalled { config_path: Option<PathBuf> },
+    NotInstalled {
+        #[schema(value_type = Option<String>)]
+        config_path: Option<PathBuf>,
+    },
     /// No Hyprland config found
     NoConfig,
 }
 
 /// Result of an install operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct InstallResult {
     /// Path to the backup file created
+    #[schema(value_type = String)]
     pub backup_path: PathBuf,
     /// The binding that was installed
     pub display_key: String,
     /// Path to the config file modified
+    #[schema(value_type = String)]
     pub config_path: PathBuf,
 }
 
 /// Result of an uninstall operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct UninstallResult {
     /// Whether a binding was actually removed
     pub removed: bool,
     /// Path to the backup file created (if any)
+    #[schema(value_type = Option<String>)]
     pub backup_path: Option<PathBuf>,
     /// Path to the config file modified
+    #[schema(value_type = String)]
     pub config_path: PathBuf,
 }
 

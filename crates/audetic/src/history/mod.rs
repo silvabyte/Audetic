@@ -6,6 +6,7 @@
 use crate::db::{self, Workflow, WorkflowData};
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 /// Parameters for searching transcription history.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -51,7 +52,7 @@ impl SearchParams {
 }
 
 /// A single history entry with formatted display data.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HistoryEntry {
     pub id: i64,
     pub text: String,
