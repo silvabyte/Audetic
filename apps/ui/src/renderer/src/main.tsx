@@ -3,7 +3,8 @@ import ReactDOM from "react-dom/client";
 import { RouterProvider } from "react-router-dom";
 import { configure } from "mobx";
 import { RootStore, RootStoreProvider } from "./stores/root-store";
-import { router } from "./router";
+import { setRootStore } from "./stores/singleton";
+import { createRouter } from "./router";
 import "./index.css";
 
 // MobX strict mode — fail loud in dev if any of our rules break.
@@ -16,7 +17,12 @@ configure({
 });
 
 const rootStore = new RootStore();
+// Register the singleton BEFORE `createRouter()` — that call eagerly
+// runs the initial-match loader, which imports `getRootStore()`.
+setRootStore(rootStore);
 rootStore.start();
+
+const router = createRouter();
 
 if (import.meta.env.DEV) {
   // Expose for chrome-devtools-mcp evaluate_script assertions during smoke tests.

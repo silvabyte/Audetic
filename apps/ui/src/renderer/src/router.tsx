@@ -1,26 +1,33 @@
 import { createBrowserRouter } from "react-router-dom";
 import { AppShell } from "./App";
-import { Dashboard } from "./routes/dashboard";
+import { dashboardRoute } from "./routes/dashboard";
 import { PlaceholderRoute } from "./routes/placeholder";
 
-export const router = createBrowserRouter([
-  {
-    path: "/",
-    element: <AppShell />,
-    children: [
-      { index: true, element: <Dashboard /> },
-      {
-        path: "history",
-        element: <PlaceholderRoute title="History" phase="Phase 2" />,
-      },
-      {
-        path: "meetings",
-        element: <PlaceholderRoute title="Meetings" phase="Phase 3" />,
-      },
-      {
-        path: "settings",
-        element: <PlaceholderRoute title="Settings" phase="Phase 4" />,
-      },
-    ],
-  },
-]);
+/**
+ * `createBrowserRouter` eagerly invokes the initial-match loader at
+ * construction time (for hydration). We need the RootStore to be
+ * registered first, so this is a factory — call it AFTER setRootStore.
+ */
+export function createRouter(): ReturnType<typeof createBrowserRouter> {
+  return createBrowserRouter([
+    {
+      path: "/",
+      element: <AppShell />,
+      children: [
+        dashboardRoute,
+        {
+          path: "history",
+          element: <PlaceholderRoute title="History" phase="Phase 2" />,
+        },
+        {
+          path: "meetings",
+          element: <PlaceholderRoute title="Meetings" phase="Phase 3" />,
+        },
+        {
+          path: "settings",
+          element: <PlaceholderRoute title="Settings" phase="Phase 4" />,
+        },
+      ],
+    },
+  ]);
+}
