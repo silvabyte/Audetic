@@ -17,7 +17,7 @@ Thumbs.db
 /tmp/
 
 # Large test fixtures (not committed)
-tests/fixtures/large_video.mp4
+crates/audetic/tests/fixtures/large_video.mp4
 
 # Release artifacts (keep manifests/notes tracked)
 /release/cli/releases/**/*.tar.gz

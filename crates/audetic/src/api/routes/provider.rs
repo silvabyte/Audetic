@@ -16,6 +16,7 @@ pub fn router() -> Router {
     get,
     path = "/provider",
     tag = "provider",
+    operation_id = "get_provider_config",
     responses(
         (status = 200, description = "Current provider configuration", body = ProviderInfo),
     ),
@@ -30,6 +31,7 @@ pub async fn get_config() -> ApiResult<Json<ProviderInfo>> {
     get,
     path = "/provider/status",
     tag = "provider",
+    operation_id = "get_provider_status",
     responses(
         (status = 200, description = "Provider availability", body = ProviderStatus),
     ),

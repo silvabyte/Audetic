@@ -20,6 +20,9 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, updat
         (url = "http://127.0.0.1:3737", description = "Local daemon"),
     ),
     paths(
+        // Service
+        super::status,
+        super::version,
         // Recording (dictation)
         recording::toggle_recording,
         recording::recording_status,
@@ -49,6 +52,9 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, updat
         meetings::get_meeting,
     ),
     components(schemas(
+        // Service
+        super::ServiceInfo,
+        super::VersionInfo,
         // Recording
         recording::ToggleRequest,
         recording::ToggleResponse,
@@ -82,6 +88,7 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, updat
         meetings::MeetingDetailResponse,
     )),
     tags(
+        (name = "service", description = "Service identity and liveness"),
         (name = "recording", description = "Dictation (voice-to-text) control"),
         (name = "meetings", description = "Long-form meeting recording"),
         (name = "history", description = "Past transcriptions"),

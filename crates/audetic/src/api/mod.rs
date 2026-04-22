@@ -16,12 +16,28 @@ pub mod routes;
 use crate::config::Config;
 use anyhow::Result;
 use axum::{response::Json, routing::get, Router};
-use serde_json::{json, Value};
+use serde::Serialize;
+use serde_json::Value;
 use tower::ServiceBuilder;
 use tracing::info;
-use utoipa::OpenApi;
+use utoipa::{OpenApi, ToSchema};
 
 pub use routes::recording::{ApiCommand, RecordingState, ToggleRequest};
+
+/// Response for GET / — service identity and basic status.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ServiceInfo {
+    pub service: String,
+    pub version: String,
+    pub status: String,
+}
+
+/// Response for GET /version.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VersionInfo {
+    pub name: String,
+    pub version: String,
+}
 
 pub struct ApiServer {
     port: u16,
@@ -115,19 +131,37 @@ impl ApiServer {
     }
 }
 
-async fn status() -> Json<Value> {
-    Json(json!({
-        "service": "audetic",
-        "version": env!("CARGO_PKG_VERSION"),
-        "status": "running"
-    }))
+#[utoipa::path(
+    get,
+    path = "/",
+    tag = "service",
+    operation_id = "service_status",
+    responses(
+        (status = 200, description = "Service identity and liveness", body = ServiceInfo),
+    ),
+)]
+pub async fn status() -> Json<ServiceInfo> {
+    Json(ServiceInfo {
+        service: "audetic".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        status: "running".to_string(),
+    })
 }
 
-async fn version() -> Json<Value> {
-    Json(json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "name": "audetic"
-    }))
+#[utoipa::path(
+    get,
+    path = "/version",
+    tag = "service",
+    operation_id = "service_version",
+    responses(
+        (status = 200, description = "Daemon name and version", body = VersionInfo),
+    ),
+)]
+pub async fn version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        name: "audetic".to_string(),
+        version: env!("CARGO_PKG_VERSION").to_string(),
+    })
 }
 
 /// Serve the OpenAPI 3.x document for the daemon's HTTP API.

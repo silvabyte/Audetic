@@ -50,6 +50,7 @@ pub fn router() -> Router {
     get,
     path = "/keybind/status",
     tag = "keybind",
+    operation_id = "get_keybind_status",
     responses(
         (status = 200, description = "Current keybind installation state", body = KeybindStatus),
     ),

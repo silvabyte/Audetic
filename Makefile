@@ -11,7 +11,7 @@ USE_CROSS ?= 0
 EXTRA_FEATURES ?=
 AUTO_COMMIT ?= 1
 
-.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix deploy deploy-beta deploy-stable
+.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix deploy deploy-beta deploy-stable ui-install ui-dev ui-build ui-typecheck codegen
 
 # Default target
 help:
@@ -39,6 +39,12 @@ help:
 	@echo "                      CONTINUE_ON_ERROR=1)"
 	@echo "  make deploy-beta  - Deploy to beta channel (convenience for CHANNEL=beta)"
 	@echo "  make deploy-stable- Deploy to stable channel (convenience for CHANNEL=stable)"
+	@echo ""
+	@echo "  make ui-install   - Install Electron UI dependencies (bun)"
+	@echo "  make ui-dev       - Run the Electron UI in dev mode"
+	@echo "  make ui-build     - Build the Electron UI (out/)"
+	@echo "  make ui-typecheck - Typecheck the Electron UI"
+	@echo "  make codegen      - Regenerate apps/ui TS types from daemon /openapi.json"
 
 # Build commands
 build:
@@ -106,6 +112,22 @@ stop:
 status:
 	@systemctl --user is-active audetic.service >/dev/null 2>&1 && echo "✓ Service is running" || echo "✗ Service is not running"
 	@curl -s http://127.0.0.1:3737/status 2>/dev/null | python3 -m json.tool || echo "✗ API not responding"
+
+# Electron UI (apps/ui)
+ui-install:
+	cd apps/ui && bun install
+
+ui-dev:
+	cd apps/ui && bun run dev
+
+ui-build:
+	cd apps/ui && bun run build
+
+ui-typecheck:
+	cd apps/ui && bun run typecheck
+
+codegen:
+	cd apps/ui && bun run codegen
 
 # Cleanup
 clean:
