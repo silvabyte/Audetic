@@ -1,5 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron";
 
+export type ThemeMode = "system" | "light" | "dark";
+
 const audetic = {
   platform: process.platform as NodeJS.Platform,
 
@@ -12,6 +14,22 @@ const audetic = {
    */
   openConfigFile(): Promise<string> {
     return ipcRenderer.invoke("audetic:openConfigFile");
+  },
+
+  /**
+   * Read the persisted theme-mode preference from electron-store.
+   * Resolves to the last user override — "system" if never set.
+   */
+  getThemeMode(): Promise<ThemeMode> {
+    return ipcRenderer.invoke("audetic:getThemeMode");
+  },
+
+  /**
+   * Persist the user's theme-mode override. No-op on invalid input;
+   * the renderer is expected to pass one of the three valid strings.
+   */
+  setThemeMode(mode: ThemeMode): Promise<void> {
+    return ipcRenderer.invoke("audetic:setThemeMode", mode);
   },
 };
 

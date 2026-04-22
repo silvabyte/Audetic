@@ -7,6 +7,7 @@ import {
   type RouteObject,
 } from "react-router-dom";
 import { Copy, Mic, Mic2, StopCircle } from "lucide-react";
+import { toast } from "sonner";
 import {
   Card,
   CardContent,
@@ -15,6 +16,11 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { StatusPill } from "@/components/status-pill";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
@@ -46,12 +52,21 @@ export const dashboardRoute: RouteObject = {
     const intent = form.get("intent");
     const root = getRootStore();
     switch (intent) {
-      case INTENT.toggleRecording:
+      case INTENT.toggleRecording: {
+        const errBefore = root.status.lastError;
         await root.status.toggle();
+        const errAfter = root.status.lastError;
+        if (errAfter && errAfter !== errBefore) {
+          toast.error("Couldn't toggle recording", { description: errAfter });
+        }
         return null;
+      }
       case INTENT.copyLastTranscription: {
         const job = root.status.lastCompletedJob;
-        if (job) await navigator.clipboard.writeText(job.text);
+        if (job) {
+          await navigator.clipboard.writeText(job.text);
+          toast.success("Copied to clipboard");
+        }
         return null;
       }
       default:
@@ -142,16 +157,6 @@ function RecordingCard() {
             Start a meeting
           </Link>
         </div>
-
-        <Observer>
-          {() => {
-            const err = store.status.lastError;
-            if (!err) return null;
-            return (
-              <div className="text-sm text-destructive">Last error: {err}</div>
-            );
-          }}
-        </Observer>
       </CardContent>
     </Card>
   );
@@ -187,10 +192,15 @@ function LastTranscriptionCard() {
                       name="intent"
                       value={INTENT.copyLastTranscription}
                     />
-                    <Button variant="ghost" size="sm" type="submit">
-                      <Copy className="mr-1 h-3.5 w-3.5" />
-                      Copy
-                    </Button>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <Button variant="ghost" size="sm" type="submit">
+                          <Copy className="mr-1 h-3.5 w-3.5" />
+                          Copy
+                        </Button>
+                      </TooltipTrigger>
+                      <TooltipContent>Copy to clipboard</TooltipContent>
+                    </Tooltip>
                   </Form>
                 </div>
               </div>

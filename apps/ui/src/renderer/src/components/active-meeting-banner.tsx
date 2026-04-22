@@ -84,12 +84,6 @@ export function ActiveMeetingBanner() {
                 <MeetingControls />
               </div>
             </div>
-
-            {meetings.lastError && (
-              <div className="mx-auto max-w-5xl px-4 pb-2 text-xs text-destructive">
-                {meetings.lastError}
-              </div>
-            )}
           </div>
         );
       }}

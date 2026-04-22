@@ -5,6 +5,7 @@ import { HistoryStore } from "./history-store";
 import { MeetingStore } from "./meeting-store";
 import { MetaStore } from "./meta-store";
 import { StatusStore } from "./status-store";
+import { UiStore } from "./ui-store";
 
 /**
  * RootStore owns every domain / UI store. Stores reach each other via
@@ -17,6 +18,7 @@ export class RootStore {
   history: HistoryStore;
   meetings: MeetingStore;
   config: ConfigStore;
+  ui: UiStore;
 
   constructor() {
     this.status = new StatusStore(this);
@@ -24,6 +26,7 @@ export class RootStore {
     this.history = new HistoryStore(this);
     this.meetings = new MeetingStore(this);
     this.config = new ConfigStore(this);
+    this.ui = new UiStore(this);
     makeAutoObservable(this);
   }
 
@@ -31,6 +34,9 @@ export class RootStore {
   start(): void {
     this.status.start();
     this.meetings.start();
+    // UiStore.start is async (reads persisted theme via IPC). Fire-and-
+    // forget — theme flicker is bounded by the one-round-trip to main.
+    void this.ui.start();
   }
 
   /** Stop all polling. Called on window close / app quit. */

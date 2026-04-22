@@ -2,6 +2,11 @@ import { Form } from "react-router-dom";
 import { Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type { HistoryEntry } from "@/stores/history-store";
 import { HISTORY_INTENTS } from "@/routes/history";
 
@@ -15,10 +20,15 @@ export function TranscriptionCard({ entry }: { entry: HistoryEntry }) {
           <Form method="post" replace>
             <input type="hidden" name="intent" value={HISTORY_INTENTS.copy} />
             <input type="hidden" name="text" value={entry.text} />
-            <Button variant="ghost" size="sm" type="submit">
-              <Copy className="mr-1 h-3.5 w-3.5" />
-              Copy
-            </Button>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button variant="ghost" size="sm" type="submit">
+                  <Copy className="mr-1 h-3.5 w-3.5" />
+                  Copy
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Copy to clipboard</TooltipContent>
+            </Tooltip>
           </Form>
         </div>
       </CardContent>

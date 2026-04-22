@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Observer } from "mobx-react-lite";
 import {
   useFetcher,
@@ -6,6 +6,7 @@ import {
   type RouteObject,
 } from "react-router-dom";
 import { CheckCircle2, Download, RefreshCcw, TriangleAlert } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -14,6 +15,8 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Switch } from "@/components/ui/switch";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
 import { cn } from "@/lib/utils";
@@ -36,12 +39,30 @@ export const settingsUpdatesRoute: RouteObject = {
         return null;
       case UPDATE_INTENTS.install: {
         const force = form.get("force") === "true";
+        const errBefore = root.config.lastError;
         await root.config.installUpdate(force);
+        const errAfter = root.config.lastError;
+        if (errAfter && errAfter !== errBefore) {
+          toast.error("Install failed", { description: errAfter });
+        } else if (root.config.update?.installed) {
+          toast.success(
+            root.config.update.restart_required
+              ? "Update installed. Restart the daemon to pick it up."
+              : "Update installed",
+          );
+        }
         return null;
       }
       case UPDATE_INTENTS.setAuto: {
         const enabled = form.get("enabled") === "true";
+        const errBefore = root.config.lastError;
         await root.config.setAutoUpdate(enabled);
+        const errAfter = root.config.lastError;
+        if (errAfter && errAfter !== errBefore) {
+          toast.error("Couldn't save auto-update setting", {
+            description: errAfter,
+          });
+        }
         return null;
       }
       default:
@@ -84,7 +105,7 @@ function UpdateStatusCard() {
         return (
           <Card>
             <CardHeader className="flex-row items-start justify-between gap-4 space-y-0">
-              <div className="space-y-1">
+              <div className="space-y-1 min-w-0">
                 <CardTitle className="text-base">Version</CardTitle>
                 <CardDescription>
                   <UpdateSummary
@@ -93,7 +114,7 @@ function UpdateStatusCard() {
                   />
                 </CardDescription>
               </div>
-              <div className="flex gap-2">
+              <div className="flex gap-2 shrink-0">
                 <checkFetcher.Form method="post">
                   <input type="hidden" name="intent" value={UPDATE_INTENTS.check} />
                   <Button
@@ -134,11 +155,6 @@ function UpdateStatusCard() {
                 {report.restart_required ? " Restart the daemon to pick up the new binary." : ""}
               </CardContent>
             )}
-            {store.config.lastError && (
-              <CardContent className="text-xs text-destructive">
-                {store.config.lastError}
-              </CardContent>
-            )}
           </Card>
         );
       }}
@@ -153,7 +169,14 @@ function UpdateSummary({
   report: ReturnType<typeof useStore>["config"]["update"];
   loading: boolean;
 }) {
-  if (loading) return <span>Loading…</span>;
+  if (loading) {
+    return (
+      <span className="inline-flex items-center gap-2">
+        <Skeleton className="h-4 w-4 rounded-full" />
+        <Skeleton className="h-3 w-48" />
+      </span>
+    );
+  }
   if (!report) return <span>Unknown.</span>;
 
   const hasUpdate =
@@ -179,10 +202,23 @@ function UpdateSummary({
 function AutoUpdateCard() {
   // The daemon doesn't report the current auto-update flag anywhere the
   // UI can read; we track the user's last toggle locally so the switch
-  // feels responsive. Flipping fires PUT /update/auto.
+  // feels responsive. Flipping fires PUT /update/auto via the route
+  // action — the Switch submits a hidden form.
   const [enabled, setEnabled] = useState(false);
   const fetcher = useFetcher();
+  const formRef = useRef<HTMLFormElement>(null);
   const submitting = fetcher.state !== "idle";
+
+  function handleToggle(next: boolean): void {
+    setEnabled(next);
+    if (!formRef.current) return;
+    // Re-submit the form with the new flag. A fresh FormData keeps the
+    // submission logic on the route action — no direct store call here.
+    const fd = new FormData();
+    fd.set("intent", UPDATE_INTENTS.setAuto);
+    fd.set("enabled", next ? "true" : "false");
+    fetcher.submit(fd, { method: "post" });
+  }
 
   return (
     <Card>
@@ -195,22 +231,25 @@ function AutoUpdateCard() {
       </CardHeader>
       <CardContent>
         <fetcher.Form
+          ref={formRef}
           method="post"
-          onSubmit={() => setEnabled((prev) => !prev)}
-          className="flex items-center gap-3"
+          className="flex items-center justify-between gap-3"
         >
           <input type="hidden" name="intent" value={UPDATE_INTENTS.setAuto} />
-          <input type="hidden" name="enabled" value={enabled ? "false" : "true"} />
-          <Button type="submit" variant="outline" size="sm" disabled={submitting}>
-            {submitting ? "Saving…" : enabled ? "Disable" : "Enable"}
-          </Button>
-          <span className="text-sm text-muted-foreground">
+          <input type="hidden" name="enabled" value={enabled ? "true" : "false"} />
+          <div className="text-sm text-muted-foreground">
             Currently{" "}
             <span className={cn(enabled ? "text-primary" : "text-foreground")}>
               {enabled ? "enabled" : "disabled"}
             </span>{" "}
-            (locally tracked — daemon doesn't expose the flag).
-          </span>
+            · locally tracked — daemon doesn't expose the flag.
+          </div>
+          <Switch
+            checked={enabled}
+            onCheckedChange={handleToggle}
+            disabled={submitting}
+            aria-label="Auto-update"
+          />
         </fetcher.Form>
       </CardContent>
     </Card>

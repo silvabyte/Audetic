@@ -5,6 +5,7 @@ import {
   type RouteObject,
 } from "react-router-dom";
 import { CheckCircle2, Trash2, XCircle } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -14,6 +15,7 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
+import { Skeleton } from "@/components/ui/skeleton";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
 
@@ -31,12 +33,29 @@ export const settingsKeybindRoute: RouteObject = {
     switch (intent) {
       case KEYBIND_INTENTS.install: {
         const key = String(form.get("key") ?? "").trim() || undefined;
+        const errBefore = root.config.lastError;
         await root.config.installKeybind(key);
+        const errAfter = root.config.lastError;
+        if (errAfter && errAfter !== errBefore) {
+          toast.error("Couldn't install keybind", { description: errAfter });
+        } else if (root.config.keybind?.status === "installed") {
+          toast.success(
+            `Keybind installed${root.config.keybind.display_key ? ` (${root.config.keybind.display_key})` : ""}`,
+          );
+        }
         return null;
       }
-      case KEYBIND_INTENTS.uninstall:
+      case KEYBIND_INTENTS.uninstall: {
+        const errBefore = root.config.lastError;
         await root.config.uninstallKeybind();
+        const errAfter = root.config.lastError;
+        if (errAfter && errAfter !== errBefore) {
+          toast.error("Couldn't uninstall keybind", { description: errAfter });
+        } else {
+          toast.success("Keybind removed");
+        }
         return null;
+      }
       default:
         return null;
     }
@@ -75,8 +94,9 @@ function KeybindStatusCard() {
         if (state === "loading" && !kb) {
           return (
             <Card>
-              <CardContent className="p-6 text-sm text-muted-foreground">
-                Loading…
+              <CardContent className="p-6 space-y-3">
+                <Skeleton className="h-4 w-32" />
+                <Skeleton className="h-3 w-64" />
               </CardContent>
             </Card>
           );

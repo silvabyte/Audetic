@@ -13,6 +13,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
 import { cn } from "@/lib/utils";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
@@ -73,7 +74,11 @@ function ProviderInfoCard() {
             </CardHeader>
             <CardContent>
               {state === "loading" && !info ? (
-                <p className="text-sm text-muted-foreground">Loading…</p>
+                <dl className="grid grid-cols-[8rem_1fr] gap-y-2 text-sm">
+                  {[0, 1, 2, 3, 4].map((i) => (
+                    <FieldSkeleton key={i} />
+                  ))}
+                </dl>
               ) : !info ? (
                 <p className="text-sm text-destructive">Couldn't load provider info.</p>
               ) : (
@@ -155,7 +160,14 @@ function StatusBadge({
   status: ReturnType<typeof useStore>["config"]["providerStatus"];
   loading: boolean;
 }) {
-  if (loading) return <span className="text-sm text-muted-foreground">Loading…</span>;
+  if (loading) {
+    return (
+      <div className="flex items-center gap-2">
+        <Skeleton className="h-4 w-4 rounded-full" />
+        <Skeleton className="h-3 w-40" />
+      </div>
+    );
+  }
   if (!status) return <span className="text-sm text-muted-foreground">Unknown.</span>;
 
   if (status.status === "ready") {
@@ -210,6 +222,15 @@ function Field({
       >
         {value ?? "—"}
       </dd>
+    </>
+  );
+}
+
+function FieldSkeleton() {
+  return (
+    <>
+      <Skeleton className="h-3 w-20" />
+      <Skeleton className="h-3 w-full max-w-[16rem]" />
     </>
   );
 }

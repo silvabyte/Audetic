@@ -4,6 +4,7 @@ import { dashboardRoute } from "./routes/dashboard";
 import { historyRoute } from "./routes/history";
 import { meetingsRoute } from "./routes/meetings";
 import { meetingDetailRoute } from "./routes/meeting-detail";
+import { settingsAppearanceRoute } from "./routes/settings/appearance";
 import { settingsConfigFileRoute } from "./routes/settings/config-file";
 import { settingsKeybindRoute } from "./routes/settings/keybind";
 import { settingsLayoutRoute } from "./routes/settings/layout";
@@ -29,6 +30,7 @@ export function createRouter(): ReturnType<typeof createBrowserRouter> {
           settingsProviderRoute,
           settingsKeybindRoute,
           settingsUpdatesRoute,
+          settingsAppearanceRoute,
           settingsConfigFileRoute,
         ]),
       ],

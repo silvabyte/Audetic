@@ -8,6 +8,7 @@ import {
   type RouteObject,
 } from "react-router-dom";
 import { ArrowLeft, Copy, FolderOpen } from "lucide-react";
+import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -16,6 +17,12 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
+import { Skeleton } from "@/components/ui/skeleton";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
 import type { MeetingDetail } from "@/stores/meeting-store";
@@ -39,7 +46,10 @@ export const meetingDetailRoute: RouteObject = {
     switch (intent) {
       case DETAIL_INTENTS.copyTranscript: {
         const text = String(form.get("text") ?? "");
-        if (text) await navigator.clipboard.writeText(text);
+        if (text) {
+          await navigator.clipboard.writeText(text);
+          toast.success("Transcript copied to clipboard");
+        }
         return null;
       }
       case DETAIL_INTENTS.openAudio: {
@@ -47,7 +57,10 @@ export const meetingDetailRoute: RouteObject = {
         // Electron this is available through the preload bridge; for
         // Phase 3 we skip the main-process IPC and just copy the path.
         const path = String(form.get("path") ?? "");
-        if (path) await navigator.clipboard.writeText(path);
+        if (path) {
+          await navigator.clipboard.writeText(path);
+          toast.success("Path copied to clipboard");
+        }
         return null;
       }
       default:
@@ -83,7 +96,7 @@ function MeetingDetailRoute() {
             if (status === "error") {
               return <p className="text-sm text-destructive">Could not load meeting.</p>;
             }
-            return <p className="text-sm text-muted-foreground">Loading…</p>;
+            return <MeetingDetailSkeleton />;
           }
           return <MeetingDetailBody detail={detail} />;
         }}
@@ -146,10 +159,15 @@ function MeetingDetailBody({ detail }: { detail: MeetingDetail }) {
                   name="text"
                   value={detail.transcript_text}
                 />
-                <Button type="submit" variant="outline" size="sm">
-                  <Copy className="mr-1 h-3.5 w-3.5" />
-                  Copy all
-                </Button>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button type="submit" variant="outline" size="sm">
+                      <Copy className="mr-1 h-3.5 w-3.5" />
+                      Copy all
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Copy to clipboard</TooltipContent>
+                </Tooltip>
               </Form>
             </>
           ) : null}
@@ -181,10 +199,45 @@ function FileRow({ label, path }: { label: string; path: string }) {
       <Form method="post" replace>
         <input type="hidden" name="intent" value={DETAIL_INTENTS.openAudio} />
         <input type="hidden" name="path" value={path} />
-        <Button type="submit" variant="ghost" size="sm" title="Copy path">
-          <FolderOpen className="h-3.5 w-3.5" />
-        </Button>
+        <Tooltip>
+          <TooltipTrigger asChild>
+            <Button type="submit" variant="ghost" size="sm">
+              <FolderOpen className="h-3.5 w-3.5" />
+            </Button>
+          </TooltipTrigger>
+          <TooltipContent>Copy path to clipboard</TooltipContent>
+        </Tooltip>
       </Form>
+    </div>
+  );
+}
+
+function MeetingDetailSkeleton() {
+  return (
+    <div className="space-y-6">
+      <div className="space-y-2">
+        <Skeleton className="h-7 w-64" />
+        <Skeleton className="h-3 w-80" />
+      </div>
+      <Card>
+        <CardHeader>
+          <Skeleton className="h-5 w-32" />
+        </CardHeader>
+        <CardContent className="space-y-2">
+          <Skeleton className="h-3 w-full" />
+          <Skeleton className="h-3 w-11/12" />
+          <Skeleton className="h-3 w-4/5" />
+        </CardContent>
+      </Card>
+      <Card>
+        <CardHeader>
+          <Skeleton className="h-5 w-20" />
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <Skeleton className="h-4 w-full" />
+          <Skeleton className="h-4 w-2/3" />
+        </CardContent>
+      </Card>
     </div>
   );
 }
@@ -194,4 +247,3 @@ function formatDuration(seconds: number): string {
   const secs = seconds % 60;
   return `${mins}m ${secs.toString().padStart(2, "0")}s`;
 }
-
