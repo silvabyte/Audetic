@@ -1,6 +1,21 @@
-import { BrowserWindow, app } from "electron";
+import { BrowserWindow, app, ipcMain, shell } from "electron";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import { destroyTray, initTray } from "./tray";
+
+function resolveConfigPath(): string {
+  // Mirrors src/config/mod.rs: $XDG_CONFIG_HOME/audetic/config.toml,
+  // falling back to ~/.config/audetic/config.toml.
+  const xdg = process.env["XDG_CONFIG_HOME"];
+  const base = xdg && xdg.length > 0 ? xdg : join(homedir(), ".config");
+  return join(base, "audetic", "config.toml");
+}
+
+ipcMain.handle("audetic:openConfigFile", async () => {
+  const path = resolveConfigPath();
+  // shell.openPath returns "" on success, or an error string.
+  return shell.openPath(path);
+});
 
 const isDev = !app.isPackaged;
 
@@ -21,7 +36,7 @@ function createWindow(): void {
     show: false,
     autoHideMenuBar: true,
     webPreferences: {
-      preload: join(__dirname, "../preload/index.js"),
+      preload: join(__dirname, "../preload/index.mjs"),
       sandbox: false,
       contextIsolation: true,
     },
