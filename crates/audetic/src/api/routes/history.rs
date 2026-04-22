@@ -28,7 +28,7 @@ pub struct HistoryQueryParams {
 pub fn router() -> Router {
     Router::new()
         .route("/", get(list_history))
-        .route("/{id}", get(get_history_by_id))
+        .route("/:id", get(get_history_by_id))
 }
 
 /// GET /history - List transcription history.

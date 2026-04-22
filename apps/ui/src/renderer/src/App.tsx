@@ -1,6 +1,8 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { History, Home, Mic2, Settings } from "lucide-react";
+import { ActiveMeetingBanner } from "./components/active-meeting-banner";
 import { DaemonDownBanner } from "./components/daemon-down";
+import { MeetingAutoNav } from "./components/meeting-auto-nav";
 import { cn } from "./lib/utils";
 
 const navItems = [
@@ -13,7 +15,9 @@ const navItems = [
 export function AppShell() {
   return (
     <div className="flex h-screen flex-col">
+      <MeetingAutoNav />
       <DaemonDownBanner />
+      <ActiveMeetingBanner />
       <div className="flex flex-1 min-h-0">
         <aside className="w-52 shrink-0 border-r bg-card">
           <div className="p-4">

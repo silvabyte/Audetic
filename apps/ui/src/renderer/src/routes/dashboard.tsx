@@ -1,11 +1,12 @@
 import { Observer } from "mobx-react-lite";
 import {
   Form,
+  Link,
   useFetcher,
   type ActionFunctionArgs,
   type RouteObject,
 } from "react-router-dom";
-import { Copy, Mic, StopCircle } from "lucide-react";
+import { Copy, Mic, Mic2, StopCircle } from "lucide-react";
 import {
   Card,
   CardContent,
@@ -130,6 +131,17 @@ function RecordingCard() {
             }}
           </Observer>
         </fetcher.Form>
+
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <span>Need a long-form recording?</span>
+          <Link
+            to="/meetings"
+            className="inline-flex items-center gap-1 font-medium text-foreground hover:underline"
+          >
+            <Mic2 className="h-3.5 w-3.5" />
+            Start a meeting
+          </Link>
+        </div>
 
         <Observer>
           {() => {

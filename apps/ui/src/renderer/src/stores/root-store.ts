@@ -1,6 +1,7 @@
 import { makeAutoObservable } from "mobx";
 import { createContext, useContext } from "react";
 import { HistoryStore } from "./history-store";
+import { MeetingStore } from "./meeting-store";
 import { MetaStore } from "./meta-store";
 import { StatusStore } from "./status-store";
 
@@ -13,22 +14,26 @@ export class RootStore {
   status: StatusStore;
   meta: MetaStore;
   history: HistoryStore;
+  meetings: MeetingStore;
 
   constructor() {
     this.status = new StatusStore(this);
     this.meta = new MetaStore(this);
     this.history = new HistoryStore(this);
+    this.meetings = new MeetingStore(this);
     makeAutoObservable(this);
   }
 
   /** Kick off background polling. Called once at app mount. */
   start(): void {
     this.status.start();
+    this.meetings.start();
   }
 
   /** Stop all polling. Called on window close / app quit. */
   stop(): void {
     this.status.stop();
+    this.meetings.stop();
   }
 
   /**

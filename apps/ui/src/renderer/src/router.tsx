@@ -2,6 +2,8 @@ import { createBrowserRouter } from "react-router-dom";
 import { AppShell } from "./App";
 import { dashboardRoute } from "./routes/dashboard";
 import { historyRoute } from "./routes/history";
+import { meetingsRoute } from "./routes/meetings";
+import { meetingDetailRoute } from "./routes/meeting-detail";
 import { PlaceholderRoute } from "./routes/placeholder";
 
 /**
@@ -17,10 +19,8 @@ export function createRouter(): ReturnType<typeof createBrowserRouter> {
       children: [
         dashboardRoute,
         historyRoute,
-        {
-          path: "meetings",
-          element: <PlaceholderRoute title="Meetings" phase="Phase 3" />,
-        },
+        meetingsRoute,
+        meetingDetailRoute,
         {
           path: "settings",
           element: <PlaceholderRoute title="Settings" phase="Phase 4" />,

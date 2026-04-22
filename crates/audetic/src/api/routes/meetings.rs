@@ -136,7 +136,7 @@ pub fn router(state: MeetingState) -> Router {
         .route("/meetings/toggle", post(toggle_meeting))
         .route("/meetings/status", get(meeting_status))
         .route("/meetings", get(list_meetings))
-        .route("/meetings/{id}", get(get_meeting))
+        .route("/meetings/:id", get(get_meeting))
         .with_state(state)
 }
 
@@ -221,7 +221,7 @@ pub async fn start_meeting(
             success: true,
             meeting_id: result.meeting_id,
             audio_path: result.audio_path.to_string_lossy().into_owned(),
-            capture_state: result.capture_state.as_str().to_string(),
+            capture_state: result.capture_state.tag().to_string(),
             message: format!("Meeting recording started ({})", result.capture_state.as_str()),
         })
         .into_response(),
@@ -312,7 +312,7 @@ pub async fn toggle_meeting(
                 meeting_id: r.meeting_id,
                 phase: "recording".to_string(),
                 audio_path: Some(r.audio_path.to_string_lossy().into_owned()),
-                capture_state: Some(r.capture_state.as_str().to_string()),
+                capture_state: Some(r.capture_state.tag().to_string()),
                 duration_seconds: None,
                 message: format!("Meeting recording started ({})", r.capture_state.as_str()),
             })

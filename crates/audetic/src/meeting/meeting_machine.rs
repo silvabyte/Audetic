@@ -36,11 +36,23 @@ pub enum CaptureState {
 }
 
 impl CaptureState {
+    /// Human-readable label for CLI output / notifications.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Both => "mic + system audio",
             Self::MicOnly => "mic only (system audio unavailable)",
             Self::SystemOnly => "system audio only (mic unavailable)",
+        }
+    }
+
+    /// Stable machine-readable tag for the HTTP API. Wire consumers
+    /// (the Electron UI) switch on these values; `as_str()` is for
+    /// humans and may change wording without breaking the contract.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::MicOnly => "mic_only",
+            Self::SystemOnly => "system_only",
         }
     }
 }
