@@ -1,6 +1,7 @@
 import { createBrowserRouter } from "react-router-dom";
 import { AppShell } from "./App";
 import { dashboardRoute } from "./routes/dashboard";
+import { historyRoute } from "./routes/history";
 import { PlaceholderRoute } from "./routes/placeholder";
 
 /**
@@ -15,10 +16,7 @@ export function createRouter(): ReturnType<typeof createBrowserRouter> {
       element: <AppShell />,
       children: [
         dashboardRoute,
-        {
-          path: "history",
-          element: <PlaceholderRoute title="History" phase="Phase 2" />,
-        },
+        historyRoute,
         {
           path: "meetings",
           element: <PlaceholderRoute title="Meetings" phase="Phase 3" />,

@@ -74,6 +74,11 @@ export class StatusStore {
       // The /status endpoint has a polymorphic response (waybar vs default);
       // here we only care about the default shape.
       const s = data as RecordingStatusResponse;
+      const nextCompletedId = s.last_completed_job?.history_id ?? null;
+      const prevCompletedId = this.lastCompletedJob?.history_id ?? null;
+      const newlyCompleted =
+        nextCompletedId !== null && nextCompletedId !== prevCompletedId;
+
       runInAction(() => {
         this.phase = normalizePhase(s.phase);
         this.currentJobId = s.job_id ?? null;
@@ -82,6 +87,13 @@ export class StatusStore {
         this.reachable = true;
         this.firstPollDone = true;
       });
+
+      // Cross-store poke: a new dictation just landed in the DB, so the
+      // history view should refresh. Fire-and-forget; HistoryStore
+      // guards against empty cache.
+      if (newlyCompleted) {
+        void this.root.history.invalidate();
+      }
     } catch {
       runInAction(() => {
         this.reachable = false;

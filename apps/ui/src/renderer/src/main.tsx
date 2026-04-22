@@ -26,8 +26,15 @@ const router = createRouter();
 
 if (import.meta.env.DEV) {
   // Expose for chrome-devtools-mcp evaluate_script assertions during smoke tests.
-  // Never used at runtime; refreshes are OK.
-  (window as unknown as { __rootStore: RootStore }).__rootStore = rootStore;
+  // Never used at runtime.
+  (window as unknown as {
+    __rootStore: RootStore;
+    __router: typeof router;
+  }).__rootStore = rootStore;
+  (window as unknown as {
+    __rootStore: RootStore;
+    __router: typeof router;
+  }).__router = router;
 }
 
 window.addEventListener("beforeunload", () => {

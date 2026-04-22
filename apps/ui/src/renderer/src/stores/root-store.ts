@@ -1,5 +1,6 @@
 import { makeAutoObservable } from "mobx";
 import { createContext, useContext } from "react";
+import { HistoryStore } from "./history-store";
 import { MetaStore } from "./meta-store";
 import { StatusStore } from "./status-store";
 
@@ -11,10 +12,12 @@ import { StatusStore } from "./status-store";
 export class RootStore {
   status: StatusStore;
   meta: MetaStore;
+  history: HistoryStore;
 
   constructor() {
     this.status = new StatusStore(this);
     this.meta = new MetaStore(this);
+    this.history = new HistoryStore(this);
     makeAutoObservable(this);
   }
 
