@@ -55,6 +55,7 @@ regex = "1.10"
 # HTTP server
 axum = "0.7"
 tower = "0.4"
+tower-http = { version = "0.5", features = ["cors"] }
 
 # OpenAPI spec generation
 utoipa = { version = "5.4", features = ["axum_extras"] }

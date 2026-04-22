@@ -1,10 +1,37 @@
 import React from "react";
 import ReactDOM from "react-dom/client";
-import { App } from "./App";
+import { RouterProvider } from "react-router-dom";
+import { configure } from "mobx";
+import { RootStore, RootStoreProvider } from "./stores/root-store";
+import { router } from "./router";
 import "./index.css";
+
+// MobX strict mode — fail loud in dev if any of our rules break.
+configure({
+  enforceActions: "always",
+  computedRequiresReaction: true,
+  reactionRequiresObservable: true,
+  observableRequiresReaction: true,
+  disableErrorBoundaries: false,
+});
+
+const rootStore = new RootStore();
+rootStore.start();
+
+if (import.meta.env.DEV) {
+  // Expose for chrome-devtools-mcp evaluate_script assertions during smoke tests.
+  // Never used at runtime; refreshes are OK.
+  (window as unknown as { __rootStore: RootStore }).__rootStore = rootStore;
+}
+
+window.addEventListener("beforeunload", () => {
+  rootStore.stop();
+});
 
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
-    <App />
+    <RootStoreProvider value={rootStore}>
+      <RouterProvider router={router} />
+    </RootStoreProvider>
   </React.StrictMode>,
 );

@@ -19,6 +19,7 @@ use axum::{response::Json, routing::get, Router};
 use serde::Serialize;
 use serde_json::Value;
 use tower::ServiceBuilder;
+use tower_http::cors::CorsLayer;
 use tracing::info;
 use utoipa::{OpenApi, ToSchema};
 
@@ -95,7 +96,11 @@ impl ApiServer {
             app = app.merge(routes::meetings::router(meeting_state));
         }
 
-        let app = app.layer(ServiceBuilder::new());
+        // Permissive CORS is safe here: the server binds to 127.0.0.1 only, so
+        // the only callers that can reach it are already on this machine. The
+        // Electron UI (and any future dev tool) needs CORS to fetch from its
+        // dev-server origin.
+        let app = app.layer(ServiceBuilder::new().layer(CorsLayer::permissive()));
 
         let listener = tokio::net::TcpListener::bind(&format!("127.0.0.1:{}", self.port)).await?;
 
