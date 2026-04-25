@@ -5,44 +5,15 @@ import { Toaster } from "sonner";
 import { ActiveMeetingBanner } from "./components/active-meeting-banner";
 import { DaemonDownBanner } from "./components/daemon-down";
 import { MeetingAutoNav } from "./components/meeting-auto-nav";
-import {
-  Tooltip,
-  TooltipContent,
-  TooltipProvider,
-  TooltipTrigger,
-} from "./components/ui/tooltip";
+import { TooltipProvider } from "./components/ui/tooltip";
 import { useStore } from "./stores/root-store";
 import { cn } from "./lib/utils";
 
 const navItems = [
-  {
-    to: "/",
-    label: "Dashboard",
-    icon: Home,
-    end: true,
-    hint: "Live status, toggle recording, last transcription",
-  },
-  {
-    to: "/history",
-    label: "History",
-    icon: History,
-    end: false,
-    hint: "Browse past dictations",
-  },
-  {
-    to: "/meetings",
-    label: "Meetings",
-    icon: Mic2,
-    end: false,
-    hint: "Long-form recordings (Super+Shift+R)",
-  },
-  {
-    to: "/settings",
-    label: "Settings",
-    icon: Settings,
-    end: false,
-    hint: "Provider, keybind, updates, appearance",
-  },
+  { to: "/", label: "Dashboard", icon: Home, end: true },
+  { to: "/history", label: "History", icon: History, end: false },
+  { to: "/meetings", label: "Meetings", icon: Mic2, end: false },
+  { to: "/settings", label: "Settings", icon: Settings, end: false },
 ];
 
 export function AppShell() {
@@ -62,26 +33,22 @@ export function AppShell() {
               {navItems.map((item) => {
                 const Icon = item.icon;
                 return (
-                  <Tooltip key={item.to}>
-                    <TooltipTrigger asChild>
-                      <NavLink
-                        to={item.to}
-                        end={item.end}
-                        className={({ isActive }) =>
-                          cn(
-                            "flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors",
-                            isActive
-                              ? "bg-accent text-accent-foreground"
-                              : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
-                          )
-                        }
-                      >
-                        <Icon className="h-4 w-4" />
-                        {item.label}
-                      </NavLink>
-                    </TooltipTrigger>
-                    <TooltipContent side="right">{item.hint}</TooltipContent>
-                  </Tooltip>
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    end={item.end}
+                    className={({ isActive }) =>
+                      cn(
+                        "flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors",
+                        isActive
+                          ? "bg-accent text-accent-foreground"
+                          : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+                      )
+                    }
+                  >
+                    <Icon className="h-4 w-4" />
+                    {item.label}
+                  </NavLink>
                 );
               })}
             </nav>
