@@ -2,6 +2,7 @@ import { makeAutoObservable } from "mobx";
 import { createContext, useContext } from "react";
 import { ConfigStore } from "./config-store";
 import { HistoryStore } from "./history-store";
+import { InstallStore } from "./install-store";
 import { MeetingStore } from "./meeting-store";
 import { MetaStore } from "./meta-store";
 import { StatusStore } from "./status-store";
@@ -19,6 +20,7 @@ export class RootStore {
   meetings: MeetingStore;
   config: ConfigStore;
   ui: UiStore;
+  install: InstallStore;
 
   constructor() {
     this.status = new StatusStore(this);
@@ -27,6 +29,7 @@ export class RootStore {
     this.meetings = new MeetingStore(this);
     this.config = new ConfigStore(this);
     this.ui = new UiStore(this);
+    this.install = new InstallStore(this);
     makeAutoObservable(this);
   }
 
@@ -37,12 +40,14 @@ export class RootStore {
     // UiStore.start is async (reads persisted theme via IPC). Fire-and-
     // forget — theme flicker is bounded by the one-round-trip to main.
     void this.ui.start();
+    this.install.start();
   }
 
   /** Stop all polling. Called on window close / app quit. */
   stop(): void {
     this.status.stop();
     this.meetings.stop();
+    this.install.stop();
   }
 
   /**

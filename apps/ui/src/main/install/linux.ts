@@ -83,7 +83,33 @@ export async function installService(
     throw new Error(`systemctl enable --now failed (code ${enable})`);
   }
 
+  // systemctl returns as soon as the unit is started, but the daemon
+  // takes ~1s to bind 3737. Poll /version so callers can rely on
+  // "install resolved" meaning "the daemon is reachable".
+  onProgress("wait-ready", "Waiting for the daemon to come up");
+  await waitForDaemon(15_000);
+
   onProgress("done", "Daemon service started");
+}
+
+const DAEMON_VERSION_URL = "http://127.0.0.1:3737/version";
+
+async function waitForDaemon(timeoutMs: number): Promise<void> {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const r = await fetch(DAEMON_VERSION_URL, {
+        signal: AbortSignal.timeout(1000),
+      });
+      if (r.ok) return;
+    } catch {
+      // not ready yet
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+  throw new Error(
+    "Daemon didn't respond on 127.0.0.1:3737 within 15s of `systemctl --user enable --now`. Check `journalctl --user -u audetic.service` for the failure.",
+  );
 }
 
 /** Stop and disable the unit. Used by the future "uninstall daemon" flow. */

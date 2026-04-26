@@ -3,8 +3,8 @@ import { Observer } from "mobx-react-lite";
 import { History, Home, Mic2, Settings } from "lucide-react";
 import { Toaster } from "sonner";
 import { ActiveMeetingBanner } from "./components/active-meeting-banner";
-import { DaemonDownBanner } from "./components/daemon-down";
 import { MeetingAutoNav } from "./components/meeting-auto-nav";
+import { OnboardingCard } from "./components/onboarding-card";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { useStore } from "./stores/root-store";
 import { cn } from "./lib/utils";
@@ -22,7 +22,7 @@ export function AppShell() {
     <TooltipProvider delayDuration={300}>
       <div className="flex h-screen flex-col">
         <MeetingAutoNav />
-        <DaemonDownBanner />
+        <OnboardingCard />
         <ActiveMeetingBanner />
         <div className="flex flex-1 min-h-0">
           <aside className="w-52 shrink-0 border-r bg-card">
