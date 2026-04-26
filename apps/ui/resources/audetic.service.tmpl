@@ -1,0 +1,28 @@
+[Unit]
+Description=Audetic Voice Transcription Service
+Documentation=https://github.com/silvabyte/Audetic
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=__EXEC_START__
+Restart=always
+RestartSec=5
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+Environment="RUST_LOG=info"
+
+# Security and resource limits — mirrors the curl-bash unit at the repo
+# root (audetic.service) so behavior stays consistent across install paths.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.config/audetic %h/.local/share/audetic %t
+# Whisper models can need significant memory.
+MemoryMax=6G
+CPUQuota=80%
+
+[Install]
+WantedBy=default.target

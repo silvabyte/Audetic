@@ -12,7 +12,11 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck": "bun run typecheck:node && bun run typecheck:web",
-    "codegen": "openapi-typescript http://127.0.0.1:3737/openapi.json -o src/renderer/src/api/schema.ts"
+    "codegen": "openapi-typescript http://127.0.0.1:3737/openapi.json -o src/renderer/src/api/schema.ts",
+    "build-daemon": "bun scripts/build-daemon.ts",
+    "package:linux": "bun run build-daemon --target=x86_64-unknown-linux-gnu && bun run build && electron-builder --linux",
+    "package:linux:arm64": "bun run build-daemon --target=aarch64-unknown-linux-gnu && bun run build && electron-builder --linux --arm64",
+    "package:mac": "bun run build-daemon --target=aarch64-apple-darwin && bun run build && electron-builder --mac --arm64"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",
@@ -23,6 +27,7 @@
     "clsx": "^2.1.1",
     "date-fns": "^4.1.0",
     "electron-store": "^11.0.2",
+    "electron-updater": "^6.8.3",
     "lucide-react": "^0.477.0",
     "mobx": "^6.13.5",
     "mobx-react-lite": "^4.1.0",
@@ -42,7 +47,7 @@
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^33.2.0",
-    "electron-builder": "^25.1.8",
+    "electron-builder": "^26.8.1",
     "electron-vite": "^2.3.0",
     "openapi-typescript": "^7.4.4",
     "tailwindcss": "^4.0.0",
