@@ -22,7 +22,20 @@ export type OnboardingResult =
   | { ok: true }
   | { ok: false; error: string };
 
+export type AppUpdateEvent =
+  | { kind: "checking" }
+  | { kind: "available"; version: string; releaseName?: string }
+  | { kind: "not-available"; currentVersion: string }
+  | { kind: "progress"; percent: number; bytesPerSecond: number }
+  | { kind: "downloaded"; version: string }
+  | { kind: "error"; message: string };
+
+export type AutoUpdateInvokeResult =
+  | { ok: true }
+  | { ok: false; reason: string };
+
 const PROGRESS_CHANNEL = "audetic:onboarding:progress";
+const APP_UPDATE_CHANNEL = "audetic:autoUpdate:event";
 
 const audetic = {
   platform: process.platform as NodeJS.Platform,
@@ -76,6 +89,33 @@ const audetic = {
       };
       ipcRenderer.on(PROGRESS_CHANNEL, listener);
       return () => ipcRenderer.removeListener(PROGRESS_CHANNEL, listener);
+    },
+  },
+
+  /**
+   * App auto-update — see src/main/auto-update.ts. In dev (`!app.isPackaged`)
+   * `check` and `install` resolve with `{ ok: false, reason: "dev" }`; the
+   * event stream is silent. Real behavior only kicks in on packaged builds.
+   */
+  autoUpdate: {
+    check(): Promise<AutoUpdateInvokeResult> {
+      return ipcRenderer.invoke("audetic:autoUpdate:check");
+    },
+    install(): Promise<AutoUpdateInvokeResult> {
+      return ipcRenderer.invoke("audetic:autoUpdate:install");
+    },
+    currentVersion(): Promise<string> {
+      return ipcRenderer.invoke("audetic:autoUpdate:currentVersion");
+    },
+    onEvent(callback: (e: AppUpdateEvent) => void): () => void {
+      const listener = (
+        _event: Electron.IpcRendererEvent,
+        payload: AppUpdateEvent,
+      ): void => {
+        callback(payload);
+      };
+      ipcRenderer.on(APP_UPDATE_CHANNEL, listener);
+      return () => ipcRenderer.removeListener(APP_UPDATE_CHANNEL, listener);
     },
   },
 };

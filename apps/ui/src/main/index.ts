@@ -2,6 +2,7 @@ import { BrowserWindow, app, ipcMain, screen, shell } from "electron";
 import Store from "electron-store";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { destroyAutoUpdate, registerAutoUpdateIpc } from "./auto-update";
 import { registerOnboardingIpc } from "./onboarding";
 import { destroyTray, initTray } from "./tray";
 
@@ -174,6 +175,7 @@ app.whenReady().then(() => {
   createWindow();
   initTray(toggleWindow);
   registerOnboardingIpc(() => mainWindow);
+  registerAutoUpdateIpc(() => mainWindow);
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
@@ -184,6 +186,7 @@ app.whenReady().then(() => {
 app.on("before-quit", () => {
   (app as unknown as { isQuitting: boolean }).isQuitting = true;
   destroyTray();
+  destroyAutoUpdate();
 });
 
 // On Linux/Windows we hide to tray on window close instead of quitting, and

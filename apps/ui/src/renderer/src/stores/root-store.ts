@@ -1,5 +1,6 @@
 import { makeAutoObservable } from "mobx";
 import { createContext, useContext } from "react";
+import { AppUpdateStore } from "./app-update-store";
 import { ConfigStore } from "./config-store";
 import { HistoryStore } from "./history-store";
 import { InstallStore } from "./install-store";
@@ -21,6 +22,7 @@ export class RootStore {
   config: ConfigStore;
   ui: UiStore;
   install: InstallStore;
+  appUpdate: AppUpdateStore;
 
   constructor() {
     this.status = new StatusStore(this);
@@ -30,6 +32,7 @@ export class RootStore {
     this.config = new ConfigStore(this);
     this.ui = new UiStore(this);
     this.install = new InstallStore(this);
+    this.appUpdate = new AppUpdateStore(this);
     makeAutoObservable(this);
   }
 
@@ -41,6 +44,7 @@ export class RootStore {
     // forget — theme flicker is bounded by the one-round-trip to main.
     void this.ui.start();
     this.install.start();
+    this.appUpdate.start();
   }
 
   /** Stop all polling. Called on window close / app quit. */
@@ -48,6 +52,7 @@ export class RootStore {
     this.status.stop();
     this.meetings.stop();
     this.install.stop();
+    this.appUpdate.stop();
   }
 
   /**

@@ -78,15 +78,125 @@ function SettingsUpdates() {
       <header>
         <h2 className="text-xl font-semibold">Updates</h2>
         <p className="text-sm text-muted-foreground">
-          Daemon self-update. Binary is fetched from install.audetic.ai on
-          the configured channel.
+          Audetic checks GitHub Releases for new versions and downloads
+          them in the background. Restart to apply.
         </p>
       </header>
 
-      <UpdateStatusCard />
-      <AutoUpdateCard />
+      <AppUpdateCard />
+      <DaemonSection />
     </div>
   );
+}
+
+/** Wraps the legacy daemon-self-update cards. They're only relevant for
+ * users on the curl-bash daemon (no bundled binary detected) — bundled
+ * users get their daemon updated automatically as part of the app update
+ * via electron-updater's quitAndInstall. */
+function DaemonSection() {
+  const store = useStore();
+  return (
+    <Observer>
+      {() => {
+        const isBundled = store.install.state.installedVersion !== null;
+        if (isBundled) return null;
+        return (
+          <section className="space-y-4">
+            <h3 className="text-sm font-medium text-muted-foreground">
+              Daemon (curl-bash install)
+            </h3>
+            <UpdateStatusCard />
+            <AutoUpdateCard />
+          </section>
+        );
+      }}
+    </Observer>
+  );
+}
+
+function AppUpdateCard() {
+  const store = useStore();
+  return (
+    <Observer>
+      {() => {
+        const u = store.appUpdate;
+        const phase = u.phase;
+        const version = u.currentVersion ?? "unknown";
+
+        return (
+          <Card>
+            <CardHeader className="flex-row items-start justify-between gap-4 space-y-0">
+              <div className="space-y-1 min-w-0">
+                <CardTitle className="text-base">App version</CardTitle>
+                <CardDescription>
+                  Current <code className="font-mono">{version}</code>
+                  {u.latestVersion && u.latestVersion !== version
+                    ? ` · latest ${u.latestVersion}`
+                    : ""}
+                </CardDescription>
+              </div>
+              <div className="flex gap-2 shrink-0">
+                {u.ready ? (
+                  <Button size="sm" onClick={() => void u.install()}>
+                    <Download className="mr-1 h-3.5 w-3.5" />
+                    Restart and update
+                  </Button>
+                ) : (
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => void u.check()}
+                    disabled={phase === "checking" || phase === "downloading"}
+                  >
+                    <RefreshCcw
+                      className={cn(
+                        "mr-1 h-3.5 w-3.5",
+                        phase === "checking" && "animate-spin",
+                      )}
+                    />
+                    {phase === "checking" ? "Checking…" : "Check"}
+                  </Button>
+                )}
+              </div>
+            </CardHeader>
+            {phase === "downloading" && (
+              <CardContent className="space-y-2">
+                <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                  <div
+                    className="h-full bg-primary transition-all"
+                    style={{ width: `${u.progressPercent}%` }}
+                  />
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  Downloading {u.latestVersion ?? ""} · {u.progressPercent}%
+                  {u.bytesPerSecond > 0
+                    ? ` · ${formatBps(u.bytesPerSecond)}`
+                    : ""}
+                </div>
+              </CardContent>
+            )}
+            {phase === "not-available" && (
+              <CardContent className="text-xs text-muted-foreground">
+                You're up to date.
+              </CardContent>
+            )}
+            {phase === "error" && u.error && (
+              <CardContent className="text-xs text-destructive">
+                {u.error}
+              </CardContent>
+            )}
+          </Card>
+        );
+      }}
+    </Observer>
+  );
+}
+
+function formatBps(bps: number): string {
+  if (bps > 1_000_000) return `${(bps / 1_000_000).toFixed(1)} MB/s`;
+  if (bps > 1_000) return `${(bps / 1_000).toFixed(0)} KB/s`;
+  return `${bps} B/s`;
 }
 
 function UpdateStatusCard() {

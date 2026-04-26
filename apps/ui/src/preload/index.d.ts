@@ -1,5 +1,7 @@
 import type {
+  AppUpdateEvent,
   AudeticBridge,
+  AutoUpdateInvokeResult,
   OnboardingProgress,
   OnboardingResult,
   OnboardingState,
@@ -15,7 +17,9 @@ declare global {
 // Re-export types so renderer code can import them from "@/preload" without
 // also pulling in the preload module itself (which uses Electron node APIs).
 export type {
+  AppUpdateEvent,
   AudeticBridge,
+  AutoUpdateInvokeResult,
   OnboardingProgress,
   OnboardingResult,
   OnboardingState,
