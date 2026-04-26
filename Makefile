@@ -11,7 +11,7 @@ USE_CROSS ?= 0
 EXTRA_FEATURES ?=
 AUTO_COMMIT ?= 1
 
-.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix deploy deploy-beta deploy-stable ui-install ui-dev ui-build ui-typecheck codegen
+.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix deploy deploy-beta deploy-stable ui-install ui-dev ui-build ui-typecheck ui-package ui-package-arm64 ui-package-mac codegen
 
 # Default target
 help:
@@ -40,11 +40,14 @@ help:
 	@echo "  make deploy-beta  - Deploy to beta channel (convenience for CHANNEL=beta)"
 	@echo "  make deploy-stable- Deploy to stable channel (convenience for CHANNEL=stable)"
 	@echo ""
-	@echo "  make ui-install   - Install Electron UI dependencies (bun)"
-	@echo "  make ui-dev       - Run the Electron UI in dev mode"
-	@echo "  make ui-build     - Build the Electron UI (out/)"
-	@echo "  make ui-typecheck - Typecheck the Electron UI"
-	@echo "  make codegen      - Regenerate apps/ui TS types from daemon /openapi.json"
+	@echo "  make ui-install        - Install Electron UI dependencies (bun)"
+	@echo "  make ui-dev            - Run the Electron UI in dev mode"
+	@echo "  make ui-build          - Build the Electron UI (out/)"
+	@echo "  make ui-typecheck      - Typecheck the Electron UI"
+	@echo "  make ui-package        - Build daemon + UI -> Linux x64 AppImage + .deb"
+	@echo "  make ui-package-arm64  - Same as ui-package but for aarch64"
+	@echo "  make ui-package-mac    - Build daemon + UI -> macOS arm64 DMG (signing required, phase 7)"
+	@echo "  make codegen           - Regenerate apps/ui TS types from daemon /openapi.json"
 
 # Build commands
 build:
@@ -128,6 +131,22 @@ ui-typecheck:
 
 codegen:
 	cd apps/ui && bun run codegen
+
+# Bundled-binary packaging — builds the daemon for the requested target,
+# stages it under apps/ui/resources/bin/, runs electron-vite, then
+# electron-builder. Output goes to apps/ui/release/.
+#
+#   make ui-package        # native Linux x64 AppImage + .deb
+#   make ui-package-arm64  # Linux aarch64 AppImage + .deb
+#   make ui-package-mac    # macOS arm64 DMG (phase 7 — needs signing)
+ui-package:
+	cd apps/ui && bun run package:linux
+
+ui-package-arm64:
+	cd apps/ui && bun run package:linux:arm64
+
+ui-package-mac:
+	cd apps/ui && bun run package:mac
 
 # Cleanup
 clean:

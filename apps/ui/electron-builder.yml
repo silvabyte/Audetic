@@ -29,6 +29,10 @@ extraResources:
 linux:
   category: AudioVideo
   executableName: audetic-ui
+  # Override the npm-scoped package name (@audetic/ui) so artifact paths
+  # don't include a slash. Without this fpm tries to write to a missing
+  # release/@audetic/ subdirectory.
+  artifactName: "audetic-${version}-${arch}.${ext}"
   synopsis: Voice-to-text desktop companion for the Audetic daemon
   description: |
     Electron + React desktop UI for the Audetic voice-to-text daemon.
