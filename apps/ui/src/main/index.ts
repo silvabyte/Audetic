@@ -2,6 +2,7 @@ import { BrowserWindow, app, ipcMain, screen, shell } from "electron";
 import Store from "electron-store";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { registerOnboardingIpc } from "./onboarding";
 import { destroyTray, initTray } from "./tray";
 
 type ThemeMode = "system" | "light" | "dark";
@@ -172,6 +173,7 @@ function toggleWindow(): void {
 app.whenReady().then(() => {
   createWindow();
   initTray(toggleWindow);
+  registerOnboardingIpc(() => mainWindow);
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
