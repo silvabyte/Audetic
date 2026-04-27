@@ -95,7 +95,7 @@ deploy-stable:
 
 # Service management
 run:
-	RUST_LOG=info cargo run --release
+	AUDETIC_DISABLE_AUTO_UPDATE=1 RUST_LOG=info cargo run --release
 
 logs:
 	journalctl --user -u audetic.service -f
