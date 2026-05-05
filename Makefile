@@ -11,7 +11,10 @@ USE_CROSS ?= 0
 EXTRA_FEATURES ?=
 AUTO_COMMIT ?= 1
 
-.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix deploy deploy-beta deploy-stable ui-install ui-dev ui-build ui-typecheck ui-package ui-package-arm64 ui-package-mac codegen
+.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix deploy deploy-beta deploy-stable \
+        ui-install ui-dev ui-build ui-preview ui-typecheck codegen \
+        electron-install electron-dev electron-build electron-typecheck electron-codegen \
+        electron-package electron-package-arm64 electron-package-mac
 
 # Default target
 help:
@@ -40,14 +43,23 @@ help:
 	@echo "  make deploy-beta  - Deploy to beta channel (convenience for CHANNEL=beta)"
 	@echo "  make deploy-stable- Deploy to stable channel (convenience for CHANNEL=stable)"
 	@echo ""
-	@echo "  make ui-install        - Install Electron UI dependencies (bun)"
-	@echo "  make ui-dev            - Run the Electron UI in dev mode"
-	@echo "  make ui-build          - Build the Electron UI (out/)"
-	@echo "  make ui-typecheck      - Typecheck the Electron UI"
-	@echo "  make ui-package        - Build daemon + UI -> Linux x64 AppImage + .deb"
-	@echo "  make ui-package-arm64  - Same as ui-package but for aarch64"
-	@echo "  make ui-package-mac    - Build daemon + UI -> macOS arm64 DMG (signing required, phase 7)"
-	@echo "  make codegen           - Regenerate apps/ui TS types from daemon /openapi.json"
+	@echo "  Web UI (apps/web-ui — current):"
+	@echo "  make ui-install        - Install web UI dependencies (bun)"
+	@echo "  make ui-dev            - Run the web UI in dev mode (vite at :5173)"
+	@echo "  make ui-build          - Build the web UI to static files (dist/)"
+	@echo "  make ui-preview        - Preview the production build locally"
+	@echo "  make ui-typecheck      - Typecheck the web UI"
+	@echo "  make codegen           - Regenerate apps/web-ui TS types from daemon /openapi.json"
+	@echo ""
+	@echo "  Electron UI (apps/ui — legacy, kept until web-ui reaches parity):"
+	@echo "  make electron-install        - Install Electron UI dependencies (bun)"
+	@echo "  make electron-dev            - Run the Electron UI in dev mode"
+	@echo "  make electron-build          - Build the Electron UI (out/)"
+	@echo "  make electron-typecheck      - Typecheck the Electron UI"
+	@echo "  make electron-codegen        - Regenerate apps/ui TS types from daemon /openapi.json"
+	@echo "  make electron-package        - Build daemon + Electron UI -> Linux x64 AppImage + .deb"
+	@echo "  make electron-package-arm64  - Same as electron-package but for aarch64"
+	@echo "  make electron-package-mac    - Build daemon + Electron UI -> macOS arm64 DMG (signing required, phase 7)"
 
 # Build commands
 build:
@@ -116,36 +128,55 @@ status:
 	@systemctl --user is-active audetic.service >/dev/null 2>&1 && echo "✓ Service is running" || echo "✗ Service is not running"
 	@curl -s http://127.0.0.1:3737/status 2>/dev/null | python3 -m json.tool || echo "✗ API not responding"
 
-# Electron UI (apps/ui)
+# Web UI (apps/web-ui) — current SPA. Daemon must be running for codegen and dev.
 ui-install:
-	cd apps/ui && bun install
+	cd apps/web-ui && bun install
 
 ui-dev:
-	cd apps/ui && bun run dev
+	cd apps/web-ui && bun run dev
 
 ui-build:
-	cd apps/ui && bun run build
+	cd apps/web-ui && bun run build
+
+ui-preview:
+	cd apps/web-ui && bun run preview
 
 ui-typecheck:
-	cd apps/ui && bun run typecheck
+	cd apps/web-ui && bun run typecheck
 
 codegen:
+	cd apps/web-ui && bun run codegen
+
+# Electron UI (apps/ui) — legacy, kept until web-ui reaches parity, then deleted.
+electron-install:
+	cd apps/ui && bun install
+
+electron-dev:
+	cd apps/ui && bun run dev
+
+electron-build:
+	cd apps/ui && bun run build
+
+electron-typecheck:
+	cd apps/ui && bun run typecheck
+
+electron-codegen:
 	cd apps/ui && bun run codegen
 
-# Bundled-binary packaging — builds the daemon for the requested target,
-# stages it under apps/ui/resources/bin/, runs electron-vite, then
-# electron-builder. Output goes to apps/ui/release/.
+# Bundled-binary packaging — Electron-only. Builds the daemon for the
+# requested target, stages it under apps/ui/resources/bin/, runs
+# electron-vite, then electron-builder. Output goes to apps/ui/release/.
 #
-#   make ui-package        # native Linux x64 AppImage + .deb
-#   make ui-package-arm64  # Linux aarch64 AppImage + .deb
-#   make ui-package-mac    # macOS arm64 DMG (phase 7 — needs signing)
-ui-package:
+#   make electron-package        # native Linux x64 AppImage + .deb
+#   make electron-package-arm64  # Linux aarch64 AppImage + .deb
+#   make electron-package-mac    # macOS arm64 DMG (phase 7 — needs signing)
+electron-package:
 	cd apps/ui && bun run package:linux
 
-ui-package-arm64:
+electron-package-arm64:
 	cd apps/ui && bun run package:linux:arm64
 
-ui-package-mac:
+electron-package-mac:
 	cd apps/ui && bun run package:mac
 
 # Cleanup

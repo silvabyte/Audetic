@@ -6,8 +6,8 @@ import type { MenuContext, Phase, TrayAdapter, TrayAdapterInit } from "./adapter
  *
  * Windows isn't a target platform for Audetic right now, but this file
  * keeps the door open and the selection logic in `index.ts` exhaustive.
- * Current behavior mirrors Linux so `make ui-dev` doesn't break if
- * someone happens to run the repo on Windows.
+ * Current behavior mirrors Linux so `make electron-dev` doesn't break
+ * if someone happens to run the repo on Windows.
  *
  * TODO (if/when Windows support is ever in scope):
  *   - Prefer 16x16 (or 32x32 for high-DPI) ICO/PNG tray icons; 22x22

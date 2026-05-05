@@ -7,7 +7,7 @@ import type { MenuContext, Phase, TrayAdapter, TrayAdapterInit } from "./adapter
  * Not fully implemented in Phase 1. This file is the landing pad for
  * Mac-specific work in Phase 5 (or whenever we first smoke-test on the
  * MacBook). Current behavior mirrors Linux so the dev loop still works
- * if someone runs `make ui-dev` on macOS.
+ * if someone runs `make electron-dev` on macOS.
  *
  * TODO (Phase 5):
  *   - Replace the 22x22 color PNGs with template images: solid black +
