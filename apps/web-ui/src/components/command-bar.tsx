@@ -1,40 +1,39 @@
 import { Observer } from "mobx-react-lite";
-import { Link, useFetcher } from "react-router-dom";
-import { Mic, Mic2, StopCircle, WifiOff } from "lucide-react";
-import { Button, buttonVariants } from "@/components/ui/button";
+import { useFetcher } from "react-router-dom";
+import { Mic, Radio, Square, WifiOff } from "lucide-react";
+import { Button } from "@/components/ui/button";
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import { StatusPill } from "@/components/status-pill";
+import { StateOrb } from "@/components/state-orb";
 import { ActiveMeetingBanner } from "@/components/active-meeting-banner";
 import { useStore } from "@/stores/root-store";
 import { DICTATIONS_INTENTS } from "@/routes/dictations";
+import { MEETING_INTENTS } from "@/routes/meetings";
 
 /**
  * Omnipresent command bar — sticky strip at the top of the app shell.
- * Shows current dictation phase + start/stop and a meeting entry point.
  *
- * Subsumes <ActiveMeetingBanner /> by rendering it inline below the
- * strip. The banner self-hides at idle, so the bar collapses to a single
- * row most of the time.
+ * The Audetic icon on the left is the primary state indicator: it
+ * pulses, glows, and shifts color based on the live dictation /
+ * meeting / pipeline state coming from the daemon. The two icon
+ * actions on the right toggle dictation and meeting directly — no
+ * navigation required.
  *
- * Posts the dictation toggle to `/dictations` (action="/dictations") —
- * the dictations route action knows how to toggle the recording
- * pipeline. The post works from any view; react-router accepts absolute
- * paths on fetcher form actions.
+ * <ActiveMeetingBanner /> still renders below for meeting-only
+ * affordances (capture-state, phase ribbon, Cancel).
  */
 export function CommandBar() {
   return (
     <header className="sticky top-0 z-20 w-full border-b bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
       <div className="mx-auto flex w-full max-w-5xl items-center gap-3 px-4 py-2">
-        <div className="text-sm font-semibold">Audetic</div>
-        <StatusPill />
+        <StateOrb />
         <DaemonReachabilityChip />
         <div className="flex-1" />
         <DictationToggleButton />
-        <MeetingEntryButton />
+        <MeetingToggleButton />
       </div>
       <ActiveMeetingBanner />
     </header>
@@ -73,63 +72,156 @@ function DictationToggleButton() {
   return (
     <Observer>
       {() => {
-        const busy = store.status.isBusy;
+        const phase = store.status.phase;
+        const recording = phase === "recording";
+        const processing = phase === "processing";
         const meetingLive = store.meetings.active;
-        // Dictation and meeting share the audio pipeline — disable the
-        // dictation toggle while a meeting is recording so the user
-        // can't accidentally interleave them.
-        const disabled = submitting || meetingLive;
+        const meetingPipeline =
+          store.meetings.phase === "compressing" ||
+          store.meetings.phase === "transcribing" ||
+          store.meetings.phase === "running_hook";
+        const reachable = store.daemonReachable;
+
+        // Mid-pipeline (processing dictation, or any meeting state) =
+        // not actionable. Show a spinner, disable, and explain why.
+        // Dictation and meeting share the audio pipeline.
+        const inFlight = processing;
+        const blockedByMeeting = meetingLive || meetingPipeline;
+        const disabled =
+          submitting || inFlight || blockedByMeeting || !reachable;
+
+        let Icon = Mic;
+        let variant: "ghost" | "destructive" = "ghost";
+        let label = submitting
+          ? "Starting dictation…"
+          : "Start dictation (Super+R)";
+
+        if (recording) {
+          Icon = Square;
+          variant = "destructive";
+          label = submitting ? "Stopping dictation…" : "Stop dictation";
+        } else if (processing) {
+          // Orb already shows the spinning pipeline state — keep the
+          // button inert with the resting icon so we don't double up.
+          label = "Transcribing dictation…";
+        } else if (meetingLive) {
+          label = "Meeting in progress — dictation unavailable";
+        } else if (meetingPipeline) {
+          label = "Meeting pipeline running — dictation unavailable";
+        }
+
         return (
-          <fetcher.Form method="post" action="/dictations">
-            <input
-              type="hidden"
-              name="intent"
-              value={DICTATIONS_INTENTS.toggle}
-            />
-            <Button
-              type="submit"
-              size="sm"
-              variant={busy ? "destructive" : "default"}
-              disabled={disabled}
-            >
-              {busy ? (
-                <>
-                  <StopCircle className="mr-1 h-3.5 w-3.5" />
-                  {submitting ? "Stopping…" : "Stop dictation"}
-                </>
-              ) : (
-                <>
-                  <Mic className="mr-1 h-3.5 w-3.5" />
-                  {submitting ? "Starting…" : "Start dictation"}
-                </>
-              )}
-            </Button>
-          </fetcher.Form>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <fetcher.Form method="post" action="/dictations">
+                <input
+                  type="hidden"
+                  name="intent"
+                  value={DICTATIONS_INTENTS.toggle}
+                />
+                <Button
+                  type="submit"
+                  size="icon"
+                  variant={variant}
+                  disabled={disabled}
+                  aria-label={label}
+                  className="h-9 w-9 rounded-full"
+                >
+                  <Icon
+                    className="h-4 w-4"
+                    {...(recording ? { fill: "currentColor" } : {})}
+                  />
+                </Button>
+              </fetcher.Form>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{label}</TooltipContent>
+          </Tooltip>
         );
       }}
     </Observer>
   );
 }
 
-function MeetingEntryButton() {
+function MeetingToggleButton() {
   const store = useStore();
+  const fetcher = useFetcher();
+  const submitting = fetcher.state !== "idle";
+
   return (
     <Observer>
       {() => {
-        // While a meeting is live the ActiveMeetingBanner (rendered
-        // directly below) provides Stop/Cancel — no point duplicating
-        // here. Hide the entry button so users aren't tempted.
-        if (store.meetings.active) return null;
+        const meetingLive = store.meetings.active;
+        const meetingPipeline =
+          store.meetings.phase === "compressing" ||
+          store.meetings.phase === "transcribing" ||
+          store.meetings.phase === "running_hook";
+        const dictationBusy = store.status.isBusy;
+        const reachable = store.daemonReachable;
+
+        // Mid-pipeline = not actionable; show a spinner. Otherwise
+        // toggle between start (ghost + Radio) and stop (default +
+        // Square). Dictation in any busy phase blocks meeting start.
+        const inFlight = meetingPipeline;
+        const blockedByDictation = !meetingLive && dictationBusy;
+        const disabled =
+          submitting || inFlight || blockedByDictation || !reachable;
+
+        let Icon = Radio;
+        let variant: "ghost" | "default" = "ghost";
+        let intent: string = MEETING_INTENTS.start;
+        let label = submitting
+          ? "Starting meeting…"
+          : "Start meeting (Super+Shift+R)";
+
+        if (meetingLive) {
+          Icon = Square;
+          variant = "default";
+          intent = MEETING_INTENTS.stop;
+          label = submitting ? "Stopping meeting…" : "Stop meeting";
+        } else if (meetingPipeline) {
+          // Orb spins for the pipeline; button stays inert.
+          label = `Meeting ${meetingPhaseVerb(store.meetings.phase)}…`;
+        } else if (dictationBusy) {
+          label = "Dictation in progress — meeting unavailable";
+        }
+
         return (
-          <Link
-            to="/meetings"
-            className={buttonVariants({ variant: "outline", size: "sm" })}
-          >
-            <Mic2 className="mr-1 h-3.5 w-3.5" />
-            New meeting
-          </Link>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <fetcher.Form method="post" action="/meetings">
+                <input type="hidden" name="intent" value={intent} />
+                <Button
+                  type="submit"
+                  size="icon"
+                  variant={variant}
+                  disabled={disabled}
+                  aria-label={label}
+                  className="h-9 w-9 rounded-full"
+                >
+                  <Icon
+                    className="h-4 w-4"
+                    {...(meetingLive ? { fill: "currentColor" } : {})}
+                  />
+                </Button>
+              </fetcher.Form>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">{label}</TooltipContent>
+          </Tooltip>
         );
       }}
     </Observer>
   );
+}
+
+function meetingPhaseVerb(phase: string): string {
+  switch (phase) {
+    case "compressing":
+      return "compressing";
+    case "transcribing":
+      return "transcribing";
+    case "running_hook":
+      return "running hook";
+    default:
+      return "working";
+  }
 }
