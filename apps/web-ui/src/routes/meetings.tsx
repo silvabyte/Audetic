@@ -5,7 +5,7 @@ import {
   type ActionFunctionArgs,
   type RouteObject,
 } from "react-router-dom";
-import { Mic2 } from "lucide-react";
+import { Radio } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -151,7 +151,7 @@ function StartMeetingButton() {
           <Dialog open={open} onOpenChange={setOpen}>
             <DialogTrigger asChild>
               <Button disabled={inProgress || submitting}>
-                <Mic2 className="mr-2 h-4 w-4" />
+                <Radio className="mr-2 h-4 w-4" />
                 New meeting
               </Button>
             </DialogTrigger>
@@ -191,7 +191,7 @@ function StartMeetingButton() {
                     Cancel
                   </Button>
                   <Button type="submit" disabled={submitting}>
-                    <Mic2 className="mr-2 h-4 w-4" />
+                    <Radio className="mr-2 h-4 w-4" />
                     Start
                   </Button>
                 </DialogFooter>

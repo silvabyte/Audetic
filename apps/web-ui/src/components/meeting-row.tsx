@@ -1,5 +1,5 @@
 import { NavLink } from "react-router-dom";
-import { Mic, CheckCircle2, TriangleAlert, Loader2, XCircle } from "lucide-react";
+import { Radio, CheckCircle2, TriangleAlert, Loader2, XCircle } from "lucide-react";
 import { Card, CardContent } from "@/components/ui/card";
 import type { MeetingSummary } from "@/stores/meeting-store";
 import { cn } from "@/lib/utils";
@@ -43,7 +43,7 @@ function StatusIcon({ status }: { status: string }) {
   if (s === "recording" || s === "compressing" || s === "transcribing" || s === "running_hook") {
     return <Loader2 className="h-5 w-5 animate-spin text-blue-400" />;
   }
-  return <Mic className="h-5 w-5 text-muted-foreground" />;
+  return <Radio className="h-5 w-5 text-muted-foreground" />;
 }
 
 function StatusPill({ status }: { status: string }) {

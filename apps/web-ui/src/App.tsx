@@ -1,6 +1,6 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { Observer } from "mobx-react-lite";
-import { History, Mic2, Settings } from "lucide-react";
+import { History, Radio, Settings } from "lucide-react";
 import { Toaster } from "sonner";
 import { CommandBar } from "./components/command-bar";
 import { MeetingAutoNav } from "./components/meeting-auto-nav";
@@ -10,7 +10,7 @@ import { cn } from "./lib/utils";
 
 const navItems = [
   { to: "/dictations", label: "Dictations", icon: History, end: false },
-  { to: "/meetings", label: "Meetings", icon: Mic2, end: false },
+  { to: "/meetings", label: "Meetings", icon: Radio, end: false },
   { to: "/settings", label: "Settings", icon: Settings, end: false },
 ];
 
