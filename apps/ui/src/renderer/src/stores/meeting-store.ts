@@ -132,6 +132,49 @@ export class MeetingStore {
     this.pendingNavigationId = null;
   }
 
+  /**
+   * Re-run transcription against the durable mp3 of a previously failed
+   * meeting. Optimistically flips the cached detail to `transcribing` so the
+   * UI updates immediately; meeting-detail polls itself while in that state.
+   *
+   * Uses raw fetch (not the typed client) because the openapi schema hasn't
+   * been regenerated against the new endpoint yet — `bun codegen` will fold
+   * it in next time.
+   */
+  async retryTranscription(id: number): Promise<void> {
+    try {
+      const r = await fetch(
+        `http://127.0.0.1:3737/meetings/${id}/retry`,
+        { method: "POST" },
+      );
+      if (!r.ok && r.status !== 202) {
+        const body = await r.text();
+        throw new Error(`HTTP ${r.status}: ${body}`);
+      }
+      runInAction(() => {
+        const cached = this.detailCache[id];
+        if (cached) {
+          this.detailCache[id] = {
+            ...cached,
+            status: "transcribing",
+            error: null,
+          };
+        }
+      });
+    } catch (e) {
+      runInAction(() => {
+        // Surface on the detail row so meeting-detail.tsx renders it inline.
+        const cached = this.detailCache[id];
+        if (cached) {
+          this.detailCache[id] = {
+            ...cached,
+            error: e instanceof Error ? e.message : String(e),
+          };
+        }
+      });
+    }
+  }
+
   // ---------------------------------------------------------------
   // List + detail fetches
   // ---------------------------------------------------------------

@@ -31,6 +31,11 @@ use super::recording::ApiCommand;
 pub struct MeetingState {
     pub tx: mpsc::Sender<ApiCommand>,
     pub status: MeetingStatusHandle,
+    /// Same transcription service the meeting machine uses. Shared so the
+    /// retry endpoint re-runs failed meetings against the same backend
+    /// without rebuilding the HTTP client / timeout config.
+    pub transcription:
+        std::sync::Arc<dyn crate::transcription::job_service::TranscriptionJobService>,
 }
 
 /// Request body for start/toggle endpoints.
@@ -137,7 +142,16 @@ pub fn router(state: MeetingState) -> Router {
         .route("/meetings/status", get(meeting_status))
         .route("/meetings", get(list_meetings))
         .route("/meetings/:id", get(get_meeting))
+        .route("/meetings/:id/retry", post(retry_meeting))
         .with_state(state)
+}
+
+/// Response for POST /meetings/:id/retry.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeetingRetryResponse {
+    pub success: bool,
+    pub meeting_id: i64,
+    pub message: String,
 }
 
 /// Convert an anyhow error from the meeting machine into a client-friendly
@@ -222,7 +236,10 @@ pub async fn start_meeting(
             meeting_id: result.meeting_id,
             audio_path: result.audio_path.to_string_lossy().into_owned(),
             capture_state: result.capture_state.tag().to_string(),
-            message: format!("Meeting recording started ({})", result.capture_state.as_str()),
+            message: format!(
+                "Meeting recording started ({})",
+                result.capture_state.as_str()
+            ),
         })
         .into_response(),
         Err(resp) => resp,
@@ -487,4 +504,140 @@ pub async fn get_meeting(
         )
             .into_response()),
     }
+}
+
+/// POST /meetings/:id/retry — re-run transcription on the durable mp3 from a
+/// previously failed meeting. Useful when the backend was the cause (e.g. the
+/// 5-min Bun-fetch idle bug in InferenceServerManager) and the audio is fine.
+///
+/// Validates: meeting exists, is in `error` state, and its mp3 is still on
+/// disk. Spawns the retry in a tokio task and returns 202 immediately so the
+/// renderer can begin polling `/meetings/:id` for the status flip.
+#[utoipa::path(
+    post,
+    path = "/meetings/{id}/retry",
+    tag = "meetings",
+    params(
+        ("id" = i64, Path, description = "Meeting id"),
+    ),
+    responses(
+        (status = 202, description = "Retry kicked off; poll /meetings/:id", body = MeetingRetryResponse),
+        (status = 404, description = "Meeting not found"),
+        (status = 409, description = "Meeting is not in a retry-eligible state, or audio file missing"),
+    ),
+)]
+pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState>) -> Response {
+    info!("Meeting {} retry requested", id);
+
+    let join = tokio::task::spawn_blocking(move || {
+        let conn = crate::db::init_db()?;
+        crate::db::meetings::MeetingRepository::get(&conn, id)
+    })
+    .await;
+
+    let meeting = match join {
+        Ok(Ok(Some(m))) => m,
+        Ok(Ok(None)) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Meeting {} not found", id),
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            error!("Failed to load meeting {}: {}", id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": e.to_string(),
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("DB task panicked while loading meeting {}: {}", id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "success": false,
+                    "message": "db task panicked",
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Only retry from a terminal failure. Re-running a `completed` meeting is
+    // a no-op the user almost certainly didn't intend; re-running an in-flight
+    // one would race with the live machine.
+    if meeting.status != MeetingPhase::Error.as_str() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "success": false,
+                "message": format!(
+                    "Meeting {} is in state '{}'; only failed meetings can be retried",
+                    id, meeting.status
+                ),
+            })),
+        )
+            .into_response();
+    }
+
+    // Resolve the file actually on disk. Older meetings (before we kept the
+    // DB row in sync with the WAV → MP3 compression swap) have a stale
+    // `.wav` path; the durable mp3 next to it is what we actually want.
+    let stored_path = std::path::PathBuf::from(&meeting.audio_path);
+    let resolved_path = if stored_path.exists() {
+        stored_path
+    } else {
+        let mp3_sibling = stored_path.with_extension("mp3");
+        if mp3_sibling.exists() {
+            info!(
+                "Meeting {} stored path missing; using mp3 sibling: {:?}",
+                id, mp3_sibling
+            );
+            // Heal the row so future calls don't pay this lookup again.
+            let mp3_str = mp3_sibling.to_string_lossy().into_owned();
+            let _ = tokio::task::spawn_blocking(move || {
+                let conn = crate::db::init_db()?;
+                crate::db::meetings::MeetingRepository::update_audio_path(&conn, id, &mp3_str)
+            })
+            .await;
+            mp3_sibling
+        } else {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "success": false,
+                    "message": format!(
+                        "Audio file no longer on disk: {} (and no .mp3 sibling)",
+                        meeting.audio_path
+                    ),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let duration = meeting.duration_seconds.unwrap_or(0);
+    let transcription = state.transcription.clone();
+    tokio::spawn(async move {
+        crate::meeting::retry_meeting_transcription(id, resolved_path, duration, transcription)
+            .await;
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(MeetingRetryResponse {
+            success: true,
+            meeting_id: id,
+            message: "Retry started; poll /meetings/:id for status".to_string(),
+        }),
+    )
+        .into_response()
 }

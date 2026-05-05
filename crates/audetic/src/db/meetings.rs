@@ -50,7 +50,22 @@ impl MeetingRepository {
         Ok(())
     }
 
-    /// Mark meeting as completed with transcript and duration.
+    /// Update the meeting's `audio_path`. The compression pipeline replaces
+    /// the original WAV with an MP3 next to it; this keeps the DB row pointing
+    /// at the file that actually exists on disk so retries can find it.
+    pub fn update_audio_path(conn: &Connection, id: i64, audio_path: &str) -> Result<()> {
+        conn.execute(
+            "UPDATE meetings SET audio_path = ?1 WHERE id = ?2",
+            params![audio_path, id],
+        )
+        .context("Failed to update meeting audio_path")?;
+        Ok(())
+    }
+
+    /// Mark meeting as completed with transcript and duration. Clears any
+    /// `error` column from a prior failed run so a successful retry leaves
+    /// the row in a clean terminal state (otherwise the UI would still show
+    /// the old error banner alongside the new transcript).
     pub fn complete(
         conn: &Connection,
         id: i64,
@@ -60,7 +75,7 @@ impl MeetingRepository {
     ) -> Result<()> {
         conn.execute(
             "UPDATE meetings SET status = ?1, transcript_path = ?2, transcript_text = ?3, \
-             duration_seconds = ?4, completed_at = CURRENT_TIMESTAMP WHERE id = ?5",
+             duration_seconds = ?4, error = NULL, completed_at = CURRENT_TIMESTAMP WHERE id = ?5",
             params![
                 MeetingPhase::Completed.as_str(),
                 transcript_path,

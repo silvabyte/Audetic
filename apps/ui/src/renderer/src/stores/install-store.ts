@@ -14,6 +14,7 @@ export interface OnboardingState {
   unitInstalled: boolean;
   unitEnabled: boolean;
   unitActive: boolean;
+  ffmpegAvailable: boolean;
 }
 
 export interface OnboardingProgress {
@@ -34,6 +35,7 @@ export type OnboardingDecision =
   | { kind: "enable" }
   | { kind: "start" }
   | { kind: "update"; bundled: string; installed: string | null }
+  | { kind: "install-ffmpeg"; platform: NodeJS.Platform }
   | { kind: "unknown" };
 
 const DEFAULT_STATE: OnboardingState = {
@@ -45,6 +47,7 @@ const DEFAULT_STATE: OnboardingState = {
   unitInstalled: false,
   unitEnabled: false,
   unitActive: false,
+  ffmpegAvailable: false,
 };
 
 /**
@@ -122,6 +125,12 @@ export class InstallStore {
           installed: s.installedVersion,
         };
       }
+      // Daemon is up but missing tools it needs. FFmpeg is required for
+      // meeting compression — surface it as an onboarding step instead of
+      // letting the user hit it mid-meeting.
+      if (!s.ffmpegAvailable) {
+        return { kind: "install-ffmpeg", platform: s.platform };
+      }
       return { kind: "happy" };
     }
 
@@ -164,8 +173,12 @@ export class InstallStore {
     await this.runFlow("update");
   }
 
+  async installFfmpeg(): Promise<void> {
+    await this.runFlow("installFfmpeg");
+  }
+
   private async runFlow(
-    op: "install" | "enable" | "update",
+    op: "install" | "enable" | "update" | "installFfmpeg",
   ): Promise<void> {
     const bridge = window.audetic;
     if (!bridge?.onboarding) return;

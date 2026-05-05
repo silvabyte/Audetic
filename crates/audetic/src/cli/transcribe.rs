@@ -9,9 +9,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 
 use crate::cli::args::{OutputFormat, TranscribeCliArgs};
-use crate::cli::compression::{
-    cleanup_temp_file, compress_for_transcription, get_file_size, is_already_compressed,
-};
+use crate::cli::compression::{cleanup_temp_file, get_file_size, prepare_for_upload};
 use crate::config::Config;
 use crate::text_io::copy_to_clipboard_sync;
 use crate::transcription::jobs_client::{
@@ -130,31 +128,33 @@ fn validate_file(path: &Path) -> Result<()> {
 
 /// Prepare file for upload, compressing if needed.
 ///
-/// Returns (file_to_upload, Option<temp_file_path>).
-/// If compression was performed, temp_file_path will be Some and should be cleaned up after upload.
+/// Wraps `compression::prepare_for_upload` with CLI-friendly progress output.
+/// Returns (file_to_upload, Option<temp_file_path>); the temp file should be
+/// cleaned up after upload when present.
 fn prepare_file_for_upload(
     path: &Path,
     skip_compression: bool,
 ) -> Result<(PathBuf, Option<PathBuf>)> {
-    // Skip compression if file is already in the target format
-    if is_already_compressed(path) {
-        return Ok((path.to_path_buf(), None));
+    let needs_compression = !skip_compression
+        && path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| !matches!(e.to_ascii_lowercase().as_str(), "mp3" | "opus"))
+            .unwrap_or(true);
+
+    if needs_compression {
+        let size_mb = get_file_size(path)? as f64 / 1_000_000.0;
+        eprintln!("Compressing to mp3 for upload ({:.1}MB)...", size_mb);
     }
 
-    // Skip compression if user passed --no-compress
-    if skip_compression {
-        return Ok((path.to_path_buf(), None));
+    let (upload_path, temp) = prepare_for_upload(path, skip_compression)?;
+
+    if let Some(temp_path) = &temp {
+        let compressed_size_mb = get_file_size(temp_path)? as f64 / 1_000_000.0;
+        eprintln!("Compressed to {:.1}MB", compressed_size_mb);
     }
 
-    // Compress to mp3
-    let size_mb = get_file_size(path)? as f64 / 1_000_000.0;
-    eprintln!("Compressing to mp3 for upload ({:.1}MB)...", size_mb);
-
-    let compressed = compress_for_transcription(path)?;
-    let compressed_size_mb = get_file_size(&compressed)? as f64 / 1_000_000.0;
-    eprintln!("Compressed to {:.1}MB", compressed_size_mb);
-
-    Ok((compressed.clone(), Some(compressed)))
+    Ok((upload_path, temp))
 }
 
 /// Derive the jobs URL from a transcriptions endpoint.

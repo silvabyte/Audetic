@@ -54,10 +54,16 @@ pub async fn run_service() -> Result<()> {
 
     // Meeting pipeline (independent from recording pipeline)
     let meeting_status = MeetingStatusHandle::default();
-    let mut meeting_machine = build_meeting_machine(&config, indicator, meeting_status.clone());
+    let meeting_transcription = build_meeting_transcription_service(&config);
+    let mut meeting_machine = build_meeting_machine(
+        &config,
+        indicator,
+        meeting_status.clone(),
+        meeting_transcription.clone(),
+    );
 
     let api_server = ApiServer::new(tx, status_handle.clone(), &config)
-        .with_meeting_state(meeting_status.clone());
+        .with_meeting_state(meeting_status.clone(), meeting_transcription.clone());
 
     tokio::spawn(async move {
         if let Err(e) = api_server.start().await {
@@ -157,24 +163,13 @@ pub async fn run_service() -> Result<()> {
     Ok(())
 }
 
-fn build_meeting_machine(
+/// Build the transcription service used by the meeting pipeline. Lives at the
+/// app level (not inside `build_meeting_machine`) so the API server can hand
+/// the same instance to retry endpoints — re-running an old failed meeting
+/// shouldn't double up the HTTP client or the timeout config.
+fn build_meeting_transcription_service(
     config: &Config,
-    indicator: Indicator,
-    status: MeetingStatusHandle,
-) -> MeetingMachine {
-    let mic_source = MicAudioSource::new(16000)
-        .map(|s| Box::new(s) as Box<dyn crate::audio::audio_source::AudioSource>)
-        .unwrap_or_else(|e| {
-            warn!(
-                "Failed to create meeting mic source: {}. Using fallback.",
-                e
-            );
-            Box::new(NullAudioSource)
-        });
-
-    let system_source = Box::new(SystemAudioSource::new(16000));
-
-    // Determine jobs API URL
+) -> Arc<dyn crate::transcription::job_service::TranscriptionJobService> {
     let jobs_url = config
         .whisper
         .api_endpoint
@@ -188,11 +183,29 @@ fn build_meeting_machine(
         })
         .unwrap_or_else(|| DEFAULT_JOBS_API_URL.to_string());
 
-    let transcription: Arc<dyn crate::transcription::job_service::TranscriptionJobService> =
-        Arc::new(RemoteTranscriptionJobService::new(
-            &jobs_url,
-            Duration::from_secs(MEETING_TRANSCRIPTION_TIMEOUT_SECS),
-        ));
+    Arc::new(RemoteTranscriptionJobService::new(
+        &jobs_url,
+        Duration::from_secs(MEETING_TRANSCRIPTION_TIMEOUT_SECS),
+    ))
+}
+
+fn build_meeting_machine(
+    config: &Config,
+    indicator: Indicator,
+    status: MeetingStatusHandle,
+    transcription: Arc<dyn crate::transcription::job_service::TranscriptionJobService>,
+) -> MeetingMachine {
+    let mic_source = MicAudioSource::new(16000)
+        .map(|s| Box::new(s) as Box<dyn crate::audio::audio_source::AudioSource>)
+        .unwrap_or_else(|e| {
+            warn!(
+                "Failed to create meeting mic source: {}. Using fallback.",
+                e
+            );
+            Box::new(NullAudioSource)
+        });
+
+    let system_source = Box::new(SystemAudioSource::new(16000));
 
     // Post-meeting hook (optional)
     let hook: Option<Arc<dyn crate::meeting::PostMeetingHook>> =

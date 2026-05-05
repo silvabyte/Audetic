@@ -1,3 +1,4 @@
+//TODO:AGENT: why is this needed? can drop a comment explaining this
 #![allow(clippy::arc_with_non_send_sync)]
 
 use anyhow::Result;

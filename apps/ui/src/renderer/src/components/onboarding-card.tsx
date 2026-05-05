@@ -1,5 +1,14 @@
 import { Observer } from "mobx-react-lite";
-import { Download, PlayCircle, RefreshCcw, Settings2, Loader2 } from "lucide-react";
+import {
+  Check,
+  Copy,
+  Download,
+  Loader2,
+  PlayCircle,
+  RefreshCcw,
+  Settings2,
+} from "lucide-react";
+import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useStore } from "@/stores/root-store";
@@ -37,6 +46,9 @@ export function OnboardingCard() {
                   <ActionRow />
                   <ProgressLine />
                   <ErrorLine />
+                  {decision.kind === "install-ffmpeg" && (
+                    <FFmpegManualDisclosure platform={decision.platform} />
+                  )}
                 </CardContent>
               </Card>
             </div>
@@ -89,6 +101,13 @@ function ActionRow() {
             Icon = RefreshCcw;
             onClick = (): void => {
               void store.install.update();
+            };
+            break;
+          case "install-ffmpeg":
+            label = running ? "Installing FFmpeg…" : "Install FFmpeg for me";
+            Icon = Download;
+            onClick = (): void => {
+              void store.install.installFfmpeg();
             };
             break;
           default:
@@ -169,6 +188,8 @@ function iconForDecision(kind: string): React.ReactNode {
       return <PlayCircle className={cn(cls, "text-primary")} />;
     case "update":
       return <RefreshCcw className={cn(cls, "text-amber-500")} />;
+    case "install-ffmpeg":
+      return <Download className={cn(cls, "text-primary")} />;
     default:
       return null;
   }
@@ -184,6 +205,8 @@ function titleForDecision(kind: string): string {
       return "Start the Audetic daemon";
     case "update":
       return "Daemon update available";
+    case "install-ffmpeg":
+      return "Install FFmpeg";
     default:
       return "";
   }
@@ -204,7 +227,149 @@ function descriptionForDecision(
       if (decision.kind !== "update") return "";
       return `Bundled daemon ${decision.bundled} differs from the installed copy${decision.installed ? ` (${decision.installed})` : ""}. Updating restarts the user service with the new binary.`;
     }
+    case "install-ffmpeg":
+      return "Audio compression for meetings needs FFmpeg. Install it locally — no sudo, no PATH changes.";
     default:
       return "";
   }
+}
+
+interface InstallCommand {
+  id: string;
+  hint: string;
+  command: string;
+}
+
+const FFMPEG_COMMANDS: InstallCommand[] = [
+  { id: "apt", hint: "Ubuntu / Debian", command: "sudo apt install ffmpeg" },
+  { id: "pacman", hint: "Arch", command: "sudo pacman -S ffmpeg" },
+  { id: "dnf", hint: "Fedora", command: "sudo dnf install ffmpeg" },
+  { id: "brew", hint: "macOS", command: "brew install ffmpeg" },
+  { id: "winget", hint: "Windows", command: "winget install ffmpeg" },
+];
+
+function primaryFFmpegCommandId(platform: NodeJS.Platform): string {
+  switch (platform) {
+    case "darwin":
+      return "brew";
+    case "win32":
+      return "winget";
+    default:
+      // Linux — apt is the most common; alternates surface the others.
+      return "apt";
+  }
+}
+
+/**
+ * Escape hatch for the bundled-install path: power users / corporate
+ * environments who'd rather drive their own package manager. Collapsed by
+ * default so it doesn't compete with the primary "Install FFmpeg for me"
+ * action above.
+ */
+function FFmpegManualDisclosure({ platform }: { platform: NodeJS.Platform }) {
+  const primaryId = primaryFFmpegCommandId(platform);
+  const primary =
+    FFMPEG_COMMANDS.find((c) => c.id === primaryId) ??
+    ({ id: "apt", hint: "Ubuntu / Debian", command: "sudo apt install ffmpeg" } as InstallCommand);
+  const alternates = FFMPEG_COMMANDS.filter((c) => c.id !== primary.id);
+
+  return (
+    <details className="group pt-1 text-xs">
+      <summary className="cursor-pointer select-none text-muted-foreground hover:text-foreground">
+        Prefer to install it yourself?
+      </summary>
+      <div className="mt-3 space-y-2">
+        <CommandRow command={primary.command} hint={primary.hint} primary />
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-muted-foreground">
+          <span className="font-medium uppercase tracking-wide text-[10px]">
+            Other systems
+          </span>
+          {alternates.map((alt) => (
+            <CommandRow
+              key={alt.id}
+              command={alt.command}
+              hint={alt.hint}
+              primary={false}
+            />
+          ))}
+        </div>
+      </div>
+    </details>
+  );
+}
+
+function CommandRow({
+  command,
+  hint,
+  primary,
+}: {
+  command: string;
+  hint: string;
+  primary: boolean;
+}) {
+  const [copied, setCopied] = useState(false);
+
+  const onCopy = async (): Promise<void> => {
+    try {
+      await navigator.clipboard.writeText(command);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch {
+      // Clipboard access can fail in restrictive contexts; fall through.
+    }
+  };
+
+  if (!primary) {
+    return (
+      <button
+        type="button"
+        onClick={() => {
+          void onCopy();
+        }}
+        className={cn(
+          "inline-flex items-center gap-1 rounded border border-transparent px-1.5 py-0.5 font-mono text-xs",
+          "text-muted-foreground hover:text-foreground hover:border-border",
+        )}
+        title={`Copy: ${command}`}
+      >
+        {copied ? (
+          <Check className="h-3 w-3" />
+        ) : (
+          <Copy className="h-3 w-3 opacity-60" />
+        )}
+        <span>{hint}</span>
+      </button>
+    );
+  }
+
+  return (
+    <div className="flex items-center justify-between gap-2 rounded border bg-muted/40 px-3 py-2">
+      <div className="flex min-w-0 flex-1 items-center gap-3">
+        <span className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+          {hint}
+        </span>
+        <code className="truncate font-mono text-xs">{command}</code>
+      </div>
+      <Button
+        variant="ghost"
+        size="sm"
+        className="h-7 px-2"
+        onClick={() => {
+          void onCopy();
+        }}
+      >
+        {copied ? (
+          <>
+            <Check className="mr-1 h-3.5 w-3.5" />
+            Copied
+          </>
+        ) : (
+          <>
+            <Copy className="mr-1 h-3.5 w-3.5" />
+            Copy
+          </>
+        )}
+      </Button>
+    </div>
+  );
 }

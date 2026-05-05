@@ -6,7 +6,7 @@
 
 use utoipa::OpenApi;
 
-use super::routes::{history, keybind, logs, meetings, provider, recording, update};
+use super::routes::{history, keybind, logs, meetings, provider, recording, system, update};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -38,6 +38,10 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, updat
         // Provider
         provider::get_config,
         provider::get_status,
+        // System
+        system::get_deps,
+        system::start_install_ffmpeg,
+        system::get_install_ffmpeg_status,
         // Update
         update::check_update,
         update::install_update,
@@ -50,6 +54,7 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, updat
         meetings::meeting_status,
         meetings::list_meetings,
         meetings::get_meeting,
+        meetings::retry_meeting,
     ),
     components(schemas(
         // Service
@@ -72,6 +77,10 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, updat
         // Provider
         crate::transcription::ProviderInfo,
         crate::transcription::ProviderStatus,
+        // System
+        system::SystemDeps,
+        system::InstallPhase,
+        system::InstallStatusResponse,
         // Update
         crate::update::UpdateReport,
         update::UpdateInstallRequest,
@@ -94,6 +103,7 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, updat
         (name = "history", description = "Past transcriptions"),
         (name = "keybind", description = "Hyprland keybinding management"),
         (name = "provider", description = "Transcription provider configuration"),
+        (name = "system", description = "External tool / dependency availability"),
         (name = "update", description = "Daemon self-update"),
         (name = "logs", description = "Application and transcription logs"),
     ),

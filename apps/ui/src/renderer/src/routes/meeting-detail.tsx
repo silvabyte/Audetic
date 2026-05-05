@@ -1,4 +1,5 @@
 import { Observer } from "mobx-react-lite";
+import { useEffect } from "react";
 import {
   Form,
   NavLink,
@@ -7,7 +8,7 @@ import {
   type LoaderFunctionArgs,
   type RouteObject,
 } from "react-router-dom";
-import { ArrowLeft, Copy, FolderOpen } from "lucide-react";
+import { ArrowLeft, Copy, FolderOpen, Loader2, RefreshCcw, Wrench } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -75,6 +76,28 @@ function MeetingDetailRoute() {
   const id = Number(params.id);
   const store = useStore();
 
+  // Auto-refresh while transcription is in flight (live recording or post-
+  // failure retry). Stops as soon as the row reaches a terminal state. The
+  // global `/meetings/status` poll only tracks the live recording machine,
+  // not per-meeting retry jobs, so this loop owns refresh for retries.
+  useEffect(() => {
+    if (!Number.isFinite(id)) return;
+    let cancelled = false;
+    const tick = (): void => {
+      if (cancelled) return;
+      const cached = store.meetings.detailCache[id];
+      if (!cached) return;
+      if (cached.status === "transcribing" || cached.status === "compressing") {
+        void store.meetings.loadDetail(id);
+      }
+    };
+    const handle = window.setInterval(tick, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(handle);
+    };
+  }, [id, store]);
+
   return (
     <div className="mx-auto max-w-3xl p-8 space-y-6">
       <NavLink
@@ -98,14 +121,24 @@ function MeetingDetailRoute() {
             }
             return <MeetingDetailSkeleton />;
           }
-          return <MeetingDetailBody detail={detail} />;
+          return <MeetingDetailBody detail={detail} meetingId={id} />;
         }}
       </Observer>
     </div>
   );
 }
 
-function MeetingDetailBody({ detail }: { detail: MeetingDetail }) {
+function MeetingDetailBody({
+  detail,
+  meetingId,
+}: {
+  detail: MeetingDetail;
+  meetingId: number;
+}) {
+  const store = useStore();
+  const isTranscribing =
+    detail.status === "transcribing" || detail.status === "compressing";
+
   return (
     <>
       <header>
@@ -122,16 +155,62 @@ function MeetingDetailBody({ detail }: { detail: MeetingDetail }) {
         </p>
       </header>
 
-      {detail.error && (
-        <Card className="border-destructive/40">
+      {isTranscribing && (
+        <Card>
           <CardHeader>
-            <CardTitle className="text-destructive">Error</CardTitle>
+            <CardTitle className="text-base flex items-center gap-2">
+              <Loader2 className="h-4 w-4 animate-spin text-primary" />
+              Transcribing…
+            </CardTitle>
+            <CardDescription>
+              The audio is being transcribed. This page will update when it
+              finishes.
+            </CardDescription>
           </CardHeader>
-          <CardContent className="text-sm whitespace-pre-wrap">
-            {detail.error}
-          </CardContent>
         </Card>
       )}
+
+      {detail.error &&
+        !isTranscribing &&
+        detail.status !== "completed" &&
+        (isFfmpegError(detail.error) ? (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base flex items-center gap-2">
+                <Wrench className="h-4 w-4 text-primary" />
+                FFmpeg required
+              </CardTitle>
+              <CardDescription>
+                This meeting couldn&apos;t be compressed because FFmpeg
+                isn&apos;t installed. Use the <strong>Install FFmpeg</strong>
+                {" "}card at the top of the page to set it up.
+              </CardDescription>
+            </CardHeader>
+          </Card>
+        ) : (
+          <Card className="border-destructive/40">
+            <CardHeader>
+              <CardTitle className="text-destructive">Error</CardTitle>
+              <CardDescription>
+                Transcription failed. The audio is still on disk — retry to
+                run it through the transcription service again.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <pre className="whitespace-pre-wrap">{detail.error}</pre>
+              <Button
+                variant="default"
+                size="sm"
+                onClick={() => {
+                  void store.meetings.retryTranscription(meetingId);
+                }}
+              >
+                <RefreshCcw className="mr-1 h-3.5 w-3.5" />
+                Retry transcription
+              </Button>
+            </CardContent>
+          </Card>
+        ))}
 
       <Card>
         <CardHeader>
@@ -246,4 +325,8 @@ function formatDuration(seconds: number): string {
   const mins = Math.floor(seconds / 60);
   const secs = seconds % 60;
   return `${mins}m ${secs.toString().padStart(2, "0")}s`;
+}
+
+function isFfmpegError(message: string): boolean {
+  return /ffmpeg/i.test(message);
 }

@@ -16,7 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::audio::audio_mixer::AudioMixer;
 use crate::audio::audio_source::AudioSource;
-use crate::cli::compression::compress_for_transcription;
+use crate::cli::compression::{cleanup_temp_file, prepare_for_upload};
 use crate::db::{self, meetings::MeetingRepository};
 use crate::transcription::job_service::TranscriptionJobService;
 use crate::ui::Indicator;
@@ -458,36 +458,79 @@ struct ProcessContext {
 /// notification; the meeting row is left in a terminal (`completed` or
 /// `error`) state before this function returns.
 async fn run_processing_task(ctx: ProcessContext) {
-    // Phase: Compressing — the original WAV stays on disk for now in case
-    // compression fails and we need to fall back to uploading it directly.
-    let compressed_path = match compress_audio(&ctx.audio_path) {
-        Ok(path) => {
-            if let Err(e) = std::fs::remove_file(&ctx.audio_path) {
-                warn!("Failed to delete original WAV: {}", e);
-            }
-            path
-        }
+    info!("Compressing meeting audio: {:?}", ctx.audio_path);
+    let (temp_upload, temp_to_cleanup) = match prepare_for_upload(&ctx.audio_path, false) {
+        Ok(v) => v,
         Err(e) => {
-            warn!("Compression failed, uploading WAV instead: {}", e);
-            ctx.audio_path.clone()
+            let error_msg = e.to_string();
+            error!(
+                "Meeting {} compression failed: {}",
+                ctx.meeting_id, error_msg
+            );
+            if let Ok(conn) = db::init_db() {
+                let _ = MeetingRepository::fail(
+                    &conn,
+                    ctx.meeting_id,
+                    &error_msg,
+                    ctx.duration_seconds as i64,
+                );
+            }
+            ctx.status.set_error(error_msg.clone()).await;
+            if let Err(e) = ctx.indicator.show_error(&error_msg).await {
+                warn!("Failed to show error indicator: {}", e);
+            }
+            return;
         }
     };
 
-    // Phase: Transcribing
+    // Move the compressed mp3 next to the original WAV via copy (cross-fs safe,
+    // unlike rename — the temp dir is typically on tmpfs while the meetings dir
+    // lives under ~/.local/share). The durable mp3 is what the post-meeting
+    // hook and history reference. Drop the WAV once the mp3 is in place.
+    let durable_mp3 = if temp_to_cleanup.is_some() {
+        let durable = ctx.audio_path.with_extension("mp3");
+        match std::fs::copy(&temp_upload, &durable) {
+            Ok(_) => {
+                if let Err(e) = std::fs::remove_file(&ctx.audio_path) {
+                    warn!("Failed to delete original WAV: {}", e);
+                }
+                durable
+            }
+            Err(e) => {
+                warn!("Failed to copy compressed mp3 next to WAV: {}", e);
+                ctx.audio_path.clone()
+            }
+        }
+    } else {
+        temp_upload.clone()
+    };
+
+    info!("Compressed meeting audio at: {:?}", durable_mp3);
+
     ctx.status.set_phase(MeetingPhase::Transcribing).await;
     if let Ok(conn) = db::init_db() {
         let _ = MeetingRepository::update_status(&conn, ctx.meeting_id, MeetingPhase::Transcribing);
+        // Keep the DB row pointing at the file that actually exists. The WAV
+        // is gone after a successful copy; retries / file UI need the .mp3
+        // path or they'll error out trying to read a deleted file.
+        if durable_mp3 != ctx.audio_path {
+            let _ = MeetingRepository::update_audio_path(
+                &conn,
+                ctx.meeting_id,
+                &durable_mp3.to_string_lossy(),
+            );
+        }
     }
 
-    let transcription_result = ctx
-        .transcription
-        .submit_and_poll(&compressed_path, None)
-        .await;
+    let transcription_result = ctx.transcription.submit_and_poll(&temp_upload, None).await;
+
+    if let Some(temp) = &temp_to_cleanup {
+        cleanup_temp_file(temp);
+    }
 
     match transcription_result {
         Ok(result) => {
-            // Save transcript file next to the audio
-            let transcript_path = compressed_path.with_extension("txt");
+            let transcript_path = durable_mp3.with_extension("txt");
             if let Err(e) = std::fs::write(&transcript_path, &result.text) {
                 error!("Failed to write transcript file: {}", e);
             }
@@ -515,7 +558,7 @@ async fn run_processing_task(ctx: ProcessContext) {
                 let meeting_result = MeetingResult {
                     meeting_id: ctx.meeting_id,
                     title: ctx.title,
-                    audio_path: compressed_path,
+                    audio_path: durable_mp3,
                     transcript_path,
                     transcript_text: result.text.clone(),
                     duration_seconds: ctx.duration_seconds,
@@ -555,15 +598,69 @@ async fn run_processing_task(ctx: ProcessContext) {
     }
 }
 
-/// Compress a WAV file to MP3 for upload, returning the final on-disk path.
-/// The compressed file is moved next to the source with a `.mp3` extension.
-fn compress_audio(wav_path: &Path) -> Result<PathBuf> {
-    info!("Compressing meeting audio: {:?}", wav_path);
-    let compressed = compress_for_transcription(wav_path)?;
+/// Re-run transcription for an existing meeting whose audio file is still on
+/// disk. Used by `POST /meetings/:id/retry` after a failed transcription
+/// (e.g. backend timeout) so the user doesn't have to re-record. Skips the
+/// compress step entirely — the durable mp3 from the original run is the
+/// upload payload.
+///
+/// Updates the DB row to `transcribing` immediately, then `completed` or
+/// `error` once the polling resolves. Writes the transcript to a `.txt`
+/// alongside the audio. Does NOT touch the live `MeetingStatusHandle` — that
+/// reflects the active recording machine, which a retry must not interfere
+/// with.
+pub async fn retry_meeting_transcription(
+    meeting_id: i64,
+    audio_path: PathBuf,
+    duration_seconds: i64,
+    transcription: Arc<dyn TranscriptionJobService>,
+) {
+    info!(
+        "Retrying transcription for meeting {} from {:?}",
+        meeting_id, audio_path
+    );
 
-    let final_path = wav_path.with_extension("mp3");
-    std::fs::rename(&compressed, &final_path)?;
+    if let Ok(conn) = db::init_db() {
+        if let Err(e) =
+            MeetingRepository::update_status(&conn, meeting_id, MeetingPhase::Transcribing)
+        {
+            warn!("Failed to mark meeting {} transcribing: {}", meeting_id, e);
+        }
+    }
 
-    info!("Compressed to: {:?}", final_path);
-    Ok(final_path)
+    let result = transcription.submit_and_poll(&audio_path, None).await;
+
+    match result {
+        Ok(r) => {
+            let transcript_path = audio_path.with_extension("txt");
+            if let Err(e) = std::fs::write(&transcript_path, &r.text) {
+                warn!("Failed to write transcript file: {}", e);
+            }
+
+            if let Ok(conn) = db::init_db() {
+                if let Err(e) = MeetingRepository::complete(
+                    &conn,
+                    meeting_id,
+                    &transcript_path.to_string_lossy(),
+                    &r.text,
+                    duration_seconds,
+                ) {
+                    error!("Failed to mark meeting {} completed: {}", meeting_id, e);
+                }
+            }
+
+            info!(
+                "Meeting {} retry transcription complete: {} chars",
+                meeting_id,
+                r.text.len()
+            );
+        }
+        Err(e) => {
+            error!("Meeting {} retry transcription failed: {}", meeting_id, e);
+            let error_msg = e.to_string();
+            if let Ok(conn) = db::init_db() {
+                let _ = MeetingRepository::fail(&conn, meeting_id, &error_msg, duration_seconds);
+            }
+        }
+    }
 }

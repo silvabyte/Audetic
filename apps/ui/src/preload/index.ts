@@ -11,6 +11,7 @@ export interface OnboardingState {
   unitInstalled: boolean;
   unitEnabled: boolean;
   unitActive: boolean;
+  ffmpegAvailable: boolean;
 }
 
 export interface OnboardingProgress {
@@ -79,6 +80,9 @@ const audetic = {
     },
     update(): Promise<OnboardingResult> {
       return ipcRenderer.invoke("audetic:onboarding:update");
+    },
+    installFfmpeg(): Promise<OnboardingResult> {
+      return ipcRenderer.invoke("audetic:onboarding:install-ffmpeg");
     },
     onProgress(callback: (p: OnboardingProgress) => void): () => void {
       const listener = (

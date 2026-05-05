@@ -34,3 +34,29 @@ export async function runningDaemonVersion(): Promise<string | null> {
     return null;
   }
 }
+
+export interface DaemonSystemDeps {
+  ffmpeg: boolean;
+}
+
+/**
+ * Ask the daemon which external tools it sees on PATH. The daemon is the
+ * source of truth: it runs the ffmpeg binary at compress time, so its view
+ * of PATH (under systemd user env) is what actually matters — querying
+ * `which ffmpeg` from the Electron process can disagree.
+ *
+ * Returns null if the daemon is unreachable (in which case onboarding will
+ * already be steering the user toward bringing the daemon up first).
+ */
+export async function daemonSystemDeps(): Promise<DaemonSystemDeps | null> {
+  try {
+    const r = await fetch(`${DAEMON_URL}/system/deps`, {
+      signal: AbortSignal.timeout(1500),
+    });
+    if (!r.ok) return null;
+    const data = (await r.json()) as Partial<DaemonSystemDeps>;
+    return { ffmpeg: data.ffmpeg === true };
+  } catch {
+    return null;
+  }
+}

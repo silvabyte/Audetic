@@ -6,4 +6,5 @@ pub mod logs;
 pub mod meetings;
 pub mod provider;
 pub mod recording;
+pub mod system;
 pub mod update;

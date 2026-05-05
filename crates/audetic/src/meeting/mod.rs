@@ -8,7 +8,8 @@ pub mod post_meeting_hook;
 pub mod status;
 
 pub use meeting_machine::{
-    CaptureState, MeetingMachine, MeetingStartResult, MeetingStopResult, ToggleOutcome,
+    retry_meeting_transcription, CaptureState, MeetingMachine, MeetingStartResult,
+    MeetingStopResult, ToggleOutcome,
 };
 pub use post_meeting_hook::{MeetingResult, PostMeetingHook, ShellCommandHook};
 pub use status::{MeetingPhase, MeetingStartOptions, MeetingState, MeetingStatusHandle};

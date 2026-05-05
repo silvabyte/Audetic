@@ -66,10 +66,14 @@ impl ApiServer {
     pub fn with_meeting_state(
         mut self,
         meeting_status: crate::meeting::MeetingStatusHandle,
+        transcription: std::sync::Arc<
+            dyn crate::transcription::job_service::TranscriptionJobService,
+        >,
     ) -> Self {
         self.meeting_state = Some(routes::meetings::MeetingState {
             tx: self.recording_state.tx.clone(),
             status: meeting_status,
+            transcription,
         });
         self
     }
@@ -88,6 +92,7 @@ impl ApiServer {
             .nest("/keybind", routes::keybind::router())
             .nest("/logs", routes::logs::router())
             .nest("/provider", routes::provider::router())
+            .nest("/system", routes::system::router())
             .nest("/update", routes::update::router());
 
         // Meeting routes (optional — only if meeting state is wired)
@@ -118,6 +123,9 @@ impl ApiServer {
         info!("  GET  /logs          - Get application logs");
         info!("  GET  /provider      - Get provider config");
         info!("  GET  /provider/status - Get provider status");
+        info!("  GET  /system/deps   - Report external tool availability");
+        info!("  POST /system/install-ffmpeg        - Install bundled FFmpeg");
+        info!("  GET  /system/install-ffmpeg/status - Poll FFmpeg install state");
         info!("  GET  /update/check  - Check for updates");
         info!("  POST /update/install - Install update");
         info!("  PUT  /update/auto   - Toggle auto-update");
