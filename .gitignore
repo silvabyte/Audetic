@@ -31,5 +31,6 @@ crates/audetic/tests/fixtures/large_video.mp4
 
 # node
 node_modules/
+apps/web-ui/dist/
 
 .env*

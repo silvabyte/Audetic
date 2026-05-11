@@ -396,7 +396,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        get?: never;
+        /** GET /update/auto - Read the current auto-update flag. */
+        get: operations["get_auto_update"];
         /** PUT /update/auto - Enable or disable auto-update. */
         put: operations["set_auto_update"];
         post?: never;
@@ -470,6 +471,10 @@ export interface components {
             auto_update: boolean;
             message: string;
             success: boolean;
+        };
+        /** @description Response body for the auto-update getter. */
+        AutoUpdateState: {
+            enabled: boolean;
         };
         /** @description The `last_completed_job` nested block inside `RecordingStatusResponse`. */
         CompletedJobSummary: {
@@ -1320,6 +1325,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AutoUpdateResponse"];
+                };
+            };
+        };
+    };
+    get_auto_update: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Whether auto-update is enabled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutoUpdateState"];
                 };
             };
         };

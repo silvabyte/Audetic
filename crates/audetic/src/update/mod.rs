@@ -576,6 +576,10 @@ impl UpdateEngine {
         self.save_state(&state).await?;
         Ok(state)
     }
+
+    pub async fn get_auto_update(&self) -> Result<bool> {
+        Ok(self.load_state().await?.auto_update)
+    }
 }
 
 #[derive(Debug)]

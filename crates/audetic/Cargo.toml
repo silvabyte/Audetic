@@ -82,3 +82,8 @@ tempfile = "3"
 # (BtbN for Linux/Windows, evermeet for macOS) into the app-local share dir
 # so users don't need a system-wide install.
 ffmpeg-sidecar = "2.5"
+
+# Embed the apps/web-ui SPA into the daemon binary at compile time so the
+# single `audetic` binary serves both the API (/api) and the UI (/).
+include_dir = "0.7"
+mime_guess = "2.0"

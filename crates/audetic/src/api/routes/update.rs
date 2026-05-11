@@ -4,7 +4,7 @@ use crate::api::error::{ApiError, ApiResult};
 use crate::update::{UpdateConfig, UpdateEngine, UpdateOptions, UpdateReport};
 use axum::{
     response::Json,
-    routing::{get, post, put},
+    routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -34,12 +34,18 @@ pub struct AutoUpdateResponse {
     pub message: String,
 }
 
+/// Response body for the auto-update getter.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AutoUpdateState {
+    pub enabled: bool,
+}
+
 /// Create the update router.
 pub fn router() -> Router {
     Router::new()
         .route("/check", get(check_update))
         .route("/install", post(install_update))
-        .route("/auto", put(set_auto_update))
+        .route("/auto", get(get_auto_update).put(set_auto_update))
 }
 
 /// GET /update/check - Check for available updates.
@@ -97,6 +103,22 @@ pub async fn install_update(
         .map_err(ApiError::from)?;
 
     Ok(Json(report))
+}
+
+/// GET /update/auto - Read the current auto-update flag.
+#[utoipa::path(
+    get,
+    path = "/update/auto",
+    tag = "update",
+    responses(
+        (status = 200, description = "Whether auto-update is enabled", body = AutoUpdateState),
+    ),
+)]
+pub async fn get_auto_update() -> ApiResult<Json<AutoUpdateState>> {
+    let config = UpdateConfig::detect(None).map_err(ApiError::from)?;
+    let engine = UpdateEngine::new(config).map_err(ApiError::from)?;
+    let enabled = engine.get_auto_update().await.map_err(ApiError::from)?;
+    Ok(Json(AutoUpdateState { enabled }))
 }
 
 /// PUT /update/auto - Enable or disable auto-update.

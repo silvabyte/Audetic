@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useRef } from "react";
 import { Observer } from "mobx-react-lite";
 import {
   useFetcher,
@@ -200,17 +200,12 @@ function UpdateSummary({
 }
 
 function AutoUpdateCard() {
-  // The daemon doesn't report the current auto-update flag anywhere the
-  // UI can read; we track the user's last toggle locally so the switch
-  // feels responsive. Flipping fires PUT /update/auto via the route
-  // action — the Switch submits a hidden form.
-  const [enabled, setEnabled] = useState(false);
+  const store = useStore();
   const fetcher = useFetcher();
   const formRef = useRef<HTMLFormElement>(null);
   const submitting = fetcher.state !== "idle";
 
   function handleToggle(next: boolean): void {
-    setEnabled(next);
     if (!formRef.current) return;
     const fd = new FormData();
     fd.set("intent", UPDATE_INTENTS.setAuto);
@@ -219,37 +214,47 @@ function AutoUpdateCard() {
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="text-base">Auto-update</CardTitle>
-        <CardDescription>
-          When enabled, the daemon checks for + installs updates in the
-          background on the configured channel.
-        </CardDescription>
-      </CardHeader>
-      <CardContent>
-        <fetcher.Form
-          ref={formRef}
-          method="post"
-          className="flex items-center justify-between gap-3"
-        >
-          <input type="hidden" name="intent" value={UPDATE_INTENTS.setAuto} />
-          <input type="hidden" name="enabled" value={enabled ? "true" : "false"} />
-          <div className="text-sm text-muted-foreground">
-            Currently{" "}
-            <span className={cn(enabled ? "text-primary" : "text-foreground")}>
-              {enabled ? "enabled" : "disabled"}
-            </span>{" "}
-            · locally tracked — daemon doesn't expose the flag.
-          </div>
-          <Switch
-            checked={enabled}
-            onCheckedChange={handleToggle}
-            disabled={submitting}
-            aria-label="Auto-update"
-          />
-        </fetcher.Form>
-      </CardContent>
-    </Card>
+    <Observer>
+      {() => {
+        const enabled = store.config.autoUpdate;
+        return (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">Auto-update</CardTitle>
+              <CardDescription>
+                When enabled, the daemon checks for + installs updates in the
+                background on the configured channel.
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <fetcher.Form
+                ref={formRef}
+                method="post"
+                className="flex items-center justify-between gap-3"
+              >
+                <input type="hidden" name="intent" value={UPDATE_INTENTS.setAuto} />
+                <input
+                  type="hidden"
+                  name="enabled"
+                  value={enabled ? "true" : "false"}
+                />
+                <div className="text-sm text-muted-foreground">
+                  Currently{" "}
+                  <span className={cn(enabled ? "text-primary" : "text-foreground")}>
+                    {enabled ? "enabled" : "disabled"}
+                  </span>
+                </div>
+                <Switch
+                  checked={enabled}
+                  onCheckedChange={handleToggle}
+                  disabled={submitting}
+                  aria-label="Auto-update"
+                />
+              </fetcher.Form>
+            </CardContent>
+          </Card>
+        );
+      }}
+    </Observer>
   );
 }

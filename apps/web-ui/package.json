@@ -15,7 +15,7 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "codegen": "openapi-typescript http://127.0.0.1:3737/openapi.json -o src/api/schema.ts"
+    "codegen": "openapi-typescript http://127.0.0.1:3737/api/openapi.json -o src/api/schema.ts"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",

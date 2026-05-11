@@ -6,6 +6,7 @@ pub mod config;
 pub mod db;
 pub mod global;
 pub mod history;
+pub mod install;
 pub mod keybind;
 pub mod logs;
 pub mod meeting;

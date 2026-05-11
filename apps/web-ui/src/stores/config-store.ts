@@ -33,6 +33,9 @@ export class ConfigStore {
   update: UpdateReport | null = null;
   updateState: Status = "idle";
 
+  autoUpdate: boolean = false;
+  autoUpdateState: Status = "idle";
+
   /** Error stashed for the last explicitly user-triggered op. */
   lastError: string | null = null;
 
@@ -43,13 +46,14 @@ export class ConfigStore {
     makeAutoObservable<this, "root">(this, { root: false });
   }
 
-  /** Fire off the four read-only fetches in parallel. */
+  /** Fire off the read-only fetches in parallel. */
   async loadAll(): Promise<void> {
     await Promise.allSettled([
       this.loadProvider(),
       this.loadProviderStatus(),
       this.loadKeybind(),
       this.loadUpdate(),
+      this.loadAutoUpdate(),
     ]);
   }
 
@@ -172,14 +176,42 @@ export class ConfigStore {
     }
   }
 
-  async setAutoUpdate(enabled: boolean): Promise<void> {
+  async loadAutoUpdate(): Promise<void> {
+    runInAction(() => {
+      this.autoUpdateState = "loading";
+    });
     try {
-      const { error } = await daemon.PUT("/update/auto", {
+      const { data, error } = await daemon.GET("/update/auto");
+      if (error || !data) throw new Error(formatError(error ?? "empty response"));
+      runInAction(() => {
+        this.autoUpdate = data.enabled;
+        this.autoUpdateState = "loaded";
+      });
+    } catch {
+      runInAction(() => {
+        this.autoUpdateState = "error";
+      });
+    }
+  }
+
+  async setAutoUpdate(enabled: boolean): Promise<void> {
+    const previous = this.autoUpdate;
+    runInAction(() => {
+      this.autoUpdate = enabled;
+    });
+    try {
+      const { data, error } = await daemon.PUT("/update/auto", {
         body: { enabled },
       });
       if (error) throw new Error(formatError(error));
+      if (data) {
+        runInAction(() => {
+          this.autoUpdate = data.auto_update;
+        });
+      }
     } catch (e) {
       runInAction(() => {
+        this.autoUpdate = previous;
         this.lastError = e instanceof Error ? e.message : String(e);
       });
     }

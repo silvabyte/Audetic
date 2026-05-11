@@ -17,7 +17,7 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, syste
         license(name = "MIT"),
     ),
     servers(
-        (url = "http://127.0.0.1:3737", description = "Local daemon"),
+        (url = "http://127.0.0.1:3737/api", description = "Local daemon"),
     ),
     paths(
         // Service
@@ -45,6 +45,7 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, syste
         // Update
         update::check_update,
         update::install_update,
+        update::get_auto_update,
         update::set_auto_update,
         // Meetings
         meetings::start_meeting,
@@ -86,6 +87,7 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, syste
         update::UpdateInstallRequest,
         update::AutoUpdateRequest,
         update::AutoUpdateResponse,
+        update::AutoUpdateState,
         // Meetings
         meetings::MeetingStartRequest,
         meetings::MeetingStartResponse,

@@ -4,6 +4,7 @@ import { History, Radio, Settings } from "lucide-react";
 import { Toaster } from "sonner";
 import { CommandBar } from "./components/command-bar";
 import { MeetingAutoNav } from "./components/meeting-auto-nav";
+import { OnboardingOverlay } from "./components/onboarding-overlay";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { useStore } from "./stores/root-store";
 import { cn } from "./lib/utils";
@@ -20,6 +21,7 @@ export function AppShell() {
     <TooltipProvider delayDuration={300}>
       <div className="flex h-screen flex-col">
         <MeetingAutoNav />
+        <OnboardingOverlay />
         <CommandBar />
         <div className="flex flex-1 min-h-0">
           <aside className="w-52 shrink-0 border-r bg-card">

@@ -12,6 +12,7 @@
 pub mod docs;
 pub mod error;
 pub mod routes;
+pub mod static_assets;
 
 use crate::config::Config;
 use anyhow::Result;
@@ -79,15 +80,14 @@ impl ApiServer {
     }
 
     pub async fn start(self) -> Result<()> {
-        let mut app = Router::new()
-            // Root and version endpoints
+        // Build the API surface. All routes nest under `/api` so the daemon
+        // can serve the bundled web-ui at `/` without colliding with API
+        // paths (e.g. /meetings is also a SPA route).
+        let mut api = Router::new()
             .route("/", get(status))
             .route("/version", get(version))
-            // OpenAPI spec
             .route("/openapi.json", get(openapi_spec))
-            // Recording control endpoints
             .nest("", routes::recording::router(self.recording_state))
-            // Other API routes
             .nest("/history", routes::history::router())
             .nest("/keybind", routes::keybind::router())
             .nest("/logs", routes::logs::router())
@@ -95,47 +95,51 @@ impl ApiServer {
             .nest("/system", routes::system::router())
             .nest("/update", routes::update::router());
 
-        // Meeting routes (optional — only if meeting state is wired)
         let has_meeting = self.meeting_state.is_some();
         if let Some(meeting_state) = self.meeting_state {
-            app = app.merge(routes::meetings::router(meeting_state));
+            api = api.merge(routes::meetings::router(meeting_state));
         }
 
         // Permissive CORS is safe here: the server binds to 127.0.0.1 only, so
-        // the only callers that can reach it are already on this machine. The
-        // Electron UI (and any future dev tool) needs CORS to fetch from its
-        // dev-server origin.
-        let app = app.layer(ServiceBuilder::new().layer(CorsLayer::permissive()));
+        // the only callers that can reach it are already on this machine.
+        // In production the SPA is same-origin (served from `/`); CORS only
+        // matters for `bun run dev` against a separately-running daemon.
+        let app = Router::new()
+            .nest("/api", api)
+            .fallback(static_assets::serve_static)
+            .layer(ServiceBuilder::new().layer(CorsLayer::permissive()));
 
         let listener = tokio::net::TcpListener::bind(&format!("127.0.0.1:{}", self.port)).await?;
 
         info!("API server listening on http://127.0.0.1:{}", self.port);
         info!("Endpoints:");
-        info!("  GET  /              - Service info");
-        info!("  POST /toggle        - Toggle recording");
-        info!("  GET  /status        - Get recording status");
-        info!("  GET  /version       - Get version info");
-        info!("  GET  /history       - List transcription history");
-        info!("  GET  /history/:id   - Get single transcription");
-        info!("  GET  /keybind/status - Get keybinding status");
-        info!("  POST /keybind/install - Install keybinding");
-        info!("  DELETE /keybind     - Uninstall keybinding");
-        info!("  GET  /logs          - Get application logs");
-        info!("  GET  /provider      - Get provider config");
-        info!("  GET  /provider/status - Get provider status");
-        info!("  GET  /system/deps   - Report external tool availability");
-        info!("  POST /system/install-ffmpeg        - Install bundled FFmpeg");
-        info!("  GET  /system/install-ffmpeg/status - Poll FFmpeg install state");
-        info!("  GET  /update/check  - Check for updates");
-        info!("  POST /update/install - Install update");
-        info!("  PUT  /update/auto   - Toggle auto-update");
+        info!("  GET  /                  - Web UI (bundled SPA)");
+        info!("  GET  /api               - Service info");
+        info!("  POST /api/toggle        - Toggle recording");
+        info!("  GET  /api/status        - Get recording status");
+        info!("  GET  /api/version       - Get version info");
+        info!("  GET  /api/history       - List transcription history");
+        info!("  GET  /api/history/:id   - Get single transcription");
+        info!("  GET  /api/keybind/status - Get keybinding status");
+        info!("  POST /api/keybind/install - Install keybinding");
+        info!("  DELETE /api/keybind     - Uninstall keybinding");
+        info!("  GET  /api/logs          - Get application logs");
+        info!("  GET  /api/provider      - Get provider config");
+        info!("  GET  /api/provider/status - Get provider status");
+        info!("  GET  /api/system/deps   - Report external tool availability");
+        info!("  POST /api/system/install-ffmpeg        - Install bundled FFmpeg");
+        info!("  GET  /api/system/install-ffmpeg/status - Poll FFmpeg install state");
+        info!("  GET  /api/update/check  - Check for updates");
+        info!("  POST /api/update/install - Install update");
+        info!("  GET  /api/update/auto   - Get auto-update setting");
+        info!("  PUT  /api/update/auto   - Toggle auto-update");
         if has_meeting {
-            info!("  POST /meetings/start  - Start meeting recording");
-            info!("  POST /meetings/stop   - Stop meeting recording");
-            info!("  POST /meetings/toggle - Toggle meeting recording");
-            info!("  GET  /meetings/status - Meeting recording status");
-            info!("  GET  /meetings        - List meetings");
-            info!("  GET  /meetings/:id    - Get meeting details");
+            info!("  POST /api/meetings/start  - Start meeting recording");
+            info!("  POST /api/meetings/stop   - Stop meeting recording");
+            info!("  POST /api/meetings/toggle - Toggle meeting recording");
+            info!("  GET  /api/meetings/status - Meeting recording status");
+            info!("  GET  /api/meetings        - List meetings");
+            info!("  GET  /api/meetings/:id    - Get meeting details");
         }
 
         axum::serve(listener, app).await?;
