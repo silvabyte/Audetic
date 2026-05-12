@@ -66,9 +66,12 @@ const version = await resolveVersion();
 console.log(`Version: ${version}`);
 
 await syncVersions(version);
+// Build the SPA bundle (and `bun install` its deps) before `cargo test` —
+// the daemon's build.rs embeds apps/web-ui/dist via include_dir!, so the
+// dist has to exist before anything compiles the crate.
+await buildWebUi();
 await maybeRunTests();
 await ensureNotes(version);
-await buildWebUi();
 
 const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "audetic-release-"));
 const artifacts: Artifact[] = [];
@@ -277,7 +280,9 @@ async function maybeRunTests() {
 		return;
 	}
 	console.log("==> cargo test");
-	await $`cargo test`;
+	// buildWebUi() already produced apps/web-ui/dist; skip the rebuild here
+	// (matches buildTarget()).
+	await $`cargo test`.env({ ...process.env, AUDETIC_SKIP_UI_BUILD: "1" });
 }
 
 async function ensureNotes(version: string) {

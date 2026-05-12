@@ -2,8 +2,9 @@
 //!
 //! The compiled assets land at `apps/web-ui/dist/` and are pulled in via
 //! `include_dir!` from `src/api/static_assets.rs`. Re-runs only when the SPA
-//! source changes; node_modules must already exist (run `bun install` once
-//! per checkout — the Makefile's `ui-install` target does this).
+//! source changes. If `apps/web-ui/node_modules` is missing (fresh clone),
+//! this runs `bun install` first, so a plain `cargo build` / `make build` /
+//! the release pipeline don't require a separate `make ui-install`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -18,6 +19,7 @@ fn main() {
         "src",
         "index.html",
         "package.json",
+        "bun.lock",
         "tsconfig.json",
         "vite.config.ts",
     ] {
@@ -41,14 +43,25 @@ fn main() {
         return;
     }
 
-    let status = Command::new("bun")
-        .args(["run", "build"])
-        .current_dir(&web_ui)
-        .status()
-        .expect("failed to invoke `bun run build` for apps/web-ui");
+    // `bun run build` needs node_modules; install on a fresh clone so callers
+    // don't have to remember `make ui-install` first.
+    if !web_ui.join("node_modules").exists() {
+        println!("cargo:warning=apps/web-ui/node_modules missing — running `bun install`");
+        run_bun(&web_ui, &["install"], "bun install");
+    }
 
+    run_bun(&web_ui, &["run", "build"], "bun run build");
+}
+
+/// Invoke `bun` in `dir` with `args`; panic with `label` on spawn or non-zero exit.
+fn run_bun(dir: &Path, args: &[&str], label: &str) {
+    let status = Command::new("bun")
+        .args(args)
+        .current_dir(dir)
+        .status()
+        .unwrap_or_else(|e| panic!("failed to invoke `{label}` for {}: {e}", dir.display()));
     if !status.success() {
-        panic!("`bun run build` failed in {}", web_ui.display());
+        panic!("`{label}` failed in {}", dir.display());
     }
 }
 
