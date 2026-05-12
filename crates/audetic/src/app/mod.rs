@@ -75,9 +75,9 @@ pub async fn run_service() -> Result<()> {
 
     info!("Audetic is ready!");
     info!("Add this to your Hyprland config:");
-    info!("bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle");
-    info!("bindd = SUPER SHIFT, R, Audetic Meeting, exec, curl -X POST http://127.0.0.1:3737/meetings/toggle");
-    info!("Or test manually: curl -X POST http://127.0.0.1:3737/toggle");
+    info!("bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/api/toggle");
+    info!("bindd = SUPER SHIFT, R, Audetic Meeting, exec, curl -X POST http://127.0.0.1:3737/api/meetings/toggle");
+    info!("Or test manually: curl -X POST http://127.0.0.1:3737/api/toggle");
 
     while let Some(command) = rx.recv().await {
         match command {

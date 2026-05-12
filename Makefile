@@ -52,7 +52,7 @@ help:
 	@echo "  make codegen           - Regenerate apps/web-ui TS types from daemon /api/openapi.json"
 	@echo ""
 	@echo "  Installer:"
-	@echo "  make installer-lint    - Lint scripts/install.sh"
+	@echo "  make installer-lint    - Lint release/cli/latest.sh"
 
 # Build commands
 build:
@@ -128,7 +128,7 @@ stop:
 
 status:
 	@systemctl --user is-active audetic.service >/dev/null 2>&1 && echo "✓ Service is running" || echo "✗ Service is not running"
-	@curl -s http://127.0.0.1:3737/status 2>/dev/null | python3 -m json.tool || echo "✗ API not responding"
+	@curl -s http://127.0.0.1:3737/api/status 2>/dev/null | python3 -m json.tool || echo "✗ API not responding"
 
 # Web UI (apps/web-ui) — current SPA. Daemon must be running for codegen and dev.
 ui-install:
@@ -149,12 +149,13 @@ ui-typecheck:
 codegen:
 	cd apps/web-ui && bun run codegen
 
-# Lint the user-local installer script. End-to-end run hits systemd and
-# pulls a real release; do that on a throwaway profile, not in CI.
+# Lint the user-local installer script (served at install.audetic.ai/cli/latest.sh).
+# End-to-end run hits systemd and pulls a real release; do that on a throwaway
+# profile, not in CI.
 installer-lint:
-	bash -n scripts/install.sh
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck scripts/install.sh; else echo "shellcheck not installed; skipping"; fi
-	@echo "✓ scripts/install.sh ok"
+	bash -n release/cli/latest.sh
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck release/cli/latest.sh; else echo "shellcheck not installed; skipping"; fi
+	@echo "✓ release/cli/latest.sh ok"
 
 # Cleanup
 clean:

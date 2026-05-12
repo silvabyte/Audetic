@@ -2,53 +2,99 @@
 
 ## What this is
 
-Browser-only SPA that talks directly to the audetic daemon at `127.0.0.1:3737`. No Electron. Eventual replacement for `apps/ui` (which we're keeping until web-ui reaches parity, then deleting).
+The Audetic UI: a browser-only SPA, **bundled into the daemon binary** and served at
+`http://127.0.0.1:3737/`. There is no Electron app — `apps/ui/` and the `platform/` folder were
+deleted; this is the only UI.
 
-Stack matches the renderer side of `apps/ui`: React 19, Vite, Tailwind v4, MobX (`<Observer>` only — see `feedback_mobx.md`), react-router-dom v6 data routes, openapi-fetch + openapi-typescript, Radix + lucide + sonner.
+Stack: React 19, Vite, Tailwind v4 (`@tailwindcss/vite`, `@theme inline` — no `tailwind.config.ts`),
+MobX (`<Observer>` only, strict mode — see `feedback_mobx.md`), `react-router-dom` v6 data routes
+(loaders are thin bridges to store methods, no `useLoaderData`), `openapi-fetch` +
+`openapi-typescript`, Radix primitives + lucide + sonner.
 
-## Run it
+Routes / surface:
+
+- `/dictations` — voice-to-text history (the index route; `/` redirects here)
+- `/meetings` and `/meetings/:id` — meeting list + detail, with an auto-nav reaction that jumps to
+  `/meetings/:id` when a meeting finishes its pipeline
+- `/settings/{provider,keybind,updates,appearance,config-file}`
+- `components/command-bar.tsx` — omnipresent sticky strip: a live state orb (pulses/glows on the
+  daemon's dictation / meeting / pipeline state), a daemon-down chip, and icon actions to toggle
+  dictation and meeting. `<ActiveMeetingBanner/>` renders below it for meeting-only affordances.
+- `components/onboarding-overlay.tsx` — first-run gate driven by `onboarding-store`: checks
+  `GET /api/system/deps` for ffmpeg, and if missing walks the user through
+  `POST /api/system/install-ffmpeg` + status polling. (Daemon binary install is done by
+  `audetic install` before the SPA ever loads, so ffmpeg is the only first-run gate left.)
+
+## How it's built and embedded
+
+`crates/audetic/build.rs` runs `bun run build` in this directory at compile time; the output lands
+in `apps/web-ui/dist/`, which `crates/audetic/src/api/static_assets.rs` pulls in via
+`include_dir!("$CARGO_MANIFEST_DIR/../../apps/web-ui/dist")`. `crates/audetic/src/api/mod.rs` mounts
+the API under `/api` and uses `serve_static` as the fallback, so the SPA is served at `/` with a
+history fallback to `index.html` (hashed `/assets/*` get a long cache; `index.html` is `no-cache`).
+
+- `bun install` must have been run once in this checkout before `cargo build` works (the build script
+  invokes `bun run build`, which needs `node_modules`). `make ui-install` does this.
+- Escape hatch: `AUDETIC_SKIP_UI_BUILD=1 cargo build` skips the SPA build (and `build.rs` also
+  silently skips if `bun` isn't on PATH). In either case it drops a placeholder `dist/index.html` so
+  `include_dir!` still resolves — the daemon builds but serves a "UI not built" stub. Use this only
+  for environments without `bun`; CI builds the real bundle.
+
+## Run it in dev
 
 ```bash
-# 1. start the daemon (separate terminal)
-cargo run -p audetic    # or systemctl --user start audetic
+# 1. start the daemon first — the SPA does NOT spawn it
+cargo run -p audetic        # or: systemctl --user start audetic
 
-# 2. install + run
-cd apps/web-ui
-bun install
-bun run codegen   # regenerates src/api/schema.ts from the running daemon
-bun run dev       # vite at http://localhost:5173 (or :5174 if busy)
+# 2. (once per checkout) install deps
+make ui-install             # cd apps/web-ui && bun install
+
+# 3. dev server
+make ui-dev                 # cd apps/web-ui && bun run dev — vite at :5173 (or :5174 if busy)
 ```
 
-Daemon must be running first — the SPA does not spawn it.
+Vite proxies `/api` to the daemon at `127.0.0.1:3737` (see `vite.config.ts`), so the dev SPA talks to
+a real running daemon. Permissive CORS on the daemon makes this work cross-origin; in production the
+SPA is same-origin.
 
-## What landed (commit c4e0246)
+`make codegen` (`bun run codegen`) regenerates `src/api/schema.ts` from the running daemon's
+`GET /api/openapi.json` (utoipa). Run it after changing daemon routes/schemas.
 
-- Scaffold: `package.json`, `vite.config.ts`, `tsconfig.json`, `index.html`, `src/main.tsx`.
-- Renderer copied from `apps/ui/src/renderer/src/` (api, lib, stores, components, routes).
-- Adapted away from Electron IPC: `ui-store` → localStorage; `root-store` drops install + appUpdate; `settings/{layout,config-file,updates}` adapted; `transcription-card` wrapped in `<Observer>`.
-- Dropped: dashboard route, install-store, app-update-store, onboarding-card.
-- New: `components/command-bar.tsx` — sticky top bar with status pill, daemon-down chip, dictation toggle, meeting entry. Subsumes `<ActiveMeetingBanner/>` below it.
-- Sidebar: Dictations / Meetings / Settings (no Dashboard). `/` redirects to `/dictations`.
+`make ui-typecheck` (`bun run typecheck`) is the only check unique to this package; `make quality`
+runs it alongside the Rust gate. CI (`.github/workflows/rust.yml`) installs `bun`, runs
+`bun install` + `bun run typecheck`, then builds/tests the daemon — which exercises the real
+`bun run build` + `include_dir!` embedding.
 
-## Smoke verified
+## Install story
 
-`/dictations` (50 entries), `/meetings` (45 meetings), `/settings/{keybind,updates,config-file}` render. Theme switch persists to `localStorage["audetic.themeMode"]`. Daemon-down chip wired to `daemonReachable`. MobX warnings down ~98% (only pre-existing strict-mode loader noise remains).
+For end users: `audetic install` (`crates/audetic/src/cli/install.rs` →
+`crates/audetic/src/install/mod.rs`) — user-local, no sudo: copies the binary to
+`~/.local/share/audetic/bin/`, writes `~/.config/systemd/user/audetic.service`, `enable --now`s it,
+waits for `127.0.0.1:3737`, and opens `http://127.0.0.1:3737/` in the browser.
+`release/cli/latest.sh` (served at `https://install.audetic.ai/cli/latest.sh`) is the
+`curl … | bash` wrapper that downloads the daemon and hands off to `audetic install`; `make
+installer-lint` checks it.
 
-## Next steps (deferred from this PR)
+## Things I'd revisit
 
-These all live in `apps/ui/src/main/` + `apps/ui/src/preload/` today and need a different home (or to die) before `apps/ui` can be deleted:
-
-- **Daemon spawn / lifecycle.** Web SPA assumes daemon is already running. Either keep manual / systemd as the supported path, or build a small launcher (Tauri shell? a desktop entry that starts the daemon and opens a browser to the served UI?).
-- **Onboarding installer.** Today: detect bundled vs installed daemon version, install systemd unit, install ffmpeg. Web has no install story — figure out distribution (curl-bash + how the user gets to the SPA).
-- **Hosting the built SPA.** `vite build` makes static files. Options: serve from the daemon itself (add a static-files route to crates/audetic), serve from a tiny separate daemon, or ship as a tarball the user `python -m http.server`'s. Pick before we ship.
-- **Tray icon.** No browser equivalent. If we still want a tray, it lives in whatever shell launches the daemon.
-- **Auto-update of the UI itself.** `electron-updater` made sense for the Electron app binary. Browser SPA = users hard-refresh. The daemon's own update endpoints (`/update/check`, `/update/install`) already work and are wired in `/settings/updates`.
-- **Native dialogs / shell.openPath.** Replaced for `config-file` with a Copy button. If other places need it, decide per-feature whether browser-friendly UX is enough.
-- **Window state persistence, deep links, packaging.** All Electron-specific. Skip.
-
-## Things I'd revisit but didn't here
-
-- **Settings/Updates auto-update flag is locally tracked** — daemon doesn't expose `GET /update/auto`. If we want truth-on-reload, daemon needs a getter.
-- **MobX `observableRequiresReaction` warnings on loader reads** — strict mode warns about route loaders calling `getRootStore().history.load(...)`. Pre-existing; benign. Could silence per-call with `untracked()` if the warnings get noisy.
-- **`apps/ui` parity** — meeting-detail and meetings list were copied verbatim and work, but I haven't actually started a meeting in web-ui to confirm the full lifecycle (start → record → stop → compress → transcribe → auto-nav). Worth doing before declaring v1 done.
-- **No build / typecheck in CI yet.** Add `apps/web-ui` to whatever check runs on PRs.
+- **Daemon lifecycle is Linux-only.** `audetic install` assumes systemd user units and `xdg-open`.
+  There's no story for macOS/Windows (launchd plist, a different launcher, etc.) — and the SPA still
+  assumes the daemon is already running.
+- **No tray equivalent.** A browser tab has no system-tray idiom. The command-bar state orb covers
+  "what is it doing right now" while a tab is open, but there's nothing surfacing state when no tab
+  is open. If we still want a tray, it lives in whatever launches the daemon.
+- **Native dialogs are replaced per-feature.** `config-file` swapped `shell.openPath` for a Copy
+  button. Other places that wanted a native picker/opener get a browser-friendly UX per-feature; no
+  general replacement.
+- **Auto-update UI vs the daemon.** Settings → Updates now reads the truth from the daemon:
+  `GET /api/update/auto` getter exists and `config-store` loads/writes it via `GET`/`PUT /api/update/auto`,
+  and `GET /api/update/check` drives the version card. So the "locally-tracked flag" caveat from the
+  Electron era no longer applies. The browser SPA itself updates by hard-refresh against the
+  daemon-served bundle (`index.html` is `no-cache`).
+- **Meeting lifecycle not exercised end-to-end in web-ui.** The meetings list / detail / banner /
+  auto-nav are wired and render, but I haven't actually run a meeting in web-ui to confirm the full
+  chain (start → record → stop → compress → transcribe → auto-nav to `/meetings/:id`). Worth doing
+  before calling v1 done.
+- **MobX `observableRequiresReaction` warnings on loader reads.** Strict mode warns when route
+  loaders call store methods that read observables outside a reaction. Pre-existing and benign; could
+  silence per-call with `untracked()` if it gets noisy.

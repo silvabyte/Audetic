@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 const SERVICE_TEMPLATE: &str = include_str!("audetic.service.tmpl");
 const SERVICE_NAME: &str = "audetic.service";
-const DAEMON_VERSION_URL: &str = "http://127.0.0.1:3737/version";
+const DAEMON_VERSION_URL: &str = "http://127.0.0.1:3737/api/version";
 const APP_URL: &str = "http://127.0.0.1:3737/";
 
 pub struct InstallOptions {

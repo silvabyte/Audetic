@@ -15,9 +15,17 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Install ALSA development libraries # <-- Add this step
+      - name: Install ALSA development libraries
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+      - name: Install web-ui dependencies
+        run: cd apps/web-ui && bun install
+      - name: Typecheck web-ui
+        run: cd apps/web-ui && bun run typecheck
       - name: Build
+        # `bun` is on PATH, so crates/audetic/build.rs runs `bun run build`
+        # in apps/web-ui and the real dist/ is embedded via include_dir!.
         run: cargo build --verbose
       - name: Run tests
         run: cargo test --verbose

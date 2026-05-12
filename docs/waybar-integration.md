@@ -13,10 +13,10 @@ Add the module to your modules list and configuration:
   "modules-center": ["custom/audetic", "clock"], // Add to any module list
   
   "custom/audetic": {
-    "exec": "curl -s 'http://127.0.0.1:3737/status?style=waybar'",
+    "exec": "curl -s 'http://127.0.0.1:3737/api/status?style=waybar'",
     "interval": 1,
     "return-type": "json", 
-    "on-click": "curl -X POST http://127.0.0.1:3737/toggle",
+    "on-click": "curl -X POST http://127.0.0.1:3737/api/toggle",
     "tooltip": true
   }
 }
@@ -68,7 +68,7 @@ CSS styling (optional):
 
 **Module not appearing**: Ensure `"custom/audetic"` is added to a module list (modules-left, modules-center, or modules-right).
 
-**Shows "N/A" or error**: Check Audetic is running: `curl http://127.0.0.1:3737/status`
+**Shows "N/A" or error**: Check Audetic is running: `curl http://127.0.0.1:3737/api/status`
 
-**Click not working**: Test the command manually: `curl -X POST http://127.0.0.1:3737/toggle`
+**Click not working**: Test the command manually: `curl -X POST http://127.0.0.1:3737/api/toggle`
 

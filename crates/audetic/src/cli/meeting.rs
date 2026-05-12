@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::cli::args::{MeetingCliArgs, MeetingCommand};
 
-const BASE_URL: &str = "http://127.0.0.1:3737";
+const BASE_URL: &str = "http://127.0.0.1:3737/api";
 
 pub async fn handle_meeting_command(args: MeetingCliArgs) -> Result<()> {
     match args.command {
