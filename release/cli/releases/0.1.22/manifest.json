@@ -1,13 +1,13 @@
 {
 	"version": "0.1.22",
-	"channel": "beta",
-	"release_date": "2025-11-25T18:58:10.801Z",
+	"channel": "stable",
+	"release_date": "2026-05-12T20:37:18.919Z",
 	"notes_url": "https://install.audetic.ai/cli/releases/0.1.22/notes.md",
 	"targets": {
 		"linux-x86_64-gnu": {
 			"archive": "audetic-0.1.22-linux-x86_64-gnu.tar.gz",
-			"sha256": "a770471fb80a0a107bb179dcd5288525a0d274bc5d1c47437affed2be32c3ec1",
-			"size": 5021199
+			"sha256": "510f2e03b6e61b781319597b001669bc1a78423a2e0e25db05eb52bd2f9542b9",
+			"size": 7035668
 		}
 	}
 }
