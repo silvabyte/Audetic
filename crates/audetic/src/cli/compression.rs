@@ -54,13 +54,19 @@ pub fn compress_for_transcription(input: &Path) -> Result<PathBuf> {
         ),
     };
 
-    // Create temp output path
+    // Create temp output path. The random component keeps concurrent
+    // compressions of same-named inputs (e.g. parallel `audetic transcribe`
+    // calls, or parallel test threads) from writing to the same file — which
+    // would make ffmpeg read a half-written input/output and fail.
     let temp_dir = std::env::temp_dir();
     let filename = input
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("audio");
-    let output = temp_dir.join(format!("{}_compressed.mp3", filename));
+    let output = temp_dir.join(format!(
+        "{filename}-{}-compressed.mp3",
+        uuid::Uuid::new_v4().simple()
+    ));
 
     // Run FFmpeg compression
     // -i: input file

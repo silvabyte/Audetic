@@ -412,21 +412,13 @@ impl MeetingMachine {
 
     fn generate_audio_path(&self) -> PathBuf {
         let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
-        let filename = format!("meeting-{}.wav", timestamp);
-        let path = self.meetings_dir.join(&filename);
-
-        // Handle collision by appending counter
-        if path.exists() {
-            for i in 1..100 {
-                let filename = format!("meeting-{}-{}.wav", timestamp, i);
-                let alt_path = self.meetings_dir.join(&filename);
-                if !alt_path.exists() {
-                    return alt_path;
-                }
-            }
-        }
-
-        path
+        // The random suffix keeps two meetings created within the same second
+        // on distinct paths — a live daemon only runs one meeting at a time,
+        // but parallel test threads can collide. Without it both WAVs (and the
+        // temp mp3s derived from those filenames) would clobber each other.
+        let unique = uuid::Uuid::new_v4().simple();
+        self.meetings_dir
+            .join(format!("meeting-{timestamp}-{unique}.wav"))
     }
 }
 

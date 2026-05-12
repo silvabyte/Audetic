@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use std::time::Duration;
 
 pub fn init_db() -> Result<Connection> {
     let db_path = crate::global::db_file()?;
@@ -10,6 +11,12 @@ pub fn init_db() -> Result<Connection> {
     }
 
     let conn = Connection::open(&db_path).context("Failed to open database connection")?;
+
+    // The daemon opens a fresh connection per request, so recording-history
+    // writes, meeting writes, and API reads overlap. Wait for the write lock
+    // instead of failing immediately with SQLITE_BUSY.
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("Failed to set SQLite busy timeout")?;
 
     migrate(&conn)?;
 
