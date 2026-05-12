@@ -2,7 +2,10 @@
 //!
 //! Uses in-memory mocks for the audio sources, transcription service, and
 //! post-meeting hook so the full lifecycle can be exercised without touching
-//! real hardware or the network.
+//! real hardware or the network. The one exception is the compression step:
+//! `test_meeting_happy_path` runs real `ffmpeg` (via the same code path the
+//! daemon uses), so `ffmpeg` with libmp3lame must be on PATH or that test
+//! ends in `Error` instead of `Completed`.
 //!
 //! These tests validate the bug regressions discovered during the v0.1.20
 //! meeting feature audit:

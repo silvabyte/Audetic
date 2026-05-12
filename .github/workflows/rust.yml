@@ -15,8 +15,11 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Install ALSA development libraries
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev
+      - name: Install system deps (ALSA headers + ffmpeg)
+        # ffmpeg is needed by the compression pipeline that the meeting and
+        # transcribe integration tests exercise; Ubuntu's package is built with
+        # libmp3lame so `-codec:a libmp3lame` works.
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev ffmpeg
       - name: Install bun
         uses: oven-sh/setup-bun@v2
       - name: Install web-ui dependencies
