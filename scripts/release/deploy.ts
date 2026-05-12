@@ -455,7 +455,9 @@ async function buildTarget(targetId: string, rustTarget: string) {
 	// installed) embed the host-built dist via include_dir!.
 	const env = { ...process.env, AUDETIC_SKIP_UI_BUILD: "1" };
 	if (featureArgs.length) {
-		await $`${builder} build --release --target ${rustTarget} --features ${config.extraFeatures}`.env(env);
+		await $`${builder} build --release --target ${rustTarget} --features ${config.extraFeatures}`.env(
+			env,
+		);
 	} else {
 		await $`${builder} build --release --target ${rustTarget}`.env(env);
 	}
