@@ -4,7 +4,7 @@ Complete installation instructions for different operating systems and environme
 
 ## Quick Install (Recommended)
 
-Audetic now ships verified binaries for Linux and macOS. Install or reinstall the service with one command—no Rust toolchain, git clone, or manual builds required:
+Audetic ships verified, pre-built binaries. Install with one command—no Rust toolchain, git clone, or manual builds required, and no sudo:
 
 ```bash
 curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
@@ -12,25 +12,25 @@ curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
 
 The installer:
 
-- Detects your OS/architecture and selects the matching artifact.
-- Verifies SHA-256 (and optional signatures) before extracting.
-- Installs the `audetic` binary into `/usr/local/bin` (or a custom prefix).
-- Drops the systemd user unit plus config scaffolding under `~/.config/audetic`.
-- Seeds `update_state.json` so the built-in auto-updater can take over.
-- Is idempotent—rerun anytime to repair, reinstall, or switch channels.
+- Detects your OS/architecture, downloads the matching artifact, and verifies its SHA-256.
+- Hands off to `audetic install`, which copies the binary to `~/.local/share/audetic/bin/audetic`.
+- Writes a systemd **user** unit at `~/.config/systemd/user/audetic.service` and `enable --now`s it.
+- Waits for the daemon to bind `127.0.0.1:3737`, then opens the web UI (`http://127.0.0.1:3737/`) in your default browser so you can finish onboarding (ffmpeg install, provider config) in the SPA.
+- Everything lives under `$HOME` — no `/usr/local/bin`, no sudo.
 
 ### Useful flags
 
 ```
 latest.sh --channel beta            # jump to another release channel
-latest.sh --clean                   # remove previous binary/service before reinstalling
-latest.sh --dry-run                 # fetch & verify artifacts without touching the system
+latest.sh --version <v>             # pin a specific version
+latest.sh --no-launch               # don't open the web UI in a browser after install
 ```
 
 After install:
-1. The installer automatically enables/starts the systemd **user** service (unless `--no-start` was set). Use `systemctl --user status audetic.service` to confirm.
-2. Add a keybind in Hyprland (or your compositor) that calls `curl -X POST http://127.0.0.1:3737/toggle`.
-3. Edit `~/.config/audetic/config.toml` if you need custom providers, models, or behavior tweaks.
+1. The installer already enabled/started the systemd **user** service. Use `systemctl --user status audetic.service` to confirm.
+2. Finish provider and ffmpeg setup in the web UI the installer opened (or visit `http://127.0.0.1:3737/`).
+3. Add a keybind in Hyprland (or your compositor) that calls `curl -X POST http://127.0.0.1:3737/api/toggle`.
+4. Edit `~/.config/audetic/config.toml` if you need custom providers, models, or behavior tweaks.
 
 ## Manual Installation
 
@@ -209,7 +209,12 @@ audio_feedback = true
 
 ## Systemd Service Setup
 
-Create a user service for automatic startup:
+The `latest.sh` installer (via `audetic install`) already sets this up: it
+writes a systemd **user** unit to `~/.config/systemd/user/audetic.service` with
+`ExecStart` pointed at `~/.local/share/audetic/bin/audetic`, runs
+`systemctl --user daemon-reload`, and `systemctl --user enable --now audetic.service`.
+
+If you built Audetic manually and want to wire up the service by hand:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -224,7 +229,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/audetic
+ExecStart=%h/.local/share/audetic/bin/audetic
 Restart=always
 RestartSec=5
 Environment="RUST_LOG=info"
@@ -235,6 +240,8 @@ CPUQuota=80%
 WantedBy=default.target
 ```
 
+(Adjust `ExecStart` to wherever your `audetic` binary lives — e.g. an older install may have it at `/usr/local/bin/audetic`.)
+
 Enable and start the service:
 
 ```bash
@@ -242,19 +249,19 @@ systemctl --user daemon-reload
 systemctl --user enable --now audetic.service
 ```
 
-> **Audio groups:** User services cannot add supplemental groups the account does not already have. Most setups that use PipeWire/ALSA through the desktop stack work without any extra privileges. If you need direct ALSA device access, add yourself to the `audio` group (followed by a re-login) or, for `latest.sh --system`, add `SupplementaryGroups=audio` via a systemd drop-in.
+> **Audio groups:** User services cannot add supplemental groups the account does not already have. Most setups that use PipeWire/ALSA through the desktop stack work without any extra privileges. If you need direct ALSA device access, add yourself to the `audio` group (followed by a re-login) or add `SupplementaryGroups=audio` via a systemd drop-in.
 
 ## Hyprland Integration
 
 Add to your Hyprland config (`~/.config/hypr/hyprland.conf`):
 
 ```
-bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle
+bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/api/toggle
 ```
 
 For Omarchy users:
 ```
-bindd = SUPER, R, Audetic, exec, $terminal -e curl -X POST http://127.0.0.1:3737/toggle
+bindd = SUPER, R, Audetic, exec, $terminal -e curl -X POST http://127.0.0.1:3737/api/toggle
 ```
 
 ## GNOME + Wayland Setup
@@ -308,13 +315,13 @@ input_method = "ydotool"  # Recommended (auto-detected first)
 1. Open GNOME Settings
 2. Go to Keyboard → Keyboard Shortcuts → View and Customize Shortcuts
 3. Go to Custom Shortcuts
-4. Add new shortcut with command: `curl -X POST http://127.0.0.1:3737/toggle`
+4. Add new shortcut with command: `curl -X POST http://127.0.0.1:3737/api/toggle`
 5. Set your preferred key combination (e.g., Super+R)
 
 ## Testing Installation
 
 1. **Test service**: `systemctl --user status audetic.service`
-2. **Test API**: `curl -X POST http://127.0.0.1:3737/toggle`
+2. **Test API**: `curl -X POST http://127.0.0.1:3737/api/toggle`
 3. **Test provider**: `audetic provider test` (validates transcription setup)
 4. **Test recording**: Press your configured keybind
 5. **Check logs**: `make logs` or `journalctl --user -u audetic.service -f`
@@ -370,10 +377,10 @@ audetic update --disable
 audetic update --enable
 ```
 
-Because `latest.sh` is idempotent, you can also rerun it at any time to jump to a specific channel or repair a broken install:
+You can also rerun the installer at any time to jump to a specific channel or repair a broken install:
 
 ```bash
-curl -fsSL https://install.audetic.ai/cli/latest.sh | bash -s -- --channel beta --clean
+curl -fsSL https://install.audetic.ai/cli/latest.sh | bash -s -- --channel beta
 ```
 
 ## Uninstalling
@@ -403,8 +410,8 @@ curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash -s -- --remove-tem
 ### What gets removed
 
 By default, the uninstaller removes:
-- `/usr/local/bin/audetic` (CLI binary)
-- `/usr/local/bin/audetic-*.bak` (backup binaries from auto-updates)
+- `~/.local/share/audetic/bin/audetic` (user-local CLI binary) — or `/usr/local/bin/audetic` for a legacy system-wide install
+- `audetic-*.bak` backup binaries from auto-updates
 - `~/.config/systemd/user/audetic.service` (systemd unit)
 - `~/.config/audetic/` (config and update state)
 - `~/.local/share/audetic/` (database and update cache)

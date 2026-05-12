@@ -68,6 +68,7 @@ console.log(`Version: ${version}`);
 await syncVersions(version);
 await maybeRunTests();
 await ensureNotes(version);
+await buildWebUi();
 
 const tmpRoot = await mkdtemp(path.join(os.tmpdir(), "audetic-release-"));
 const artifacts: Artifact[] = [];
@@ -261,7 +262,7 @@ async function updateTomlVersion(
 	const contents = await Bun.file(filePath).text();
 	const regex = anchor
 		? new RegExp(`(${anchor}[\\s\\S]*?version = ")([^"]+)(")`)
-		: /(\[package\][\s\S]*?^version\s*=\s*")([^"]+)(")/m;
+		: /((?:\[workspace\.package\]|\[package\])[\s\S]*?^version\s*=\s*")([^"]+)(")/m;
 	const next = contents.replace(regex, `$1${version}$3`);
 	await Bun.write(filePath, next);
 }
@@ -444,11 +445,23 @@ async function buildTarget(targetId: string, rustTarget: string) {
 	if (config.dryRun) {
 		return;
 	}
+	// `bun run build` was already done once in buildWebUi(); skip the
+	// per-target rebuild so cross containers (which may not have bun
+	// installed) embed the host-built dist via include_dir!.
+	const env = { ...process.env, AUDETIC_SKIP_UI_BUILD: "1" };
 	if (featureArgs.length) {
-		await $`${builder} build --release --target ${rustTarget} --features ${config.extraFeatures}`;
+		await $`${builder} build --release --target ${rustTarget} --features ${config.extraFeatures}`.env(env);
 	} else {
-		await $`${builder} build --release --target ${rustTarget}`;
+		await $`${builder} build --release --target ${rustTarget}`.env(env);
 	}
+}
+
+async function buildWebUi() {
+	if (config.dryRun) return;
+	const webUiDir = path.join(ROOT_DIR, "apps", "web-ui");
+	console.log("==> bun --cwd apps/web-ui run build");
+	await $`bun install`.cwd(webUiDir);
+	await $`bun run build`.cwd(webUiDir);
 }
 
 async function packageTarget(

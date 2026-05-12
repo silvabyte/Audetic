@@ -15,11 +15,24 @@ Audetic ships pre-built, signed binaries.
 curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
 ```
 
+This downloads the daemon and runs `audetic install`, which copies the binary
+under `~/.local/share/audetic/bin/`, installs a systemd **user** service at
+`~/.config/systemd/user/audetic.service`, `enable --now`s it, waits for it to
+bind `127.0.0.1:3737`, and opens the web UI in your browser so you can finish
+onboarding (ffmpeg, provider config). No sudo. Pass `--no-launch` to skip
+opening the browser.
+
 **After installation:**
 
-1. Confirm the service: `audetic` - streams the logs
-2. Add a keybind in Hyprland (or your compositor): `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/toggle`
+1. Finish provider and ffmpeg setup in the web UI the installer opened (or visit `http://127.0.0.1:3737/`).
+2. Add a keybind in Hyprland (or your compositor): `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/api/toggle`
 3. Press the keybind to start/stop recording!
+
+## Web UI
+
+The daemon serves a web UI at `http://127.0.0.1:3737/` for onboarding, provider
+configuration, and browsing transcription history. The HTTP API lives under
+`http://127.0.0.1:3737/api/*` (e.g. `POST /api/toggle`, `GET /api/status`).
 
 ## Configuration
 

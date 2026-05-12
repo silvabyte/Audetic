@@ -11,7 +11,9 @@ USE_CROSS ?= 0
 EXTRA_FEATURES ?=
 AUTO_COMMIT ?= 1
 
-.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix deploy deploy-beta deploy-stable
+.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix quality deploy deploy-beta deploy-stable \
+        ui-install ui-dev ui-build ui-preview ui-typecheck codegen \
+        installer-lint
 
 # Default target
 help:
@@ -24,6 +26,7 @@ help:
 	@echo "  make lint      - Run clippy linter"
 	@echo "  make fmt       - Check formatting"
 	@echo "  make fix       - Fix formatting and simple lint issues"
+	@echo "  make quality   - Run all quality checks (rust fmt/clippy/test + web-ui typecheck)"
 	@echo ""
 	@echo "  make run       - Run Audetic directly"
 	@echo "  make start     - Enable and start service"
@@ -39,6 +42,17 @@ help:
 	@echo "                      CONTINUE_ON_ERROR=1)"
 	@echo "  make deploy-beta  - Deploy to beta channel (convenience for CHANNEL=beta)"
 	@echo "  make deploy-stable- Deploy to stable channel (convenience for CHANNEL=stable)"
+	@echo ""
+	@echo "  Web UI (apps/web-ui — bundled into the daemon binary):"
+	@echo "  make ui-install        - Install web UI dependencies (bun)"
+	@echo "  make ui-dev            - Run the web UI in dev mode (vite at :5173, proxies /api to :3737)"
+	@echo "  make ui-build          - Build the web UI to static files (dist/)"
+	@echo "  make ui-preview        - Preview the production build locally"
+	@echo "  make ui-typecheck      - Typecheck the web UI"
+	@echo "  make codegen           - Regenerate apps/web-ui TS types from daemon /api/openapi.json"
+	@echo ""
+	@echo "  Installer:"
+	@echo "  make installer-lint    - Lint release/cli/latest.sh"
 
 # Build commands
 build:
@@ -63,6 +77,15 @@ fmt:
 fix:
 	cargo fix --allow-dirty --allow-staged
 
+# One-shot gate for both projects: Rust (fmt + clippy + tests) and the
+# bun web-ui (typecheck). Run before committing or in CI.
+quality:
+	cargo fmt --all -- --check
+	cargo clippy --all-targets --all-features -- -D warnings
+	cargo test
+	cd apps/web-ui && bun run typecheck
+	@echo "✓ quality checks passed (rust + web-ui)"
+
 deploy:
 	@VERSION=$(VERSION) \
 	 CHANNEL=$(CHANNEL) \
@@ -86,7 +109,7 @@ deploy-stable:
 
 # Service management
 run:
-	RUST_LOG=info cargo run --release
+	AUDETIC_DISABLE_AUTO_UPDATE=1 RUST_LOG=info cargo run --release
 
 logs:
 	journalctl --user -u audetic.service -f
@@ -105,7 +128,34 @@ stop:
 
 status:
 	@systemctl --user is-active audetic.service >/dev/null 2>&1 && echo "✓ Service is running" || echo "✗ Service is not running"
-	@curl -s http://127.0.0.1:3737/status 2>/dev/null | python3 -m json.tool || echo "✗ API not responding"
+	@curl -s http://127.0.0.1:3737/api/status 2>/dev/null | python3 -m json.tool || echo "✗ API not responding"
+
+# Web UI (apps/web-ui) — current SPA. Daemon must be running for codegen and dev.
+ui-install:
+	cd apps/web-ui && bun install
+
+ui-dev:
+	cd apps/web-ui && bun run dev
+
+ui-build:
+	cd apps/web-ui && bun run build
+
+ui-preview:
+	cd apps/web-ui && bun run preview
+
+ui-typecheck:
+	cd apps/web-ui && bun run typecheck
+
+codegen:
+	cd apps/web-ui && bun run codegen
+
+# Lint the user-local installer script (served at install.audetic.ai/cli/latest.sh).
+# End-to-end run hits systemd and pulls a real release; do that on a throwaway
+# profile, not in CI.
+installer-lint:
+	bash -n release/cli/latest.sh
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck release/cli/latest.sh; else echo "shellcheck not installed; skipping"; fi
+	@echo "✓ release/cli/latest.sh ok"
 
 # Cleanup
 clean:
