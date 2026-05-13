@@ -12,7 +12,6 @@ const RELEASE_DIR = path.join(ROOT_DIR, "release", "cli");
 const RELEASES_ROOT = path.join(RELEASE_DIR, "releases");
 const CARGO_TOML = path.join(ROOT_DIR, "Cargo.toml");
 const CARGO_LOCK = path.join(ROOT_DIR, "Cargo.lock");
-const SERVICE_FILE = path.join(ROOT_DIR, "audetic.service");
 const EXAMPLE_CONFIG = path.join(ROOT_DIR, "example_config.toml");
 
 $.cwd(ROOT_DIR);
@@ -490,8 +489,6 @@ async function packageTarget(
 	await mkdir(stageDir, { recursive: true });
 
 	await copyFile(binaryPath, path.join(stageDir, "audetic"));
-	await assertPath(SERVICE_FILE, "audetic.service");
-	await copyFile(SERVICE_FILE, path.join(stageDir, "audetic.service"));
 	await assertPath(EXAMPLE_CONFIG, "example_config");
 	await copyFile(EXAMPLE_CONFIG, path.join(stageDir, "example_config.toml"));
 	await Bun.write(
@@ -499,8 +496,7 @@ async function packageTarget(
 		`Audetic ${version} (${targetId})
 
 Files:
-  audetic             - main binary
-  audetic.service     - systemd user unit template
+  audetic             - main binary (run \`./audetic install\` to set up systemd user unit)
   example_config.toml - starter configuration
 
 Installation instructions: https://install.audetic.ai/
