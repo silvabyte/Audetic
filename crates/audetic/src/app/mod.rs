@@ -73,11 +73,13 @@ pub async fn run_service() -> Result<()> {
 
     spawn_update_manager();
 
+    let toggle_url = crate::api::url::api_url(crate::api::url::paths::TOGGLE);
+    let meetings_toggle_url = crate::api::url::api_url(crate::api::url::paths::MEETINGS_TOGGLE);
     info!("Audetic is ready!");
     info!("Add this to your Hyprland config:");
-    info!("bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/api/toggle");
-    info!("bindd = SUPER SHIFT, R, Audetic Meeting, exec, curl -X POST http://127.0.0.1:3737/api/meetings/toggle");
-    info!("Or test manually: curl -X POST http://127.0.0.1:3737/api/toggle");
+    info!("bindd = SUPER, R, Audetic, exec, curl -X POST {toggle_url}");
+    info!("bindd = SUPER SHIFT, R, Audetic Meeting, exec, curl -X POST {meetings_toggle_url}");
+    info!("Or test manually: curl -X POST {toggle_url}");
 
     while let Some(command) = rx.recv().await {
         match command {

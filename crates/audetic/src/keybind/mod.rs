@@ -39,7 +39,12 @@ pub const DEFAULT_KEY: &str = "R";
 pub const DEFAULT_MODIFIERS: &[&str] = &["SUPER"];
 pub const FALLBACK_MODIFIERS: &[&str] = &["SUPER", "SHIFT"];
 pub const AUDETIC_SECTION_MARKER: &str = "# Audetic voice-to-text (managed by audetic keybind)";
-pub const AUDETIC_TOGGLE_ENDPOINT: &str = "http://127.0.0.1:3737/api/toggle";
+
+/// URL the hyprland binding POSTs to. Derived from [`crate::api::url`]
+/// so a change to the daemon's host/port/prefix flows here automatically.
+pub fn audetic_toggle_endpoint() -> String {
+    crate::api::url::api_url(crate::api::url::paths::TOGGLE)
+}
 
 /// Represents a proposed keybinding to install
 #[derive(Debug, Clone)]
@@ -56,7 +61,7 @@ impl Default for ProposedBinding {
             modifiers: Modifiers::from_strs(DEFAULT_MODIFIERS),
             key: DEFAULT_KEY.to_string(),
             description: "Audetic".to_string(),
-            command: format!("curl -X POST {}", AUDETIC_TOGGLE_ENDPOINT),
+            command: format!("curl -X POST {}", audetic_toggle_endpoint()),
         }
     }
 }
