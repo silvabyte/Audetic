@@ -132,9 +132,9 @@ cd Audetic
 # Build release version
 cargo build --release
 
-# Install binary
-sudo cp target/release/audetic /usr/local/bin/
-sudo chmod +x /usr/local/bin/audetic
+# Install into the user-local layout (~/.local/share/audetic/bin + systemd
+# user unit). No sudo needed — this is the same path `latest.sh` takes.
+./target/release/audetic install
 ```
 
 ## Configuration
@@ -239,8 +239,6 @@ CPUQuota=80%
 [Install]
 WantedBy=default.target
 ```
-
-(Adjust `ExecStart` to wherever your `audetic` binary lives — e.g. an older install may have it at `/usr/local/bin/audetic`.)
 
 Enable and start the service:
 
@@ -410,10 +408,11 @@ curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash -s -- --remove-tem
 ### What gets removed
 
 By default, the uninstaller removes:
-- `~/.local/share/audetic/bin/audetic` (user-local CLI binary) — or `/usr/local/bin/audetic` for a legacy system-wide install
-- `audetic-*.bak` backup binaries from auto-updates
+- `~/.local/share/audetic/bin/` (binary + `audetic-*.bak` files from auto-updates)
 - `~/.config/systemd/user/audetic.service` (systemd unit)
 - `~/.config/audetic/` (config and update state)
-- `~/.local/share/audetic/` (database and update cache)
+- `~/.local/share/audetic/audetic.db*` (transcription history)
+- `~/.local/share/audetic/updates/`, `update.lock` (auto-update cache)
+- `~/.local/share/audetic/meetings/`, `keybind-backups/`
 
 Use `--keep-config`, `--keep-database`, or `--keep-updates` to preserve specific artifacts.
