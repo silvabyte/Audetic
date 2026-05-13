@@ -90,4 +90,25 @@ mod tests {
              Update either api/docs.rs servers() or api::url to match."
         );
     }
+
+    /// Every `paths::*` constant must correspond to an operation in
+    /// the OpenAPI spec. If you rename a route or drop a path const
+    /// without updating the other side, this fails loudly.
+    #[test]
+    fn well_known_paths_exist_in_openapi_spec() {
+        use crate::api::docs::ApiDoc;
+        use utoipa::OpenApi;
+
+        let doc = ApiDoc::openapi();
+        let spec_paths: std::collections::HashSet<String> =
+            doc.paths.paths.keys().cloned().collect();
+
+        for known in [paths::VERSION, paths::TOGGLE, paths::MEETINGS_TOGGLE] {
+            assert!(
+                spec_paths.contains(known),
+                "api::url::paths references \"{known}\" but the OpenAPI \
+                 spec has no such operation. Spec paths: {spec_paths:?}"
+            );
+        }
+    }
 }

@@ -1,13 +1,5 @@
-//! Meeting recording API endpoints.
-//!
-//! Provides HTTP endpoints for:
-//! - Starting meeting recording (POST /api/meetings/start)
-//! - Stopping meeting recording (POST /api/meetings/stop)
-//! - Cancelling meeting recording (POST /api/meetings/cancel)
-//! - Toggling meeting recording (POST /api/meetings/toggle)
-//! - Getting meeting status (GET /api/meetings/status)
-//! - Listing meetings (GET /api/meetings)
-//! - Getting a specific meeting (GET /api/meetings/:id)
+//! Meeting recording API endpoints. See OpenAPI spec at
+//! `/api/openapi.json` for the canonical method/path list.
 
 use crate::meeting::{MeetingPhase, MeetingStartOptions, MeetingStatusHandle};
 use axum::{
@@ -44,7 +36,8 @@ pub struct MeetingStartRequest {
     pub title: Option<String>,
 }
 
-/// Response for POST /api/meetings/start.
+/// Confirmation that a meeting recording has begun: the assigned id,
+/// where audio is being written, and capture-source state.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingStartResponse {
     pub success: bool,
@@ -54,7 +47,8 @@ pub struct MeetingStartResponse {
     pub message: String,
 }
 
-/// Response for POST /api/meetings/stop and POST /api/meetings/cancel.
+/// Result of ending a meeting (stop or cancel): the meeting id and how
+/// long it ran.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingStopResponse {
     pub success: bool,
@@ -63,9 +57,9 @@ pub struct MeetingStopResponse {
     pub message: String,
 }
 
-/// Response for POST /api/meetings/toggle — shape varies by whether a
-/// meeting was started or stopped. Extra fields are only present
-/// when relevant; both `duration_seconds` and `audio_path` may be null.
+/// Result of a meeting toggle. Shape varies by whether a meeting was
+/// started or stopped: `audio_path`/`capture_state` appear on start,
+/// `duration_seconds` appears on stop, hence the optional fields.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingToggleResponse {
     pub success: bool,
@@ -80,7 +74,8 @@ pub struct MeetingToggleResponse {
     pub message: String,
 }
 
-/// Default (non-waybar) response for GET /api/meetings/status.
+/// Default (non-waybar) meeting status snapshot. The waybar variant
+/// has a different shape — see the union response on the handler.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingStatusResponse {
     pub active: bool,
@@ -92,7 +87,8 @@ pub struct MeetingStatusResponse {
     pub last_error: Option<String>,
 }
 
-/// Summary of one meeting as returned in GET /api/meetings.
+/// Summary of one meeting in a list response — enough to render a row
+/// without loading the full transcript.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingSummary {
     pub id: i64,
@@ -104,13 +100,13 @@ pub struct MeetingSummary {
     pub transcript_path: Option<String>,
 }
 
-/// Response for GET /api/meetings.
+/// Paginated list of meeting summaries.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingsListResponse {
     pub meetings: Vec<MeetingSummary>,
 }
 
-/// Response for GET /api/meetings/:id.
+/// Full meeting record including transcript text when available.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingDetailResponse {
     pub id: i64,
@@ -126,7 +122,7 @@ pub struct MeetingDetailResponse {
     pub created_at: String,
 }
 
-/// Query parameters accepted by GET /api/meetings and GET /api/meetings/status.
+/// Pagination + filter knobs shared by list and status endpoints.
 #[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct MeetingsListQuery {
     /// Maximum meetings to return (default 20)
@@ -146,7 +142,8 @@ pub fn router(state: MeetingState) -> Router {
         .with_state(state)
 }
 
-/// Response for POST /api/meetings/:id/retry.
+/// Confirmation that a failed meeting's transcription has been
+/// re-queued; the actual work runs in the background.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingRetryResponse {
     pub success: bool,
@@ -506,13 +503,13 @@ pub async fn get_meeting(
     }
 }
 
-/// POST /api/meetings/:id/retry — re-run transcription on the durable mp3 from a
-/// previously failed meeting. Useful when the backend was the cause (e.g. the
-/// 5-min Bun-fetch idle bug in InferenceServerManager) and the audio is fine.
+/// Re-run transcription on the durable mp3 from a previously failed
+/// meeting. Useful when the backend was the cause (e.g. the 5-min
+/// Bun-fetch idle bug in InferenceServerManager) and the audio is fine.
 ///
-/// Validates: meeting exists, is in `error` state, and its mp3 is still on
-/// disk. Spawns the retry in a tokio task and returns 202 immediately so the
-/// renderer can begin polling `/meetings/:id` for the status flip.
+/// Validates: meeting exists, is in `error` state, and its mp3 is still
+/// on disk. Spawns the retry in a tokio task and returns 202
+/// immediately so the renderer can begin polling for the status flip.
 #[utoipa::path(
     post,
     path = "/meetings/{id}/retry",

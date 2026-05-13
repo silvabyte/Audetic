@@ -49,7 +49,7 @@ export class StatusStore {
     }
   }
 
-  /** Toggle recording via POST /api/toggle and nudge the poll. */
+  /** Toggle recording and nudge the poll. */
   async toggle(opts?: {
     copy_to_clipboard?: boolean;
     auto_paste?: boolean;

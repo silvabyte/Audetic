@@ -1,8 +1,6 @@
-//! Recording control endpoints.
-//!
-//! Provides HTTP endpoints for:
-//! - Toggling recording (POST /api/toggle)
-//! - Getting recording status (GET /api/status)
+//! Recording (dictation) control endpoints. See OpenAPI spec at
+//! `/api/openapi.json` for the canonical method/path list — don't
+//! enumerate them here.
 
 use crate::audio::{JobOptions, RecordingPhase, RecordingStatus, RecordingStatusHandle};
 use crate::config::WaybarConfig;
@@ -32,7 +30,8 @@ pub struct ToggleRequest {
     pub auto_paste: Option<bool>,
 }
 
-/// Response body for POST /api/toggle.
+/// Result of toggling recording: lifecycle phase, the job id when one
+/// is being processed, and a human-readable status message.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ToggleResponse {
     pub success: bool,
@@ -50,7 +49,8 @@ pub struct CompletedJobSummary {
     pub created_at: String,
 }
 
-/// Default (non-waybar) response for GET /api/status.
+/// Default (non-waybar) recording status snapshot. The waybar variant
+/// is a different shape — see the union response on the handler.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RecordingStatusResponse {
     pub recording: bool,

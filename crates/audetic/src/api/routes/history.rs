@@ -31,7 +31,7 @@ pub fn router() -> Router {
         .route("/:id", get(get_history_by_id))
 }
 
-/// GET /api/history - List transcription history.
+/// List transcription history.
 #[utoipa::path(
     get,
     path = "/history",
@@ -55,7 +55,7 @@ pub async fn list_history(
     Ok(Json(entries))
 }
 
-/// GET /api/history/:id - Get a single transcription.
+/// Get a single transcription.
 #[utoipa::path(
     get,
     path = "/history/{id}",
