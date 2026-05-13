@@ -8,6 +8,7 @@
 //! `http://127.0.0.1:3737/` so the user can finish onboarding (ffmpeg,
 //! provider config) in the SPA.
 
+use crate::api::url;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -16,8 +17,6 @@ use std::time::{Duration, Instant};
 
 const SERVICE_TEMPLATE: &str = include_str!("audetic.service.tmpl");
 const SERVICE_NAME: &str = "audetic.service";
-const DAEMON_VERSION_URL: &str = "http://127.0.0.1:3737/api/version";
-const APP_URL: &str = "http://127.0.0.1:3737/";
 
 pub struct InstallOptions {
     pub no_launch: bool,
@@ -25,6 +24,7 @@ pub struct InstallOptions {
 
 pub async fn run(opts: InstallOptions) -> Result<()> {
     let paths = InstallPaths::resolve()?;
+    let app_url = url::app_url();
 
     println!("→ Installing audetic as a systemd user service");
     place_binary(&paths)?;
@@ -36,11 +36,11 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     println!("✓ audetic.service is active");
 
     if opts.no_launch {
-        println!("  Open {APP_URL} in your browser to finish onboarding.");
+        println!("  Open {app_url} in your browser to finish onboarding.");
     } else {
-        match open_browser(APP_URL) {
-            Ok(()) => println!("→ Opened {APP_URL}"),
-            Err(err) => println!("  Open {APP_URL} in your browser to finish onboarding ({err})"),
+        match open_browser(&app_url) {
+            Ok(()) => println!("→ Opened {app_url}"),
+            Err(err) => println!("  Open {app_url} in your browser to finish onboarding ({err})"),
         }
     }
     Ok(())
@@ -81,8 +81,7 @@ impl InstallPaths {
 
 fn ensure_runtime_dirs(paths: &InstallPaths) -> Result<()> {
     for dir in [&paths.config_dir, &paths.data_dir] {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("Failed to create {}", dir.display()))?;
+        fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     }
     Ok(())
 }
@@ -153,7 +152,9 @@ fn enable_and_start() -> Result<()> {
 }
 
 async fn wait_for_daemon(timeout: Duration) -> Result<()> {
-    println!("  · Waiting for daemon to bind 127.0.0.1:3737");
+    let probe_url = url::api_url(url::paths::VERSION);
+    let bind_addr = format!("{}:{}", url::HOST, url::DEFAULT_PORT);
+    println!("  · Waiting for daemon to bind {bind_addr}");
     let client = reqwest::Client::builder()
         .timeout(Duration::from_millis(1000))
         .build()
@@ -161,7 +162,7 @@ async fn wait_for_daemon(timeout: Duration) -> Result<()> {
 
     let start = Instant::now();
     while start.elapsed() < timeout {
-        if let Ok(resp) = client.get(DAEMON_VERSION_URL).send().await {
+        if let Ok(resp) = client.get(&probe_url).send().await {
             if resp.status().is_success() {
                 return Ok(());
             }
@@ -169,7 +170,7 @@ async fn wait_for_daemon(timeout: Duration) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     bail!(
-        "Daemon did not respond on 127.0.0.1:3737 within {}s. \
+        "Daemon did not respond on {bind_addr} within {}s. \
          Check `journalctl --user -u audetic.service` for the failure.",
         timeout.as_secs()
     );

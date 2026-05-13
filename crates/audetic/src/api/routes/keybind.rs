@@ -17,7 +17,8 @@ pub struct InstallRequest {
     pub key: Option<String>,
 }
 
-/// Response body for POST /keybind/install.
+/// Result of installing a hyprland binding: the resulting key
+/// combination, where the config was edited, and the backup path.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct InstallResponse {
     pub success: bool,
@@ -27,7 +28,7 @@ pub struct InstallResponse {
     pub config_path: Option<String>,
 }
 
-/// Response body for DELETE /keybind.
+/// Result of removing an Audetic-managed hyprland binding.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UninstallResponse {
     pub success: bool,
@@ -45,7 +46,7 @@ pub fn router() -> Router {
         .route("/", delete(uninstall_keybind))
 }
 
-/// GET /keybind/status - Get keybinding status.
+/// Get keybinding status.
 #[utoipa::path(
     get,
     path = "/keybind/status",
@@ -60,7 +61,7 @@ pub async fn get_status() -> ApiResult<Json<KeybindStatus>> {
     Ok(Json(status))
 }
 
-/// POST /keybind/install - Install a keybinding.
+/// Install a keybinding.
 #[utoipa::path(
     post,
     path = "/keybind/install",
@@ -97,7 +98,7 @@ pub async fn install_keybind(
     }))
 }
 
-/// DELETE /keybind - Uninstall the keybinding.
+/// Uninstall the keybinding.
 #[utoipa::path(
     delete,
     path = "/keybind",

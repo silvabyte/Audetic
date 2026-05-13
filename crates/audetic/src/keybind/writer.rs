@@ -135,7 +135,7 @@ pub fn remove_binding(config_path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keybind::{Modifiers, AUDETIC_TOGGLE_ENDPOINT};
+    use crate::keybind::{audetic_toggle_endpoint, Modifiers};
 
     #[test]
     fn test_append_binding() {
@@ -144,7 +144,7 @@ mod tests {
             modifiers: Modifiers::from_strs(&["SUPER"]),
             key: "R".to_string(),
             description: "Audetic".to_string(),
-            command: format!("curl -X POST {}", AUDETIC_TOGGLE_ENDPOINT),
+            command: format!("curl -X POST {}", audetic_toggle_endpoint()),
         };
 
         let result = update_or_append_binding(content, &binding);
@@ -164,7 +164,7 @@ mod tests {
             modifiers: Modifiers::from_strs(&["SUPER", "SHIFT"]),
             key: "R".to_string(),
             description: "Audetic".to_string(),
-            command: format!("curl -X POST {}", AUDETIC_TOGGLE_ENDPOINT),
+            command: format!("curl -X POST {}", audetic_toggle_endpoint()),
         };
 
         let result = update_or_append_binding(&content, &binding);

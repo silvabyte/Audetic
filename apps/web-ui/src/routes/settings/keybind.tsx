@@ -69,7 +69,7 @@ function SettingsKeybind() {
       <header>
         <h2 className="text-xl font-semibold">Keybind</h2>
         <p className="text-sm text-muted-foreground">
-          Hyprland binding that POSTs <code className="font-mono text-xs">/toggle</code>.
+          Hyprland binding that POSTs <code className="font-mono text-xs">/api/toggle</code>.
           Defaults to <kbd className="rounded border px-1 font-mono text-xs">SUPER+R</kbd>.
         </p>
       </header>

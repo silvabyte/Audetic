@@ -18,7 +18,7 @@ pub fn router() -> Router {
     Router::new().route("/", get(get_logs))
 }
 
-/// GET /logs - Get application and transcription logs.
+/// Get application and transcription logs.
 #[utoipa::path(
     get,
     path = "/logs",
