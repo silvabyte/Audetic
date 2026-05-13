@@ -14,8 +14,9 @@ StandardOutput=journal
 StandardError=journal
 Environment="RUST_LOG=info"
 
-# Security and resource limits — mirrors the curl-bash unit at the repo
-# root (audetic.service) so behavior stays consistent across install paths.
+# Security and resource limits.
+# The ReadWritePaths directories must exist before the unit starts, or
+# systemd fails with status=226/NAMESPACE — the installer creates them.
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only

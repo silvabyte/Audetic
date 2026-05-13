@@ -23,10 +23,10 @@ KEEP_DATABASE=false
 KEEP_UPDATES=false
 REMOVE_TEMP=false
 
-# Paths
+# Paths — must match the layout produced by `audetic install`.
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/audetic"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/audetic"
-BIN_DIR="/usr/local/bin"
+BIN_DIR="$DATA_DIR/bin"
 SERVICE_NAME="audetic.service"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
@@ -120,10 +120,6 @@ parse_args() {
   done
 }
 
-require_sudo() {
-  command -v sudo >/dev/null 2>&1 || die "Need elevated privileges; install sudo"
-}
-
 systemctl_available() {
   command -v systemctl >/dev/null 2>&1
 }
@@ -169,24 +165,23 @@ add_kept() {
   ARTIFACTS_KEPT+=("$path|$reason")
 }
 
-# Discover all installed artifacts
+# Discover all installed artifacts.
+#
+# Layout produced by `audetic install`:
+#   ~/.local/share/audetic/bin/             — binary + auto-update .bak files
+#   ~/.local/share/audetic/audetic.db{,-wal,-shm}
+#   ~/.local/share/audetic/updates/         — staged update archives
+#   ~/.local/share/audetic/update.lock
+#   ~/.local/share/audetic/meetings/        — meeting recordings + transcripts
+#   ~/.local/share/audetic/keybind-backups/
+#   ~/.config/audetic/                       — config.toml, update_state.json
+#   ~/.config/systemd/user/audetic.service
 discover_artifacts() {
   log info "Scanning for Audetic artifacts..."
 
-  # Binary
-  if [[ -x "$BIN_DIR/audetic" ]]; then
-    add_artifact "$BIN_DIR/audetic" "CLI binary"
-  fi
-
-  # Backup binaries from auto-updates
-  if ! $KEEP_UPDATES; then
-    for bak in "$BIN_DIR"/audetic-*.bak; do
-      [[ -e "$bak" ]] && add_artifact "$bak" "Backup binary"
-    done
-  else
-    for bak in "$BIN_DIR"/audetic-*.bak; do
-      [[ -e "$bak" ]] && add_kept "$bak" "--keep-updates"
-    done
+  # Binary directory — always removed (it's the program itself).
+  if [[ -d "$BIN_DIR" ]]; then
+    add_artifact "$BIN_DIR" "Binary directory"
   fi
 
   # Service file
@@ -204,35 +199,37 @@ discover_artifacts() {
     fi
   fi
 
-  # Data directory (handle selectively)
+  # Data directory: itemize so we can honor --keep-database / --keep-updates
+  # without orphaning the binary (which lives under $DATA_DIR/bin).
   if [[ -d "$DATA_DIR" ]]; then
     local db_path="$DATA_DIR/audetic.db"
     local db_wal="$DATA_DIR/audetic.db-wal"
     local db_shm="$DATA_DIR/audetic.db-shm"
     local updates_dir="$DATA_DIR/updates"
     local update_lock="$DATA_DIR/update.lock"
+    local meetings_dir="$DATA_DIR/meetings"
+    local keybind_backups="$DATA_DIR/keybind-backups"
 
-    if $KEEP_DATABASE && $KEEP_UPDATES; then
-      # Keep everything in data dir
-      add_kept "$DATA_DIR" "--keep-database --keep-updates"
-    elif $KEEP_DATABASE; then
-      # Keep database, remove updates
+    if $KEEP_DATABASE; then
       [[ -f "$db_path" ]] && add_kept "$db_path" "--keep-database"
       [[ -f "$db_wal" ]] && add_kept "$db_wal" "--keep-database"
       [[ -f "$db_shm" ]] && add_kept "$db_shm" "--keep-database"
-      [[ -d "$updates_dir" ]] && add_artifact "$updates_dir" "Update cache"
-      [[ -f "$update_lock" ]] && add_artifact "$update_lock" "Update lock file"
-    elif $KEEP_UPDATES; then
-      # Keep updates, remove database
+    else
       [[ -f "$db_path" ]] && add_artifact "$db_path" "Transcription database"
       [[ -f "$db_wal" ]] && add_artifact "$db_wal" "Database WAL"
       [[ -f "$db_shm" ]] && add_artifact "$db_shm" "Database SHM"
+    fi
+
+    if $KEEP_UPDATES; then
       [[ -d "$updates_dir" ]] && add_kept "$updates_dir" "--keep-updates"
       [[ -f "$update_lock" ]] && add_kept "$update_lock" "--keep-updates"
     else
-      # Remove entire data directory
-      add_artifact "$DATA_DIR" "Data directory"
+      [[ -d "$updates_dir" ]] && add_artifact "$updates_dir" "Update cache"
+      [[ -f "$update_lock" ]] && add_artifact "$update_lock" "Update lock file"
     fi
+
+    [[ -d "$meetings_dir" ]] && add_artifact "$meetings_dir" "Meeting recordings"
+    [[ -d "$keybind_backups" ]] && add_artifact "$keybind_backups" "Keybind backups"
   fi
 
   # Temp files (only with --remove-temp)
@@ -267,7 +264,7 @@ print_plan() {
     printf "  ${RED}✗${RESET} %-35s %s ${DIM}(%s)${RESET}\n" "$description" "$path" "$human"
   done
   echo ""
-  log info "Total size: $(human_size $TOTAL_SIZE)"
+  log info "Total size: $(human_size "$TOTAL_SIZE")"
 
   if [[ ${#ARTIFACTS_KEPT[@]} -gt 0 ]]; then
     echo ""
@@ -331,16 +328,9 @@ remove_path() {
     return 0
   fi
 
-  # Try without sudo first
-  if rm -rf "$path" 2>/dev/null; then
+  # Everything Audetic writes lives under $HOME — no sudo needed.
+  if rm -rf "$path"; then
     log success "Removed $description"
-    return 0
-  fi
-
-  # Need sudo (likely for /usr/local/bin)
-  require_sudo
-  if sudo rm -rf "$path"; then
-    log success "Removed $description (sudo)"
     return 0
   else
     log error "Failed to remove $path"
@@ -368,7 +358,10 @@ perform_uninstall() {
     systemctl --user daemon-reload >/dev/null 2>&1 || true
   fi
 
-  # Clean up empty parent directories
+  # Clean up empty parent directories.
+  # $DATA_DIR is itemized (bin/, db, updates/, etc.) so it may be empty
+  # after removal — rmdir leaves it alone if anything was kept via flags.
+  rmdir "$DATA_DIR" 2>/dev/null || true
   rmdir "$SYSTEMD_USER_DIR" 2>/dev/null || true
   rmdir "$(dirname "$SYSTEMD_USER_DIR")" 2>/dev/null || true
 

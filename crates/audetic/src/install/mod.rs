@@ -28,6 +28,7 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
 
     println!("→ Installing audetic as a systemd user service");
     place_binary(&paths)?;
+    ensure_runtime_dirs(&paths)?;
     write_unit(&paths)?;
     daemon_reload()?;
     enable_and_start()?;
@@ -49,6 +50,10 @@ struct InstallPaths {
     installed_dir: PathBuf,
     installed_binary: PathBuf,
     systemd_unit: PathBuf,
+    // Listed in the unit's `ReadWritePaths=` — must exist before the
+    // service starts or systemd fails with status=226/NAMESPACE.
+    config_dir: PathBuf,
+    data_dir: PathBuf,
 }
 
 impl InstallPaths {
@@ -58,16 +63,28 @@ impl InstallPaths {
         let config = dirs::config_local_dir()
             .ok_or_else(|| anyhow!("Could not resolve XDG_CONFIG_HOME / ~/.config"))?;
 
-        let installed_dir = data.join("audetic").join("bin");
+        let data_dir = data.join("audetic");
+        let installed_dir = data_dir.join("bin");
         let installed_binary = installed_dir.join("audetic");
         let systemd_unit = config.join("systemd").join("user").join(SERVICE_NAME);
+        let config_dir = config.join("audetic");
 
         Ok(Self {
             installed_dir,
             installed_binary,
             systemd_unit,
+            config_dir,
+            data_dir,
         })
     }
+}
+
+fn ensure_runtime_dirs(paths: &InstallPaths) -> Result<()> {
+    for dir in [&paths.config_dir, &paths.data_dir] {
+        fs::create_dir_all(dir)
+            .with_context(|| format!("Failed to create {}", dir.display()))?;
+    }
+    Ok(())
 }
 
 fn place_binary(paths: &InstallPaths) -> Result<()> {

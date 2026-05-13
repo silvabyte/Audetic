@@ -8,6 +8,7 @@ shell=bash
 disable=SC2250  # Prefer braces around variable references (style - optional)
 disable=SC2292  # Prefer [[ ]] over [ ] in Bash (style - optional)
 disable=SC2310  # Function invoked in 'if' condition (info - expected with set -e)
+disable=SC2312  # Consider invoking command separately (info - same family as SC2310)
 
 # Enable optional checks
 enable=all

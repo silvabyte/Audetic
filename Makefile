@@ -154,8 +154,9 @@ codegen:
 # profile, not in CI.
 installer-lint:
 	bash -n release/cli/latest.sh
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck release/cli/latest.sh; else echo "shellcheck not installed; skipping"; fi
-	@echo "✓ release/cli/latest.sh ok"
+	bash -n release/cli/uninstall.sh
+	@if command -v shellcheck >/dev/null 2>&1; then shellcheck release/cli/latest.sh release/cli/uninstall.sh; else echo "shellcheck not installed; skipping"; fi
+	@echo "✓ release/cli/*.sh ok"
 
 # Cleanup
 clean:
