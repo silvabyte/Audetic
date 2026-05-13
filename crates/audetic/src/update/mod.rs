@@ -709,4 +709,3 @@ fn unix_timestamp() -> u64 {
         .map(|d| d.as_secs())
         .unwrap_or_default()
 }
-

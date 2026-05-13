@@ -27,7 +27,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /history - List transcription history. */
+        /** GET /api/history - List transcription history. */
         get: operations["list_history"];
         put?: never;
         post?: never;
@@ -44,7 +44,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /history/:id - Get a single transcription. */
+        /** GET /api/history/:id - Get a single transcription. */
         get: operations["get_history_by_id"];
         put?: never;
         post?: never;
@@ -64,7 +64,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** DELETE /keybind - Uninstall the keybinding. */
+        /** DELETE /api/keybind - Uninstall the keybinding. */
         delete: operations["uninstall_keybind"];
         options?: never;
         head?: never;
@@ -80,7 +80,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** POST /keybind/install - Install a keybinding. */
+        /** POST /api/keybind/install - Install a keybinding. */
         post: operations["install_keybind"];
         delete?: never;
         options?: never;
@@ -95,7 +95,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /keybind/status - Get keybinding status. */
+        /** GET /api/keybind/status - Get keybinding status. */
         get: operations["get_keybind_status"];
         put?: never;
         post?: never;
@@ -112,7 +112,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /logs - Get application and transcription logs. */
+        /** GET /api/logs - Get application and transcription logs. */
         get: operations["get_logs"];
         put?: never;
         post?: never;
@@ -244,7 +244,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * POST /meetings/:id/retry — re-run transcription on the durable mp3 from a
+         * POST /api/meetings/:id/retry — re-run transcription on the durable mp3 from a
          *     previously failed meeting. Useful when the backend was the cause (e.g. the
          *     5-min Bun-fetch idle bug in InferenceServerManager) and the audio is fine.
          * @description Validates: meeting exists, is in `error` state, and its mp3 is still on
@@ -265,7 +265,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /provider - Get provider configuration. */
+        /** GET /api/provider - Get provider configuration. */
         get: operations["get_provider_config"];
         put?: never;
         post?: never;
@@ -282,7 +282,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /provider/status - Get provider status and health. */
+        /** GET /api/provider/status - Get provider status and health. */
         get: operations["get_provider_status"];
         put?: never;
         post?: never;
@@ -319,7 +319,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /system/deps - report availability of required external tools. */
+        /** GET /api/system/deps - report availability of required external tools. */
         get: operations["get_system_deps"];
         put?: never;
         post?: never;
@@ -339,7 +339,7 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * POST /system/install-ffmpeg - kick off an app-local FFmpeg install.
+         * POST /api/system/install-ffmpeg - kick off an app-local FFmpeg install.
          * @description Idempotent w.r.t. already-installed: if ffmpeg already resolves (either as
          *     the sidecar binary or on PATH), the response is 200 with phase=`done` and
          *     no work happens.
@@ -362,7 +362,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /system/install-ffmpeg/status - poll the current install state. */
+        /** GET /api/system/install-ffmpeg/status - poll the current install state. */
         get: operations["get_install_ffmpeg_status"];
         put?: never;
         post?: never;
@@ -396,9 +396,9 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /update/auto - Read the current auto-update flag. */
+        /** GET /api/update/auto - Read the current auto-update flag. */
         get: operations["get_auto_update"];
-        /** PUT /update/auto - Enable or disable auto-update. */
+        /** PUT /api/update/auto - Enable or disable auto-update. */
         put: operations["set_auto_update"];
         post?: never;
         delete?: never;
@@ -414,7 +414,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** GET /update/check - Check for available updates. */
+        /** GET /api/update/check - Check for available updates. */
         get: operations["check_update"];
         put?: never;
         post?: never;
@@ -433,7 +433,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** POST /update/install - Install an update. */
+        /** POST /api/update/install - Install an update. */
         post: operations["install_update"];
         delete?: never;
         options?: never;
@@ -503,7 +503,7 @@ export interface components {
             /** @description Custom key string (e.g., "SUPER+R" or "SUPER SHIFT, T") */
             key?: string | null;
         };
-        /** @description Response body for POST /keybind/install. */
+        /** @description Response body for POST /api/keybind/install. */
         InstallResponse: {
             backup_path?: string | null;
             config_path?: string | null;
@@ -561,7 +561,7 @@ export interface components {
             /** @description Recent transcription entries */
             transcriptions: components["schemas"]["HistoryEntry"][];
         };
-        /** @description Response for GET /meetings/:id. */
+        /** @description Response for GET /api/meetings/:id. */
         MeetingDetailResponse: {
             audio_path: string;
             completed_at?: string | null;
@@ -577,7 +577,7 @@ export interface components {
             transcript_path?: string | null;
             transcript_text?: string | null;
         };
-        /** @description Response for POST /meetings/:id/retry. */
+        /** @description Response for POST /api/meetings/:id/retry. */
         MeetingRetryResponse: {
             /** Format: int64 */
             meeting_id: number;
@@ -588,7 +588,7 @@ export interface components {
         MeetingStartRequest: {
             title?: string | null;
         };
-        /** @description Response for POST /meetings/start. */
+        /** @description Response for POST /api/meetings/start. */
         MeetingStartResponse: {
             audio_path: string;
             capture_state: string;
@@ -597,7 +597,7 @@ export interface components {
             message: string;
             success: boolean;
         };
-        /** @description Default (non-waybar) response for GET /meetings/status. */
+        /** @description Default (non-waybar) response for GET /api/meetings/status. */
         MeetingStatusResponse: {
             active: boolean;
             audio_path?: string | null;
@@ -609,7 +609,7 @@ export interface components {
             phase: string;
             title?: string | null;
         };
-        /** @description Response for POST /meetings/stop and POST /meetings/cancel. */
+        /** @description Response for POST /api/meetings/stop and POST /api/meetings/cancel. */
         MeetingStopResponse: {
             /** Format: int64 */
             duration_seconds: number;
@@ -618,7 +618,7 @@ export interface components {
             message: string;
             success: boolean;
         };
-        /** @description Summary of one meeting as returned in GET /meetings. */
+        /** @description Summary of one meeting as returned in GET /api/meetings. */
         MeetingSummary: {
             audio_path: string;
             /** Format: int64 */
@@ -631,7 +631,7 @@ export interface components {
             transcript_path?: string | null;
         };
         /**
-         * @description Response for POST /meetings/toggle — shape varies by whether a
+         * @description Response for POST /api/meetings/toggle — shape varies by whether a
          *     meeting was started or stopped. Extra fields are only present
          *     when relevant; both `duration_seconds` and `audio_path` may be null.
          */
@@ -646,7 +646,7 @@ export interface components {
             phase: string;
             success: boolean;
         };
-        /** @description Response for GET /meetings. */
+        /** @description Response for GET /api/meetings. */
         MeetingsListResponse: {
             meetings: components["schemas"]["MeetingSummary"][];
         };
@@ -676,7 +676,7 @@ export interface components {
             /** @enum {string} */
             status: "not_configured";
         };
-        /** @description Default (non-waybar) response for GET /status. */
+        /** @description Default (non-waybar) response for GET /api/status. */
         RecordingStatusResponse: {
             job_id?: string | null;
             last_completed_job?: null | components["schemas"]["CompletedJobSummary"];
@@ -708,14 +708,14 @@ export interface components {
             /** @description Whether to copy the transcription to clipboard (default: true) */
             copy_to_clipboard?: boolean | null;
         };
-        /** @description Response body for POST /toggle. */
+        /** @description Response body for POST /api/toggle. */
         ToggleResponse: {
             job_id?: string | null;
             message: string;
             phase: string;
             success: boolean;
         };
-        /** @description Response body for DELETE /keybind. */
+        /** @description Response body for DELETE /api/keybind. */
         UninstallResponse: {
             backup_path?: string | null;
             config_path?: string | null;
@@ -1305,6 +1305,26 @@ export interface operations {
             };
         };
     };
+    get_auto_update: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Whether auto-update is enabled */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AutoUpdateState"];
+                };
+            };
+        };
+    };
     set_auto_update: {
         parameters: {
             query?: never;
@@ -1325,26 +1345,6 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["AutoUpdateResponse"];
-                };
-            };
-        };
-    };
-    get_auto_update: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Whether auto-update is enabled */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AutoUpdateState"];
                 };
             };
         };

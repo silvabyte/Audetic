@@ -48,7 +48,7 @@ pub fn router() -> Router {
         .route("/auto", get(get_auto_update).put(set_auto_update))
 }
 
-/// GET /update/check - Check for available updates.
+/// GET /api/update/check - Check for available updates.
 #[utoipa::path(
     get,
     path = "/update/check",
@@ -75,7 +75,7 @@ pub async fn check_update() -> ApiResult<Json<UpdateReport>> {
     Ok(Json(report))
 }
 
-/// POST /update/install - Install an update.
+/// POST /api/update/install - Install an update.
 #[utoipa::path(
     post,
     path = "/update/install",
@@ -105,7 +105,7 @@ pub async fn install_update(
     Ok(Json(report))
 }
 
-/// GET /update/auto - Read the current auto-update flag.
+/// GET /api/update/auto - Read the current auto-update flag.
 #[utoipa::path(
     get,
     path = "/update/auto",
@@ -121,7 +121,7 @@ pub async fn get_auto_update() -> ApiResult<Json<AutoUpdateState>> {
     Ok(Json(AutoUpdateState { enabled }))
 }
 
-/// PUT /update/auto - Enable or disable auto-update.
+/// PUT /api/update/auto - Enable or disable auto-update.
 #[utoipa::path(
     put,
     path = "/update/auto",

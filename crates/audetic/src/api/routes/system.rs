@@ -143,7 +143,7 @@ pub fn router() -> Router {
         .route("/install-ffmpeg/status", get(get_install_ffmpeg_status))
 }
 
-/// GET /system/deps - report availability of required external tools.
+/// GET /api/system/deps - report availability of required external tools.
 #[utoipa::path(
     get,
     path = "/system/deps",
@@ -159,7 +159,7 @@ pub async fn get_deps() -> Json<SystemDeps> {
     })
 }
 
-/// POST /system/install-ffmpeg - kick off an app-local FFmpeg install.
+/// POST /api/system/install-ffmpeg - kick off an app-local FFmpeg install.
 ///
 /// Idempotent w.r.t. already-installed: if ffmpeg already resolves (either as
 /// the sidecar binary or on PATH), the response is 200 with phase=`done` and
@@ -227,7 +227,7 @@ pub async fn start_install_ffmpeg() -> impl IntoResponse {
     (StatusCode::ACCEPTED, Json(resp))
 }
 
-/// GET /system/install-ffmpeg/status - poll the current install state.
+/// GET /api/system/install-ffmpeg/status - poll the current install state.
 #[utoipa::path(
     get,
     path = "/system/install-ffmpeg/status",

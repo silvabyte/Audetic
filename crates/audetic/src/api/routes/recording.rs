@@ -1,8 +1,8 @@
 //! Recording control endpoints.
 //!
 //! Provides HTTP endpoints for:
-//! - Toggling recording (POST /toggle)
-//! - Getting recording status (GET /status)
+//! - Toggling recording (POST /api/toggle)
+//! - Getting recording status (GET /api/status)
 
 use crate::audio::{JobOptions, RecordingPhase, RecordingStatus, RecordingStatusHandle};
 use crate::config::WaybarConfig;
@@ -32,7 +32,7 @@ pub struct ToggleRequest {
     pub auto_paste: Option<bool>,
 }
 
-/// Response body for POST /toggle.
+/// Response body for POST /api/toggle.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ToggleResponse {
     pub success: bool,
@@ -50,7 +50,7 @@ pub struct CompletedJobSummary {
     pub created_at: String,
 }
 
-/// Default (non-waybar) response for GET /status.
+/// Default (non-waybar) response for GET /api/status.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RecordingStatusResponse {
     pub recording: bool,

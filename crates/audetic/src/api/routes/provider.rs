@@ -11,7 +11,7 @@ pub fn router() -> Router {
         .route("/status", get(get_status))
 }
 
-/// GET /provider - Get provider configuration.
+/// GET /api/provider - Get provider configuration.
 #[utoipa::path(
     get,
     path = "/provider",
@@ -26,7 +26,7 @@ pub async fn get_config() -> ApiResult<Json<ProviderInfo>> {
     Ok(Json(info))
 }
 
-/// GET /provider/status - Get provider status and health.
+/// GET /api/provider/status - Get provider status and health.
 #[utoipa::path(
     get,
     path = "/provider/status",

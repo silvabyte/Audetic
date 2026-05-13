@@ -15,7 +15,7 @@ export interface HistoryQuery {
 type Status = "idle" | "loading" | "loaded" | "error";
 
 /**
- * HistoryStore mirrors GET /history. The route is the source of truth
+ * HistoryStore mirrors GET /api/history. The route is the source of truth
  * for the *query* (via URL searchParams); this store holds fetched
  * entries + loading/error state.
  *

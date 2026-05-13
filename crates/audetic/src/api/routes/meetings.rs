@@ -1,13 +1,13 @@
 //! Meeting recording API endpoints.
 //!
 //! Provides HTTP endpoints for:
-//! - Starting meeting recording (POST /meetings/start)
-//! - Stopping meeting recording (POST /meetings/stop)
-//! - Cancelling meeting recording (POST /meetings/cancel)
-//! - Toggling meeting recording (POST /meetings/toggle)
-//! - Getting meeting status (GET /meetings/status)
-//! - Listing meetings (GET /meetings)
-//! - Getting a specific meeting (GET /meetings/:id)
+//! - Starting meeting recording (POST /api/meetings/start)
+//! - Stopping meeting recording (POST /api/meetings/stop)
+//! - Cancelling meeting recording (POST /api/meetings/cancel)
+//! - Toggling meeting recording (POST /api/meetings/toggle)
+//! - Getting meeting status (GET /api/meetings/status)
+//! - Listing meetings (GET /api/meetings)
+//! - Getting a specific meeting (GET /api/meetings/:id)
 
 use crate::meeting::{MeetingPhase, MeetingStartOptions, MeetingStatusHandle};
 use axum::{
@@ -44,7 +44,7 @@ pub struct MeetingStartRequest {
     pub title: Option<String>,
 }
 
-/// Response for POST /meetings/start.
+/// Response for POST /api/meetings/start.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingStartResponse {
     pub success: bool,
@@ -54,7 +54,7 @@ pub struct MeetingStartResponse {
     pub message: String,
 }
 
-/// Response for POST /meetings/stop and POST /meetings/cancel.
+/// Response for POST /api/meetings/stop and POST /api/meetings/cancel.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingStopResponse {
     pub success: bool,
@@ -63,7 +63,7 @@ pub struct MeetingStopResponse {
     pub message: String,
 }
 
-/// Response for POST /meetings/toggle — shape varies by whether a
+/// Response for POST /api/meetings/toggle — shape varies by whether a
 /// meeting was started or stopped. Extra fields are only present
 /// when relevant; both `duration_seconds` and `audio_path` may be null.
 #[derive(Debug, Serialize, ToSchema)]
@@ -80,7 +80,7 @@ pub struct MeetingToggleResponse {
     pub message: String,
 }
 
-/// Default (non-waybar) response for GET /meetings/status.
+/// Default (non-waybar) response for GET /api/meetings/status.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingStatusResponse {
     pub active: bool,
@@ -92,7 +92,7 @@ pub struct MeetingStatusResponse {
     pub last_error: Option<String>,
 }
 
-/// Summary of one meeting as returned in GET /meetings.
+/// Summary of one meeting as returned in GET /api/meetings.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingSummary {
     pub id: i64,
@@ -104,13 +104,13 @@ pub struct MeetingSummary {
     pub transcript_path: Option<String>,
 }
 
-/// Response for GET /meetings.
+/// Response for GET /api/meetings.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingsListResponse {
     pub meetings: Vec<MeetingSummary>,
 }
 
-/// Response for GET /meetings/:id.
+/// Response for GET /api/meetings/:id.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingDetailResponse {
     pub id: i64,
@@ -126,7 +126,7 @@ pub struct MeetingDetailResponse {
     pub created_at: String,
 }
 
-/// Query parameters accepted by GET /meetings and GET /meetings/status.
+/// Query parameters accepted by GET /api/meetings and GET /api/meetings/status.
 #[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct MeetingsListQuery {
     /// Maximum meetings to return (default 20)
@@ -146,7 +146,7 @@ pub fn router(state: MeetingState) -> Router {
         .with_state(state)
 }
 
-/// Response for POST /meetings/:id/retry.
+/// Response for POST /api/meetings/:id/retry.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingRetryResponse {
     pub success: bool,
@@ -506,7 +506,7 @@ pub async fn get_meeting(
     }
 }
 
-/// POST /meetings/:id/retry — re-run transcription on the durable mp3 from a
+/// POST /api/meetings/:id/retry — re-run transcription on the durable mp3 from a
 /// previously failed meeting. Useful when the backend was the cause (e.g. the
 /// 5-min Bun-fetch idle bug in InferenceServerManager) and the audio is fine.
 ///

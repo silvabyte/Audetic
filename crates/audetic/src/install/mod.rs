@@ -81,8 +81,7 @@ impl InstallPaths {
 
 fn ensure_runtime_dirs(paths: &InstallPaths) -> Result<()> {
     for dir in [&paths.config_dir, &paths.data_dir] {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("Failed to create {}", dir.display()))?;
+        fs::create_dir_all(dir).with_context(|| format!("Failed to create {}", dir.display()))?;
     }
     Ok(())
 }

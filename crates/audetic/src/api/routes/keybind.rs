@@ -17,7 +17,7 @@ pub struct InstallRequest {
     pub key: Option<String>,
 }
 
-/// Response body for POST /keybind/install.
+/// Response body for POST /api/keybind/install.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct InstallResponse {
     pub success: bool,
@@ -27,7 +27,7 @@ pub struct InstallResponse {
     pub config_path: Option<String>,
 }
 
-/// Response body for DELETE /keybind.
+/// Response body for DELETE /api/keybind.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UninstallResponse {
     pub success: bool,
@@ -45,7 +45,7 @@ pub fn router() -> Router {
         .route("/", delete(uninstall_keybind))
 }
 
-/// GET /keybind/status - Get keybinding status.
+/// GET /api/keybind/status - Get keybinding status.
 #[utoipa::path(
     get,
     path = "/keybind/status",
@@ -60,7 +60,7 @@ pub async fn get_status() -> ApiResult<Json<KeybindStatus>> {
     Ok(Json(status))
 }
 
-/// POST /keybind/install - Install a keybinding.
+/// POST /api/keybind/install - Install a keybinding.
 #[utoipa::path(
     post,
     path = "/keybind/install",
@@ -97,7 +97,7 @@ pub async fn install_keybind(
     }))
 }
 
-/// DELETE /keybind - Uninstall the keybinding.
+/// DELETE /api/keybind - Uninstall the keybinding.
 #[utoipa::path(
     delete,
     path = "/keybind",

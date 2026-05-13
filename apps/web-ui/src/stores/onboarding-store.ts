@@ -11,9 +11,9 @@ const POLL_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * Drives the SPA onboarding overlay:
- *   1. GET /system/deps → ffmpeg present?
- *   2. If missing, user clicks Install → POST /system/install-ffmpeg
- *   3. Poll GET /system/install-ffmpeg/status until done|error
+ *   1. GET /api/system/deps → ffmpeg present?
+ *   2. If missing, user clicks Install → POST /api/system/install-ffmpeg
+ *   3. Poll GET /api/system/install-ffmpeg/status until done|error
  *   4. Re-check deps; clear overlay
  *
  * Daemon binary install is handled by `audetic install` before the user
