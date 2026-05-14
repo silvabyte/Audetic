@@ -9,6 +9,9 @@ use uuid::Uuid;
 
 use crate::audio::AudioStreamManager;
 use crate::db::{self, VoiceToTextData, Workflow, WorkflowData, WorkflowType};
+use crate::post_processing::{
+    DictationCompletedPayload, Event as PostProcessingEvent, PostProcessingService,
+};
 use crate::text_io::TextIoService;
 use crate::transcription::TranscriptionService;
 use crate::ui::Indicator;
@@ -169,6 +172,7 @@ struct ProcessingContext {
     temp_path: PathBuf,
     job_id: Option<String>,
     delete_audio_files: bool,
+    post_processing: Arc<PostProcessingService>,
 }
 
 pub struct RecordingMachine {
@@ -178,6 +182,7 @@ pub struct RecordingMachine {
     text_io: TextIoService,
     behavior: BehaviorOptions,
     status: RecordingStatusHandle,
+    post_processing: Arc<PostProcessingService>,
 }
 
 impl RecordingMachine {
@@ -188,6 +193,7 @@ impl RecordingMachine {
         text_io: TextIoService,
         behavior: BehaviorOptions,
         status: RecordingStatusHandle,
+        post_processing: Arc<PostProcessingService>,
     ) -> Self {
         Self {
             audio,
@@ -196,6 +202,7 @@ impl RecordingMachine {
             text_io,
             behavior,
             status,
+            post_processing,
         }
     }
 
@@ -333,6 +340,7 @@ impl RecordingMachine {
             temp_path,
             job_id,
             delete_audio_files: self.behavior.delete_audio_files,
+            post_processing: Arc::clone(&self.post_processing),
         };
 
         tokio::spawn(async move {
@@ -405,6 +413,20 @@ impl RecordingMachine {
 
                     match db_result {
                         Ok(Ok(history_id)) => {
+                            // Fire any post-processing jobs subscribed to
+                            // `dictation.completed`. Fire-and-forget — failures
+                            // are logged inside the dispatcher and never block
+                            // the recording pipeline.
+                            ctx.post_processing
+                                .dispatch(PostProcessingEvent::DictationCompleted(
+                                    DictationCompletedPayload {
+                                        dictation_id: history_id,
+                                        workflow_type: "VoiceToText".to_string(),
+                                        audio_path: ctx.temp_path.clone(),
+                                        text: text.clone(),
+                                    },
+                                ));
+
                             let completed = CompletedJob {
                                 job_id: ctx.job_id.unwrap_or_else(|| "unknown".to_string()),
                                 history_id,

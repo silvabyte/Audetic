@@ -258,6 +258,77 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/post-processing/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List every event kind the daemon can fire. */
+        get: operations["list_events"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/post-processing/jobs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List all jobs (optionally filtered by event kind). */
+        get: operations["list_jobs"];
+        put?: never;
+        /** Create a new job. */
+        post: operations["create_job"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/post-processing/jobs/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_job"];
+        put?: never;
+        post?: never;
+        delete: operations["delete_job"];
+        options?: never;
+        head?: never;
+        patch: operations["update_job"];
+        trace?: never;
+    };
+    "/post-processing/jobs/{id}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a job once with a synthetic payload. Useful for "did I write the
+         *     command right?" before waiting for a real event.
+         */
+        post: operations["test_job"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/provider": {
         parameters: {
             query?: never;
@@ -461,6 +532,21 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /**
+         * @description What a job does when matched.
+         *
+         *     Stored on disk as two columns: `action_type` (the tag) and
+         *     `action_config` (a JSON blob holding the variant fields). The
+         *     [`Action`] serde shape mirrors this so we can round-trip via
+         *     `serde_json` when materializing the row.
+         */
+        Action: {
+            command: string;
+            /** Format: int64 */
+            timeout_seconds?: number;
+            /** @enum {string} */
+            type: "command";
+        };
         /** @description Request body for auto-update toggle. */
         AutoUpdateRequest: {
             /** @description Enable or disable auto-update */
@@ -483,6 +569,32 @@ export interface components {
             history_id?: number | null;
             job_id: string;
             text: string;
+        };
+        DeleteResponse: {
+            /** Format: int64 */
+            id: number;
+            success: boolean;
+        };
+        /** @description One supported event in the `events` listing. */
+        EventDescriptor: {
+            /** @description What the JSON `data` shape contains when this event fires. */
+            description: string;
+            /** @description Human-readable label for UI dropdowns. */
+            label: string;
+            /**
+             * @description Wire identifier persisted in `post_processing_jobs.event` and
+             *     accepted in the `event` field of new/updated jobs.
+             */
+            name: string;
+        };
+        /**
+         * @description Stable identifier for an event type, as stored in the
+         *     `post_processing_jobs.event` column and exposed over the API.
+         * @enum {string}
+         */
+        EventKind: "dictation.completed" | "meeting.completed";
+        EventsListResponse: {
+            events: components["schemas"]["EventDescriptor"][];
         };
         /** @description A single history entry with formatted display data. */
         HistoryEntry: {
@@ -539,6 +651,20 @@ export interface components {
              * @description Set during `Downloading`. May be 0 before headers arrive.
              */
             totalBytes?: number | null;
+        };
+        /** @description A row from `post_processing_jobs`, materialized into a strong type. */
+        Job: {
+            action: components["schemas"]["Action"];
+            created_at: string;
+            enabled: boolean;
+            event: components["schemas"]["EventKind"];
+            /** Format: int64 */
+            id: number;
+            name: string;
+            updated_at: string;
+        };
+        JobsListResponse: {
+            jobs: components["schemas"]["Job"][];
         };
         /** @description Status of Audetic keybinding installation */
         KeybindStatus: {
@@ -668,6 +794,16 @@ export interface components {
         MeetingsListResponse: {
             meetings: components["schemas"]["MeetingSummary"][];
         };
+        /**
+         * @description Request body for `POST /api/post-processing/jobs`. Same shape the
+         *     CLI builds when piping args from `audetic post-processing add`.
+         */
+        NewJob: {
+            action: components["schemas"]["Action"];
+            enabled?: boolean;
+            event: components["schemas"]["EventKind"];
+            name: string;
+        };
         /** @description Get a summary of the current provider configuration. */
         ProviderInfo: {
             api_endpoint?: string | null;
@@ -719,6 +855,15 @@ export interface components {
              */
             ffmpeg: boolean;
         };
+        /** @description Result body for `POST /jobs/:id/test`. */
+        TestJobResponse: {
+            /** Format: int32 */
+            exit_code?: number | null;
+            stderr: string;
+            stdout: string;
+            success: boolean;
+            timed_out: boolean;
+        };
         /**
          * @description Request body for the toggle recording endpoint.
          *     All fields are optional - if not provided, defaults are used from config.
@@ -753,6 +898,16 @@ export interface components {
             channel?: string | null;
             /** @description Force update even if versions match */
             force?: boolean | null;
+        };
+        /**
+         * @description Request body for `PATCH /api/post-processing/jobs/:id`. All fields
+         *     optional — only what's supplied is updated.
+         */
+        UpdateJob: {
+            action?: null | components["schemas"]["Action"];
+            enabled?: boolean | null;
+            event?: null | components["schemas"]["EventKind"];
+            name?: string | null;
         };
         UpdateReport: {
             current_version: string;
@@ -1156,6 +1311,218 @@ export interface operations {
             };
             /** @description Meeting is not in a retry-eligible state, or audio file missing */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_events: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Supported event kinds */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["EventsListResponse"];
+                };
+            };
+        };
+    };
+    list_jobs: {
+        parameters: {
+            query?: {
+                /** @description Filter to a single event kind (e.g. `meeting.completed`). */
+                event?: string | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Jobs newest first */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["JobsListResponse"];
+                };
+            };
+            /** @description Unknown event filter */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    create_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["NewJob"];
+            };
+        };
+        responses: {
+            /** @description Created job */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Job"];
+                };
+            };
+            /** @description Invalid input */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Job id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Job"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Job id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeleteResponse"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Job id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateJob"];
+            };
+        };
+        responses: {
+            /** @description Updated job */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Job"];
+                };
+            };
+            /** @description Invalid input */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    test_job: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Job id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Execution result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TestJobResponse"];
+                };
+            };
+            /** @description Not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

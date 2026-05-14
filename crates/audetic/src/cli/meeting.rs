@@ -174,12 +174,6 @@ async fn show_status() -> Result<()> {
         "transcribing" => {
             println!("Meeting #{}: transcribing...", meeting_id.unwrap_or(0));
         }
-        "running_hook" => {
-            println!(
-                "Meeting #{}: running post-meeting hook...",
-                meeting_id.unwrap_or(0)
-            );
-        }
         "completed" => {
             println!("Meeting #{}: completed", meeting_id.unwrap_or(0));
         }

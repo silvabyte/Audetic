@@ -74,5 +74,31 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create meetings status index")?;
 
+    // Post-processing jobs: user-defined commands fired on daemon events
+    // (e.g. dictation.completed, meeting.completed). `action_config` is a
+    // serialized JSON blob whose shape depends on `action_type`; future
+    // action types (webhook, etc.) reuse the same row.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS post_processing_jobs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            event TEXT NOT NULL,
+            action_type TEXT NOT NULL,
+            action_config TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+        [],
+    )
+    .context("Failed to create post_processing_jobs table")?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pp_jobs_event_enabled \
+         ON post_processing_jobs(event) WHERE enabled = 1",
+        [],
+    )
+    .context("Failed to create post_processing_jobs event index")?;
+
     Ok(())
 }

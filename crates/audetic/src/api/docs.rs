@@ -6,7 +6,9 @@
 
 use utoipa::OpenApi;
 
-use super::routes::{history, keybind, logs, meetings, provider, recording, system, update};
+use super::routes::{
+    history, keybind, logs, meetings, post_processing, provider, recording, system, update,
+};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -56,6 +58,14 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, syste
         meetings::list_meetings,
         meetings::get_meeting,
         meetings::retry_meeting,
+        // Post-processing jobs
+        post_processing::list_events,
+        post_processing::list_jobs,
+        post_processing::create_job,
+        post_processing::get_job,
+        post_processing::update_job,
+        post_processing::delete_job,
+        post_processing::test_job,
     ),
     components(schemas(
         // Service
@@ -97,6 +107,17 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, syste
         meetings::MeetingSummary,
         meetings::MeetingsListResponse,
         meetings::MeetingDetailResponse,
+        // Post-processing
+        crate::post_processing::Action,
+        crate::post_processing::Job,
+        crate::post_processing::NewJob,
+        crate::post_processing::UpdateJob,
+        crate::post_processing::EventKind,
+        post_processing::EventDescriptor,
+        post_processing::EventsListResponse,
+        post_processing::JobsListResponse,
+        post_processing::DeleteResponse,
+        post_processing::TestJobResponse,
     )),
     tags(
         (name = "service", description = "Service identity and liveness"),
@@ -108,6 +129,7 @@ use super::routes::{history, keybind, logs, meetings, provider, recording, syste
         (name = "system", description = "External tool / dependency availability"),
         (name = "update", description = "Daemon self-update"),
         (name = "logs", description = "Application and transcription logs"),
+        (name = "post_processing", description = "User-defined commands fired on daemon events"),
     ),
 )]
 pub struct ApiDoc;

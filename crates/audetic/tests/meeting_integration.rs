@@ -18,11 +18,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 use audetic::audio::audio_source::AudioSource;
 use audetic::meeting::{MeetingMachine, MeetingPhase, MeetingStartOptions, MeetingStatusHandle};
-use audetic::meeting::{MeetingResult, PostMeetingHook};
+use audetic::post_processing::PostProcessingService;
 use audetic::transcription::job_service::{TranscriptionJobResult, TranscriptionJobService};
 use audetic::ui::Indicator;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -117,49 +117,31 @@ impl TranscriptionJobService for MockTranscription {
     }
 }
 
-// ---- mock post-meeting hook ----
-
-struct MockHook {
-    called: Arc<AtomicBool>,
-}
-
-impl MockHook {
-    fn new() -> (Self, Arc<AtomicBool>) {
-        let flag = Arc::new(AtomicBool::new(false));
-        (
-            Self {
-                called: Arc::clone(&flag),
-            },
-            flag,
-        )
-    }
-}
-
-#[async_trait]
-impl PostMeetingHook for MockHook {
-    async fn execute(&self, _result: &MeetingResult) -> Result<()> {
-        self.called.store(true, Ordering::SeqCst);
-        Ok(())
-    }
-}
-
 // ---- helpers ----
 
 /// Build a meeting machine with mock dependencies. Skips the Hyprland
 /// notification side-effects by using the default Indicator with audio
-/// feedback disabled.
+/// feedback disabled. Post-processing is a no-op in tests — no DB rows
+/// means dispatch fans out to zero jobs.
 fn build_test_machine(
     mic_samples: Vec<f32>,
     system_samples: Vec<f32>,
     transcription: Arc<dyn TranscriptionJobService>,
-    hook: Option<Arc<dyn PostMeetingHook>>,
 ) -> (MeetingMachine, MeetingStatusHandle) {
     let mic: Box<dyn AudioSource> = Box::new(MockAudioSource::new(mic_samples, 16000));
     let system: Box<dyn AudioSource> = Box::new(MockAudioSource::new(system_samples, 16000));
     let indicator = Indicator::new().with_audio_feedback(false);
     let status = MeetingStatusHandle::default();
+    let post_processing = Arc::new(PostProcessingService::new());
 
-    let machine = MeetingMachine::new(mic, system, transcription, hook, indicator, status.clone());
+    let machine = MeetingMachine::new(
+        mic,
+        system,
+        transcription,
+        post_processing,
+        indicator,
+        status.clone(),
+    );
     (machine, status)
 }
 
@@ -201,7 +183,7 @@ async fn wait_for_terminal(status: &MeetingStatusHandle, timeout: Duration) -> M
 async fn test_meeting_stop_when_idle_errors() {
     let (transcription, _count) = MockTranscription::ok("ignored");
     let (mut machine, _status) =
-        build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription), None);
+        build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription));
 
     let result = machine.stop().await;
     assert!(
@@ -220,12 +202,8 @@ async fn test_meeting_stop_when_idle_errors() {
 #[tokio::test]
 async fn test_meeting_start_while_recording_errors() {
     let (transcription, _count) = MockTranscription::ok("ignored");
-    let (mut machine, status) = build_test_machine(
-        fake_audio(0.5),
-        fake_audio(0.5),
-        Arc::new(transcription),
-        None,
-    );
+    let (mut machine, status) =
+        build_test_machine(fake_audio(0.5), fake_audio(0.5), Arc::new(transcription));
 
     let first = machine
         .start(None)
@@ -260,7 +238,6 @@ async fn test_meeting_cancel_during_recording() {
         fake_audio(0.5),
         fake_audio(0.5),
         Arc::clone(&transcription) as Arc<dyn TranscriptionJobService>,
-        None,
     );
 
     let start = machine.start(None).await.expect("start should succeed");
@@ -282,7 +259,7 @@ async fn test_meeting_cancel_during_recording() {
 async fn test_meeting_cancel_when_idle_errors() {
     let (transcription, _count) = MockTranscription::ok("ignored");
     let (mut machine, _status) =
-        build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription), None);
+        build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription));
 
     let result = machine.cancel().await;
     assert!(result.is_err());
@@ -297,13 +274,8 @@ async fn test_meeting_cancel_when_idle_errors() {
 #[tokio::test]
 async fn test_meeting_happy_path() {
     let (transcription, call_count) = MockTranscription::ok("hello world from the mock");
-    let (hook, hook_called) = MockHook::new();
-    let (mut machine, status) = build_test_machine(
-        fake_audio(0.5),
-        fake_audio(0.5),
-        Arc::new(transcription),
-        Some(Arc::new(hook)),
-    );
+    let (mut machine, status) =
+        build_test_machine(fake_audio(0.5), fake_audio(0.5), Arc::new(transcription));
 
     let start = machine
         .start(Some(MeetingStartOptions {
@@ -326,18 +298,13 @@ async fn test_meeting_happy_path() {
     );
 
     assert_eq!(call_count.load(Ordering::SeqCst), 1);
-    assert!(hook_called.load(Ordering::SeqCst), "hook should have run");
 }
 
 #[tokio::test]
 async fn test_meeting_transcription_failure() {
     let (transcription, _count) = MockTranscription::failing();
-    let (mut machine, status) = build_test_machine(
-        fake_audio(0.5),
-        fake_audio(0.5),
-        Arc::new(transcription),
-        None,
-    );
+    let (mut machine, status) =
+        build_test_machine(fake_audio(0.5), fake_audio(0.5), Arc::new(transcription));
 
     let _start = machine.start(None).await.expect("start");
     let _stop = machine.stop().await.expect("stop");
