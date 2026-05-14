@@ -148,6 +148,14 @@ pub enum MeetingCommand {
         /// Meeting ID
         id: i64,
     },
+    /// Import an existing audio or video file as a new meeting
+    Import {
+        /// Path to the media file (audio or video) to import
+        path: PathBuf,
+        /// Optional meeting title; defaults to the filename
+        #[arg(short, long)]
+        title: Option<String>,
+    },
 }
 
 #[derive(ClapArgs, Debug)]

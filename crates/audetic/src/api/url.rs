@@ -33,6 +33,7 @@ pub mod paths {
     pub const VERSION: &str = "/version";
     pub const TOGGLE: &str = "/toggle";
     pub const MEETINGS_TOGGLE: &str = "/meetings/toggle";
+    pub const MEETINGS_IMPORT: &str = "/meetings/import";
     pub const POST_PROCESSING_JOBS: &str = "/post-processing/jobs";
     pub const POST_PROCESSING_EVENTS: &str = "/post-processing/events";
 }
@@ -119,6 +120,7 @@ mod tests {
             paths::VERSION,
             paths::TOGGLE,
             paths::MEETINGS_TOGGLE,
+            paths::MEETINGS_IMPORT,
             paths::POST_PROCESSING_JOBS,
             paths::POST_PROCESSING_EVENTS,
         ] {

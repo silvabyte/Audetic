@@ -133,6 +133,69 @@ export class MeetingStore {
   }
 
   /**
+   * Upload an existing media file as a new meeting. Returns the new
+   * meeting id on success. Same-origin POST goes through the
+   * `/api/meetings/import` endpoint; the daemon streams the file to
+   * disk and kicks off the processing pipeline, so the response comes
+   * back as soon as the upload finishes — not when the transcription
+   * does. Refreshes the list so the new row shows up in
+   * "compressing" state and the detail page's auto-refresh takes over.
+   *
+   * Reports failures via `lastError` (same surface other mutations
+   * use) so route actions can diff and toast.
+   */
+  async importFile(
+    file: File,
+    title?: string,
+  ): Promise<{ meetingId: number } | null> {
+    // openapi-fetch doesn't have first-class multipart helpers, so we
+    // build the FormData ourselves and POST against the same base URL
+    // the typed client uses.
+    const form = new FormData();
+    form.append("file", file);
+    const trimmed = title?.trim();
+    if (trimmed) {
+      form.append("title", trimmed);
+    }
+
+    try {
+      const response = await fetch("/api/meetings/import", {
+        method: "POST",
+        body: form,
+      });
+      const text = await response.text();
+      if (!response.ok) {
+        const message = (() => {
+          try {
+            const parsed = JSON.parse(text);
+            if (
+              parsed &&
+              typeof parsed === "object" &&
+              typeof parsed.message === "string"
+            ) {
+              return parsed.message;
+            }
+          } catch {
+            // fall through
+          }
+          return `Import failed (HTTP ${response.status})`;
+        })();
+        throw new Error(message);
+      }
+      const data = JSON.parse(text) as { meeting_id?: number };
+      const meetingId = typeof data.meeting_id === "number" ? data.meeting_id : null;
+      // Best-effort list refresh so the row appears immediately.
+      void this.loadList();
+      return meetingId !== null ? { meetingId } : null;
+    } catch (e) {
+      runInAction(() => {
+        this.lastError = e instanceof Error ? e.message : String(e);
+      });
+      return null;
+    }
+  }
+
+  /**
    * Re-run transcription against the durable mp3 of a previously failed
    * meeting. Optimistically flips the cached detail to `transcribing` so the
    * UI updates immediately; meeting-detail polls itself while in that state.

@@ -1,11 +1,11 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import { Observer } from "mobx-react-lite";
 import {
   useFetcher,
   type ActionFunctionArgs,
   type RouteObject,
 } from "react-router-dom";
-import { Radio } from "lucide-react";
+import { Radio, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -36,6 +36,26 @@ export const MEETING_INTENTS = {
   stop: "stop-meeting",
   cancel: "cancel-meeting",
 } as const;
+
+/// Accepted media extensions, mirrored from the daemon's
+/// `mime_type_for_extension` in `crates/audetic/src/transcription/jobs_client.rs`.
+/// The daemon is the source of truth — this is a UX nicety so the file picker
+/// doesn't even surface unsupported formats. The daemon will still reject
+/// anything outside this list with a 400.
+const ACCEPTED_EXTENSIONS = [
+  ".wav",
+  ".mp3",
+  ".m4a",
+  ".flac",
+  ".ogg",
+  ".opus",
+  ".mp4",
+  ".mkv",
+  ".webm",
+  ".avi",
+  ".mov",
+] as const;
+const ACCEPTED_ATTR = ACCEPTED_EXTENSIONS.join(",");
 
 /**
  * /meetings — list + start dialog.
@@ -99,24 +119,175 @@ export const meetingsRoute: RouteObject = {
 
 function MeetingsRoute() {
   return (
-    <div className="mx-auto max-w-3xl p-8 space-y-6">
-      <header className="flex items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold">Meetings</h1>
-          <p className="text-sm text-muted-foreground">
-            Long-form recordings. Press{" "}
-            <kbd className="rounded border px-1.5 py-0.5 font-mono text-xs">
-              Super+Shift+R
-            </kbd>{" "}
-            to toggle via hotkey.
-          </p>
-        </div>
-        <StartMeetingButton />
-      </header>
+    <ImportDropZone>
+      <div className="mx-auto max-w-3xl p-8 space-y-6">
+        <header className="flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-2xl font-semibold">Meetings</h1>
+            <p className="text-sm text-muted-foreground">
+              Long-form recordings. Press{" "}
+              <kbd className="rounded border px-1.5 py-0.5 font-mono text-xs">
+                Super+Shift+R
+              </kbd>{" "}
+              to toggle via hotkey, or drop an audio/video file to import.
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            <ImportFileButton />
+            <StartMeetingButton />
+          </div>
+        </header>
 
-      <MeetingList />
+        <MeetingList />
+      </div>
+    </ImportDropZone>
+  );
+}
+
+/**
+ * Wraps the route in a page-level drop target. Hovers light up an
+ * overlay; releasing a file kicks off the import. Multi-file drops
+ * import each in sequence (one POST each — the daemon happily
+ * processes them concurrently).
+ *
+ * Drop events use a ref-based counter to handle nested dragenter/leave
+ * cleanly. Without it, dragging over a child element fires `dragleave`
+ * on the parent and the overlay flickers.
+ */
+function ImportDropZone({ children }: { children: React.ReactNode }) {
+  const store = useStore();
+  const [dragging, setDragging] = useState(false);
+  const counter = useRef(0);
+
+  function isFileDrag(e: React.DragEvent<HTMLDivElement>): boolean {
+    return Array.from(e.dataTransfer.types).includes("Files");
+  }
+
+  function handleDragEnter(e: React.DragEvent<HTMLDivElement>): void {
+    if (!isFileDrag(e)) return;
+    counter.current += 1;
+    setDragging(true);
+  }
+
+  function handleDragLeave(e: React.DragEvent<HTMLDivElement>): void {
+    if (!isFileDrag(e)) return;
+    counter.current = Math.max(0, counter.current - 1);
+    if (counter.current === 0) setDragging(false);
+  }
+
+  function handleDragOver(e: React.DragEvent<HTMLDivElement>): void {
+    if (!isFileDrag(e)) return;
+    // Must call preventDefault on dragover, otherwise drop never fires.
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+  }
+
+  async function handleDrop(e: React.DragEvent<HTMLDivElement>): Promise<void> {
+    if (!isFileDrag(e)) return;
+    e.preventDefault();
+    counter.current = 0;
+    setDragging(false);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length === 0) return;
+    await importFiles(store, files);
+  }
+
+  return (
+    <div
+      className="relative"
+      onDragEnter={handleDragEnter}
+      onDragLeave={handleDragLeave}
+      onDragOver={handleDragOver}
+      onDrop={handleDrop}
+    >
+      {children}
+      {dragging && (
+        <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-background/80 backdrop-blur-sm">
+          <div className="rounded-lg border-2 border-dashed border-primary px-12 py-10 text-center">
+            <Upload className="mx-auto h-10 w-10 text-primary" />
+            <p className="mt-3 text-base font-medium">
+              Drop to import as a meeting
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Audio (wav/mp3/m4a/flac/ogg/opus) or video (mp4/mkv/webm/avi/mov)
+            </p>
+          </div>
+        </div>
+      )}
     </div>
   );
+}
+
+/**
+ * Button-driven import — opens the native file picker. Same code path as
+ * drag-and-drop, just sourced from `<input type="file">`. Multi-select
+ * imports each selected file.
+ */
+function ImportFileButton() {
+  const store = useStore();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function handleChange(
+    e: React.ChangeEvent<HTMLInputElement>,
+  ): Promise<void> {
+    const files = e.target.files ? Array.from(e.target.files) : [];
+    // Reset value so re-selecting the same file fires `onChange` again.
+    e.target.value = "";
+    if (files.length === 0) return;
+    setBusy(true);
+    try {
+      await importFiles(store, files);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <input
+        ref={inputRef}
+        type="file"
+        accept={ACCEPTED_ATTR}
+        multiple
+        hidden
+        onChange={handleChange}
+      />
+      <Button
+        type="button"
+        variant="outline"
+        disabled={busy}
+        onClick={() => inputRef.current?.click()}
+      >
+        <Upload className="mr-2 h-4 w-4" />
+        {busy ? "Importing…" : "Import file"}
+      </Button>
+    </>
+  );
+}
+
+/**
+ * Shared import flow used by both the drop zone and the file-picker
+ * button. Uploads each file in sequence and toasts per file. Sequential
+ * (not parallel) so the user gets coherent progress feedback in the
+ * toast stream — the daemon can run them concurrently if it wants.
+ */
+async function importFiles(
+  store: ReturnType<typeof useStore>,
+  files: File[],
+): Promise<void> {
+  for (const file of files) {
+    const errBefore = store.meetings.lastError;
+    const result = await store.meetings.importFile(file);
+    const errAfter = store.meetings.lastError;
+    if (result) {
+      toast.success(`Imported ${file.name}`, {
+        description: `Meeting #${result.meetingId} — transcription running.`,
+      });
+    } else if (errAfter && errAfter !== errBefore) {
+      toast.error(`Couldn't import ${file.name}`, { description: errAfter });
+    }
+  }
 }
 
 function StartMeetingButton() {

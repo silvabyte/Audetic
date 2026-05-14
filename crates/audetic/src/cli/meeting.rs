@@ -4,10 +4,20 @@
 
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
+use std::path::PathBuf;
 
+use crate::api::url::{api_url, paths};
 use crate::cli::args::{MeetingCliArgs, MeetingCommand};
 
-const BASE_URL: &str = "http://127.0.0.1:3737/api";
+/// Daemon API base — single derived value so we never inline
+/// `http://127.0.0.1:3737/api/...` in this module.
+fn base_url() -> String {
+    let mut url = api_url("");
+    if url.ends_with('/') {
+        url.pop();
+    }
+    url
+}
 
 pub async fn handle_meeting_command(args: MeetingCliArgs) -> Result<()> {
     match args.command {
@@ -17,6 +27,7 @@ pub async fn handle_meeting_command(args: MeetingCliArgs) -> Result<()> {
         MeetingCommand::Status => show_status().await,
         MeetingCommand::List { limit } => list_meetings(limit).await,
         MeetingCommand::Show { id } => show_meeting(id).await,
+        MeetingCommand::Import { path, title } => import_meeting(path, title).await,
     }
 }
 
@@ -53,7 +64,7 @@ async fn start_meeting(title: Option<String>) -> Result<()> {
     }
 
     let response = client
-        .post(format!("{}/meetings/start", BASE_URL))
+        .post(format!("{}/meetings/start", base_url()))
         .json(&body)
         .send()
         .await
@@ -83,7 +94,7 @@ async fn stop_meeting() -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .post(format!("{}/meetings/stop", BASE_URL))
+        .post(format!("{}/meetings/stop", base_url()))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -108,7 +119,7 @@ async fn cancel_meeting() -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .post(format!("{}/meetings/cancel", BASE_URL))
+        .post(format!("{}/meetings/cancel", base_url()))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -130,7 +141,7 @@ async fn show_status() -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/meetings/status", BASE_URL))
+        .get(format!("{}/meetings/status", base_url()))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -196,7 +207,7 @@ async fn list_meetings(limit: usize) -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/meetings?limit={}", BASE_URL, limit))
+        .get(format!("{}/meetings?limit={}", base_url(), limit))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -245,7 +256,7 @@ async fn show_meeting(id: i64) -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/meetings/{}", BASE_URL, id))
+        .get(format!("{}/meetings/{}", base_url(), id))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -288,6 +299,64 @@ async fn show_meeting(id: i64) -> Result<()> {
             println!("\n--- Transcript ---\n{}", transcript);
         }
     }
+
+    Ok(())
+}
+
+async fn import_meeting(path: PathBuf, title: Option<String>) -> Result<()> {
+    if !path.exists() {
+        bail!("File does not exist: {}", path.display());
+    }
+    let metadata =
+        std::fs::metadata(&path).with_context(|| format!("Failed to stat {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("Not a regular file: {}", path.display());
+    }
+
+    let filename = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "upload".to_string());
+
+    let file_size = metadata.len();
+    let mime_type = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .and_then(crate::transcription::jobs_client::mime_type_for_extension)
+        .unwrap_or("application/octet-stream");
+
+    let file = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("Failed to open {}", path.display()))?;
+    let stream = tokio_util::io::ReaderStream::new(file);
+    let body = reqwest::Body::wrap_stream(stream);
+
+    let part = reqwest::multipart::Part::stream_with_length(body, file_size)
+        .file_name(filename.clone())
+        .mime_str(mime_type)?;
+
+    let mut form = reqwest::multipart::Form::new().part("file", part);
+    if let Some(t) = title.as_deref() {
+        form = form.text("title", t.to_string());
+    }
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post(api_url(paths::MEETINGS_IMPORT))
+        .multipart(form)
+        .send()
+        .await
+        .context("Failed to connect to Audetic service. Is it running?")?;
+
+    let json = json_or_error(response, "import meeting").await?;
+    let meeting_id = json.get("meeting_id").and_then(|v| v.as_i64()).unwrap_or(0);
+
+    println!("Imported {} as meeting #{}", filename, meeting_id);
+    println!(
+        "Transcription running in background. Run 'audetic meeting show {}' to check progress.",
+        meeting_id
+    );
 
     Ok(())
 }

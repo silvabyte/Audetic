@@ -52,8 +52,9 @@ which = "6.0"
 # Text processing
 regex = "1.10"
 
-# HTTP server
-axum = "0.7"
+# HTTP server. `multipart` enables the file-upload extractor used by
+# `POST /api/meetings/import`.
+axum = { version = "0.7", features = ["multipart"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
 

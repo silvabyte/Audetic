@@ -134,6 +134,12 @@ fn build_test_machine(
     let status = MeetingStatusHandle::default();
     let post_processing = Arc::new(PostProcessingService::new());
 
+    // Each test gets its own meetings dir under /tmp so concurrent test threads
+    // can't clobber one another's audio files. Matches what `app::mod`
+    // computes from `dirs::data_dir()` in production.
+    let meetings_dir = tempfile::tempdir()
+        .expect("create test meetings dir")
+        .keep();
     let machine = MeetingMachine::new(
         mic,
         system,
@@ -141,6 +147,7 @@ fn build_test_machine(
         post_processing,
         indicator,
         status.clone(),
+        meetings_dir,
     );
     (machine, status)
 }

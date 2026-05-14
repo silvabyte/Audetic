@@ -1,9 +1,12 @@
 //! Meeting recording API endpoints. See OpenAPI spec at
 //! `/api/openapi.json` for the canonical method/path list.
 
-use crate::meeting::{MeetingPhase, MeetingStartOptions, MeetingStatusHandle};
+use crate::meeting::{
+    import_meeting_file, ImportArgs, MediaInspector, MeetingPhase, MeetingStartOptions,
+    MeetingStatusHandle, ProcessingServices,
+};
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{get, post},
@@ -12,8 +15,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
 use super::recording::ApiCommand;
@@ -28,6 +34,18 @@ pub struct MeetingState {
     /// without rebuilding the HTTP client / timeout config.
     pub transcription:
         std::sync::Arc<dyn crate::transcription::job_service::TranscriptionJobService>,
+    /// Pipeline dependencies — transcription service and optional hook.
+    /// Used by the import endpoint to spawn the same pipeline a live
+    /// recording does.
+    pub services: ProcessingServices,
+    /// Media duration probe — `FfprobeMediaInspector` in production. Used
+    /// by the import endpoint to seed `duration_seconds` before kicking
+    /// off the pipeline.
+    pub inspector: Arc<dyn MediaInspector>,
+    /// Durable meetings directory (`~/.local/share/audetic/meetings`).
+    /// Uploaded files are staged into a `.uploads` sub-dir, then moved
+    /// alongside live recordings on success.
+    pub meetings_dir: PathBuf,
 }
 
 /// Request body for start/toggle endpoints.
@@ -129,6 +147,16 @@ pub struct MeetingsListQuery {
     pub limit: Option<usize>,
 }
 
+/// Confirmation that an imported media file has been accepted as a new
+/// meeting. The processing pipeline runs in the background; clients poll
+/// `GET /meetings/{id}` for phase progression and the final transcript.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeetingImportResponse {
+    pub success: bool,
+    pub meeting_id: i64,
+    pub message: String,
+}
+
 pub fn router(state: MeetingState) -> Router {
     Router::new()
         .route("/meetings/start", post(start_meeting))
@@ -137,6 +165,14 @@ pub fn router(state: MeetingState) -> Router {
         .route("/meetings/toggle", post(toggle_meeting))
         .route("/meetings/status", get(meeting_status))
         .route("/meetings", get(list_meetings))
+        .route(
+            "/meetings/import",
+            // Disable the global 2 MiB body limit on this route only —
+            // meeting recordings and video files run into the hundreds of
+            // MB. The multipart extractor below streams chunks to disk so
+            // memory usage stays bounded regardless of body size.
+            post(import_meeting).layer(DefaultBodyLimit::disable()),
+        )
         .route("/meetings/:id", get(get_meeting))
         .route("/meetings/:id/retry", post(retry_meeting))
         .with_state(state)
@@ -635,6 +671,194 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
             meeting_id: id,
             message: "Retry started; poll /meetings/:id for status".to_string(),
         }),
+    )
+        .into_response()
+}
+
+/// Import a media file as a new meeting.
+///
+/// Accepts a `multipart/form-data` body with:
+/// - `file`: the audio or video bytes (required)
+/// - `title`: optional human-readable title; defaults to the filename
+///   stem if absent
+///
+/// The file is streamed chunk-by-chunk into a temp file under the meetings
+/// directory, then handed to `meeting::import_meeting_file`, which moves
+/// it into place, inserts the DB row, and spawns the processing pipeline.
+/// Returns 202 with the new meeting id; clients poll `GET /meetings/{id}`
+/// for status. The response intentionally omits the storage path —
+/// callers shouldn't depend on the filesystem layout.
+#[utoipa::path(
+    post,
+    path = "/meetings/import",
+    tag = "meetings",
+    request_body(
+        content_type = "multipart/form-data",
+        description = "File upload with optional title",
+    ),
+    responses(
+        (status = 202, description = "Import accepted; poll /meetings/:id", body = MeetingImportResponse),
+        (status = 400, description = "Missing file part or unsupported extension"),
+        (status = 500, description = "Failed to stage upload or insert meeting row"),
+    ),
+)]
+pub async fn import_meeting(
+    State(state): State<MeetingState>,
+    mut multipart: Multipart,
+) -> Response {
+    info!("Meeting import command received via API");
+
+    let uploads_dir = state.meetings_dir.join(".uploads");
+    if let Err(e) = tokio::fs::create_dir_all(&uploads_dir).await {
+        return import_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to create uploads dir: {e}"),
+        );
+    }
+
+    let mut staged: Option<(PathBuf, Option<String>)> = None;
+    let mut title: Option<String> = None;
+
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(f)) => f,
+            Ok(None) => break,
+            Err(e) => {
+                cleanup_staged(staged.as_ref().map(|(p, _)| p)).await;
+                return import_error(
+                    StatusCode::BAD_REQUEST,
+                    format!("Malformed multipart body: {e}"),
+                );
+            }
+        };
+
+        match field.name() {
+            Some("file") => {
+                if staged.is_some() {
+                    cleanup_staged(staged.as_ref().map(|(p, _)| p)).await;
+                    return import_error(
+                        StatusCode::BAD_REQUEST,
+                        "Only one `file` part is allowed".to_string(),
+                    );
+                }
+                let original_filename = field.file_name().map(|s| s.to_string());
+                let temp_name = format!("upload-{}", uuid::Uuid::new_v4().simple());
+                let temp_path = uploads_dir.join(&temp_name);
+
+                match stream_field_to_disk(field, &temp_path).await {
+                    Ok(()) => {
+                        staged = Some((temp_path, original_filename));
+                    }
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&temp_path).await;
+                        return import_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("Failed to stage upload: {e}"),
+                        );
+                    }
+                }
+            }
+            Some("title") => match field.text().await {
+                Ok(t) => {
+                    let trimmed = t.trim();
+                    if !trimmed.is_empty() {
+                        title = Some(trimmed.to_string());
+                    }
+                }
+                Err(e) => {
+                    cleanup_staged(staged.as_ref().map(|(p, _)| p)).await;
+                    return import_error(
+                        StatusCode::BAD_REQUEST,
+                        format!("Failed to read title field: {e}"),
+                    );
+                }
+            },
+            _ => {
+                // Ignore unknown fields rather than rejecting — keeps the
+                // door open for additive form extensions without breaking
+                // older clients.
+            }
+        }
+    }
+
+    let (source_path, original_filename) = match staged {
+        Some(v) => v,
+        None => {
+            return import_error(
+                StatusCode::BAD_REQUEST,
+                "Missing required `file` part".to_string(),
+            );
+        }
+    };
+
+    let args = ImportArgs {
+        source_path: source_path.clone(),
+        original_filename,
+        title,
+        services: state.services.clone(),
+        inspector: state.inspector.clone(),
+        meetings_dir: state.meetings_dir.clone(),
+    };
+
+    match import_meeting_file(args).await {
+        Ok(result) => (
+            StatusCode::ACCEPTED,
+            Json(MeetingImportResponse {
+                success: true,
+                meeting_id: result.meeting_id,
+                message: "Import accepted; poll /meetings/:id for status".to_string(),
+            }),
+        )
+            .into_response(),
+        Err(e) => {
+            // import_meeting_file cleans up its own destination file on
+            // DB-insert failure, but if it bailed before staging (e.g.
+            // unsupported extension) the temp upload is still on disk.
+            let _ = tokio::fs::remove_file(&source_path).await;
+            let msg = e.to_string();
+            let lower = msg.to_lowercase();
+            let status_code =
+                if lower.contains("unsupported") || lower.contains("missing an extension") {
+                    StatusCode::BAD_REQUEST
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+            import_error(status_code, msg)
+        }
+    }
+}
+
+/// Stream a multipart field's bytes to a file on disk. Bounded memory
+/// regardless of upload size — we never collect the whole field into a
+/// `Vec`.
+async fn stream_field_to_disk(
+    mut field: axum::extract::multipart::Field<'_>,
+    destination: &std::path::Path,
+) -> anyhow::Result<()> {
+    let mut file = tokio::fs::File::create(destination).await?;
+    while let Some(chunk) = field.chunk().await? {
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    Ok(())
+}
+
+async fn cleanup_staged(path: Option<&PathBuf>) {
+    if let Some(p) = path {
+        if let Err(e) = tokio::fs::remove_file(p).await {
+            warn!("Failed to clean up staged upload at {:?}: {}", p, e);
+        }
+    }
+}
+
+fn import_error(status: StatusCode, message: String) -> Response {
+    error!("Meeting import failed ({}): {}", status, message);
+    (
+        status,
+        Json(json!({
+            "success": false,
+            "message": message,
+        })),
     )
         .into_response()
 }

@@ -154,6 +154,36 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/meetings/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import a media file as a new meeting.
+         * @description Accepts a `multipart/form-data` body with:
+         *     - `file`: the audio or video bytes (required)
+         *     - `title`: optional human-readable title; defaults to the filename
+         *       stem if absent
+         *
+         *     The file is streamed chunk-by-chunk into a temp file under the meetings
+         *     directory, then handed to `meeting::import_meeting_file`, which moves
+         *     it into place, inserts the DB row, and spawns the processing pipeline.
+         *     Returns 202 with the new meeting id; clients poll `GET /meetings/{id}`
+         *     for status. The response intentionally omits the storage path —
+         *     callers shouldn't depend on the filesystem layout.
+         */
+        post: operations["import_meeting"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/meetings/start": {
         parameters: {
             query?: never;
@@ -707,6 +737,17 @@ export interface components {
             transcript_text?: string | null;
         };
         /**
+         * @description Confirmation that an imported media file has been accepted as a new
+         *     meeting. The processing pipeline runs in the background; clients poll
+         *     `GET /meetings/{id}` for phase progression and the final transcript.
+         */
+        MeetingImportResponse: {
+            /** Format: int64 */
+            meeting_id: number;
+            message: string;
+            success: boolean;
+        };
+        /**
          * @description Confirmation that a failed meeting's transcription has been
          *     re-queued; the actual work runs in the background.
          */
@@ -1139,6 +1180,45 @@ export interface operations {
             };
             /** @description No meeting recording in progress to cancel */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    import_meeting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description File upload with optional title */
+        requestBody?: {
+            content: {
+                "multipart/form-data": unknown;
+            };
+        };
+        responses: {
+            /** @description Import accepted; poll /meetings/:id */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeetingImportResponse"];
+                };
+            };
+            /** @description Missing file part or unsupported extension */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Failed to stage upload or insert meeting row */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

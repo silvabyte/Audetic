@@ -6,7 +6,7 @@ use crate::audio::{
     BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle, ToggleResult,
 };
 use crate::config::Config;
-use crate::meeting::{MeetingMachine, MeetingStatusHandle};
+use crate::meeting::{FfprobeMediaInspector, MediaInspector, MeetingMachine, MeetingStatusHandle};
 use crate::post_processing::PostProcessingService;
 use crate::text_io::TextIoService;
 use crate::transcription::job_service::RemoteTranscriptionJobService;
@@ -59,14 +59,22 @@ pub async fn run_service() -> Result<()> {
         Arc::clone(&post_processing),
     );
 
-    // Meeting pipeline (independent from recording pipeline)
+    // Meeting pipeline (independent from recording pipeline). `meetings_dir`,
+    // the media inspector, and the post-processing service all live at the
+    // app level so the live recording machine and the import endpoint share
+    // a single instance — no path drift between recording and imports, and
+    // no duplicate dispatch of `meeting.completed` jobs.
     let meeting_status = MeetingStatusHandle::default();
     let meeting_transcription = build_meeting_transcription_service(&config);
+    let meetings_dir = resolve_meetings_dir();
+    let meeting_inspector: Arc<dyn MediaInspector> = Arc::new(FfprobeMediaInspector);
+
     let mut meeting_machine = build_meeting_machine(
         indicator,
         meeting_status.clone(),
         meeting_transcription.clone(),
         Arc::clone(&post_processing),
+        meetings_dir.clone(),
     );
 
     let api_server = ApiServer::new(
@@ -75,7 +83,13 @@ pub async fn run_service() -> Result<()> {
         &config,
         Arc::clone(&post_processing),
     )
-    .with_meeting_state(meeting_status.clone(), meeting_transcription.clone());
+    .with_meeting_state(
+        meeting_status.clone(),
+        meeting_transcription.clone(),
+        Arc::clone(&post_processing),
+        meeting_inspector,
+        meetings_dir.clone(),
+    );
 
     tokio::spawn(async move {
         if let Err(e) = api_server.start().await {
@@ -208,6 +222,7 @@ fn build_meeting_machine(
     status: MeetingStatusHandle,
     transcription: Arc<dyn crate::transcription::job_service::TranscriptionJobService>,
     post_processing: Arc<PostProcessingService>,
+    meetings_dir: std::path::PathBuf,
 ) -> MeetingMachine {
     let mic_source = MicAudioSource::new(16000)
         .map(|s| Box::new(s) as Box<dyn crate::audio::audio_source::AudioSource>)
@@ -228,7 +243,18 @@ fn build_meeting_machine(
         post_processing,
         indicator,
         status,
+        meetings_dir,
     )
+}
+
+/// Resolve the durable meetings directory used for both live recordings
+/// and imported files. Falls back to `/tmp/audetic/meetings` if `dirs`
+/// can't find a data dir (e.g. degraded container env), matching what
+/// `MeetingMachine` did inline before this was hoisted.
+fn resolve_meetings_dir() -> std::path::PathBuf {
+    crate::global::data_dir()
+        .map(|d| d.join("meetings"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/audetic/meetings"))
 }
 
 /// Fallback audio source that produces no samples (for when mic init fails).

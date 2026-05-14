@@ -58,6 +58,7 @@ use super::routes::{
         meetings::list_meetings,
         meetings::get_meeting,
         meetings::retry_meeting,
+        meetings::import_meeting,
         // Post-processing jobs
         post_processing::list_events,
         post_processing::list_jobs,
@@ -107,6 +108,8 @@ use super::routes::{
         meetings::MeetingSummary,
         meetings::MeetingsListResponse,
         meetings::MeetingDetailResponse,
+        meetings::MeetingRetryResponse,
+        meetings::MeetingImportResponse,
         // Post-processing
         crate::post_processing::Action,
         crate::post_processing::Job,
