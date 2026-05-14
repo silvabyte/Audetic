@@ -133,6 +133,54 @@ export class MeetingStore {
   }
 
   /**
+   * Upload an existing media file as a new meeting. Returns the new
+   * meeting id on success. POSTs through the same typed `daemon` client
+   * the rest of this store uses; the daemon streams the file to disk
+   * and kicks off the processing pipeline, so the response comes back
+   * as soon as the upload finishes — not when the transcription does.
+   * Refreshes the list so the new row shows up in "compressing" state
+   * and the detail page's auto-refresh takes over.
+   *
+   * Reports failures via `lastError` (same surface other mutations
+   * use) so route actions can diff and toast.
+   */
+  async importFile(
+    file: File,
+    title?: string,
+  ): Promise<{ meetingId: number } | null> {
+    const form = new FormData();
+    form.append("file", file);
+    const trimmed = title?.trim();
+    if (trimmed) {
+      form.append("title", trimmed);
+    }
+
+    try {
+      // openapi-fetch defaults `bodySerializer` to JSON.stringify, which
+      // would corrupt the FormData boundary. Pass-through serializer +
+      // empty `Content-Type` lets the browser set the multipart header
+      // (with its random boundary token) for us. The schema types the
+      // body as `unknown`, hence the cast.
+      const { data, error } = await daemon.POST("/meetings/import", {
+        body: form as never,
+        bodySerializer: (body) => body as BodyInit,
+        headers: { "Content-Type": null },
+      });
+      if (error || !data) {
+        throw new Error(formatError(error ?? "empty response"));
+      }
+      // Best-effort list refresh so the row appears immediately.
+      void this.loadList();
+      return { meetingId: data.meeting_id };
+    } catch (e) {
+      runInAction(() => {
+        this.lastError = e instanceof Error ? e.message : String(e);
+      });
+      return null;
+    }
+  }
+
+  /**
    * Re-run transcription against the durable mp3 of a previously failed
    * meeting. Optimistically flips the cached detail to `transcribing` so the
    * UI updates immediately; meeting-detail polls itself while in that state.

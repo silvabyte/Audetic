@@ -50,6 +50,15 @@ pub fn resolve_ffmpeg_binary() -> Option<PathBuf> {
     which::which("ffmpeg").ok()
 }
 
+/// Resolve the `ffprobe` binary if available. Only consults PATH — the
+/// app-local sidecar drops `ffprobe` (see `KEEP_ONLY_FFMPEG=1` in
+/// `install_blocking`) so a sibling lookup next to the sidecar would always
+/// miss. `None` is non-fatal: callers that probe duration treat absent
+/// `ffprobe` as "unknown duration" and continue.
+pub fn resolve_ffprobe_binary() -> Option<PathBuf> {
+    which::which("ffprobe").ok()
+}
+
 /// Quick "do we have ffmpeg" check used by `GET /system/deps` and the
 /// pre-flight in `compress_for_transcription`.
 pub fn check_available() -> bool {

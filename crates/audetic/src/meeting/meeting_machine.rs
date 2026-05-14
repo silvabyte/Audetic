@@ -1,12 +1,12 @@
-//! Meeting lifecycle orchestrator.
+//! Meeting lifecycle orchestrator for live recordings.
 //!
-//! Manages the full meeting recording pipeline:
-//! start → stop → compress → transcribe → save → hook → done
-//!
-//! Post-recording processing (compress + transcribe + hook) runs in a spawned
-//! background task so the `stop()` call returns to the caller quickly.
-//! Phase transitions are surfaced via the injected `Indicator` (Hyprland
-//! notifications + audio feedback) and the `MeetingStatusHandle`.
+//! Owns mic + system audio capture and writes the final WAV. Post-recording
+//! processing (compress → transcribe → write transcript → dispatch
+//! `meeting.completed` to user-defined jobs → mark completed) is delegated
+//! to `meeting::processing::process_meeting`, which is the shared pipeline
+//! reused by retries and imported media files. Phase transitions during
+//! processing are forwarded to the singleton `MeetingStatusHandle` and the
+//! `Indicator` via `LiveProgressObserver`.
 
 use anyhow::{bail, Result};
 use hound::{WavSpec, WavWriter};
@@ -16,14 +16,13 @@ use tracing::{error, info, warn};
 
 use crate::audio::audio_mixer::AudioMixer;
 use crate::audio::audio_source::AudioSource;
-use crate::cli::compression::{cleanup_temp_file, prepare_for_upload};
 use crate::db::{self, meetings::MeetingRepository};
-use crate::post_processing::{
-    Event as PostProcessingEvent, MeetingCompletedPayload, PostProcessingService,
-};
+use crate::post_processing::PostProcessingService;
 use crate::transcription::job_service::TranscriptionJobService;
 use crate::ui::Indicator;
 
+use super::processing::{process_meeting, ProcessingArgs, ProcessingServices};
+use super::progress::LiveProgressObserver;
 use super::status::{MeetingPhase, MeetingStartOptions, MeetingStatusHandle};
 
 /// Which audio sources were actually capturing at the start of a meeting.
@@ -92,11 +91,8 @@ impl MeetingMachine {
         post_processing: Arc<PostProcessingService>,
         indicator: Indicator,
         status: MeetingStatusHandle,
+        meetings_dir: PathBuf,
     ) -> Self {
-        let meetings_dir = crate::global::data_dir()
-            .map(|d| d.join("meetings"))
-            .unwrap_or_else(|_| PathBuf::from("/tmp/audetic/meetings"));
-
         Self {
             mic_source,
             system_source,
@@ -214,8 +210,9 @@ impl MeetingMachine {
     ///
     /// Halts audio sources, mixes the captured samples, writes the WAV file,
     /// and spawns a background task to handle compression + transcription +
-    /// the post-meeting hook. Returns `MeetingStopResult` immediately after
-    /// the WAV is written so the HTTP caller unblocks within milliseconds.
+    /// post-processing dispatch. Returns `MeetingStopResult` immediately
+    /// after the WAV is written so the HTTP caller unblocks within
+    /// milliseconds.
     pub async fn stop(&mut self) -> Result<MeetingStopResult> {
         let state = self.status.get().await;
         if state.phase != MeetingPhase::Recording {
@@ -294,19 +291,25 @@ impl MeetingMachine {
         }
 
         // Spawn the compress → transcribe → dispatch pipeline so the caller
-        // doesn't have to wait for it. The spawned task owns its own clones
-        // of the non-`!Send` dependencies.
-        let ctx = ProcessContext {
+        // doesn't have to wait for it. `LiveProgressObserver` forwards phase
+        // transitions to the singleton status handle and the Hyprland
+        // indicator; the pipeline itself is oblivious to either.
+        let observer = Arc::new(LiveProgressObserver::new(
+            self.status.clone(),
+            self.indicator.clone(),
+        ));
+        let args = ProcessingArgs {
             meeting_id,
             audio_path: audio_path.clone(),
             title,
             duration_seconds,
-            status: self.status.clone(),
-            transcription: Arc::clone(&self.transcription),
-            post_processing: Arc::clone(&self.post_processing),
-            indicator: self.indicator.clone(),
+            services: ProcessingServices {
+                transcription: Arc::clone(&self.transcription),
+                post_processing: Arc::clone(&self.post_processing),
+            },
+            observer,
         };
-        tokio::spawn(async move { run_processing_task(ctx).await });
+        tokio::spawn(async move { process_meeting(args).await });
 
         Ok(MeetingStopResult {
             meeting_id,
@@ -428,166 +431,6 @@ impl MeetingMachine {
 pub enum ToggleOutcome {
     Started(MeetingStartResult),
     Stopped(MeetingStopResult),
-}
-
-/// Everything the background post-processing task needs.
-/// All fields are `Send + Sync` (or cheaply clonable) so the whole struct can
-/// move into a `tokio::spawn` without borrowing the `MeetingMachine` (which
-/// is `!Send` due to `cpal::Stream` in `MicAudioSource`).
-struct ProcessContext {
-    meeting_id: i64,
-    audio_path: PathBuf,
-    title: Option<String>,
-    duration_seconds: u64,
-    status: MeetingStatusHandle,
-    transcription: Arc<dyn TranscriptionJobService>,
-    post_processing: Arc<PostProcessingService>,
-    indicator: Indicator,
-}
-
-/// Run the post-recording pipeline: compress → transcribe → persist → hook.
-///
-/// Updates `status`, DB row, and fires indicator notifications for every phase
-/// transition. Errors at any stage are persisted and surfaced via an error
-/// notification; the meeting row is left in a terminal (`completed` or
-/// `error`) state before this function returns.
-async fn run_processing_task(ctx: ProcessContext) {
-    info!("Compressing meeting audio: {:?}", ctx.audio_path);
-    let (temp_upload, temp_to_cleanup) = match prepare_for_upload(&ctx.audio_path, false) {
-        Ok(v) => v,
-        Err(e) => {
-            let error_msg = e.to_string();
-            error!(
-                "Meeting {} compression failed: {}",
-                ctx.meeting_id, error_msg
-            );
-            if let Ok(conn) = db::init_db() {
-                let _ = MeetingRepository::fail(
-                    &conn,
-                    ctx.meeting_id,
-                    &error_msg,
-                    ctx.duration_seconds as i64,
-                );
-            }
-            ctx.status.set_error(error_msg.clone()).await;
-            if let Err(e) = ctx.indicator.show_error(&error_msg).await {
-                warn!("Failed to show error indicator: {}", e);
-            }
-            return;
-        }
-    };
-
-    // Move the compressed mp3 next to the original WAV via copy (cross-fs safe,
-    // unlike rename — the temp dir is typically on tmpfs while the meetings dir
-    // lives under ~/.local/share). The durable mp3 is what the post-meeting
-    // hook and history reference. Drop the WAV once the mp3 is in place.
-    let durable_mp3 = if temp_to_cleanup.is_some() {
-        let durable = ctx.audio_path.with_extension("mp3");
-        match std::fs::copy(&temp_upload, &durable) {
-            Ok(_) => {
-                if let Err(e) = std::fs::remove_file(&ctx.audio_path) {
-                    warn!("Failed to delete original WAV: {}", e);
-                }
-                durable
-            }
-            Err(e) => {
-                warn!("Failed to copy compressed mp3 next to WAV: {}", e);
-                ctx.audio_path.clone()
-            }
-        }
-    } else {
-        temp_upload.clone()
-    };
-
-    info!("Compressed meeting audio at: {:?}", durable_mp3);
-
-    ctx.status.set_phase(MeetingPhase::Transcribing).await;
-    if let Ok(conn) = db::init_db() {
-        let _ = MeetingRepository::update_status(&conn, ctx.meeting_id, MeetingPhase::Transcribing);
-        // Keep the DB row pointing at the file that actually exists. The WAV
-        // is gone after a successful copy; retries / file UI need the .mp3
-        // path or they'll error out trying to read a deleted file.
-        if durable_mp3 != ctx.audio_path {
-            let _ = MeetingRepository::update_audio_path(
-                &conn,
-                ctx.meeting_id,
-                &durable_mp3.to_string_lossy(),
-            );
-        }
-    }
-
-    let transcription_result = ctx.transcription.submit_and_poll(&temp_upload, None).await;
-
-    if let Some(temp) = &temp_to_cleanup {
-        cleanup_temp_file(temp);
-    }
-
-    match transcription_result {
-        Ok(result) => {
-            let transcript_path = durable_mp3.with_extension("txt");
-            if let Err(e) = std::fs::write(&transcript_path, &result.text) {
-                error!("Failed to write transcript file: {}", e);
-            }
-
-            if let Ok(conn) = db::init_db() {
-                let _ = MeetingRepository::complete(
-                    &conn,
-                    ctx.meeting_id,
-                    &transcript_path.to_string_lossy(),
-                    &result.text,
-                    ctx.duration_seconds as i64,
-                );
-            }
-
-            info!(
-                "Meeting {} transcription complete: {} chars",
-                ctx.meeting_id,
-                result.text.len()
-            );
-
-            // Fire any post-processing jobs subscribed to `meeting.completed`.
-            // Dispatch is fire-and-forget: each matching job runs in its own
-            // spawned task, and failures are logged but never flip the meeting
-            // to `error` (the transcription itself succeeded).
-            ctx.post_processing
-                .dispatch(PostProcessingEvent::MeetingCompleted(
-                    MeetingCompletedPayload {
-                        meeting_id: ctx.meeting_id,
-                        title: ctx.title,
-                        audio_path: durable_mp3,
-                        transcript_path,
-                        transcript_text: result.text.clone(),
-                        duration_seconds: ctx.duration_seconds,
-                    },
-                ));
-
-            ctx.status.complete().await;
-
-            // Final "complete" notification with transcript preview.
-            if let Err(e) = ctx.indicator.show_complete(&result.text).await {
-                warn!("Failed to show completion indicator: {}", e);
-            }
-        }
-        Err(e) => {
-            error!("Meeting {} transcription failed: {}", ctx.meeting_id, e);
-            let error_msg = e.to_string();
-
-            if let Ok(conn) = db::init_db() {
-                let _ = MeetingRepository::fail(
-                    &conn,
-                    ctx.meeting_id,
-                    &error_msg,
-                    ctx.duration_seconds as i64,
-                );
-            }
-
-            ctx.status.set_error(error_msg.clone()).await;
-
-            if let Err(e) = ctx.indicator.show_error(&error_msg).await {
-                warn!("Failed to show error indicator: {}", e);
-            }
-        }
-    }
 }
 
 /// Re-run transcription for an existing meeting whose audio file is still on

@@ -77,11 +77,21 @@ impl ApiServer {
         transcription: std::sync::Arc<
             dyn crate::transcription::job_service::TranscriptionJobService,
         >,
+        post_processing: std::sync::Arc<PostProcessingService>,
+        inspector: std::sync::Arc<dyn crate::meeting::MediaInspector>,
+        meetings_dir: std::path::PathBuf,
     ) -> Self {
+        let services = crate::meeting::ProcessingServices {
+            transcription: transcription.clone(),
+            post_processing,
+        };
         self.meeting_state = Some(routes::meetings::MeetingState {
             tx: self.recording_state.tx.clone(),
             status: meeting_status,
             transcription,
+            services,
+            inspector,
+            meetings_dir,
         });
         self
     }
