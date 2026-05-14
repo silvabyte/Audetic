@@ -6,8 +6,8 @@ use audetic::{
     app,
     cli::{
         handle_history_command, handle_install_command, handle_keybind_command,
-        handle_logs_command, handle_meeting_command, handle_provider_command,
-        handle_transcribe_command, handle_update_command, Cli, CliCommand,
+        handle_logs_command, handle_meeting_command, handle_post_processing_command,
+        handle_provider_command, handle_transcribe_command, handle_update_command, Cli, CliCommand,
     },
 };
 use clap::Parser;
@@ -55,6 +55,10 @@ async fn main() -> Result<()> {
         }
         Some(CliCommand::Meeting(args)) => {
             handle_meeting_command(args).await?;
+            return Ok(());
+        }
+        Some(CliCommand::PostProcessing(args)) => {
+            handle_post_processing_command(args).await?;
             return Ok(());
         }
         Some(CliCommand::Install(args)) => {

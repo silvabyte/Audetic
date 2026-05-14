@@ -18,10 +18,12 @@ use crate::audio::audio_mixer::AudioMixer;
 use crate::audio::audio_source::AudioSource;
 use crate::cli::compression::{cleanup_temp_file, prepare_for_upload};
 use crate::db::{self, meetings::MeetingRepository};
+use crate::post_processing::{
+    Event as PostProcessingEvent, MeetingCompletedPayload, PostProcessingService,
+};
 use crate::transcription::job_service::TranscriptionJobService;
 use crate::ui::Indicator;
 
-use super::post_meeting_hook::{MeetingResult, PostMeetingHook};
 use super::status::{MeetingPhase, MeetingStartOptions, MeetingStatusHandle};
 
 /// Which audio sources were actually capturing at the start of a meeting.
@@ -76,7 +78,7 @@ pub struct MeetingMachine {
     mic_source: Box<dyn AudioSource>,
     system_source: Box<dyn AudioSource>,
     transcription: Arc<dyn TranscriptionJobService>,
-    hook: Option<Arc<dyn PostMeetingHook>>,
+    post_processing: Arc<PostProcessingService>,
     indicator: Indicator,
     status: MeetingStatusHandle,
     meetings_dir: PathBuf,
@@ -87,7 +89,7 @@ impl MeetingMachine {
         mic_source: Box<dyn AudioSource>,
         system_source: Box<dyn AudioSource>,
         transcription: Arc<dyn TranscriptionJobService>,
-        hook: Option<Arc<dyn PostMeetingHook>>,
+        post_processing: Arc<PostProcessingService>,
         indicator: Indicator,
         status: MeetingStatusHandle,
     ) -> Self {
@@ -99,7 +101,7 @@ impl MeetingMachine {
             mic_source,
             system_source,
             transcription,
-            hook,
+            post_processing,
             indicator,
             status,
             meetings_dir,
@@ -291,7 +293,7 @@ impl MeetingMachine {
             warn!("Failed to show processing indicator: {}", e);
         }
 
-        // Spawn the compress → transcribe → hook pipeline so the caller
+        // Spawn the compress → transcribe → dispatch pipeline so the caller
         // doesn't have to wait for it. The spawned task owns its own clones
         // of the non-`!Send` dependencies.
         let ctx = ProcessContext {
@@ -301,7 +303,7 @@ impl MeetingMachine {
             duration_seconds,
             status: self.status.clone(),
             transcription: Arc::clone(&self.transcription),
-            hook: self.hook.as_ref().map(Arc::clone),
+            post_processing: Arc::clone(&self.post_processing),
             indicator: self.indicator.clone(),
         };
         tokio::spawn(async move { run_processing_task(ctx).await });
@@ -439,7 +441,7 @@ struct ProcessContext {
     duration_seconds: u64,
     status: MeetingStatusHandle,
     transcription: Arc<dyn TranscriptionJobService>,
-    hook: Option<Arc<dyn PostMeetingHook>>,
+    post_processing: Arc<PostProcessingService>,
     indicator: Indicator,
 }
 
@@ -543,23 +545,21 @@ async fn run_processing_task(ctx: ProcessContext) {
                 result.text.len()
             );
 
-            // Optional post-meeting hook — failures don't flip the meeting to
-            // `error` because the transcription itself succeeded.
-            if let Some(hook) = &ctx.hook {
-                ctx.status.set_phase(MeetingPhase::RunningHook).await;
-                let meeting_result = MeetingResult {
-                    meeting_id: ctx.meeting_id,
-                    title: ctx.title,
-                    audio_path: durable_mp3,
-                    transcript_path,
-                    transcript_text: result.text.clone(),
-                    duration_seconds: ctx.duration_seconds,
-                };
-
-                if let Err(e) = hook.execute(&meeting_result).await {
-                    warn!("Post-meeting hook failed: {}", e);
-                }
-            }
+            // Fire any post-processing jobs subscribed to `meeting.completed`.
+            // Dispatch is fire-and-forget: each matching job runs in its own
+            // spawned task, and failures are logged but never flip the meeting
+            // to `error` (the transcription itself succeeded).
+            ctx.post_processing
+                .dispatch(PostProcessingEvent::MeetingCompleted(
+                    MeetingCompletedPayload {
+                        meeting_id: ctx.meeting_id,
+                        title: ctx.title,
+                        audio_path: durable_mp3,
+                        transcript_path,
+                        transcript_text: result.text.clone(),
+                        duration_seconds: ctx.duration_seconds,
+                    },
+                ));
 
             ctx.status.complete().await;
 

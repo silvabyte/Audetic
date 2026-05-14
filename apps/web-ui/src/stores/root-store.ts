@@ -5,6 +5,7 @@ import { HistoryStore } from "./history-store";
 import { MeetingStore } from "./meeting-store";
 import { MetaStore } from "./meta-store";
 import { OnboardingStore } from "./onboarding-store";
+import { PostProcessingStore } from "./post-processing-store";
 import { StatusStore } from "./status-store";
 import { UiStore } from "./ui-store";
 
@@ -19,6 +20,7 @@ export class RootStore {
   history: HistoryStore;
   meetings: MeetingStore;
   config: ConfigStore;
+  postProcessing: PostProcessingStore;
   onboarding: OnboardingStore;
   ui: UiStore;
 
@@ -28,6 +30,7 @@ export class RootStore {
     this.history = new HistoryStore(this);
     this.meetings = new MeetingStore(this);
     this.config = new ConfigStore(this);
+    this.postProcessing = new PostProcessingStore(this);
     this.onboarding = new OnboardingStore(this);
     this.ui = new UiStore(this);
     makeAutoObservable(this);

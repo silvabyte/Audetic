@@ -7,6 +7,7 @@ import { settingsAppearanceRoute } from "./routes/settings/appearance";
 import { settingsConfigFileRoute } from "./routes/settings/config-file";
 import { settingsKeybindRoute } from "./routes/settings/keybind";
 import { settingsLayoutRoute } from "./routes/settings/layout";
+import { settingsPostProcessingRoute } from "./routes/settings/post-processing";
 import { settingsProviderRoute } from "./routes/settings/provider";
 import { settingsUpdatesRoute } from "./routes/settings/updates";
 
@@ -28,6 +29,7 @@ export function createRouter(): ReturnType<typeof createBrowserRouter> {
         settingsLayoutRoute([
           settingsProviderRoute,
           settingsKeybindRoute,
+          settingsPostProcessingRoute,
           settingsUpdatesRoute,
           settingsAppearanceRoute,
           settingsConfigFileRoute,

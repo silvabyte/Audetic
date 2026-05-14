@@ -33,6 +33,18 @@ pub mod paths {
     pub const VERSION: &str = "/version";
     pub const TOGGLE: &str = "/toggle";
     pub const MEETINGS_TOGGLE: &str = "/meetings/toggle";
+    pub const POST_PROCESSING_JOBS: &str = "/post-processing/jobs";
+    pub const POST_PROCESSING_EVENTS: &str = "/post-processing/events";
+}
+
+/// Path to one job: `POST_PROCESSING_JOBS/{id}`.
+pub fn post_processing_job_path(id: i64) -> String {
+    format!("{}/{id}", paths::POST_PROCESSING_JOBS)
+}
+
+/// Path to a job's test endpoint: `POST_PROCESSING_JOBS/{id}/test`.
+pub fn post_processing_job_test_path(id: i64) -> String {
+    format!("{}/{id}/test", paths::POST_PROCESSING_JOBS)
 }
 
 /// Build a fully-qualified daemon API URL — e.g.
@@ -103,7 +115,13 @@ mod tests {
         let spec_paths: std::collections::HashSet<String> =
             doc.paths.paths.keys().cloned().collect();
 
-        for known in [paths::VERSION, paths::TOGGLE, paths::MEETINGS_TOGGLE] {
+        for known in [
+            paths::VERSION,
+            paths::TOGGLE,
+            paths::MEETINGS_TOGGLE,
+            paths::POST_PROCESSING_JOBS,
+            paths::POST_PROCESSING_EVENTS,
+        ] {
             assert!(
                 spec_paths.contains(known),
                 "api::url::paths references \"{known}\" but the OpenAPI \

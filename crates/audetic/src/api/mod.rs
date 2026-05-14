@@ -16,6 +16,7 @@ pub mod static_assets;
 pub mod url;
 
 use crate::config::Config;
+use crate::post_processing::PostProcessingService;
 use anyhow::Result;
 use axum::{response::Json, routing::get, Router};
 use serde::Serialize;
@@ -46,6 +47,7 @@ pub struct ApiServer {
     port: u16,
     recording_state: RecordingState,
     meeting_state: Option<routes::meetings::MeetingState>,
+    post_processing_state: routes::post_processing::PostProcessingApiState,
 }
 
 impl ApiServer {
@@ -53,6 +55,7 @@ impl ApiServer {
         tx: tokio::sync::mpsc::Sender<ApiCommand>,
         status: crate::audio::RecordingStatusHandle,
         config: &Config,
+        post_processing: std::sync::Arc<PostProcessingService>,
     ) -> Self {
         Self {
             port: url::DEFAULT_PORT,
@@ -62,6 +65,9 @@ impl ApiServer {
                 waybar_config: config.ui.waybar.clone(),
             },
             meeting_state: None,
+            post_processing_state: routes::post_processing::PostProcessingApiState {
+                service: post_processing,
+            },
         }
     }
 
@@ -94,7 +100,8 @@ impl ApiServer {
             .nest("/logs", routes::logs::router())
             .nest("/provider", routes::provider::router())
             .nest("/system", routes::system::router())
-            .nest("/update", routes::update::router());
+            .nest("/update", routes::update::router())
+            .merge(routes::post_processing::router(self.post_processing_state));
 
         let has_meeting = self.meeting_state.is_some();
         if let Some(meeting_state) = self.meeting_state {

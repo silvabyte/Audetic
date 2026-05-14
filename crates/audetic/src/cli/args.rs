@@ -30,8 +30,84 @@ pub enum CliCommand {
     Transcribe(TranscribeCliArgs),
     /// Record and transcribe meetings
     Meeting(MeetingCliArgs),
+    /// Manage post-processing jobs (run commands on daemon events)
+    PostProcessing(PostProcessingCliArgs),
     /// Install audetic as a systemd user service and open the UI
     Install(InstallCliArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PostProcessingCliArgs {
+    #[command(subcommand)]
+    pub command: PostProcessingCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PostProcessingCommand {
+    /// List all configured jobs (optionally filtered by event)
+    List {
+        /// Filter to a single event kind (e.g. `dictation.completed`)
+        #[arg(short, long)]
+        event: Option<String>,
+    },
+    /// Show details of a specific job
+    Show {
+        /// Job id
+        id: i64,
+    },
+    /// Create a new job
+    Add {
+        /// Human-readable name
+        #[arg(short, long)]
+        name: String,
+        /// Event to subscribe to (e.g. `dictation.completed`)
+        #[arg(short, long)]
+        event: String,
+        /// Shell command to run
+        #[arg(short, long)]
+        command: String,
+        /// Timeout in seconds (default 3600)
+        #[arg(long, default_value = "3600")]
+        timeout: u64,
+        /// Create the job disabled (won't fire until enabled)
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// Update an existing job
+    Update {
+        /// Job id
+        id: i64,
+        /// New name
+        #[arg(short, long)]
+        name: Option<String>,
+        /// New event
+        #[arg(short, long)]
+        event: Option<String>,
+        /// New command
+        #[arg(short, long)]
+        command: Option<String>,
+        /// New timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Enable the job
+        #[arg(long)]
+        enable: bool,
+        /// Disable the job
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+    },
+    /// Delete a job
+    Remove {
+        /// Job id
+        id: i64,
+    },
+    /// Run a job once with a synthetic payload to verify the command
+    Test {
+        /// Job id
+        id: i64,
+    },
+    /// List the supported event kinds
+    Events,
 }
 
 #[derive(ClapArgs, Debug)]

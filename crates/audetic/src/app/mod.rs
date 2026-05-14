@@ -6,7 +6,8 @@ use crate::audio::{
     BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle, ToggleResult,
 };
 use crate::config::Config;
-use crate::meeting::{MeetingMachine, MeetingStatusHandle, ShellCommandHook};
+use crate::meeting::{MeetingMachine, MeetingStatusHandle};
+use crate::post_processing::PostProcessingService;
 use crate::text_io::TextIoService;
 use crate::transcription::job_service::RemoteTranscriptionJobService;
 use crate::transcription::{ProviderConfig, Transcriber, TranscriptionService};
@@ -39,6 +40,11 @@ pub async fn run_service() -> Result<()> {
     let indicator =
         Indicator::from_config(&config.ui).with_audio_feedback(config.behavior.audio_feedback);
 
+    // Post-processing service is shared across both pipelines + the API
+    // server. Cheap to clone (zero-sized), so the Arc is only for the
+    // explicit `&Arc<...>` shape MeetingMachine/RecordingMachine accept.
+    let post_processing = Arc::new(PostProcessingService::new());
+
     let status_handle = RecordingStatusHandle::default();
     let recording_machine = RecordingMachine::new(
         audio_recorder.clone(),
@@ -50,20 +56,26 @@ pub async fn run_service() -> Result<()> {
             delete_audio_files: config.behavior.delete_audio_files,
         },
         status_handle.clone(),
+        Arc::clone(&post_processing),
     );
 
     // Meeting pipeline (independent from recording pipeline)
     let meeting_status = MeetingStatusHandle::default();
     let meeting_transcription = build_meeting_transcription_service(&config);
     let mut meeting_machine = build_meeting_machine(
-        &config,
         indicator,
         meeting_status.clone(),
         meeting_transcription.clone(),
+        Arc::clone(&post_processing),
     );
 
-    let api_server = ApiServer::new(tx, status_handle.clone(), &config)
-        .with_meeting_state(meeting_status.clone(), meeting_transcription.clone());
+    let api_server = ApiServer::new(
+        tx,
+        status_handle.clone(),
+        &config,
+        Arc::clone(&post_processing),
+    )
+    .with_meeting_state(meeting_status.clone(), meeting_transcription.clone());
 
     tokio::spawn(async move {
         if let Err(e) = api_server.start().await {
@@ -192,10 +204,10 @@ fn build_meeting_transcription_service(
 }
 
 fn build_meeting_machine(
-    config: &Config,
     indicator: Indicator,
     status: MeetingStatusHandle,
     transcription: Arc<dyn crate::transcription::job_service::TranscriptionJobService>,
+    post_processing: Arc<PostProcessingService>,
 ) -> MeetingMachine {
     let mic_source = MicAudioSource::new(16000)
         .map(|s| Box::new(s) as Box<dyn crate::audio::audio_source::AudioSource>)
@@ -209,22 +221,11 @@ fn build_meeting_machine(
 
     let system_source = Box::new(SystemAudioSource::new(16000));
 
-    // Post-meeting hook (optional)
-    let hook: Option<Arc<dyn crate::meeting::PostMeetingHook>> =
-        if !config.meeting.post_command.is_empty() {
-            Some(Arc::new(ShellCommandHook::new(
-                config.meeting.post_command.clone(),
-                config.meeting.post_command_timeout_seconds,
-            )))
-        } else {
-            None
-        };
-
     MeetingMachine::new(
         mic_source,
         system_source,
         transcription,
-        hook,
+        post_processing,
         indicator,
         status,
     )

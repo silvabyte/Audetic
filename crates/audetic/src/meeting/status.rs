@@ -13,7 +13,6 @@ pub enum MeetingPhase {
     Recording,
     Compressing,
     Transcribing,
-    RunningHook,
     Completed,
     Error,
     Cancelled,
@@ -26,7 +25,6 @@ impl MeetingPhase {
             Self::Recording => "recording",
             Self::Compressing => "compressing",
             Self::Transcribing => "transcribing",
-            Self::RunningHook => "running_hook",
             Self::Completed => "completed",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
@@ -137,7 +135,6 @@ mod tests {
         assert_eq!(MeetingPhase::Recording.as_str(), "recording");
         assert_eq!(MeetingPhase::Compressing.as_str(), "compressing");
         assert_eq!(MeetingPhase::Transcribing.as_str(), "transcribing");
-        assert_eq!(MeetingPhase::RunningHook.as_str(), "running_hook");
         assert_eq!(MeetingPhase::Completed.as_str(), "completed");
         assert_eq!(MeetingPhase::Error.as_str(), "error");
     }
@@ -228,10 +225,6 @@ mod tests {
         // Transcribe
         handle.set_phase(MeetingPhase::Transcribing).await;
         assert_eq!(handle.get().await.phase, MeetingPhase::Transcribing);
-
-        // Hook
-        handle.set_phase(MeetingPhase::RunningHook).await;
-        assert_eq!(handle.get().await.phase, MeetingPhase::RunningHook);
 
         // Complete
         handle.complete().await;
