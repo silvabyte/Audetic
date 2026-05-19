@@ -14,7 +14,7 @@ AUTO_COMMIT ?= 1
 .PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix quality deploy deploy-beta deploy-stable \
         ui-install ui-dev ui-build ui-preview ui-typecheck codegen \
         installer-lint \
-        macos-sign macos-sign-release
+        macos-sign macos-sign-release macos-app macos-app-debug
 
 # Default target
 help:
@@ -181,6 +181,45 @@ macos-sign:
 
 macos-sign-release: MACOS_BINARY=target/release/audetic
 macos-sign-release: macos-sign
+
+# macOS app bundle. Produces target/<profile>/Audetic.app containing the
+# daemon binary, Info.plist, and PkgInfo. Signed in place — for shareable
+# builds override SIGN_IDENTITY to a Developer ID Application identity.
+#
+#   make macos-app                 # release bundle, ad-hoc signed
+#   make macos-app SIGN_IDENTITY="Developer ID Application: Mat Silva (Z25737G79K)"
+#   make macos-app-debug           # debug bundle for quick iteration
+#
+# An installed Audetic.app gets its TCC identity from the bundle (cdhash for
+# ad-hoc, Team ID for Developer ID), so permission grants survive across
+# rebuilds only when signed with a stable identity.
+MACOS_APP_PROFILE ?= release
+MACOS_APP_DIR     ?= target/$(MACOS_APP_PROFILE)/Audetic.app
+
+macos-app: release
+	@$(MAKE) _macos-app-build MACOS_APP_PROFILE=release
+
+macos-app-debug: build
+	@$(MAKE) _macos-app-build MACOS_APP_PROFILE=debug
+
+# Internal: assemble + sign the bundle. Don't call directly — go through
+# macos-app / macos-app-debug so the underlying cargo build runs first.
+_macos-app-build:
+	@echo "→ Assembling $(MACOS_APP_DIR)"
+	@rm -rf $(MACOS_APP_DIR)
+	@mkdir -p $(MACOS_APP_DIR)/Contents/MacOS
+	@mkdir -p $(MACOS_APP_DIR)/Contents/Resources
+	@cp crates/audetic/macos/Info.plist $(MACOS_APP_DIR)/Contents/Info.plist
+	@cp target/$(MACOS_APP_PROFILE)/audetic $(MACOS_APP_DIR)/Contents/MacOS/audetic
+	@printf 'APPL????' > $(MACOS_APP_DIR)/Contents/PkgInfo
+	@echo "→ codesign ($(SIGN_IDENTITY)) $(MACOS_APP_DIR)"
+	codesign --force --sign $(SIGN_IDENTITY) \
+		--options runtime \
+		--entitlements $(MACOS_ENTITLEMENTS) \
+		--timestamp=none \
+		$(MACOS_APP_DIR)
+	@echo "✓ $(MACOS_APP_DIR)"
+	@codesign -dv --verbose=2 $(MACOS_APP_DIR) 2>&1 | grep -E 'Identifier|Format|Signature|TeamIdentifier|Info.plist'
 
 # Cleanup
 clean:

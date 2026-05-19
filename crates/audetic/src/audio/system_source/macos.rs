@@ -18,16 +18,11 @@
 use anyhow::{anyhow, Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{SampleFormat, SupportedStreamConfig};
-use rubato::{FftFixedIn, Resampler};
 use std::sync::{Arc, Mutex};
 use tracing::{debug, error, info, warn};
 
 use crate::audio::audio_source::AudioSource;
-
-/// rubato FFT chunk size. 1024 frames @ 48 kHz ≈ 21 ms — small enough to keep
-/// the final partial-chunk padding cheap, large enough that the FFT overhead
-/// per chunk is negligible compared to the recording length.
-const RESAMPLE_CHUNK_FRAMES: usize = 1024;
+use crate::audio::resample::{push_mono_f32, resample_mono_f32};
 
 pub struct SystemAudioSource {
     target_sample_rate: u32,
@@ -93,7 +88,7 @@ impl SystemAudioSource {
             .build_input_stream(
                 &stream_config,
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                    push_mono(data, channels, &samples);
+                    push_mono_f32(data, channels, &samples);
                 },
                 |err| error!("System audio stream error: {err}"),
                 None,
@@ -102,70 +97,6 @@ impl SystemAudioSource {
 
         Ok((stream, config))
     }
-}
-
-/// Mix interleaved multi-channel input down to mono and append to `dst`.
-/// For mono input this is a straight extend; for stereo+ each frame is
-/// averaged across channels.
-fn push_mono(data: &[f32], channels: usize, dst: &Arc<Mutex<Vec<f32>>>) {
-    if channels == 0 {
-        return;
-    }
-    let Ok(mut buf) = dst.lock() else { return };
-    if channels == 1 {
-        buf.extend_from_slice(data);
-        return;
-    }
-    let inv = 1.0 / channels as f32;
-    buf.reserve(data.len() / channels);
-    for frame in data.chunks_exact(channels) {
-        let sum: f32 = frame.iter().sum();
-        buf.push(sum * inv);
-    }
-}
-
-/// Resample a mono buffer from `from_rate` Hz to `to_rate` Hz using rubato's
-/// FFT-based fixed-input resampler. Pads the final partial chunk with silence.
-fn resample_to_target(input: &[f32], from_rate: u32, to_rate: u32) -> Result<Vec<f32>> {
-    if from_rate == to_rate || input.is_empty() {
-        return Ok(input.to_vec());
-    }
-
-    let mut resampler = FftFixedIn::<f32>::new(
-        from_rate as usize,
-        to_rate as usize,
-        RESAMPLE_CHUNK_FRAMES,
-        1, // sub-chunks per chunk
-        1, // channels
-    )
-    .context("Failed to construct rubato resampler")?;
-
-    let mut output: Vec<f32> =
-        Vec::with_capacity(input.len() * to_rate as usize / from_rate as usize);
-    let mut chunk_buf = vec![0.0_f32; RESAMPLE_CHUNK_FRAMES];
-    let mut idx = 0;
-
-    while idx < input.len() {
-        let remaining = input.len() - idx;
-        if remaining >= RESAMPLE_CHUNK_FRAMES {
-            chunk_buf.copy_from_slice(&input[idx..idx + RESAMPLE_CHUNK_FRAMES]);
-            idx += RESAMPLE_CHUNK_FRAMES;
-        } else {
-            chunk_buf[..remaining].copy_from_slice(&input[idx..]);
-            for slot in &mut chunk_buf[remaining..] {
-                *slot = 0.0;
-            }
-            idx = input.len();
-        }
-
-        let waves_in = vec![chunk_buf.clone()];
-        let waves_out = resampler
-            .process(&waves_in, None)
-            .context("rubato resample failed")?;
-        output.extend_from_slice(&waves_out[0]);
-    }
-
-    Ok(output)
 }
 
 impl AudioSource for SystemAudioSource {
@@ -244,7 +175,7 @@ impl AudioSource for SystemAudioSource {
             return Ok(Vec::new());
         }
 
-        let resampled = resample_to_target(&native, native_rate, self.target_sample_rate)?;
+        let resampled = resample_mono_f32(&native, native_rate, self.target_sample_rate)?;
         info!(
             "System audio stopped: {} native @ {} Hz → {} samples @ {} Hz",
             native.len(),

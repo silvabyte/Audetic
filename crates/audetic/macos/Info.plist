@@ -3,7 +3,7 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleIdentifier</key>
-    <string>com.audetic.daemon</string>
+    <string>ai.audetic.daemon</string>
     <key>CFBundleName</key>
     <string>audetic</string>
     <key>CFBundleDisplayName</key>

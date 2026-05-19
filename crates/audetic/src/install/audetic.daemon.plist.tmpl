@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.audetic.daemon</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__EXEC_START__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>__LOG_PATH__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_PATH__</string>
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>RUST_LOG</key>
+        <string>info</string>
+        <!-- Auto-update flow is Linux-only today; on macOS we ship signed
+             bundles through the install script. Leaving this disabled until
+             the macOS update path lands so a stale stable channel does not
+             clobber a locally-built bundle. -->
+        <key>AUDETIC_DISABLE_AUTO_UPDATE</key>
+        <string>1</string>
+    </dict>
+    <!-- launchd defaults to a 10s throttle between restarts. Set lower so
+         a crash during onboarding does not feel hung. KeepAlive=true means
+         the daemon is restarted on any exit; ThrottleInterval just caps
+         how fast that can happen. -->
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
+</dict>
+</plist>
