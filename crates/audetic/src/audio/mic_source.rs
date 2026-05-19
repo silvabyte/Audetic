@@ -33,12 +33,15 @@ impl MicAudioSource {
 
         info!(
             "Meeting mic source using device: {}",
-            device.name().unwrap_or_else(|_| "unknown".to_string())
+            device
+                .description()
+                .map(|d| d.name().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
         );
 
         let config = cpal::StreamConfig {
             channels: 1,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 

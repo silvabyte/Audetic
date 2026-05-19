@@ -14,6 +14,8 @@ fn main() {
     let web_ui = manifest_dir.join("../../apps/web-ui");
     let web_ui = web_ui.canonicalize().unwrap_or(web_ui);
 
+    embed_macos_info_plist(&manifest_dir);
+
     // Re-run the SPA build only when source the bundle depends on changes.
     for path in [
         "src",
@@ -63,6 +65,37 @@ fn run_bun(dir: &Path, args: &[&str], label: &str) {
     if !status.success() {
         panic!("`{label}` failed in {}", dir.display());
     }
+}
+
+/// Embed `macos/Info.plist` into linked artifacts as a `__TEXT,__info_plist`
+/// Mach-O section when building for macOS. Without this, the OS will not
+/// present `NSMicrophoneUsageDescription` / `NSScreenCaptureUsageDescription`
+/// prompts and the audio APIs return either silence or `kTCCServiceDisabled`.
+///
+/// Applied to both the main `audetic` binary and to examples (so the
+/// smoke-test example also gets correct permission prompts). Tests are not
+/// targeted: they tend not to hit gated APIs and embedding the plist there
+/// would tie unit-test binaries to a fixed bundle identifier.
+fn embed_macos_info_plist(manifest_dir: &Path) {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
+        return;
+    }
+    let plist = manifest_dir.join("macos").join("Info.plist");
+    if !plist.exists() {
+        println!(
+            "cargo:warning=macos/Info.plist not found at {} — \
+             macOS permission prompts will not appear.",
+            plist.display()
+        );
+        return;
+    }
+    println!("cargo:rerun-if-changed={}", plist.display());
+    let plist_str = plist
+        .to_str()
+        .expect("Info.plist path is not valid UTF-8 — refusing to embed");
+    let arg = format!("-Wl,-sectcreate,__TEXT,__info_plist,{plist_str}");
+    println!("cargo:rustc-link-arg-bins={arg}");
+    println!("cargo:rustc-link-arg-examples={arg}");
 }
 
 fn has_command(cmd: &str) -> bool {

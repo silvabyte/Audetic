@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Mic capture for VTT and meeting recording. -->
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+
+    <!-- Notarization requires the hardened runtime; cpal/coreaudio-rs uses
+         dynamic linking through the system frameworks, which is allowed by
+         the default hardened-runtime policy. No extra exceptions needed
+         today. Add a com.apple.security.cs.* key here if a future dep
+         pulls in JIT, unsigned executable memory, or library validation
+         bypass. -->
+</dict>
+</plist>

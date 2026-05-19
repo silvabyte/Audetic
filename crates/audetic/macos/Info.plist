@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.audetic.daemon</string>
+    <key>CFBundleName</key>
+    <string>audetic</string>
+    <key>CFBundleDisplayName</key>
+    <string>Audetic</string>
+    <key>CFBundleExecutable</key>
+    <string>audetic</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.1.25</string>
+    <key>CFBundleVersion</key>
+    <string>0.1.25</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.6</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Audetic uses your microphone to capture your voice for meeting notes, voice-to-text dictation, and transcription.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Audetic captures your computer's audio output so it can transcribe the other participants on a call. No screen or video is recorded.</string>
+</dict>
+</plist>

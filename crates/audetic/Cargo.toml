@@ -19,8 +19,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 
 # Audio recording
-cpal = "0.15"
+cpal = "0.17"
 hound = "3.5"
+
+# Sample-rate conversion (macOS loopback delivers samples at the output
+# device's native rate, typically 48 kHz; the VTT pipeline wants 16 kHz).
+rubato = "0.16"
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
@@ -35,9 +39,6 @@ anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Clipboard
-arboard = { version = "3.3", features = ["wayland-data-control"] }
 
 # CLI args
 clap = { version = "4.4", features = ["derive"] }
@@ -88,3 +89,11 @@ ffmpeg-sidecar = "2.5"
 # single `audetic` binary serves both the API (/api) and the UI (/).
 include_dir = "0.7"
 mime_guess = "2.0"
+
+# Clipboard. The `wayland-data-control` feature pulls Wayland-only deps;
+# gate it to Linux so the workspace builds on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.3", features = ["wayland-data-control"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+arboard = "3.3"

@@ -32,12 +32,18 @@ impl AudioStreamManager {
             .default_input_device()
             .context("No input device available")?;
 
-        info!("Using audio device: {}", device.name()?);
+        info!(
+            "Using audio device: {}",
+            device
+                .description()
+                .map(|d| d.name().to_string())
+                .unwrap_or_else(|_| "unknown".to_string())
+        );
 
         let _config = device.default_input_config()?;
         let config = cpal::StreamConfig {
             channels: 1,
-            sample_rate: cpal::SampleRate(16000), // Whisper optimal
+            sample_rate: 16000, // Whisper optimal
             buffer_size: cpal::BufferSize::Default,
         };
 

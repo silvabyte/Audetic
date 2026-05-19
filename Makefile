@@ -13,7 +13,8 @@ AUTO_COMMIT ?= 1
 
 .PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix quality deploy deploy-beta deploy-stable \
         ui-install ui-dev ui-build ui-preview ui-typecheck codegen \
-        installer-lint
+        installer-lint \
+        macos-sign macos-sign-release
 
 # Default target
 help:
@@ -157,6 +158,29 @@ installer-lint:
 	bash -n release/cli/uninstall.sh
 	@if command -v shellcheck >/dev/null 2>&1; then shellcheck release/cli/latest.sh release/cli/uninstall.sh; else echo "shellcheck not installed; skipping"; fi
 	@echo "✓ release/cli/*.sh ok"
+
+# macOS code-signing. Ad-hoc-signs the local binary with the hardened runtime
+# and entitlements so the OS associates the embedded Info.plist with this
+# specific binary path and shows the Microphone / Screen Recording prompts.
+# Without this step, TCC sees an unsigned binary and either uses the wrong
+# identity or silently skips the prompt entirely.
+#
+# For shareable builds use `make macos-sign-release SIGN_IDENTITY="Developer ID Application: … (Z25737G79K)"`.
+SIGN_IDENTITY ?= -
+MACOS_BINARY  ?= target/debug/audetic
+MACOS_ENTITLEMENTS ?= crates/audetic/macos/audetic.entitlements
+
+macos-sign:
+	@echo "→ codesign ($(SIGN_IDENTITY)) $(MACOS_BINARY)"
+	codesign --force --sign $(SIGN_IDENTITY) \
+		--options runtime \
+		--entitlements $(MACOS_ENTITLEMENTS) \
+		--timestamp=none \
+		$(MACOS_BINARY)
+	@echo "✓ signed. Verify with: codesign -dv --verbose=2 $(MACOS_BINARY)"
+
+macos-sign-release: MACOS_BINARY=target/release/audetic
+macos-sign-release: macos-sign
 
 # Cleanup
 clean:
