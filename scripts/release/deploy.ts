@@ -45,6 +45,12 @@ const config = {
 	releaseDate: env.RELEASE_DATE ?? new Date().toISOString(),
 	continueOnError: flag("CONTINUE_ON_ERROR", true),
 	bumpStrategy: (env.VERSION_AUTO_BUMP ?? "patch").toLowerCase(),
+	// macOS-only knobs. Defaults match what `make macos-app` / `make macos-notarize`
+	// use, so a release run on a configured macOS dev box works without extra env.
+	macosSignIdentity:
+		env.MACOS_SIGN_IDENTITY ?? "Developer ID Application",
+	macosNotaryProfile: env.MACOS_NOTARY_PROFILE ?? "audetic-notary",
+	macosSkipNotarize: flag("MACOS_SKIP_NOTARIZE", false),
 };
 
 if (!config.targets.length) {
@@ -438,7 +444,17 @@ async function getPreviousVersion(
 }
 
 async function buildTarget(targetId: string, rustTarget: string) {
-	const builder = config.useCross ? "cross" : "cargo";
+	if (targetId.startsWith("macos-") && process.platform !== "darwin") {
+		throw new Error(
+			"macOS targets must be built on a Darwin host (cross-compilation " +
+				"of CoreAudio/CoreGraphics is not supported). Run this on the " +
+				"self-hosted Mac runner.",
+		);
+	}
+
+	const builder = config.useCross && !targetId.startsWith("macos-")
+		? "cross"
+		: "cargo";
 	const featureArgs = config.extraFeatures
 		? ["--features", config.extraFeatures]
 		: [];
@@ -460,6 +476,67 @@ async function buildTarget(targetId: string, rustTarget: string) {
 	} else {
 		await $`${builder} build --release --target ${rustTarget}`.env(env);
 	}
+
+	if (targetId.startsWith("macos-")) {
+		await assembleAndNotarizeBundle(targetId, rustTarget);
+	}
+}
+
+/// Post-build pipeline for darwin targets: assemble Audetic.app from the
+/// cargo output, codesign with the Developer ID identity, submit to
+/// notarytool, and staple the resulting ticket. Idempotent — re-running
+/// against an already-stapled bundle re-signs but skips the network round
+/// trip if notarization is disabled.
+async function assembleAndNotarizeBundle(targetId: string, rustTarget: string) {
+	const targetDir = path.join(ROOT_DIR, "target", rustTarget, "release");
+	const binaryPath = path.join(targetDir, "audetic");
+	const appPath = path.join(targetDir, "Audetic.app");
+	const contents = path.join(appPath, "Contents");
+	const macos = path.join(contents, "MacOS");
+	const resources = path.join(contents, "Resources");
+	const infoPlistSrc = path.join(
+		ROOT_DIR,
+		"crates/audetic/macos/Info.plist",
+	);
+	const entitlements = path.join(
+		ROOT_DIR,
+		"crates/audetic/macos/audetic.entitlements",
+	);
+
+	await assertPath(binaryPath, "compiled binary");
+	await assertPath(infoPlistSrc, "Info.plist");
+	await assertPath(entitlements, "entitlements file");
+
+	console.log(`==> [${targetId}] Assembling ${path.relative(ROOT_DIR, appPath)}`);
+	await rm(appPath, { recursive: true, force: true });
+	await mkdir(macos, { recursive: true });
+	await mkdir(resources, { recursive: true });
+	await copyFile(infoPlistSrc, path.join(contents, "Info.plist"));
+	await copyFile(binaryPath, path.join(macos, "audetic"));
+	await Bun.write(path.join(contents, "PkgInfo"), "APPL????");
+
+	console.log(`==> [${targetId}] codesign (${config.macosSignIdentity})`);
+	await $`codesign --force --sign ${config.macosSignIdentity} --options runtime --entitlements ${entitlements} --timestamp ${appPath}`;
+
+	if (config.macosSkipNotarize) {
+		console.log(
+			`==> [${targetId}] Skipping notarization (MACOS_SKIP_NOTARIZE=1). ` +
+				"Resulting tarball will be rejected by Gatekeeper on download.",
+		);
+		return;
+	}
+
+	const notaryZip = `${appPath}.notarize.zip`;
+	await rm(notaryZip, { force: true });
+	console.log(`==> [${targetId}] ditto -c -k --keepParent (for notarization)`);
+	await $`ditto -c -k --keepParent ${appPath} ${notaryZip}`;
+	console.log(
+		`==> [${targetId}] notarytool submit --wait (profile: ${config.macosNotaryProfile})`,
+	);
+	await $`xcrun notarytool submit ${notaryZip} --keychain-profile ${config.macosNotaryProfile} --wait`;
+	await rm(notaryZip);
+	console.log(`==> [${targetId}] stapler staple`);
+	await $`xcrun stapler staple ${appPath}`;
 }
 
 async function buildWebUi() {
@@ -476,6 +553,10 @@ async function packageTarget(
 	rustTarget: string,
 	tmpRoot: string,
 ): Promise<Artifact> {
+	if (targetId.startsWith("macos-")) {
+		return packageTargetDarwin(version, targetId, rustTarget, tmpRoot);
+	}
+
 	const binaryPath = path.join(
 		ROOT_DIR,
 		"target",
@@ -500,6 +581,60 @@ Files:
   example_config.toml - starter configuration
 
 Installation instructions: https://install.audetic.ai/
+`,
+	);
+
+	const releaseDir = path.join(RELEASES_ROOT, version);
+	await mkdir(releaseDir, { recursive: true });
+
+	const archiveName = `audetic-${version}-${targetId}.tar.gz`;
+	const archivePath = path.join(releaseDir, archiveName);
+	await $`tar -C ${stageDir} -czf ${archivePath} .`;
+
+	const sha = await sha256File(archivePath);
+	await Bun.write(
+		`${archivePath}.sha256`,
+		`${sha}  ${path.basename(archivePath)}\n`,
+	);
+	const size = (await stat(archivePath)).size;
+	return { targetId, archivePath, sha, size };
+}
+
+/// macOS packaging: tar the assembled Audetic.app bundle (signed +
+/// optionally notarized in buildTarget) into the release directory. Uses
+/// `ditto` for the bundle copy so extended attributes — including the
+/// codesign metadata — survive intact. Plain `cp -R` works for our
+/// current bundle structure but `ditto` is the macOS-canonical choice.
+async function packageTargetDarwin(
+	version: string,
+	targetId: string,
+	rustTarget: string,
+	tmpRoot: string,
+): Promise<Artifact> {
+	const appPath = path.join(
+		ROOT_DIR,
+		"target",
+		rustTarget,
+		"release",
+		"Audetic.app",
+	);
+	await assertPath(appPath, "Audetic.app bundle");
+
+	const stageDir = path.join(tmpRoot, targetId);
+	await mkdir(stageDir, { recursive: true });
+
+	await $`ditto ${appPath} ${path.join(stageDir, "Audetic.app")}`;
+
+	await Bun.write(
+		path.join(stageDir, "README.txt"),
+		`Audetic ${version} (${targetId})
+
+Files:
+  Audetic.app - signed + notarized macOS app bundle. Run
+                \`./Audetic.app/Contents/MacOS/audetic install\` to register
+                the LaunchAgent, or use the installer:
+
+Installation: https://install.audetic.ai/cli/latest.sh
 `,
 	);
 

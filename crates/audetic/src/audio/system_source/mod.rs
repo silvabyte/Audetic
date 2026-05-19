@@ -17,6 +17,9 @@ mod macos;
 #[cfg(target_os = "macos")]
 pub use macos::SystemAudioSource;
 
+#[cfg(target_os = "macos")]
+pub mod permissions;
+
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 mod stub;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]

@@ -9,23 +9,59 @@ Basically superwhisper for Omarchy, Audetic is a voice to text application for W
 
 ## Quick Install (Recommended)
 
-Audetic ships pre-built, signed binaries.
+Audetic ships pre-built, signed binaries for Linux and macOS.
 
 ```bash
 curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
 ```
 
-This downloads the daemon and runs `audetic install`, which copies the binary
-under `~/.local/share/audetic/bin/`, installs a systemd **user** service at
-`~/.config/systemd/user/audetic.service`, `enable --now`s it, waits for it to
-bind `127.0.0.1:3737`, and opens the web UI in your browser so you can finish
-onboarding (ffmpeg, provider config). No sudo. Pass `--no-launch` to skip
-opening the browser.
+The installer detects your platform and hands off to `audetic install`.
+Everything lives under `$HOME` — no sudo.
+
+### Linux
+
+Copies the binary to `~/.local/share/audetic/bin/`, installs a systemd
+**user** service at `~/.config/systemd/user/audetic.service`,
+`enable --now`s it, waits for it to bind `127.0.0.1:3737`, and opens the
+web UI in your browser. Pass `--no-launch` to skip opening the browser.
+
+### macOS
+
+Unpacks the signed and notarized `Audetic.app` to `~/Applications/`,
+drops a LaunchAgent plist at
+`~/Library/LaunchAgents/ai.audetic.daemon.plist`, `launchctl bootstrap`s
+it, waits for `127.0.0.1:3737`, and opens the web UI.
+
+Two permission prompts on first run:
+
+- **Microphone** — needed for voice-to-text and meeting mic capture.
+  Fires automatically the first time the daemon opens the mic.
+- **Screen Recording** (called *Screen & System Audio Recording* on
+  macOS 15+) — needed for meeting *system* audio capture. The daemon
+  triggers this prompt on first launch via `CGRequestScreenCaptureAccess`.
+  After you click Allow, the daemon **auto-restarts** to pick up the
+  fresh permission (launchd's `KeepAlive` does the heavy lifting); no
+  manual restart needed.
+
+If you ever need to revoke or reset permissions, open **System
+Settings → Privacy & Security**, find Audetic, and toggle as needed.
+To force a fresh prompt:
+
+```bash
+tccutil reset Microphone ai.audetic.daemon
+tccutil reset ScreenCapture ai.audetic.daemon
+launchctl kickstart -k gui/$(id -u)/ai.audetic.daemon
+```
+
+System audio capture requires macOS **14.6 or later** (Core Audio Tap
+API). On older versions, meetings fall back to mic-only.
 
 **After installation:**
 
 1. Finish provider and ffmpeg setup in the web UI the installer opened (or visit `http://127.0.0.1:3737/`).
-2. Add a keybind in Hyprland (or your compositor): `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/api/toggle`
+2. Add a keybind:
+   - Hyprland: `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/api/toggle`
+   - macOS: System Settings → Keyboard → Keyboard Shortcuts → Services / Shortcuts.app calling the same `curl` command.
 3. Press the keybind to start/stop recording!
 
 ## Web UI
@@ -97,6 +133,18 @@ Audetic includes an auto-updater plus manual controls:
 
 ```bash
 audetic update
+```
+
+## Uninstall — macOS
+
+```bash
+launchctl bootout gui/$(id -u)/ai.audetic.daemon
+rm -rf ~/Applications/Audetic.app
+rm  ~/Library/LaunchAgents/ai.audetic.daemon.plist
+rm -rf "~/Library/Application Support/audetic"
+rm -rf ~/Library/Logs/Audetic
+tccutil reset Microphone ai.audetic.daemon
+tccutil reset ScreenCapture ai.audetic.daemon
 ```
 
 ## Uninstall

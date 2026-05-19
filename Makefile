@@ -14,7 +14,8 @@ AUTO_COMMIT ?= 1
 .PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix quality deploy deploy-beta deploy-stable \
         ui-install ui-dev ui-build ui-preview ui-typecheck codegen \
         installer-lint \
-        macos-sign macos-sign-release macos-app macos-app-debug
+        macos-sign macos-sign-release macos-app macos-app-debug \
+        macos-notarize macos-tarball macos-release
 
 # Default target
 help:
@@ -172,7 +173,7 @@ MACOS_ENTITLEMENTS ?= crates/audetic/macos/audetic.entitlements
 
 macos-sign:
 	@echo "→ codesign ($(SIGN_IDENTITY)) $(MACOS_BINARY)"
-	codesign --force --sign $(SIGN_IDENTITY) \
+	codesign --force --sign "$(SIGN_IDENTITY)" \
 		--options runtime \
 		--entitlements $(MACOS_ENTITLEMENTS) \
 		--timestamp=none \
@@ -213,13 +214,74 @@ _macos-app-build:
 	@cp target/$(MACOS_APP_PROFILE)/audetic $(MACOS_APP_DIR)/Contents/MacOS/audetic
 	@printf 'APPL????' > $(MACOS_APP_DIR)/Contents/PkgInfo
 	@echo "→ codesign ($(SIGN_IDENTITY)) $(MACOS_APP_DIR)"
-	codesign --force --sign $(SIGN_IDENTITY) \
+	codesign --force --sign "$(SIGN_IDENTITY)" \
 		--options runtime \
 		--entitlements $(MACOS_ENTITLEMENTS) \
 		--timestamp=none \
 		$(MACOS_APP_DIR)
 	@echo "✓ $(MACOS_APP_DIR)"
 	@codesign -dv --verbose=2 $(MACOS_APP_DIR) 2>&1 | grep -E 'Identifier|Format|Signature|TeamIdentifier|Info.plist'
+
+# macOS notarization. Requires a notarytool keychain profile already stored
+# via `xcrun notarytool store-credentials`. The profile name defaults to
+# `audetic-notary`; override with `make macos-notarize NOTARY_PROFILE=foo`.
+#
+# This pipeline is intentionally idempotent: re-running on an already-
+# stapled bundle is a no-op (Apple's tooling detects the existing ticket).
+NOTARY_PROFILE ?= audetic-notary
+NOTARY_ZIP     ?= $(MACOS_APP_DIR).notarize.zip
+
+macos-notarize:
+	@if [ ! -d "$(MACOS_APP_DIR)" ]; then \
+		echo "✗ $(MACOS_APP_DIR) not found. Run \`make macos-app\` first." >&2; \
+		exit 1; \
+	fi
+	@echo "→ ditto -c -k --keepParent $(MACOS_APP_DIR) $(NOTARY_ZIP)"
+	@rm -f $(NOTARY_ZIP)
+	ditto -c -k --keepParent $(MACOS_APP_DIR) $(NOTARY_ZIP)
+	@echo "→ notarytool submit (profile: $(NOTARY_PROFILE))"
+	xcrun notarytool submit $(NOTARY_ZIP) --keychain-profile $(NOTARY_PROFILE) --wait
+	@rm -f $(NOTARY_ZIP)
+	@echo "→ stapler staple $(MACOS_APP_DIR)"
+	xcrun stapler staple $(MACOS_APP_DIR)
+	@echo "✓ notarized + stapled: $(MACOS_APP_DIR)"
+
+# Tarball the (signed/notarized) bundle into release/cli/releases/$(VERSION)/.
+# Used both standalone and as the final step of `make macos-release`. Reads
+# the workspace version from Cargo.toml unless MACOS_VERSION is set.
+MACOS_VERSION ?= $(shell awk -F\" '/^version *= *"/{print $$2; exit}' Cargo.toml)
+MACOS_TARGET  ?= macos-aarch64
+MACOS_RELEASE_DIR ?= release/cli/releases/$(MACOS_VERSION)
+MACOS_ARCHIVE ?= $(MACOS_RELEASE_DIR)/audetic-$(MACOS_VERSION)-$(MACOS_TARGET).tar.gz
+
+macos-tarball:
+	@if [ ! -d "$(MACOS_APP_DIR)" ]; then \
+		echo "✗ $(MACOS_APP_DIR) not found. Run \`make macos-app\` first." >&2; \
+		exit 1; \
+	fi
+	@mkdir -p $(MACOS_RELEASE_DIR)
+	@echo "→ ditto $(MACOS_APP_DIR) → /tmp/audetic-stage/Audetic.app"
+	@rm -rf /tmp/audetic-stage
+	@mkdir -p /tmp/audetic-stage
+	ditto $(MACOS_APP_DIR) /tmp/audetic-stage/Audetic.app
+	@printf 'Audetic %s (%s)\n\nInstaller: https://install.audetic.ai/cli/latest.sh\n' \
+		"$(MACOS_VERSION)" "$(MACOS_TARGET)" > /tmp/audetic-stage/README.txt
+	@echo "→ tar -czf $(MACOS_ARCHIVE)"
+	tar -C /tmp/audetic-stage -czf $(MACOS_ARCHIVE) .
+	@rm -rf /tmp/audetic-stage
+	@shasum -a 256 $(MACOS_ARCHIVE) | awk '{print $$1 "  " "$(notdir $(MACOS_ARCHIVE))"}' > $(MACOS_ARCHIVE).sha256
+	@echo "✓ $(MACOS_ARCHIVE)"
+	@cat $(MACOS_ARCHIVE).sha256
+
+# Full local release flow: build → assemble bundle → sign → notarize → staple →
+# tarball. Requires `SIGN_IDENTITY="Developer ID Application: … (TEAMID)"` and
+# a stored notarytool keychain profile.
+macos-release: macos-app macos-notarize macos-tarball
+	@echo ""
+	@echo "✓ Local macOS release ready:"
+	@echo "    bundle:  $(MACOS_APP_DIR)"
+	@echo "    archive: $(MACOS_ARCHIVE)"
+	@echo "    sha256:  $(MACOS_ARCHIVE).sha256"
 
 # Cleanup
 clean:
