@@ -1,6 +1,7 @@
 pub mod audio_mixer;
 pub mod audio_source;
 pub mod audio_stream_manager;
+pub mod input_device;
 pub mod mic_source;
 pub mod recording_machine;
 pub mod resample;
