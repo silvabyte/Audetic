@@ -11,15 +11,40 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    name: build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            runner: ubuntu-latest
+          - platform: macos
+            # Self-hosted runner registered on a maintainer's Mac.
+            # See: https://docs.github.com/en/actions/hosting-your-own-runners
+            runner: [self-hosted, macOS]
+    runs-on: ${{ matrix.runner }}
 
     steps:
       - uses: actions/checkout@v4
-      - name: Install system deps (ALSA headers + ffmpeg)
+
+      - name: Install system deps (Linux — ALSA headers + ffmpeg)
+        if: matrix.platform == 'linux'
         # ffmpeg is needed by the compression pipeline that the meeting and
-        # transcribe integration tests exercise; Ubuntu's package is built with
-        # libmp3lame so `-codec:a libmp3lame` works.
+        # transcribe integration tests exercise; Ubuntu's package is built
+        # with libmp3lame so `-codec:a libmp3lame` works.
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev ffmpeg
+
+      - name: Ensure ffmpeg (macOS — Homebrew)
+        if: matrix.platform == 'macos'
+        # `ffmpeg-sidecar` will download a binary on first use, but installing
+        # via brew avoids the network round-trip and keeps the integration
+        # tests deterministic. No-op if already present (common on a self-
+        # hosted dev machine).
+        run: |
+          if ! command -v ffmpeg >/dev/null 2>&1; then
+            brew install ffmpeg
+          fi
+
       - name: Install bun
         uses: oven-sh/setup-bun@v2
       - name: Install web-ui dependencies
@@ -31,4 +56,6 @@ jobs:
         # in apps/web-ui and the real dist/ is embedded via include_dir!.
         run: cargo build --verbose
       - name: Run tests
+        # Audio tests gate themselves on $CI to avoid blocking on absent
+        # devices / unprompted TCC dialogs; see audio_stream_manager::tests.
         run: cargo test --verbose

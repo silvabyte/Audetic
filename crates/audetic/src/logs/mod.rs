@@ -6,6 +6,7 @@
 use crate::history::{self, HistoryEntry};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use utoipa::ToSchema;
 
@@ -42,10 +43,31 @@ pub fn get_logs(options: &LogsOptions) -> Result<LogsResult> {
     })
 }
 
-/// Get application logs from systemd journal.
+/// Get application logs from the platform's log store.
 ///
-/// Returns a vector of log lines. Returns empty vec if journal is unavailable.
+/// Linux: systemd journal via `journalctl --user -u audetic.service`.
+/// macOS: tail `~/Library/Logs/Audetic/audetic.log` (written by launchd).
+/// Other: empty (no log integration yet).
+///
+/// Returns a vector of log lines. Returns empty vec if the source is
+/// unavailable rather than erroring — log retrieval is best-effort and
+/// shouldn't break the `audetic logs` command on a clean install.
 pub fn get_app_logs(lines: usize) -> Result<Vec<String>> {
+    #[cfg(target_os = "linux")]
+    return get_app_logs_journalctl(lines);
+
+    #[cfg(target_os = "macos")]
+    return get_app_logs_file(lines);
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = lines;
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn get_app_logs_journalctl(lines: usize) -> Result<Vec<String>> {
     let output = Command::new("journalctl")
         .arg("--user")
         .arg("-u")
@@ -65,9 +87,33 @@ pub fn get_app_logs(lines: usize) -> Result<Vec<String>> {
             .map(String::from)
             .collect())
     } else {
-        // Return empty vec instead of error - journal might not be available
+        // Journal might not exist (no systemd, unit never installed). Empty
+        // vec keeps `audetic logs` usable instead of erroring out.
         Ok(Vec::new())
     }
+}
+
+#[cfg(target_os = "macos")]
+fn get_app_logs_file(lines: usize) -> Result<Vec<String>> {
+    let Some(home) = dirs::home_dir() else {
+        return Ok(Vec::new());
+    };
+    let path = home.join("Library/Logs/Audetic/audetic.log");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = std::fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read {}", path.display()))?;
+
+    // Tail the last `lines` non-empty lines.
+    let mut all: Vec<String> = contents
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(String::from)
+        .collect();
+    let start = all.len().saturating_sub(lines);
+    Ok(all.split_off(start))
 }
 
 /// Get transcription history logs.

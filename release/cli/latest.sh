@@ -4,10 +4,11 @@
 #
 #   curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
 #
-# Downloads the audetic daemon and runs `audetic install`, which drops a
-# systemd user unit at ~/.config/systemd/user/audetic.service, enables it,
-# waits for it to bind 127.0.0.1:3737, and opens the web UI in your default
-# browser. Everything lives under your $HOME — no /usr/local/bin, no sudo.
+# Downloads the audetic daemon and hands off to `audetic install`. On Linux
+# the daemon is a raw binary registered as a systemd user service. On macOS
+# it ships as Audetic.app and registers as a LaunchAgent. Both flows end
+# with the web UI opening on http://127.0.0.1:3737/ — everything under $HOME,
+# no sudo.
 #
 # Source of truth lives in the repo at release/cli/latest.sh; `make
 # installer-lint` checks it.
@@ -66,7 +67,19 @@ require_cmd() {
 
 require_cmd curl
 require_cmd tar
-require_cmd sha256sum
+
+# `sha256sum` ships with Linux coreutils; macOS only has `shasum -a 256`.
+# Pick whichever is on PATH and warn if neither is.
+sha256() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  else
+    echo "No sha256 tool found (need sha256sum or shasum)" >&2
+    exit 1
+  fi
+}
 
 detect_target() {
   local os arch
@@ -83,8 +96,18 @@ detect_target() {
           ;;
       esac
       ;;
+    Darwin)
+      case "$arch" in
+        arm64 | aarch64) echo "macos-aarch64" ;;
+        x86_64) echo "macos-x86_64" ;;
+        *)
+          echo "Unsupported macOS architecture: $arch" >&2
+          exit 1
+          ;;
+      esac
+      ;;
     *)
-      echo "Unsupported OS: $os (Linux only for now)" >&2
+      echo "Unsupported OS: $os" >&2
       exit 1
       ;;
   esac
@@ -114,7 +137,7 @@ echo "==> Downloading $ARCHIVE_URL"
 curl -fsSL "$ARCHIVE_URL" -o "$TMP/$ARCHIVE"
 
 EXPECTED_SHA="$(curl -fsSL "$ARCHIVE_URL.sha256" | awk '{print $1}')"
-GOT_SHA="$(sha256sum "$TMP/$ARCHIVE" | awk '{print $1}')"
+GOT_SHA="$(sha256 "$TMP/$ARCHIVE")"
 if [[ "$EXPECTED_SHA" != "$GOT_SHA" ]]; then
   echo "Checksum mismatch: expected $EXPECTED_SHA, got $GOT_SHA" >&2
   exit 1
@@ -122,14 +145,31 @@ fi
 echo "==> Verified sha256"
 
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
-BINARY="$(find "$TMP" -maxdepth 3 -type f -name 'audetic' -perm -u+x | head -n1)"
+
+# On macOS the archive holds an Audetic.app bundle; the daemon lives at
+# Contents/MacOS/audetic and `audetic install` requires being invoked
+# from inside the bundle so it can derive the bundle root via current_exe.
+case "$TARGET" in
+  macos-*)
+    BUNDLE="$(find "$TMP" -maxdepth 3 -type d -name 'Audetic.app' | head -n1)"
+    [[ -d "$BUNDLE" ]] || {
+      echo "Archive missing Audetic.app" >&2
+      exit 1
+    }
+    BINARY="$BUNDLE/Contents/MacOS/audetic"
+    ;;
+  *)
+    BINARY="$(find "$TMP" -maxdepth 3 -type f -name 'audetic' -perm -u+x | head -n1)"
+    ;;
+esac
+
 [[ -x "$BINARY" ]] || {
   echo "Archive missing audetic binary" >&2
   exit 1
 }
 
-# Hand off to `audetic install` — the binary owns systemd unit setup,
-# enable --now, readiness probe, and `xdg-open <url>`.
+# Hand off to `audetic install` — the binary owns service setup, readiness
+# probe, and opening the UI in the default browser.
 INSTALL_ARGS=()
 $NO_LAUNCH && INSTALL_ARGS+=(--no-launch)
 "$BINARY" install "${INSTALL_ARGS[@]}"

@@ -25,6 +25,18 @@ const MEETING_TRANSCRIPTION_TIMEOUT_SECS: u64 = 7200; // 2 hours
 pub async fn run_service() -> Result<()> {
     info!("Starting Audetic service");
 
+    // On macOS, fire the Screen Recording TCC prompt early if it isn't
+    // already granted. AudioHardwareCreateProcessTap (cpal's loopback path)
+    // doesn't auto-prompt reliably, so without this users get silent
+    // captures with no UI signal that anything is wrong. The watcher
+    // re-exits the daemon when the grant flips so launchd's KeepAlive
+    // restarts us with the fresh TCC state — meetings then work without
+    // the user ever opening System Settings.
+    #[cfg(target_os = "macos")]
+    crate::audio::system_source::permissions::spawn_grant_watcher_then_exit(
+        std::time::Duration::from_secs(2),
+    );
+
     let config = Config::load()?;
 
     let (tx, mut rx) = mpsc::channel::<ApiCommand>(10);

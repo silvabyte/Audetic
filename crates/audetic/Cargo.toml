@@ -19,8 +19,12 @@ tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 
 # Audio recording
-cpal = "0.15"
+cpal = "0.17"
 hound = "3.5"
+
+# Sample-rate conversion (macOS loopback delivers samples at the output
+# device's native rate, typically 48 kHz; the VTT pipeline wants 16 kHz).
+rubato = "0.16"
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
@@ -35,9 +39,6 @@ anyhow = "1.0"
 thiserror = "1.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Clipboard
-arboard = { version = "3.3", features = ["wayland-data-control"] }
 
 # CLI args
 clap = { version = "4.4", features = ["derive"] }
@@ -88,3 +89,26 @@ ffmpeg-sidecar = "2.5"
 # single `audetic` binary serves both the API (/api) and the UI (/).
 include_dir = "0.7"
 mime_guess = "2.0"
+
+# Clipboard. The `wayland-data-control` feature pulls Wayland-only deps;
+# gate it to Linux so the workspace builds on macOS.
+[target.'cfg(target_os = "linux")'.dependencies]
+arboard = { version = "3.3", features = ["wayland-data-control"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+arboard = "3.3"
+
+# macOS Microphone TCC permission. AVFoundation's AVCaptureDevice is the only
+# way to preflight/request mic access without actually opening a stream, so we
+# mirror the Screen Recording grant-watcher (CoreGraphics, linked directly in
+# audio/system_source/permissions.rs) for the mic. objc2/block2/objc2-foundation
+# are already in the tree transitively via cpal's CoreAudio backend.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+block2 = "0.6"
+objc2-av-foundation = { version = "0.3", features = [
+    "AVCaptureDevice",
+    "AVMediaFormat",
+    "block2",
+] }

@@ -1,7 +1,7 @@
-//! System audio capture (what others say on Zoom/Meet/etc.).
+//! System audio capture on Linux via PipeWire's `pw-cat --record`.
 //!
-//! Captures audio from PipeWire monitor sources by spawning `pw-cat --record`
-//! and reading raw f32 PCM samples from its stdout.
+//! Reads raw f32 PCM samples from a PipeWire monitor source on the default
+//! sink. macOS uses cpal's native loopback instead — see `macos.rs`.
 
 use anyhow::Result;
 use std::io::Read as _;
@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 use which::which;
 
-use super::audio_source::AudioSource;
+use crate::audio::audio_source::AudioSource;
 
 pub struct SystemAudioSource {
     child: Option<Child>,

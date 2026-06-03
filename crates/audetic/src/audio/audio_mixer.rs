@@ -12,13 +12,21 @@ pub struct AudioMixer;
 
 impl AudioMixer {
     /// Mix sample vectors (all at the same sample rate) into a single output.
-    /// Zero-pads shorter inputs and normalizes to prevent clipping.
+    /// Zero-pads shorter inputs; normalizes only if the summed signal clips.
+    ///
+    /// Sources are *summed* rather than averaged. Averaging halves voice
+    /// amplitude during mic-only portions of a meeting, which makes quiet
+    /// speakers inaudible against louder system audio in the latter portion
+    /// of the recording. With sum-and-normalize, each source retains its
+    /// captured level when the others are silent; we only attenuate when
+    /// the simultaneous sum would actually clip beyond [-1, 1].
     pub fn mix(sources: &[Vec<f32>]) -> Vec<f32> {
         if sources.is_empty() {
             return Vec::new();
         }
 
-        // Filter out empty sources
+        // Filter out empty sources so a system-audio-denied meeting doesn't
+        // get penalised by a zero-pad average.
         let non_empty: Vec<&Vec<f32>> = sources.iter().filter(|s| !s.is_empty()).collect();
 
         if non_empty.is_empty() {
@@ -30,7 +38,6 @@ impl AudioMixer {
         }
 
         let max_len = non_empty.iter().map(|s| s.len()).max().unwrap_or(0);
-        let num_sources = non_empty.len() as f32;
 
         let mut mixed = vec![0.0f32; max_len];
 
@@ -40,14 +47,10 @@ impl AudioMixer {
             }
         }
 
-        // Average the samples to prevent clipping
-        for sample in &mut mixed {
-            *sample /= num_sources;
-        }
-
-        // Normalize if any samples exceed [-1.0, 1.0]
+        // Only scale when the sum would clip. This preserves the original
+        // amplitude of each source in segments where it's the only one with
+        // signal — e.g. a voice-only opening followed by music.
         let max_abs = mixed.iter().map(|s| s.abs()).fold(0.0f32, f32::max);
-
         if max_abs > 1.0 {
             for sample in &mut mixed {
                 *sample /= max_abs;
@@ -106,21 +109,24 @@ mod tests {
     }
 
     #[test]
-    fn test_mix_two_equal_sources() {
+    fn test_mix_two_equal_sources_no_clip() {
+        // Sum=1.0 → no clipping → no scaling. Each source contributes fully.
         let a = vec![0.5, 0.5, 0.5];
         let b = vec![0.5, 0.5, 0.5];
         let result = AudioMixer::mix(&[a, b]);
-        // Average: (0.5 + 0.5) / 2 = 0.5
-        assert_eq!(result, vec![0.5, 0.5, 0.5]);
+        assert_eq!(result, vec![1.0, 1.0, 1.0]);
     }
 
     #[test]
-    fn test_mix_different_lengths() {
+    fn test_mix_different_lengths_preserves_lone_source() {
+        // Voice-only opening (a) followed by both (a + b) — the lone-source
+        // region must keep its original amplitude, not be halved.
         let a = vec![1.0, 1.0];
         let b = vec![1.0, 1.0, 1.0, 1.0];
         let result = AudioMixer::mix(&[a, b]);
         assert_eq!(result.len(), 4);
-        // First two: (1.0+1.0)/2 = 1.0, last two: (0.0+1.0)/2 = 0.5
+        // First two: 1.0 + 1.0 = 2.0 → normalized by max_abs=2.0 → 1.0.
+        // Last two: 0.0 + 1.0 = 1.0 → normalized by same factor → 0.5.
         assert_eq!(result[0], 1.0);
         assert_eq!(result[2], 0.5);
     }
@@ -135,14 +141,26 @@ mod tests {
 
     #[test]
     fn test_mix_normalizes_clipping() {
+        // 1.0 + 1.0 = 2.0 → clip → scale by 2.0 → 1.0
         let a = vec![1.0, 1.0];
         let b = vec![1.0, 1.0];
         let result = AudioMixer::mix(&[a, b]);
-        // Average is 1.0, no clipping needed
         for s in &result {
             assert!(*s <= 1.0);
             assert!(*s >= -1.0);
         }
+        assert_eq!(result, vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_mix_quiet_voice_with_silent_system_keeps_voice_amplitude() {
+        // The exact failure mode reported on macOS: quiet voice in the first
+        // few seconds while the system audio is silent. The voice must not
+        // be attenuated by averaging against a silent source.
+        let voice = vec![0.002, 0.002, 0.002];
+        let silent_system = vec![0.0, 0.0, 0.0];
+        let result = AudioMixer::mix(&[voice.clone(), silent_system]);
+        assert_eq!(result, voice);
     }
 
     #[test]
