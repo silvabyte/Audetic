@@ -1,5 +1,6 @@
-//! Linux install: systemd user unit at `~/.config/systemd/user/audetic.service`,
-//! `enable --now`, readiness probe, `xdg-open` the UI.
+//! Linux install: systemd user unit at `~/.config/systemd/user/audeticd.service`,
+//! `enable --now`, readiness probe, `xdg-open` the UI. Also places the standalone
+//! `audetic` CLI on PATH (`~/.local/bin/audetic`).
 
 use super::{wait_for_daemon, InstallOptions};
 use crate::api::url;
@@ -10,20 +11,21 @@ use std::process::Command;
 use std::time::Duration;
 
 const SERVICE_TEMPLATE: &str = include_str!("audetic.service.tmpl");
-const SERVICE_NAME: &str = "audetic.service";
+const SERVICE_NAME: &str = "audeticd.service";
 
 pub async fn run(opts: InstallOptions) -> Result<()> {
     let paths = InstallPaths::resolve()?;
     let app_url = url::app_url();
 
-    println!("→ Installing audetic as a systemd user service");
+    println!("→ Installing audeticd as a systemd user service");
     place_binary(&paths)?;
+    place_cli();
     ensure_runtime_dirs(&paths)?;
     write_unit(&paths)?;
     daemon_reload()?;
     enable_and_start()?;
     wait_for_daemon(Duration::from_secs(15)).await?;
-    println!("✓ audetic.service is active");
+    println!("✓ audeticd.service is active");
 
     if opts.no_launch {
         println!("  Open {app_url} in your browser to finish onboarding.");
@@ -55,7 +57,7 @@ impl InstallPaths {
 
         let data_dir = data.join("audetic");
         let installed_dir = data_dir.join("bin");
-        let installed_binary = installed_dir.join("audetic");
+        let installed_binary = installed_dir.join("audeticd");
         let systemd_unit = config.join("systemd").join("user").join(SERVICE_NAME);
         let config_dir = config.join("audetic");
 
@@ -99,6 +101,63 @@ fn place_binary(paths: &InstallPaths) -> Result<()> {
         set_executable(&paths.installed_binary)?;
     }
     Ok(())
+}
+
+/// Best-effort: copy the standalone `audetic` CLI (shipped next to `audeticd`
+/// in the release archive) onto PATH at `~/.local/bin/audetic`. Never fails the
+/// install — if the CLI isn't found alongside the daemon, we just print a hint.
+fn place_cli() {
+    let Ok(current) = std::env::current_exe() else {
+        return;
+    };
+    let source = match current.parent().map(|dir| dir.join("audetic")) {
+        Some(p) if p.exists() => p,
+        _ => {
+            println!(
+                "  · Standalone `audetic` CLI not found next to the daemon; skipping PATH install."
+            );
+            return;
+        }
+    };
+
+    let target_dir =
+        dirs::executable_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local").join("bin")));
+    let Some(target_dir) = target_dir else {
+        return;
+    };
+    let target = target_dir.join("audetic");
+
+    if fs::create_dir_all(&target_dir).is_err() {
+        println!(
+            "  · Could not create {}; skipping CLI install.",
+            target_dir.display()
+        );
+        return;
+    }
+
+    match fs::copy(&source, &target) {
+        Ok(_) => {
+            let _ = set_executable(&target);
+            println!("  · Installed `audetic` CLI → {}", target.display());
+            if !on_path(&target_dir) {
+                println!(
+                    "    Note: {} is not on your PATH. Add it to use `audetic` directly.",
+                    target_dir.display()
+                );
+            }
+        }
+        Err(err) => println!(
+            "  · Could not install `audetic` CLI to {} ({err}); the daemon is still installed.",
+            target.display()
+        ),
+    }
+}
+
+/// Whether `dir` appears in the `PATH` environment variable.
+fn on_path(dir: &Path) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p == dir))
+        .unwrap_or(false)
 }
 
 fn write_unit(paths: &InstallPaths) -> Result<()> {

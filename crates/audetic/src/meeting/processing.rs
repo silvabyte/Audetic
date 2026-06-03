@@ -15,12 +15,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
-use crate::cli::compression::{cleanup_temp_file, prepare_for_upload};
 use crate::db::{self, meetings::MeetingRepository};
 use crate::post_processing::{
     Event as PostProcessingEvent, MeetingCompletedPayload, PostProcessingService,
 };
 use crate::transcription::job_service::TranscriptionJobService;
+use audetic_core::compression::{cleanup_temp_file, prepare_for_upload};
 
 use super::progress::MeetingProgressObserver;
 use super::status::MeetingPhase;

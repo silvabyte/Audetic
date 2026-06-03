@@ -3,7 +3,7 @@
 //! Provides FFmpeg-based compression to mp3 format for efficient upload
 //! and transcription.
 
-use crate::system::ffmpeg::resolve_ffmpeg_binary;
+use crate::ffmpeg::resolve_ffmpeg_binary;
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -25,10 +25,10 @@ pub fn get_file_size(path: &Path) -> Result<u64> {
 }
 
 /// Check if FFmpeg is available — either as the app-local sidecar binary in
-/// the daemon's exe dir or on the system PATH. See `system::ffmpeg` for the
+/// the daemon's exe dir or on the system PATH. See [`crate::ffmpeg`] for the
 /// resolution order.
 pub fn check_ffmpeg_available() -> bool {
-    crate::system::ffmpeg::check_available()
+    crate::ffmpeg::check_available()
 }
 
 /// Compress media file to MP3 format for transcription.

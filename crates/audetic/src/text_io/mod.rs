@@ -7,6 +7,13 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 use which::which;
 
+// The clipboard backend table and the synchronous copy helper are shared with
+// the standalone CLI via `audetic-core`. The async injection fallback below
+// reuses `CLIPBOARD_BACKENDS`; `copy_to_clipboard_sync` is re-exported so
+// existing `crate::text_io::copy_to_clipboard_sync` call sites keep working.
+pub use audetic_core::clipboard::copy_to_clipboard_sync;
+use audetic_core::clipboard::CLIPBOARD_BACKENDS;
+
 #[derive(Clone)]
 pub struct TextIoService {
     inner: Arc<TextIoInner>,
@@ -312,73 +319,6 @@ impl InjectionMethod {
     }
 }
 
-struct ClipboardBackend {
-    name: &'static str,
-    copy_cmd: &'static str,
-    copy_args: &'static [&'static str],
-    use_stdin: bool,
-}
-
-const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[
-    ClipboardBackend {
-        name: "wl-copy",
-        copy_cmd: "wl-copy",
-        copy_args: &[],
-        use_stdin: true,
-    },
-    ClipboardBackend {
-        name: "xclip",
-        copy_cmd: "xclip",
-        copy_args: &["-selection", "clipboard"],
-        use_stdin: true,
-    },
-    ClipboardBackend {
-        name: "xsel",
-        copy_cmd: "xsel",
-        copy_args: &["--clipboard", "--input"],
-        use_stdin: true,
-    },
-];
-
-/// Copy text to clipboard using system clipboard tools (synchronous version).
-///
-/// Uses wl-copy (Wayland), xclip, or xsel (X11) for persistent clipboard
-/// storage that survives after the process exits.
-///
-/// This is a standalone function for use in synchronous contexts (e.g., CLI commands).
-pub fn copy_to_clipboard_sync(text: &str) -> Result<()> {
-    if text.is_empty() {
-        return Ok(());
-    }
-
-    for backend in CLIPBOARD_BACKENDS {
-        if which(backend.copy_cmd).is_err() {
-            continue;
-        }
-
-        let mut child = match Command::new(backend.copy_cmd)
-            .args(backend.copy_args)
-            .stdin(Stdio::piped())
-            .spawn()
-        {
-            Ok(child) => child,
-            Err(_) => continue,
-        };
-
-        if let Some(stdin) = child.stdin.as_mut() {
-            if stdin.write_all(text.as_bytes()).is_err() {
-                continue;
-            }
-        }
-
-        if let Ok(status) = child.wait() {
-            if status.success() {
-                return Ok(());
-            }
-        }
-    }
-
-    Err(anyhow!(
-        "No clipboard tool available. Please install wl-copy (Wayland), xclip, or xsel (X11)."
-    ))
-}
+// `ClipboardBackend`, `CLIPBOARD_BACKENDS`, and `copy_to_clipboard_sync` now
+// live in `audetic_core::clipboard` (imported/re-exported at the top of this
+// module).

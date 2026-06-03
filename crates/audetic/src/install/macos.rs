@@ -23,9 +23,10 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     let paths = InstallPaths::resolve()?;
     let app_url = url::app_url();
 
-    println!("→ Installing audetic as a LaunchAgent");
+    println!("→ Installing audeticd as a LaunchAgent");
     ensure_runtime_dirs(&paths)?;
     place_bundle(&paths)?;
+    link_cli(&paths);
     write_plist(&paths)?;
     bootstrap_agent(&paths)?;
     wait_for_daemon(Duration::from_secs(15)).await?;
@@ -59,7 +60,7 @@ impl InstallPaths {
         let current = std::env::current_exe()
             .context("Could not determine the path of the running audetic binary")?;
 
-        // Walk up: Contents/MacOS/audetic → Contents/MacOS → Contents → Audetic.app
+        // Walk up: Contents/MacOS/audeticd → Contents/MacOS → Contents → Audetic.app
         let source_bundle = current
             .parent()
             .and_then(|p| p.parent())
@@ -68,9 +69,9 @@ impl InstallPaths {
             .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
             .ok_or_else(|| {
                 anyhow!(
-                    "audetic must be invoked from inside an `Audetic.app` bundle on macOS; \
+                    "audeticd must be invoked from inside an `Audetic.app` bundle on macOS; \
                      current_exe is {}. Build the bundle with `make macos-app` and run \
-                     `./target/release/Audetic.app/Contents/MacOS/audetic install`.",
+                     `./target/release/Audetic.app/Contents/MacOS/audeticd install`.",
                     current.display()
                 )
             })?;
@@ -80,7 +81,7 @@ impl InstallPaths {
         let installed_binary = installed_bundle
             .join("Contents")
             .join("MacOS")
-            .join("audetic");
+            .join("audeticd");
         let plist_path = home
             .join("Library")
             .join("LaunchAgents")
@@ -172,6 +173,54 @@ fn place_bundle(paths: &InstallPaths) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Best-effort: symlink the bundle's standalone `audetic` CLI onto PATH so users
+/// can run `audetic …` from a shell. Prefers `/usr/local/bin` (on PATH, often
+/// user-writable via Homebrew); falls back to `~/.local/bin`. Never fails the
+/// install.
+fn link_cli(paths: &InstallPaths) {
+    use std::os::unix::fs::symlink;
+
+    let cli_source = paths
+        .installed_bundle
+        .join("Contents")
+        .join("MacOS")
+        .join("audetic");
+    if !cli_source.exists() {
+        println!("  · Standalone `audetic` CLI not found in the bundle; skipping PATH symlink.");
+        return;
+    }
+
+    let candidates = [
+        PathBuf::from("/usr/local/bin"),
+        paths.home.join(".local").join("bin"),
+    ];
+
+    for dir in candidates {
+        if fs::create_dir_all(&dir).is_err() {
+            continue;
+        }
+        let link = dir.join("audetic");
+        // Replace any stale symlink/file so re-installs and upgrades repoint cleanly.
+        let _ = fs::remove_file(&link);
+        match symlink(&cli_source, &link) {
+            Ok(()) => {
+                println!("  · Linked `audetic` CLI → {}", link.display());
+                return;
+            }
+            Err(_) => continue,
+        }
+    }
+
+    println!(
+        "  · Could not symlink the `audetic` CLI onto PATH. Add an alias to \
+         {} manually if you want it on your shell.",
+        paths
+            .installed_bundle
+            .join("Contents/MacOS/audetic")
+            .display()
+    );
 }
 
 fn write_plist(paths: &InstallPaths) -> Result<()> {

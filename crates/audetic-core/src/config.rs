@@ -14,6 +14,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[serde(default)]
 pub struct WhisperConfig {
     pub model: Option<String>,

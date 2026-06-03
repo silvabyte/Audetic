@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::time::sleep;
 
-use crate::cli::args::{OutputFormat, TranscribeCliArgs};
-use crate::cli::compression::{cleanup_temp_file, get_file_size, prepare_for_upload};
-use crate::config::Config;
-use crate::text_io::copy_to_clipboard_sync;
-use crate::transcription::jobs_client::{
+use crate::args::{OutputFormat, TranscribeCliArgs};
+use audetic_core::clipboard::copy_to_clipboard_sync;
+use audetic_core::compression::{cleanup_temp_file, get_file_size, prepare_for_upload};
+use audetic_core::config::Config;
+use audetic_core::jobs_client::{
     mime_type_for_extension, status, Job, JobsClient, TranscriptionResult,
 };
 const POLL_INTERVAL_MS: u64 = 1000;

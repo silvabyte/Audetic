@@ -6,8 +6,8 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::PathBuf;
 
-use crate::api::url::{api_url, paths};
-use crate::cli::args::{MeetingCliArgs, MeetingCommand};
+use crate::args::{MeetingCliArgs, MeetingCommand};
+use audetic_core::url::{api_url, paths};
 
 /// Daemon API base — single derived value so we never inline
 /// `http://127.0.0.1:3737/api/...` in this module.
@@ -323,7 +323,7 @@ async fn import_meeting(path: PathBuf, title: Option<String>) -> Result<()> {
     let mime_type = path
         .extension()
         .and_then(|e| e.to_str())
-        .and_then(crate::transcription::jobs_client::mime_type_for_extension)
+        .and_then(audetic_core::jobs_client::mime_type_for_extension)
         .unwrap_or("application/octet-stream");
 
     let file = tokio::fs::File::open(&path)

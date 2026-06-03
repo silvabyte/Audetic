@@ -23,11 +23,13 @@ KEEP_DATABASE=false
 KEEP_UPDATES=false
 REMOVE_TEMP=false
 
-# Paths — must match the layout produced by `audetic install`.
+# Paths — must match the layout produced by `audeticd install`.
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/audetic"
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/audetic"
 BIN_DIR="$DATA_DIR/bin"
-SERVICE_NAME="audetic.service"
+# Standalone CLI placed on PATH by `audeticd install` (XDG_BIN_HOME → ~/.local/bin).
+CLI_BIN="${XDG_BIN_HOME:-$HOME/.local/bin}/audetic"
+SERVICE_NAME="audeticd.service"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
 
 # Discovered artifacts
@@ -175,13 +177,19 @@ add_kept() {
 #   ~/.local/share/audetic/meetings/        — meeting recordings + transcripts
 #   ~/.local/share/audetic/keybind-backups/
 #   ~/.config/audetic/                       — config.toml, update_state.json
-#   ~/.config/systemd/user/audetic.service
+#   ~/.config/systemd/user/audeticd.service
+#   ~/.local/bin/audetic                      — standalone CLI on PATH
 discover_artifacts() {
   log info "Scanning for Audetic artifacts..."
 
   # Binary directory — always removed (it's the program itself).
   if [[ -d "$BIN_DIR" ]]; then
     add_artifact "$BIN_DIR" "Binary directory"
+  fi
+
+  # Standalone CLI symlink/binary on PATH.
+  if [[ -e "$CLI_BIN" || -L "$CLI_BIN" ]]; then
+    add_artifact "$CLI_BIN" "Standalone audetic CLI"
   fi
 
   # Service file

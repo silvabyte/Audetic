@@ -65,7 +65,7 @@ async fn wait_for_daemon(timeout: Duration) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn log_hint() -> &'static str {
-    "`journalctl --user -u audetic.service`"
+    "`journalctl --user -u audeticd.service`"
 }
 
 #[cfg(target_os = "macos")]

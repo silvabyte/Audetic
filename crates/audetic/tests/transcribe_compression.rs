@@ -34,7 +34,7 @@ fn test_compression_produces_smaller_file() {
         return;
     }
 
-    use audetic::cli::compression::{cleanup_temp_file, compress_for_transcription, get_file_size};
+    use audetic_core::compression::{cleanup_temp_file, compress_for_transcription, get_file_size};
 
     let input_size = get_file_size(input).unwrap();
 
@@ -62,7 +62,7 @@ fn test_compression_produces_smaller_file() {
 
 #[test]
 fn test_is_already_compressed() {
-    use audetic::cli::compression::is_already_compressed;
+    use audetic_core::compression::is_already_compressed;
     assert!(is_already_compressed(Path::new("test.mp3")));
     assert!(is_already_compressed(Path::new("test.MP3")));
     assert!(is_already_compressed(Path::new("test.opus")));
@@ -85,7 +85,7 @@ fn test_compression_works_on_small_file() {
         return;
     }
 
-    use audetic::cli::compression::{cleanup_temp_file, compress_for_transcription};
+    use audetic_core::compression::{cleanup_temp_file, compress_for_transcription};
 
     let output = compress_for_transcription(input).unwrap();
 
@@ -97,7 +97,7 @@ fn test_compression_works_on_small_file() {
 
 #[test]
 fn test_ffmpeg_check_does_not_panic() {
-    use audetic::cli::compression::check_ffmpeg_available;
+    use audetic_core::compression::check_ffmpeg_available;
     // Just verify it doesn't panic - result depends on system
     let _available = check_ffmpeg_available();
 }

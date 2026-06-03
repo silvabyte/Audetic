@@ -111,25 +111,25 @@ deploy-stable:
 
 # Service management
 run:
-	AUDETIC_DISABLE_AUTO_UPDATE=1 RUST_LOG=info cargo run --release
+	AUDETIC_DISABLE_AUTO_UPDATE=1 RUST_LOG=info cargo run --release -p audetic
 
 logs:
-	journalctl --user -u audetic.service -f
+	journalctl --user -u audeticd.service -f
 
 start:
-	systemctl --user enable --now audetic.service
+	systemctl --user enable --now audeticd.service
 	@echo "✓ Service enabled and started"
 
 restart:
-	systemctl --user restart audetic.service
+	systemctl --user restart audeticd.service
 	@echo "✓ Service restarted"
 
 stop:
-	systemctl --user stop audetic.service
+	systemctl --user stop audeticd.service
 	@echo "✓ Service stopped"
 
 status:
-	@systemctl --user is-active audetic.service >/dev/null 2>&1 && echo "✓ Service is running" || echo "✗ Service is not running"
+	@systemctl --user is-active audeticd.service >/dev/null 2>&1 && echo "✓ Service is running" || echo "✗ Service is not running"
 	@curl -s http://127.0.0.1:3737/api/status 2>/dev/null | python3 -m json.tool || echo "✗ API not responding"
 
 # Web UI (apps/web-ui) — current SPA. Daemon must be running for codegen and dev.
@@ -168,7 +168,7 @@ installer-lint:
 #
 # For shareable builds use `make macos-sign-release SIGN_IDENTITY="Developer ID Application: … (Z25737G79K)"`.
 SIGN_IDENTITY ?= -
-MACOS_BINARY  ?= target/debug/audetic
+MACOS_BINARY  ?= target/debug/audeticd
 MACOS_ENTITLEMENTS ?= crates/audetic/macos/audetic.entitlements
 
 macos-sign:
@@ -180,7 +180,7 @@ macos-sign:
 		$(MACOS_BINARY)
 	@echo "✓ signed. Verify with: codesign -dv --verbose=2 $(MACOS_BINARY)"
 
-macos-sign-release: MACOS_BINARY=target/release/audetic
+macos-sign-release: MACOS_BINARY=target/release/audeticd
 macos-sign-release: macos-sign
 
 # macOS app bundle. Produces target/<profile>/Audetic.app containing the
@@ -211,8 +211,18 @@ _macos-app-build:
 	@mkdir -p $(MACOS_APP_DIR)/Contents/MacOS
 	@mkdir -p $(MACOS_APP_DIR)/Contents/Resources
 	@cp crates/audetic/macos/Info.plist $(MACOS_APP_DIR)/Contents/Info.plist
+	@cp target/$(MACOS_APP_PROFILE)/audeticd $(MACOS_APP_DIR)/Contents/MacOS/audeticd
+	@# Ship the slim `audetic` CLI inside the bundle too; `audeticd install`
+	@# symlinks it onto PATH. Keeping it inside the bundle means a single
+	@# downloadable artifact still yields both the daemon and the CLI.
 	@cp target/$(MACOS_APP_PROFILE)/audetic $(MACOS_APP_DIR)/Contents/MacOS/audetic
 	@printf 'APPL????' > $(MACOS_APP_DIR)/Contents/PkgInfo
+	@# Sign the nested CLI first (no mic/screen entitlements — it never
+	@# captures), then sign the bundle so the whole thing validates.
+	codesign --force --sign "$(SIGN_IDENTITY)" \
+		--options runtime \
+		--timestamp=none \
+		$(MACOS_APP_DIR)/Contents/MacOS/audetic
 	@echo "→ codesign ($(SIGN_IDENTITY)) $(MACOS_APP_DIR)"
 	codesign --force --sign "$(SIGN_IDENTITY)" \
 		--options runtime \
