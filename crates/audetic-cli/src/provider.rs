@@ -1,40 +1,67 @@
 //! CLI handler for transcription provider management.
 //!
-//! This module handles terminal presentation and user interaction.
-//! Core business logic is delegated to the `transcription` module.
+//! The interactive wizard runs locally, but all reads/writes/tests go through
+//! the daemon's REST API (`GET`/`PUT /api/provider/config`,
+//! `POST /api/provider/reset`, `POST /api/provider/test`,
+//! `GET /api/provider/status`). The daemon owns `config.toml` (and its backups),
+//! so there is a single writer.
 
-use crate::cli::{ProviderCliArgs, ProviderCommand};
-use crate::config::{Config, WhisperConfig};
-use crate::transcription::{
-    get_provider_status_from_config, ProviderConfig, ProviderStatus, Transcriber,
-};
-use anyhow::{anyhow, Context, Result};
-use chrono::Local;
+use crate::args::{ProviderCliArgs, ProviderCommand};
+use crate::client::{base_url, json_or_error, CONNECT_HINT};
+use anyhow::{Context, Result};
+use audetic_core::config::WhisperConfig;
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
+use serde_json::json;
 use std::fs;
 use std::io::{self, IsTerminal};
-use std::path::{Path, PathBuf};
-use std::time::Instant;
-use tracing::info;
+use std::path::Path;
 use which::which;
 
-const MAX_CONFIG_BACKUPS: usize = 3;
-
-pub fn handle_provider_command(args: ProviderCliArgs) -> Result<()> {
+pub async fn handle_provider_command(args: ProviderCliArgs) -> Result<()> {
     match args.command {
-        Some(ProviderCommand::Show) => handle_show(),
-        Some(ProviderCommand::Configure { dry_run }) => handle_configure(dry_run),
-        Some(ProviderCommand::Test { file }) => handle_test(file),
-        Some(ProviderCommand::Status) => handle_status(),
-        Some(ProviderCommand::Reset { force }) => handle_reset(force),
-        None => handle_interactive(),
+        Some(ProviderCommand::Show) => handle_show().await,
+        Some(ProviderCommand::Configure { dry_run }) => handle_configure(dry_run).await,
+        Some(ProviderCommand::Test { file }) => handle_test(file).await,
+        Some(ProviderCommand::Status) => handle_status().await,
+        Some(ProviderCommand::Reset { force }) => handle_reset(force).await,
+        None => handle_interactive().await,
     }
 }
 
-/// Interactive provider setup wizard (default when no subcommand provided)
-fn handle_interactive() -> Result<()> {
+// ============================================================================
+// REST helpers
+// ============================================================================
+
+/// Fetch the raw provider config from the daemon.
+async fn fetch_config() -> Result<WhisperConfig> {
+    let response = reqwest::Client::new()
+        .get(format!("{}/provider/config", base_url()))
+        .send()
+        .await
+        .context(CONNECT_HINT)?;
+    let body = json_or_error(response, "get provider config").await?;
+    serde_json::from_value(body).context("Failed to parse provider config")
+}
+
+/// Persist a provider config via the daemon (it backs up `config.toml` first).
+async fn save_config(whisper: &WhisperConfig) -> Result<()> {
+    let response = reqwest::Client::new()
+        .put(format!("{}/provider/config", base_url()))
+        .json(whisper)
+        .send()
+        .await
+        .context(CONNECT_HINT)?;
+    json_or_error(response, "save provider config").await?;
+    Ok(())
+}
+
+// ============================================================================
+// Commands
+// ============================================================================
+
+async fn handle_interactive() -> Result<()> {
     if !io::stdin().is_terminal() {
-        info!("Non-interactive session. Use 'audetic provider configure' for automated setup.");
+        eprintln!("Non-interactive session. Use 'audetic provider configure' for automated setup.");
         return Ok(());
     }
 
@@ -45,16 +72,13 @@ fn handle_interactive() -> Result<()> {
     println!("======================");
     println!();
 
-    // Show current status summary
-    let config = Config::load()?;
-    let provider_name = config.whisper.provider.as_deref().unwrap_or("<not set>");
-    let status = get_provider_status_from_config(&config.whisper)?;
-
-    println!("Current provider: {}", provider_name);
-    println!("Status: {}", provider_status_display(&status));
+    let whisper = fetch_config().await?;
+    println!(
+        "Current provider: {}",
+        whisper.provider.as_deref().unwrap_or("<not set>")
+    );
     println!();
 
-    // Interactive menu
     let options = vec![
         "Configure provider",
         "Test current provider",
@@ -70,10 +94,10 @@ fn handle_interactive() -> Result<()> {
         .interact()?;
 
     match selection {
-        0 => handle_configure(false),
-        1 => handle_test(None),
-        2 => handle_show(),
-        3 => handle_reset(false),
+        0 => handle_configure(false).await,
+        1 => handle_test(None).await,
+        2 => handle_show().await,
+        3 => handle_reset(false).await,
         _ => {
             println!("Exiting provider setup.");
             Ok(())
@@ -81,10 +105,8 @@ fn handle_interactive() -> Result<()> {
     }
 }
 
-/// Show current provider configuration
-fn handle_show() -> Result<()> {
-    let config = Config::load()?;
-    let whisper = &config.whisper;
+async fn handle_show() -> Result<()> {
+    let whisper = fetch_config().await?;
 
     println!();
     println!("Provider Configuration");
@@ -110,22 +132,19 @@ fn handle_show() -> Result<()> {
     println!("Local Binary Settings:");
     println!("  Command:    {}", display_value(&whisper.command_path));
     println!("  Model Path: {}", display_value(&whisper.model_path));
-    println!();
-    println!("Config file:  {}", crate::global::config_file()?.display());
 
     Ok(())
 }
 
-/// Configure provider with optional dry-run
-fn handle_configure(dry_run: bool) -> Result<()> {
+async fn handle_configure(dry_run: bool) -> Result<()> {
     if !io::stdin().is_terminal() {
-        info!("Non-interactive session detected. Please edit ~/.config/audetic/config.toml manually to change providers.");
+        eprintln!("Non-interactive session detected. Run `audetic provider configure` from a terminal to change providers.");
         return Ok(());
     }
 
     let theme = ColorfulTheme::default();
-    let mut config = Config::load()?;
-    let old_config = config.whisper.clone();
+    let mut whisper = fetch_config().await?;
+    let old_config = whisper.clone();
 
     println!();
     println!("Provider Configuration");
@@ -133,26 +152,25 @@ fn handle_configure(dry_run: bool) -> Result<()> {
     println!();
     println!(
         "Current provider: {}",
-        config.whisper.provider.as_deref().unwrap_or("<not set>")
+        whisper.provider.as_deref().unwrap_or("<not set>")
     );
     println!();
 
-    let selection = prompt_provider_selection(&theme, config.whisper.provider.as_deref())?;
-    config.whisper.provider = Some(selection.as_str().to_string());
+    let selection = prompt_provider_selection(&theme, whisper.provider.as_deref())?;
+    whisper.provider = Some(selection.as_str().to_string());
 
     match selection {
-        ProviderSelection::AudeticApi => configure_audetic_api(&theme, &mut config.whisper)?,
-        ProviderSelection::AssemblyAi => configure_assembly_ai(&theme, &mut config.whisper)?,
-        ProviderSelection::OpenAiApi => configure_openai_api(&theme, &mut config.whisper)?,
-        ProviderSelection::OpenAiCli => configure_openai_cli(&theme, &mut config.whisper)?,
-        ProviderSelection::WhisperCpp => configure_whisper_cpp(&theme, &mut config.whisper)?,
+        ProviderSelection::AudeticApi => configure_audetic_api(&theme, &mut whisper)?,
+        ProviderSelection::AssemblyAi => configure_assembly_ai(&theme, &mut whisper)?,
+        ProviderSelection::OpenAiApi => configure_openai_api(&theme, &mut whisper)?,
+        ProviderSelection::OpenAiCli => configure_openai_cli(&theme, &mut whisper)?,
+        ProviderSelection::WhisperCpp => configure_whisper_cpp(&theme, &mut whisper)?,
     }
 
-    // Show what would change
     println!();
     println!("Configuration Changes");
     println!("---------------------");
-    print_config_diff(&old_config, &config.whisper);
+    print_config_diff(&old_config, &whisper);
 
     if dry_run {
         println!();
@@ -161,162 +179,130 @@ fn handle_configure(dry_run: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Confirm before saving
     println!();
     let proceed = Confirm::with_theme(&theme)
         .with_prompt("Save these changes?")
         .default(true)
         .interact()?;
-
     if !proceed {
         println!("Configuration cancelled.");
         return Ok(());
     }
 
-    // Create backup before saving
-    let config_path = crate::global::config_file()?;
-    if config_path.exists() {
-        let backup_path = create_config_backup(&config_path)?;
-        println!("Backup: {}", backup_path.display());
-    }
-
-    config.save()?;
+    save_config(&whisper).await?;
     println!();
     println!(
         "Provider updated to '{}'.",
-        config.whisper.provider.as_deref().unwrap_or_default()
+        whisper.provider.as_deref().unwrap_or_default()
     );
     println!();
     println!("Next steps:");
     println!("  audetic provider test    - Verify the provider works");
-    println!("  systemctl --user restart audetic.service  - Apply to running service");
+    println!("  Restart the Audetic daemon to apply changes to the running service");
 
     Ok(())
 }
 
-/// Test provider with optional audio file
-fn handle_test(file: Option<String>) -> Result<()> {
-    let config = Config::load()?;
-    let provider_name = config.whisper.provider.as_deref().ok_or_else(|| {
-        anyhow!("No transcription provider configured. Run `audetic provider configure` first.")
-    })?;
-
+async fn handle_test(file: Option<String>) -> Result<()> {
     println!();
     println!("Provider Test");
     println!("=============");
     println!();
-    println!("Provider: {}", provider_name);
 
-    // Initialize provider
-    print!("Initializing... ");
-    let provider_config = provider_config_from_whisper(&config.whisper);
-    let transcriber = Transcriber::with_provider(provider_name, provider_config)?;
-    println!("OK");
+    if let Some(f) = &file {
+        println!("Audio file: {f}");
+    }
+    print!("Testing... ");
 
-    // If file provided, test with it
-    if let Some(audio_file) = file {
-        let audio_path = PathBuf::from(&audio_file);
-        if !audio_path.exists() {
-            return Err(anyhow!("Audio file not found: {}", audio_file));
+    let response = reqwest::Client::new()
+        .post(format!("{}/provider/test", base_url()))
+        .json(&json!({ "file": file }))
+        .send()
+        .await
+        .context(CONNECT_HINT)?;
+    let body = json_or_error(response, "test provider").await?;
+
+    let success = body
+        .get("success")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    println!("{}", if success { "OK" } else { "failed" });
+    println!();
+
+    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
+        if !err.is_empty() {
+            println!("Error: {err}");
+            return Ok(());
         }
-
-        println!("Audio file: {}", audio_file);
-        println!();
-        print!("Transcribing... ");
-
-        let start = Instant::now();
-        let result = tokio::runtime::Runtime::new()?
-            .block_on(async { transcriber.transcribe(&audio_path).await })?;
-        let elapsed = start.elapsed();
-
-        println!("done ({:.2}s)", elapsed.as_secs_f64());
-        println!();
-        println!("Result:");
-        println!("  \"{}\"", result);
-        println!();
-        println!("Provider '{}' is working correctly.", provider_name);
-    } else {
-        // No file provided - just validate configuration
-        println!();
-        println!("Provider '{}' initialized successfully.", provider_name);
-        println!();
-        println!("To test with actual audio:");
-        println!("  audetic provider test --file <audio.wav>");
-        println!();
-        println!("Or use Audetic normally to test recording and transcription.");
     }
 
+    if let Some(text) = body.get("transcription").and_then(|v| v.as_str()) {
+        if !text.is_empty() {
+            let duration = body
+                .get("duration_secs")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            println!("Result ({duration:.2}s):");
+            println!("  \"{text}\"");
+            println!();
+        }
+    }
+
+    if success {
+        println!("Provider is working correctly.");
+    }
     Ok(())
 }
 
-/// Show provider status and health - uses transcription::get_provider_status_from_config()
-fn handle_status() -> Result<()> {
-    let config = Config::load()?;
-    let whisper = &config.whisper;
-    let status = get_provider_status_from_config(whisper)?;
+async fn handle_status() -> Result<()> {
+    let response = reqwest::Client::new()
+        .get(format!("{}/provider/status", base_url()))
+        .send()
+        .await
+        .context(CONNECT_HINT)?;
+    let body = json_or_error(response, "get provider status").await?;
 
     println!();
     println!("Audetic Provider Status");
     println!("=======================");
     println!();
 
-    match status {
-        ProviderStatus::Ready {
-            provider,
-            model,
-            language,
-        } => {
+    match body.get("status").and_then(|v| v.as_str()) {
+        Some("ready") => {
             println!("Status: READY");
             println!();
-            println!("Provider:  {}", provider);
-            println!("Model:     {}", model.as_deref().unwrap_or("<default>"));
-            println!("Language:  {}", language.as_deref().unwrap_or("<default>"));
-
-            // Show provider-specific config
-            match provider.as_str() {
-                "audetic-api" => {
-                    println!(
-                        "Endpoint:  {}",
-                        whisper.api_endpoint.as_deref().unwrap_or("<default>")
-                    );
-                }
-                "assembly-ai" => {
-                    println!("API Key:   {}", mask_secret(&whisper.api_key));
-                    println!(
-                        "Base URL:  {}",
-                        whisper.api_endpoint.as_deref().unwrap_or("<default>")
-                    );
-                }
-                "openai-api" => {
-                    println!("API Key:   {}", mask_secret(&whisper.api_key));
-                    println!(
-                        "Endpoint:  {}",
-                        whisper.api_endpoint.as_deref().unwrap_or("<default>")
-                    );
-                }
-                "openai-cli" => {
-                    println!("Command:   {}", display_value(&whisper.command_path));
-                }
-                "whisper-cpp" => {
-                    println!("Command:   {}", display_value(&whisper.command_path));
-                    println!("Model:     {}", display_value(&whisper.model_path));
-                }
-                _ => {}
+            if let Some(p) = body.get("provider").and_then(|v| v.as_str()) {
+                println!("Provider:  {p}");
             }
-
+            println!(
+                "Model:     {}",
+                body.get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<default>")
+            );
+            println!(
+                "Language:  {}",
+                body.get("language")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<default>")
+            );
             println!();
             println!("Health: Ready for transcription");
         }
-        ProviderStatus::ConfigError { provider, error } => {
+        Some("config_error") => {
             println!("Status: CONFIGURATION ERROR");
             println!();
-            println!("Provider:  {}", provider);
-            println!();
-            println!("Error: {}", error);
+            if let Some(p) = body.get("provider").and_then(|v| v.as_str()) {
+                println!("Provider:  {p}");
+            }
+            if let Some(e) = body.get("error").and_then(|v| v.as_str()) {
+                println!();
+                println!("Error: {e}");
+            }
             println!();
             println!("Run 'audetic provider configure' to fix the configuration.");
         }
-        ProviderStatus::NotConfigured => {
+        _ => {
             println!("Status: NOT CONFIGURED");
             println!();
             println!("No transcription provider has been set up.");
@@ -324,20 +310,18 @@ fn handle_status() -> Result<()> {
             println!("Run 'audetic provider' to configure a provider.");
         }
     }
-
     Ok(())
 }
 
-/// Reset provider to defaults
-fn handle_reset(force: bool) -> Result<()> {
-    let config = Config::load()?;
-    let current_provider = config.whisper.provider.as_deref().unwrap_or("<not set>");
+async fn handle_reset(force: bool) -> Result<()> {
+    let whisper = fetch_config().await?;
+    let current_provider = whisper.provider.as_deref().unwrap_or("<not set>");
 
     println!();
     println!("Reset Provider Configuration");
     println!("============================");
     println!();
-    println!("Current provider: {}", current_provider);
+    println!("Current provider: {current_provider}");
     println!();
     println!("This will reset to:");
     println!("  Provider: audetic-api (default)");
@@ -351,97 +335,30 @@ fn handle_reset(force: bool) -> Result<()> {
             println!("Non-interactive session. Use --force to reset without confirmation.");
             return Ok(());
         }
-
         let theme = ColorfulTheme::default();
         let proceed = Confirm::with_theme(&theme)
             .with_prompt("Proceed with reset?")
             .default(false)
             .interact()?;
-
         if !proceed {
             println!("Reset cancelled.");
             return Ok(());
         }
     }
 
-    // Create backup
-    let config_path = crate::global::config_file()?;
-    if config_path.exists() {
-        let backup_path = create_config_backup(&config_path)?;
-        println!("Backup: {}", backup_path.display());
-    }
-
-    // Reset whisper config to defaults
-    let mut new_config = config;
-    new_config.whisper = WhisperConfig::default();
-    new_config.save()?;
+    let response = reqwest::Client::new()
+        .post(format!("{}/provider/reset", base_url()))
+        .send()
+        .await
+        .context(CONNECT_HINT)?;
+    json_or_error(response, "reset provider config").await?;
 
     println!();
     println!("Provider configuration reset to defaults.");
     println!();
     println!("Next steps:");
     println!("  audetic provider           - Configure a new provider");
-    println!("  systemctl --user restart audetic.service  - Apply changes");
-
-    Ok(())
-}
-
-// ============================================================================
-// Provider status helpers
-// ============================================================================
-
-/// Display helper for ProviderStatus
-fn provider_status_display(status: &ProviderStatus) -> &'static str {
-    match status {
-        ProviderStatus::Ready { .. } => "Ready",
-        ProviderStatus::ConfigError { .. } => "Configuration error",
-        ProviderStatus::NotConfigured => "Not configured",
-    }
-}
-
-// ============================================================================
-// Backup helpers
-// ============================================================================
-
-fn create_config_backup(config_path: &Path) -> Result<PathBuf> {
-    let backup_dir = crate::global::data_dir()?.join("config-backups");
-    fs::create_dir_all(&backup_dir)
-        .with_context(|| format!("Failed to create backup directory: {:?}", backup_dir))?;
-
-    let timestamp = Local::now().format("%Y%m%d-%H%M%S");
-    let backup_name = format!("config.toml.backup-{}", timestamp);
-    let backup_path = backup_dir.join(&backup_name);
-
-    fs::copy(config_path, &backup_path)
-        .with_context(|| format!("Failed to create backup of {:?}", config_path))?;
-
-    // Rotate old backups
-    rotate_config_backups(&backup_dir)?;
-
-    Ok(backup_path)
-}
-
-fn rotate_config_backups(backup_dir: &Path) -> Result<()> {
-    let mut backups: Vec<PathBuf> = fs::read_dir(backup_dir)?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.file_name()
-                .and_then(|n| n.to_str())
-                .map(|n| n.starts_with("config.toml.backup-"))
-                .unwrap_or(false)
-        })
-        .collect();
-
-    backups.sort_by(|a, b| {
-        let a_time = fs::metadata(a).and_then(|m| m.modified()).ok();
-        let b_time = fs::metadata(b).and_then(|m| m.modified()).ok();
-        b_time.cmp(&a_time)
-    });
-
-    for old_backup in backups.iter().skip(MAX_CONFIG_BACKUPS) {
-        let _ = fs::remove_file(old_backup);
-    }
+    println!("  Restart the Audetic daemon to apply changes");
 
     Ok(())
 }
@@ -464,15 +381,13 @@ fn print_field_diff(name: &str, old: &Option<String>, new: &Option<String>) {
     if old != new {
         let old_display = old.as_deref().unwrap_or("<not set>");
         let new_display = new.as_deref().unwrap_or("<not set>");
-        println!("  {}: {} -> {}", name, old_display, new_display);
+        println!("  {name}: {old_display} -> {new_display}");
     }
 }
 
 fn print_secret_diff(name: &str, old: &Option<String>, new: &Option<String>) {
     if old != new {
-        let old_display = mask_secret(old);
-        let new_display = mask_secret(new);
-        println!("  {}: {} -> {}", name, old_display, new_display);
+        println!("  {name}: {} -> {}", mask_secret(old), mask_secret(new));
     }
 }
 
@@ -503,7 +418,6 @@ fn configure_audetic_api(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> 
     )?);
 
     prompt_language_choice(theme, whisper, "en")?;
-
     Ok(())
 }
 
@@ -524,11 +438,8 @@ fn configure_assembly_ai(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> 
         &endpoint_default,
     )?);
 
-    // AssemblyAI doesn't use a model parameter like OpenAI
     whisper.model = None;
-
     prompt_language_choice(theme, whisper, "en")?;
-
     Ok(())
 }
 
@@ -560,7 +471,6 @@ fn configure_openai_api(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> R
     )?);
 
     prompt_language_choice(theme, whisper, "en")?;
-
     Ok(())
 }
 
@@ -588,7 +498,6 @@ fn configure_openai_cli(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> R
     )?);
 
     prompt_language_choice(theme, whisper, "en")?;
-
     Ok(())
 }
 
@@ -620,7 +529,6 @@ fn configure_whisper_cpp(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> 
     )?);
 
     prompt_language_choice(theme, whisper, "en")?;
-
     Ok(())
 }
 
@@ -651,7 +559,7 @@ fn prompt_provider_selection(
 
     let items: Vec<String> = OPTIONS
         .iter()
-        .map(|(name, desc)| format!("{:<12} - {}", name, desc))
+        .map(|(name, desc)| format!("{name:<12} - {desc}"))
         .collect();
 
     let default_index = current
@@ -670,7 +578,7 @@ fn prompt_provider_selection(
 fn prompt_secret(theme: &ColorfulTheme, prompt: &str, current: Option<&String>) -> Result<String> {
     if let Some(existing) = current {
         let keep = Confirm::with_theme(theme)
-            .with_prompt(format!("Keep existing {}?", prompt))
+            .with_prompt(format!("Keep existing {prompt}?"))
             .default(true)
             .interact()?;
         if keep {
@@ -682,7 +590,7 @@ fn prompt_secret(theme: &ColorfulTheme, prompt: &str, current: Option<&String>) 
         let value = Password::new().with_prompt(prompt).interact()?;
         let trimmed = value.trim();
         if trimmed.is_empty() {
-            println!("{} cannot be empty.", prompt);
+            println!("{prompt} cannot be empty.");
             continue;
         }
         return Ok(trimmed.to_string());
@@ -690,9 +598,8 @@ fn prompt_secret(theme: &ColorfulTheme, prompt: &str, current: Option<&String>) 
 }
 
 fn prompt_string_with_default(theme: &ColorfulTheme, label: &str, current: &str) -> Result<String> {
-    let prompt = format!("{label} [{current}]");
     let value: String = Input::with_theme(theme)
-        .with_prompt(prompt)
+        .with_prompt(format!("{label} [{current}]"))
         .allow_empty(true)
         .interact_text()?;
 
@@ -714,18 +621,19 @@ fn prompt_language_choice(
         .clone()
         .unwrap_or_else(|| fallback.to_string());
 
-    let prompt = format!("Language code (ISO 639-1, e.g. en, es, auto) [{current}]");
     let value: String = Input::with_theme(theme)
-        .with_prompt(prompt)
+        .with_prompt(format!(
+            "Language code (ISO 639-1, e.g. en, es, auto) [{current}]"
+        ))
         .allow_empty(true)
         .interact_text()?;
 
     let trimmed = value.trim();
-    if trimmed.is_empty() {
-        whisper.language = Some(current);
+    whisper.language = Some(if trimmed.is_empty() {
+        current
     } else {
-        whisper.language = Some(trimmed.to_string());
-    }
+        trimmed.to_string()
+    });
     Ok(())
 }
 
@@ -747,11 +655,12 @@ fn prompt_required_path(
             .interact_text()?;
 
         let candidate = if value.trim().is_empty() {
-            if let Some(def) = &default {
-                def.clone()
-            } else {
-                println!("Value cannot be empty.");
-                continue;
+            match &default {
+                Some(def) => def.clone(),
+                None => {
+                    println!("Value cannot be empty.");
+                    continue;
+                }
             }
         } else {
             value.trim().to_string()
@@ -759,12 +668,8 @@ fn prompt_required_path(
 
         if validate_path(&candidate, require_file) {
             return Ok(candidate);
-        } else {
-            println!(
-                "Path '{}' does not exist or is not accessible. Please try again.",
-                candidate
-            );
         }
+        println!("Path '{candidate}' does not exist or is not accessible. Please try again.");
     }
 }
 
@@ -785,17 +690,6 @@ fn detect_default_binary(program: &str) -> Option<String> {
     which(program)
         .ok()
         .map(|path| path.to_string_lossy().to_string())
-}
-
-fn provider_config_from_whisper(whisper: &WhisperConfig) -> ProviderConfig {
-    ProviderConfig {
-        model: whisper.model.clone(),
-        model_path: whisper.model_path.clone(),
-        language: whisper.language.clone(),
-        command_path: whisper.command_path.clone(),
-        api_endpoint: whisper.api_endpoint.clone(),
-        api_key: whisper.api_key.clone(),
-    }
 }
 
 // ============================================================================
@@ -861,19 +755,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_provider_status_display() {
-        let status = ProviderStatus::Ready {
-            provider: "audetic-api".to_string(),
-            model: Some("base".to_string()),
-            language: Some("en".to_string()),
-        };
-        assert_eq!(provider_status_display(&status), "Ready");
-
-        let status = ProviderStatus::NotConfigured;
-        assert_eq!(provider_status_display(&status), "Not configured");
-    }
-
-    #[test]
     fn test_mask_secret() {
         assert_eq!(mask_secret(&None), "<not set>");
         assert_eq!(mask_secret(&Some("".to_string())), "<not set>");
@@ -882,30 +763,5 @@ mod tests {
             mask_secret(&Some("sk-1234567890abcdef".to_string())),
             "sk-1****ef"
         );
-    }
-
-    #[test]
-    fn test_get_provider_status() {
-        let mut whisper = WhisperConfig::default();
-
-        // Default has audetic-api which needs no extra config
-        let status = get_provider_status_from_config(&whisper).unwrap();
-        assert!(matches!(status, ProviderStatus::Ready { .. }));
-
-        // OpenAI API without key should error
-        whisper.provider = Some("openai-api".to_string());
-        whisper.api_key = None;
-        let status = get_provider_status_from_config(&whisper).unwrap();
-        assert!(matches!(status, ProviderStatus::ConfigError { .. }));
-
-        // OpenAI API with key is valid
-        whisper.api_key = Some("sk-test".to_string());
-        let status = get_provider_status_from_config(&whisper).unwrap();
-        // Note: This will likely still fail initialization as the API key is fake
-        // But it should at least pass validation
-        assert!(matches!(
-            status,
-            ProviderStatus::Ready { .. } | ProviderStatus::ConfigError { .. }
-        ));
     }
 }

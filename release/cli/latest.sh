@@ -146,9 +146,12 @@ echo "==> Verified sha256"
 
 tar -xzf "$TMP/$ARCHIVE" -C "$TMP"
 
-# On macOS the archive holds an Audetic.app bundle; the daemon lives at
-# Contents/MacOS/audetic and `audetic install` requires being invoked
-# from inside the bundle so it can derive the bundle root via current_exe.
+# The archive ships two binaries: the daemon `audeticd` and the standalone
+# CLI `audetic`. We hand off to `audeticd install`, which sets up the service
+# AND places the `audetic` CLI on PATH. On macOS both live inside the
+# Audetic.app bundle (Contents/MacOS/{audeticd,audetic}); `audeticd install`
+# must run from inside the bundle so it can derive the bundle root via
+# current_exe.
 case "$TARGET" in
   macos-*)
     BUNDLE="$(find "$TMP" -maxdepth 3 -type d -name 'Audetic.app' | head -n1)"
@@ -156,20 +159,20 @@ case "$TARGET" in
       echo "Archive missing Audetic.app" >&2
       exit 1
     }
-    BINARY="$BUNDLE/Contents/MacOS/audetic"
+    BINARY="$BUNDLE/Contents/MacOS/audeticd"
     ;;
   *)
-    BINARY="$(find "$TMP" -maxdepth 3 -type f -name 'audetic' -perm -u+x | head -n1)"
+    BINARY="$(find "$TMP" -maxdepth 3 -type f -name 'audeticd' -perm -u+x | head -n1)"
     ;;
 esac
 
 [[ -x "$BINARY" ]] || {
-  echo "Archive missing audetic binary" >&2
+  echo "Archive missing audeticd binary" >&2
   exit 1
 }
 
-# Hand off to `audetic install` — the binary owns service setup, readiness
-# probe, and opening the UI in the default browser.
+# Hand off to `audeticd install` — the daemon owns service setup, the readiness
+# probe, placing the `audetic` CLI on PATH, and opening the UI in the browser.
 INSTALL_ARGS=()
 $NO_LAUNCH && INSTALL_ARGS+=(--no-launch)
 "$BINARY" install "${INSTALL_ARGS[@]}"

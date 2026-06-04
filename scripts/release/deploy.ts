@@ -489,7 +489,8 @@ async function buildTarget(targetId: string, rustTarget: string) {
 /// trip if notarization is disabled.
 async function assembleAndNotarizeBundle(targetId: string, rustTarget: string) {
 	const targetDir = path.join(ROOT_DIR, "target", rustTarget, "release");
-	const binaryPath = path.join(targetDir, "audetic");
+	const daemonPath = path.join(targetDir, "audeticd");
+	const cliPath = path.join(targetDir, "audetic");
 	const appPath = path.join(targetDir, "Audetic.app");
 	const contents = path.join(appPath, "Contents");
 	const macos = path.join(contents, "MacOS");
@@ -503,7 +504,8 @@ async function assembleAndNotarizeBundle(targetId: string, rustTarget: string) {
 		"crates/audetic/macos/audetic.entitlements",
 	);
 
-	await assertPath(binaryPath, "compiled binary");
+	await assertPath(daemonPath, "compiled daemon binary");
+	await assertPath(cliPath, "compiled CLI binary");
 	await assertPath(infoPlistSrc, "Info.plist");
 	await assertPath(entitlements, "entitlements file");
 
@@ -512,10 +514,15 @@ async function assembleAndNotarizeBundle(targetId: string, rustTarget: string) {
 	await mkdir(macos, { recursive: true });
 	await mkdir(resources, { recursive: true });
 	await copyFile(infoPlistSrc, path.join(contents, "Info.plist"));
-	await copyFile(binaryPath, path.join(macos, "audetic"));
+	// The bundle's main executable is the daemon; the slim `audetic` CLI rides
+	// along so `audeticd install` can symlink it onto PATH.
+	await copyFile(daemonPath, path.join(macos, "audeticd"));
+	await copyFile(cliPath, path.join(macos, "audetic"));
 	await Bun.write(path.join(contents, "PkgInfo"), "APPL????");
 
 	console.log(`==> [${targetId}] codesign (${config.macosSignIdentity})`);
+	// Sign the nested CLI first (no mic/screen entitlements), then the bundle.
+	await $`codesign --force --sign ${config.macosSignIdentity} --options runtime --timestamp ${path.join(macos, "audetic")}`;
 	await $`codesign --force --sign ${config.macosSignIdentity} --options runtime --entitlements ${entitlements} --timestamp ${appPath}`;
 
 	if (config.macosSkipNotarize) {
@@ -557,19 +564,19 @@ async function packageTarget(
 		return packageTargetDarwin(version, targetId, rustTarget, tmpRoot);
 	}
 
-	const binaryPath = path.join(
-		ROOT_DIR,
-		"target",
-		rustTarget,
-		"release",
-		"audetic",
-	);
-	await assertPath(binaryPath, "compiled binary");
+	const releaseTargetDir = path.join(ROOT_DIR, "target", rustTarget, "release");
+	const daemonPath = path.join(releaseTargetDir, "audeticd");
+	const cliPath = path.join(releaseTargetDir, "audetic");
+	await assertPath(daemonPath, "compiled daemon binary");
+	await assertPath(cliPath, "compiled CLI binary");
 
 	const stageDir = path.join(tmpRoot, targetId);
 	await mkdir(stageDir, { recursive: true });
 
-	await copyFile(binaryPath, path.join(stageDir, "audetic"));
+	// Ship both: the daemon (`audeticd`) and the standalone CLI (`audetic`).
+	// `audeticd install` registers the service and symlinks the CLI onto PATH.
+	await copyFile(daemonPath, path.join(stageDir, "audeticd"));
+	await copyFile(cliPath, path.join(stageDir, "audetic"));
 	await assertPath(EXAMPLE_CONFIG, "example_config");
 	await copyFile(EXAMPLE_CONFIG, path.join(stageDir, "example_config.toml"));
 	await Bun.write(
@@ -577,7 +584,9 @@ async function packageTarget(
 		`Audetic ${version} (${targetId})
 
 Files:
-  audetic             - main binary (run \`./audetic install\` to set up systemd user unit)
+  audeticd            - daemon binary (run \`./audeticd install\` to set up the
+                        systemd user unit and put the audetic CLI on PATH)
+  audetic             - standalone CLI client (talks to the daemon's REST API)
   example_config.toml - starter configuration
 
 Installation instructions: https://install.audetic.ai/
@@ -631,8 +640,9 @@ async function packageTargetDarwin(
 
 Files:
   Audetic.app - signed + notarized macOS app bundle. Run
-                \`./Audetic.app/Contents/MacOS/audetic install\` to register
-                the LaunchAgent, or use the installer:
+                \`./Audetic.app/Contents/MacOS/audeticd install\` to register
+                the LaunchAgent (and put the audetic CLI on PATH), or use the
+                installer:
 
 Installation: https://install.audetic.ai/cli/latest.sh
 `,

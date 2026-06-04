@@ -10,8 +10,11 @@ use crate::normalizer::TranscriptionNormalizer;
 mod transcription_service;
 
 pub mod job_service;
-pub mod jobs_client;
 pub mod providers;
+
+// The jobs API client is shared with the standalone CLI; it lives in
+// `audetic-core` and is re-exported here as `crate::transcription::jobs_client`.
+pub use audetic_core::jobs_client;
 
 pub use providers::{
     AssemblyAIProvider, AudeticProvider, OpenAIProvider, OpenAIWhisperCliProvider,
@@ -142,7 +145,7 @@ pub enum ProviderStatus {
 }
 
 /// Result of testing a provider
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProviderTestResult {
     /// Whether the test succeeded
     pub success: bool,

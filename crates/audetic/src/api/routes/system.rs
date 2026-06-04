@@ -5,8 +5,8 @@
 //! so the user is prompted to install missing tools before they hit an
 //! in-band failure (e.g. starting a meeting only to have compression fail).
 
-use crate::cli::compression::check_ffmpeg_available;
 use crate::system::ffmpeg::{install_blocking, InstallProgress};
+use audetic_core::compression::check_ffmpeg_available;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},

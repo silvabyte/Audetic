@@ -9,7 +9,7 @@
     <key>CFBundleDisplayName</key>
     <string>Audetic</string>
     <key>CFBundleExecutable</key>
-    <string>audetic</string>
+    <string>audeticd</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>

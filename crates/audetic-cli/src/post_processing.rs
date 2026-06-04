@@ -7,8 +7,8 @@
 use anyhow::{bail, Context, Result};
 use serde_json::{json, Value};
 
-use crate::api::url::{api_url, paths, post_processing_job_path, post_processing_job_test_path};
-use crate::cli::args::{PostProcessingCliArgs, PostProcessingCommand};
+use crate::args::{PostProcessingCliArgs, PostProcessingCommand};
+use audetic_core::url::{api_url, paths, post_processing_job_path, post_processing_job_test_path};
 
 pub async fn handle_post_processing_command(args: PostProcessingCliArgs) -> Result<()> {
     match args.command {

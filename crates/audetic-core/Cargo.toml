@@ -1,0 +1,47 @@
+[package]
+name = "audetic-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+description = "Shared, daemon-independent building blocks for Audetic (config, URLs, the transcription jobs client, ffmpeg helpers, clipboard) used by both the daemon and the standalone CLI."
+license.workspace = true
+
+[features]
+# Adds `utoipa::ToSchema` derives to the DTOs that the daemon exposes over its
+# OpenAPI surface (e.g. `WhisperConfig` on the provider-config endpoints). The
+# slim CLI leaves this off so it never links utoipa.
+schema = ["dep:utoipa"]
+
+[dependencies]
+# Serialization / config
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+
+# Errors / logging
+anyhow = "1.0"
+tracing = "0.1"
+
+# Paths
+dirs = "5.0"
+
+# HTTP client (jobs API) + async file streaming
+reqwest = { version = "0.11", features = ["json", "multipart", "stream"] }
+tokio = { version = "1.35", features = ["fs"] }
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Process discovery (clipboard backends, binaries)
+which = "6.0"
+
+# Temp-file naming for compression output
+uuid = { version = "1.18.1", features = ["v4"] }
+
+# Bundled FFmpeg installer / resolver
+ffmpeg-sidecar = "2.5"
+
+# OpenAPI schema derives — optional, enabled by the daemon via `schema`.
+utoipa = { version = "5.4", optional = true }
+
+[dev-dependencies]
+# Used by the compression unit tests.
+tempfile = "3"

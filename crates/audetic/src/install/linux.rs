@@ -1,5 +1,6 @@
-//! Linux install: systemd user unit at `~/.config/systemd/user/audetic.service`,
-//! `enable --now`, readiness probe, `xdg-open` the UI.
+//! Linux install: systemd user unit at `~/.config/systemd/user/audeticd.service`,
+//! `enable --now`, readiness probe, `xdg-open` the UI. Also places the standalone
+//! `audetic` CLI on PATH (`~/.local/bin/audetic`).
 
 use super::{wait_for_daemon, InstallOptions};
 use crate::api::url;
@@ -10,20 +11,21 @@ use std::process::Command;
 use std::time::Duration;
 
 const SERVICE_TEMPLATE: &str = include_str!("audetic.service.tmpl");
-const SERVICE_NAME: &str = "audetic.service";
+const SERVICE_NAME: &str = "audeticd.service";
 
 pub async fn run(opts: InstallOptions) -> Result<()> {
     let paths = InstallPaths::resolve()?;
     let app_url = url::app_url();
 
-    println!("→ Installing audetic as a systemd user service");
+    println!("→ Installing audeticd as a systemd user service");
     place_binary(&paths)?;
+    place_cli();
     ensure_runtime_dirs(&paths)?;
     write_unit(&paths)?;
     daemon_reload()?;
     enable_and_start()?;
     wait_for_daemon(Duration::from_secs(15)).await?;
-    println!("✓ audetic.service is active");
+    println!("✓ audeticd.service is active");
 
     if opts.no_launch {
         println!("  Open {app_url} in your browser to finish onboarding.");
@@ -55,7 +57,7 @@ impl InstallPaths {
 
         let data_dir = data.join("audetic");
         let installed_dir = data_dir.join("bin");
-        let installed_binary = installed_dir.join("audetic");
+        let installed_binary = installed_dir.join("audeticd");
         let systemd_unit = config.join("systemd").join("user").join(SERVICE_NAME);
         let config_dir = config.join("audetic");
 
@@ -96,9 +98,21 @@ fn place_binary(paths: &InstallPaths) -> Result<()> {
                 paths.installed_binary.display()
             )
         })?;
-        set_executable(&paths.installed_binary)?;
+        super::set_executable(&paths.installed_binary)?;
     }
     Ok(())
+}
+
+/// Best-effort: copy the standalone `audetic` CLI (shipped next to `audeticd`
+/// in the release archive) onto PATH. Delegates to the shared placement helper.
+fn place_cli() {
+    let Ok(current) = std::env::current_exe() else {
+        return;
+    };
+    let Some(source) = current.parent().map(|dir| dir.join("audetic")) else {
+        return;
+    };
+    super::place_cli_on_path(&source);
 }
 
 fn write_unit(paths: &InstallPaths) -> Result<()> {
@@ -149,17 +163,6 @@ fn open_browser(url: &str) -> Result<()> {
     if !status.success() {
         bail!("`xdg-open {url}` exited with {status}");
     }
-    Ok(())
-}
-
-fn set_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)
-        .with_context(|| format!("Failed to stat {}", path.display()))?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms)
-        .with_context(|| format!("Failed to chmod {}", path.display()))?;
     Ok(())
 }
 

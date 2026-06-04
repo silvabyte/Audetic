@@ -40,6 +40,10 @@ use super::routes::{
         // Provider
         provider::get_config,
         provider::get_status,
+        provider::get_raw_config,
+        provider::set_raw_config,
+        provider::reset_config,
+        provider::run_test,
         // System
         system::get_deps,
         system::start_install_ffmpeg,
@@ -89,6 +93,9 @@ use super::routes::{
         // Provider
         crate::transcription::ProviderInfo,
         crate::transcription::ProviderStatus,
+        crate::transcription::ProviderTestResult,
+        crate::config::WhisperConfig,
+        provider::ProviderTestRequest,
         // System
         system::SystemDeps,
         system::InstallPhase,
@@ -136,3 +143,63 @@ use super::routes::{
     ),
 )]
 pub struct ApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::ApiDoc;
+    use crate::api::url::{api_url, paths};
+    use utoipa::OpenApi;
+
+    /// utoipa requires a literal in the `servers(url = ...)` macro, so we can't
+    /// reference `api::url::API_PREFIX` there directly. This test catches the
+    /// case where the two drift apart. (Lives in the daemon — `audetic-core`,
+    /// which owns the url module, has no access to the OpenAPI doc.)
+    #[test]
+    fn openapi_servers_url_matches_api_url() {
+        let doc = ApiDoc::openapi();
+        let server_url = doc
+            .servers
+            .as_ref()
+            .and_then(|s| s.first())
+            .map(|s| s.url.clone())
+            .expect("OpenAPI doc must declare at least one server");
+
+        // Server URL is the base (no path suffix), so we compare against `api_url("")`.
+        assert_eq!(
+            server_url,
+            api_url(""),
+            "OpenAPI servers URL drifted from api::url::api_url(\"\"). \
+             Update either api/docs.rs servers() or audetic_core::url to match."
+        );
+    }
+
+    /// Every `paths::*` constant that names a well-known endpoint must
+    /// correspond to an operation in the OpenAPI spec. If you rename a route or
+    /// drop a path const without updating the other side, this fails loudly.
+    #[test]
+    fn well_known_paths_exist_in_openapi_spec() {
+        let doc = ApiDoc::openapi();
+        let spec_paths: std::collections::HashSet<String> =
+            doc.paths.paths.keys().cloned().collect();
+
+        for known in [
+            paths::VERSION,
+            paths::TOGGLE,
+            paths::MEETINGS_TOGGLE,
+            paths::MEETINGS_IMPORT,
+            paths::POST_PROCESSING_JOBS,
+            paths::POST_PROCESSING_EVENTS,
+            paths::PROVIDER,
+            paths::PROVIDER_STATUS,
+            paths::PROVIDER_CONFIG,
+            paths::PROVIDER_RESET,
+            paths::PROVIDER_TEST,
+        ] {
+            assert!(
+                spec_paths.contains(known),
+                "audetic_core::url::paths references \"{known}\" but the OpenAPI \
+                 spec has no such operation. Spec paths: {spec_paths:?}"
+            );
+        }
+    }
+}

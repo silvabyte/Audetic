@@ -36,6 +36,19 @@ pub mod paths {
     pub const MEETINGS_IMPORT: &str = "/meetings/import";
     pub const POST_PROCESSING_JOBS: &str = "/post-processing/jobs";
     pub const POST_PROCESSING_EVENTS: &str = "/post-processing/events";
+    pub const PROVIDER: &str = "/provider";
+    pub const PROVIDER_STATUS: &str = "/provider/status";
+    pub const PROVIDER_CONFIG: &str = "/provider/config";
+    pub const PROVIDER_RESET: &str = "/provider/reset";
+    pub const PROVIDER_TEST: &str = "/provider/test";
+    pub const HISTORY: &str = "/history";
+    pub const LOGS: &str = "/logs";
+    pub const KEYBIND_STATUS: &str = "/keybind/status";
+    pub const KEYBIND_INSTALL: &str = "/keybind/install";
+    pub const KEYBIND: &str = "/keybind";
+    pub const UPDATE_CHECK: &str = "/update/check";
+    pub const UPDATE_INSTALL: &str = "/update/install";
+    pub const UPDATE_AUTO: &str = "/update/auto";
 }
 
 /// Path to one job: `POST_PROCESSING_JOBS/{id}`.
@@ -76,59 +89,5 @@ mod tests {
     #[test]
     fn app_url_formats_correctly() {
         assert_eq!(app_url(), "http://127.0.0.1:3737/");
-    }
-
-    /// utoipa requires a literal in the `servers(url = ...)` macro,
-    /// so we can't reference [`API_PREFIX`] there directly. This test
-    /// catches the case where the two drift apart.
-    #[test]
-    fn openapi_servers_url_matches_api_url() {
-        use crate::api::docs::ApiDoc;
-        use utoipa::OpenApi;
-
-        let doc = ApiDoc::openapi();
-        let server_url = doc
-            .servers
-            .as_ref()
-            .and_then(|s| s.first())
-            .map(|s| s.url.clone())
-            .expect("OpenAPI doc must declare at least one server");
-
-        // Server URL is the base (no path suffix), so we compare
-        // against `api_url("")`.
-        assert_eq!(
-            server_url,
-            api_url(""),
-            "OpenAPI servers URL drifted from api::url::api_url(\"\"). \
-             Update either api/docs.rs servers() or api::url to match."
-        );
-    }
-
-    /// Every `paths::*` constant must correspond to an operation in
-    /// the OpenAPI spec. If you rename a route or drop a path const
-    /// without updating the other side, this fails loudly.
-    #[test]
-    fn well_known_paths_exist_in_openapi_spec() {
-        use crate::api::docs::ApiDoc;
-        use utoipa::OpenApi;
-
-        let doc = ApiDoc::openapi();
-        let spec_paths: std::collections::HashSet<String> =
-            doc.paths.paths.keys().cloned().collect();
-
-        for known in [
-            paths::VERSION,
-            paths::TOGGLE,
-            paths::MEETINGS_TOGGLE,
-            paths::MEETINGS_IMPORT,
-            paths::POST_PROCESSING_JOBS,
-            paths::POST_PROCESSING_EVENTS,
-        ] {
-            assert!(
-                spec_paths.contains(known),
-                "api::url::paths references \"{known}\" but the OpenAPI \
-                 spec has no such operation. Spec paths: {spec_paths:?}"
-            );
-        }
     }
 }

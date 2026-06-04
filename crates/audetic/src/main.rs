@@ -1,17 +1,44 @@
 //TODO:AGENT: why is this needed? can drop a comment explaining this
 #![allow(clippy::arc_with_non_send_sync)]
 
+//! `audeticd` — the Audetic daemon.
+//!
+//! With no subcommand it runs the long-lived service (audio capture, the HTTP
+//! API on 127.0.0.1:3737, and the bundled web UI). The only subcommand is
+//! `install`, which bootstraps the platform service (systemd user unit on
+//! Linux, LaunchAgent on macOS) and places the standalone `audetic` CLI on
+//! PATH. `install` deliberately lives here rather than in the slim CLI because
+//! on macOS it must run from inside the `Audetic.app` bundle so TCC permission
+//! attribution lands on the bundle's cdhash.
+//!
+//! Day-to-day commands (meeting, history, transcribe, provider, …) live in the
+//! separate `audetic` binary, which talks to this daemon over its REST API.
+
 use anyhow::Result;
-use audetic::{
-    app,
-    cli::{
-        handle_history_command, handle_install_command, handle_keybind_command,
-        handle_logs_command, handle_meeting_command, handle_post_processing_command,
-        handle_provider_command, handle_transcribe_command, handle_update_command, Cli, CliCommand,
-    },
-};
-use clap::Parser;
+use audetic::{app, install};
+use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+
+#[derive(Parser)]
+#[command(name = "audeticd", version, about = "The Audetic voice-to-text daemon")]
+struct Cli {
+    /// Enable verbose (debug) logging.
+    #[arg(short, long, global = true)]
+    verbose: bool,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Install audetic as a background service and put the `audetic` CLI on PATH.
+    Install {
+        /// Don't open the web UI in a browser after install.
+        #[arg(long)]
+        no_launch: bool,
+    },
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -25,48 +52,9 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Some(CliCommand::Version) => {
-            println!("Audetic {}", env!("CARGO_PKG_VERSION"));
-            return Ok(());
+        Some(Command::Install { no_launch }) => {
+            install::run(install::InstallOptions { no_launch }).await
         }
-        Some(CliCommand::Update(args)) => {
-            handle_update_command(args).await?;
-            return Ok(());
-        }
-        Some(CliCommand::Provider(args)) => {
-            handle_provider_command(args)?;
-            return Ok(());
-        }
-        Some(CliCommand::History(args)) => {
-            handle_history_command(args)?;
-            return Ok(());
-        }
-        Some(CliCommand::Logs(args)) => {
-            handle_logs_command(args)?;
-            return Ok(());
-        }
-        Some(CliCommand::Keybind(args)) => {
-            handle_keybind_command(args)?;
-            return Ok(());
-        }
-        Some(CliCommand::Transcribe(args)) => {
-            handle_transcribe_command(args).await?;
-            return Ok(());
-        }
-        Some(CliCommand::Meeting(args)) => {
-            handle_meeting_command(args).await?;
-            return Ok(());
-        }
-        Some(CliCommand::PostProcessing(args)) => {
-            handle_post_processing_command(args).await?;
-            return Ok(());
-        }
-        Some(CliCommand::Install(args)) => {
-            handle_install_command(args).await?;
-            return Ok(());
-        }
-        None => {}
+        None => app::run_service().await,
     }
-
-    app::run_service().await
 }

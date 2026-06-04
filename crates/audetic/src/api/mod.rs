@@ -13,7 +13,10 @@ pub mod docs;
 pub mod error;
 pub mod routes;
 pub mod static_assets;
-pub mod url;
+
+// The API URL surface lives in `audetic-core` so the CLI can build daemon URLs
+// without depending on the daemon. Re-exported here as `crate::api::url`.
+pub use audetic_core::url;
 
 use crate::config::Config;
 use crate::post_processing::PostProcessingService;

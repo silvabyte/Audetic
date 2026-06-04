@@ -7,10 +7,14 @@ description.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "audetic"
+name = "audeticd"
 path = "src/main.rs"
 
 [dependencies]
+# Shared, daemon-independent building blocks (config, URLs, jobs client,
+# ffmpeg, clipboard). `schema` adds the utoipa derives the API surface needs.
+audetic-core = { path = "../audetic-core", features = ["schema"] }
+
 # Async runtime
 tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }

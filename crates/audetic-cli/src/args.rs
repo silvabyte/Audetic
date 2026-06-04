@@ -32,8 +32,6 @@ pub enum CliCommand {
     Meeting(MeetingCliArgs),
     /// Manage post-processing jobs (run commands on daemon events)
     PostProcessing(PostProcessingCliArgs),
-    /// Install audetic as a systemd user service and open the UI
-    Install(InstallCliArgs),
 }
 
 #[derive(ClapArgs, Debug)]
@@ -108,13 +106,6 @@ pub enum PostProcessingCommand {
     },
     /// List the supported event kinds
     Events,
-}
-
-#[derive(ClapArgs, Debug)]
-pub struct InstallCliArgs {
-    /// Skip opening the web UI in a browser after install
-    #[arg(long)]
-    pub no_launch: bool,
 }
 
 #[derive(ClapArgs, Debug)]
