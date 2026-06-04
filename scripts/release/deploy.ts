@@ -58,11 +58,36 @@ if (!config.targets.length) {
 	process.exit(1);
 }
 
+// Pick the [program, build-subcommand] for a target.
+//   - macOS targets always build natively (CoreAudio/CoreGraphics can't be
+//     cross-compiled).
+//   - A linux-* target can't be built natively from a non-linux host — macOS has
+//     no GNU linker/glibc, and the daemon links real system libraries (ALSA,
+//     liblzma, sqlite, wayland, xcb). The durable way to supply all of those is
+//     Docker-based `cross`, whose container apt-installs them (see Cross.toml).
+//     So linux-from-non-linux is routed through `cross` automatically — no need
+//     to remember USE_CROSS=1.
+//   - USE_CROSS=1 forces `cross` for every non-macOS target regardless of host.
+// Prereqs on a fresh Mac: Docker running + `cross` from git main (the published
+// 0.2.5 is incompatible with rustup >= 1.28). See `make help` / README.
+function builderFor(targetId: string): [string, string] {
+	if (targetId.startsWith("macos-")) {
+		return ["cargo", "build"];
+	}
+	const needsCross =
+		config.useCross ||
+		(targetId.startsWith("linux-") && process.platform !== "linux");
+	return needsCross ? ["cross", "build"] : ["cargo", "build"];
+}
+
 console.log("==> Audetic release");
 console.log(`Targets: ${config.targets.join(", ")}`);
 console.log(`Dry run: ${config.dryRun ? "yes" : "no"}`);
 
-await ensureCommands([config.useCross ? "cross" : "cargo", "tar"]);
+// Fail fast with a clear message if a chosen builder's tool is missing, instead
+// of a cryptic mid-build error on a fresh machine.
+const needCross = config.targets.some((t) => builderFor(t)[0] === "cross");
+await ensureCommands(["cargo", "tar", ...(needCross ? ["cross"] : [])]);
 if (!config.allowDirty && !config.dryRun) {
 	await assertCleanGit();
 }
@@ -452,13 +477,11 @@ async function buildTarget(targetId: string, rustTarget: string) {
 		);
 	}
 
-	const builder = config.useCross && !targetId.startsWith("macos-")
-		? "cross"
-		: "cargo";
+	const [program, buildCmd] = builderFor(targetId);
 	const featureArgs = config.extraFeatures
 		? ["--features", config.extraFeatures]
 		: [];
-	const label = `${builder} build --release --target ${rustTarget}${
+	const label = `${program} ${buildCmd} --release --target ${rustTarget}${
 		featureArgs.length ? ` --features ${config.extraFeatures}` : ""
 	}`;
 	console.log(`==> [${targetId}] ${label}`);
@@ -470,11 +493,11 @@ async function buildTarget(targetId: string, rustTarget: string) {
 	// installed) embed the host-built dist via include_dir!.
 	const env = { ...process.env, AUDETIC_SKIP_UI_BUILD: "1" };
 	if (featureArgs.length) {
-		await $`${builder} build --release --target ${rustTarget} --features ${config.extraFeatures}`.env(
+		await $`${program} ${buildCmd} --release --target ${rustTarget} --features ${config.extraFeatures}`.env(
 			env,
 		);
 	} else {
-		await $`${builder} build --release --target ${rustTarget}`.env(env);
+		await $`${program} ${buildCmd} --release --target ${rustTarget}`.env(env);
 	}
 
 	if (targetId.startsWith("macos-")) {

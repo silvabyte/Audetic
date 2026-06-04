@@ -1,0 +1,32 @@
+# Cross-compilation config for `cross` (https://github.com/cross-rs/cross).
+#
+# `make deploy` (and deploy-stable/beta) builds the Linux release artifacts on a
+# macOS host via `cross`, which runs cargo inside a Linux Docker container that
+# carries the full GNU toolchain. The default cross images are a minimal Ubuntu,
+# so the daemon's system library dependencies have to be apt-installed into the
+# container before the build. Each `-dev` package below maps to a `*-sys` crate
+# in the tree:
+#
+#   pkg-config              - how the *-sys crates locate the libs below
+#   libasound2-dev          - alsa-sys      (cpal audio backend)
+#   liblzma-dev             - lzma-sys      (xz2, model/archive decompression)
+#   libsqlite3-dev          - libsqlite3-sys (rusqlite, meetings DB)
+#   libwayland-dev          - wayland-sys   (wlroots clipboard/screencopy)
+#   libxcb*-dev             - x11rb         (X11 clipboard fallback)
+#   libssl-dev              - NOT needed: reqwest uses rustls, not OpenSSL.
+#
+# The cross x86_64 image is itself an amd64 Ubuntu, so these are plain native
+# apt packages (no multiarch gymnastics needed) for the linux-x86_64-gnu target.
+
+[target.x86_64-unknown-linux-gnu]
+pre-build = [
+    "apt-get update && apt-get install --assume-yes --no-install-recommends pkg-config libasound2-dev liblzma-dev libsqlite3-dev libwayland-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev",
+]
+
+# For the aarch64 Linux target the libraries must come from the arm64 mirror, so
+# enable multiarch and install the arm64 (`:$CROSS_DEB_ARCH`) variants.
+[target.aarch64-unknown-linux-gnu]
+pre-build = [
+    "dpkg --add-architecture $CROSS_DEB_ARCH",
+    "apt-get update && apt-get install --assume-yes --no-install-recommends pkg-config libasound2-dev:$CROSS_DEB_ARCH liblzma-dev:$CROSS_DEB_ARCH libsqlite3-dev:$CROSS_DEB_ARCH libwayland-dev:$CROSS_DEB_ARCH libxcb1-dev:$CROSS_DEB_ARCH libxcb-render0-dev:$CROSS_DEB_ARCH libxcb-shape0-dev:$CROSS_DEB_ARCH libxcb-xfixes0-dev:$CROSS_DEB_ARCH",
+]

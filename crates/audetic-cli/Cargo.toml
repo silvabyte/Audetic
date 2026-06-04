@@ -18,7 +18,7 @@ audetic-core = { path = "../audetic-core" }
 # Async runtime + HTTP client for talking to the daemon and the jobs API.
 tokio = { version = "1.35", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
-reqwest = { version = "0.11", features = ["json", "multipart", "stream"] }
+reqwest = { version = "0.11", default-features = false, features = ["json", "multipart", "stream", "rustls-tls"] }
 
 # CLI args + interactive prompts.
 clap = { version = "4.4", features = ["derive"] }
