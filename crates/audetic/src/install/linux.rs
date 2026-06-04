@@ -98,66 +98,21 @@ fn place_binary(paths: &InstallPaths) -> Result<()> {
                 paths.installed_binary.display()
             )
         })?;
-        set_executable(&paths.installed_binary)?;
+        super::set_executable(&paths.installed_binary)?;
     }
     Ok(())
 }
 
 /// Best-effort: copy the standalone `audetic` CLI (shipped next to `audeticd`
-/// in the release archive) onto PATH at `~/.local/bin/audetic`. Never fails the
-/// install — if the CLI isn't found alongside the daemon, we just print a hint.
+/// in the release archive) onto PATH. Delegates to the shared placement helper.
 fn place_cli() {
     let Ok(current) = std::env::current_exe() else {
         return;
     };
-    let source = match current.parent().map(|dir| dir.join("audetic")) {
-        Some(p) if p.exists() => p,
-        _ => {
-            println!(
-                "  · Standalone `audetic` CLI not found next to the daemon; skipping PATH install."
-            );
-            return;
-        }
-    };
-
-    let target_dir =
-        dirs::executable_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local").join("bin")));
-    let Some(target_dir) = target_dir else {
+    let Some(source) = current.parent().map(|dir| dir.join("audetic")) else {
         return;
     };
-    let target = target_dir.join("audetic");
-
-    if fs::create_dir_all(&target_dir).is_err() {
-        println!(
-            "  · Could not create {}; skipping CLI install.",
-            target_dir.display()
-        );
-        return;
-    }
-
-    match fs::copy(&source, &target) {
-        Ok(_) => {
-            let _ = set_executable(&target);
-            println!("  · Installed `audetic` CLI → {}", target.display());
-            if !on_path(&target_dir) {
-                println!(
-                    "    Note: {} is not on your PATH. Add it to use `audetic` directly.",
-                    target_dir.display()
-                );
-            }
-        }
-        Err(err) => println!(
-            "  · Could not install `audetic` CLI to {} ({err}); the daemon is still installed.",
-            target.display()
-        ),
-    }
-}
-
-/// Whether `dir` appears in the `PATH` environment variable.
-fn on_path(dir: &Path) -> bool {
-    std::env::var_os("PATH")
-        .map(|paths| std::env::split_paths(&paths).any(|p| p == dir))
-        .unwrap_or(false)
+    super::place_cli_on_path(&source);
 }
 
 fn write_unit(paths: &InstallPaths) -> Result<()> {
@@ -208,17 +163,6 @@ fn open_browser(url: &str) -> Result<()> {
     if !status.success() {
         bail!("`xdg-open {url}` exited with {status}");
     }
-    Ok(())
-}
-
-fn set_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(path)
-        .with_context(|| format!("Failed to stat {}", path.display()))?
-        .permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(path, perms)
-        .with_context(|| format!("Failed to chmod {}", path.display()))?;
     Ok(())
 }
 

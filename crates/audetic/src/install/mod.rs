@@ -7,6 +7,7 @@
 
 use crate::api::url;
 use anyhow::{bail, Context, Result};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 pub struct InstallOptions {
@@ -31,6 +32,81 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+
+/// Copy the standalone `audetic` CLI onto PATH at `~/.local/bin/audetic`
+/// (`$XDG_BIN_HOME` if set; `dirs::executable_dir()` is `None` on macOS and
+/// falls back to `~/.local/bin`). Everything stays under `$HOME` — no sudo,
+/// never `/usr/local/bin` — matching the installer's contract. Best-effort:
+/// prints a hint and returns without failing the install if the CLI can't be
+/// found or placed.
+///
+/// `source` is the CLI binary shipped with the daemon — next to `audeticd` in
+/// the Linux archive, or inside the installed `Audetic.app` bundle on macOS.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn place_cli_on_path(source: &Path) {
+    if !source.exists() {
+        println!(
+            "  · Standalone `audetic` CLI not found at {}; skipping PATH install.",
+            source.display()
+        );
+        return;
+    }
+
+    let Some(target_dir) =
+        dirs::executable_dir().or_else(|| dirs::home_dir().map(|h| h.join(".local").join("bin")))
+    else {
+        return;
+    };
+    let target = target_dir.join("audetic");
+
+    if std::fs::create_dir_all(&target_dir).is_err() {
+        println!(
+            "  · Could not create {}; skipping CLI install.",
+            target_dir.display()
+        );
+        return;
+    }
+
+    // Replace any stale copy so re-installs/upgrades refresh the CLI.
+    let _ = std::fs::remove_file(&target);
+    match std::fs::copy(source, &target) {
+        Ok(_) => {
+            let _ = set_executable(&target);
+            println!("  · Installed `audetic` CLI → {}", target.display());
+            if !on_path(&target_dir) {
+                println!(
+                    "    Note: {} is not on your PATH. Add it to use `audetic` directly.",
+                    target_dir.display()
+                );
+            }
+        }
+        Err(err) => println!(
+            "  · Could not install `audetic` CLI to {} ({err}); the daemon is still installed.",
+            target.display()
+        ),
+    }
+}
+
+/// Whether `dir` appears in the `PATH` environment variable.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn on_path(dir: &Path) -> bool {
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).any(|p| p == dir))
+        .unwrap_or(false)
+}
+
+/// `chmod 0o755` — the copied CLI must be executable.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn set_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = std::fs::metadata(path)
+        .with_context(|| format!("Failed to stat {}", path.display()))?
+        .permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms)
+        .with_context(|| format!("Failed to chmod {}", path.display()))?;
+    Ok(())
+}
 
 /// Poll the daemon's HTTP API until it responds OK or the timeout fires.
 ///
