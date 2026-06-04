@@ -13,7 +13,7 @@ AUTO_COMMIT ?= 1
 
 .PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix quality deploy deploy-beta deploy-stable \
         ui-install ui-dev ui-build ui-preview ui-typecheck codegen \
-        installer-lint \
+        installer-lint deploy-setup \
         macos-sign macos-sign-release macos-app macos-app-debug \
         macos-notarize macos-tarball macos-release
 
@@ -44,6 +44,8 @@ help:
 	@echo "                      CONTINUE_ON_ERROR=1)"
 	@echo "  make deploy-beta  - Deploy to beta channel (convenience for CHANNEL=beta)"
 	@echo "  make deploy-stable- Deploy to stable channel (convenience for CHANNEL=stable)"
+	@echo "  make deploy-setup - One-time setup to build Linux artifacts from macOS"
+	@echo "                      (installs 'cross' from git + checks Docker; needed once per machine)"
 	@echo ""
 	@echo "  Web UI (apps/web-ui — bundled into the daemon binary):"
 	@echo "  make ui-install        - Install web UI dependencies (bun)"
@@ -108,6 +110,18 @@ deploy-beta:
 deploy-stable:
 	@echo "🚀 Deploying to stable channel..."
 	@$(MAKE) deploy CHANNEL=stable
+
+# One-time per-machine setup for building the Linux release artifacts from macOS.
+# The deploy routes linux-* targets through `cross` (Docker), which builds inside
+# a Linux container that carries the GNU toolchain + system libs (see Cross.toml).
+# The published cross 0.2.5 is incompatible with rustup >= 1.28, so install from
+# git main (pinned). Requires Docker Desktop installed and running.
+deploy-setup:
+	@command -v docker >/dev/null || { echo "✗ Docker not found — install Docker Desktop first"; exit 1; }
+	@docker info >/dev/null 2>&1 || { echo "✗ Docker daemon not running — start Docker Desktop"; exit 1; }
+	@rustup target add x86_64-unknown-linux-gnu
+	cargo install cross --git https://github.com/cross-rs/cross --locked
+	@echo "✓ deploy prerequisites ready (cross + Docker). Run 'make deploy-stable'."
 
 # Service management
 run:
