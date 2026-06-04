@@ -1,0 +1,13 @@
+{
+  "version": "0.1.26",
+  "channel": "stable",
+  "release_date": "2026-06-04T15:37:20.538Z",
+  "notes_url": "https://install.audetic.ai/cli/releases/0.1.26/notes.md",
+  "targets": {
+    "linux-x86_64-gnu": {
+      "archive": "audetic-0.1.26-linux-x86_64-gnu.tar.gz",
+      "sha256": "65cfc4551fcb21aadcebf0b4d5a69900184ad298f6f18f5b76d7cd795541defc",
+      "size": 11376940
+    }
+  }
+}
