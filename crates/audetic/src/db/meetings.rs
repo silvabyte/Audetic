@@ -50,6 +50,19 @@ impl MeetingRepository {
         Ok(())
     }
 
+    /// Mark a meeting as awaiting review after recording stopped, persisting
+    /// the captured duration. The audio WAV is on disk but has not yet been
+    /// sent for transcription; the user confirms (and optionally trims) it via
+    /// `MeetingMachine::confirm`.
+    pub fn set_review(conn: &Connection, id: i64, duration_seconds: i64) -> Result<()> {
+        conn.execute(
+            "UPDATE meetings SET status = ?1, duration_seconds = ?2 WHERE id = ?3",
+            params![MeetingPhase::Review.as_str(), duration_seconds, id],
+        )
+        .context("Failed to mark meeting for review")?;
+        Ok(())
+    }
+
     /// Update the meeting's `audio_path`. The compression pipeline replaces
     /// the original WAV with an MP3 next to it; this keeps the DB row pointing
     /// at the file that actually exists on disk so retries can find it.

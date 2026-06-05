@@ -122,9 +122,20 @@ pub enum MeetingCommand {
         #[arg(short, long)]
         title: Option<String>,
     },
-    /// Stop recording the current meeting
+    /// Stop recording the current meeting (pauses for review before transcribing)
     Stop,
-    /// Cancel the in-progress meeting without transcribing
+    /// Confirm the recording awaiting review and send it for transcription,
+    /// optionally trimming the start/end first. Times accept `SS`, `MM:SS`,
+    /// or `HH:MM:SS` (fractional seconds allowed, e.g. `1:05.5`).
+    Confirm {
+        /// Trim the recording to start at this time (keeps original start if omitted)
+        #[arg(long)]
+        start: Option<String>,
+        /// Trim the recording to end at this time (keeps original end if omitted)
+        #[arg(long)]
+        end: Option<String>,
+    },
+    /// Cancel the in-progress or under-review meeting without transcribing
     Cancel,
     /// Show current meeting recording status
     Status,

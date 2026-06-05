@@ -7,6 +7,7 @@ type OrbState =
   | "offline"
   | "error"
   | "meeting-active"
+  | "meeting-review"
   | "meeting-pipeline"
   | "dictation-rec"
   | "dictation-proc"
@@ -31,6 +32,12 @@ const orbStyles: Record<
   "meeting-active": {
     container: "bg-primary/15 ring-2 ring-primary/60",
     glyph: "text-primary",
+    pulse: true,
+    spinRing: false,
+  },
+  "meeting-review": {
+    container: "bg-amber-500/15 ring-2 ring-amber-500/60",
+    glyph: "text-amber-500",
     pulse: true,
     spinRing: false,
   },
@@ -104,6 +111,7 @@ function computeState(store: ReturnType<typeof useStore>): OrbState {
   if (!store.daemonReachable) return "offline";
   if (store.meetings.active) return "meeting-active";
   const mp = store.meetings.phase;
+  if (mp === "review") return "meeting-review";
   if (mp === "compressing" || mp === "transcribing" || mp === "running_hook") {
     return "meeting-pipeline";
   }
@@ -127,6 +135,8 @@ function describe(state: OrbState, store: ReturnType<typeof useStore>): string {
         ? `${title} · ${formatDuration(dur)}`
         : title;
     }
+    case "meeting-review":
+      return "Recording stopped — review and trim before transcribing.";
     case "meeting-pipeline":
       return `Meeting: ${meetingPhaseLabel(store.meetings.phase).toLowerCase()}…`;
     case "dictation-rec":

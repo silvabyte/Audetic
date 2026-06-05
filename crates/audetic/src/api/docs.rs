@@ -56,11 +56,13 @@ use super::routes::{
         // Meetings
         meetings::start_meeting,
         meetings::stop_meeting,
+        meetings::confirm_meeting,
         meetings::cancel_meeting,
         meetings::toggle_meeting,
         meetings::meeting_status,
         meetings::list_meetings,
         meetings::get_meeting,
+        meetings::meeting_audio,
         meetings::retry_meeting,
         meetings::import_meeting,
         // Post-processing jobs
@@ -109,6 +111,7 @@ use super::routes::{
         // Meetings
         meetings::MeetingStartRequest,
         meetings::MeetingStartResponse,
+        meetings::MeetingConfirmRequest,
         meetings::MeetingStopResponse,
         meetings::MeetingToggleResponse,
         meetings::MeetingStatusResponse,

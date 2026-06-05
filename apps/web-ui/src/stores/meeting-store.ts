@@ -15,6 +15,7 @@ export type MeetingDetail = components["schemas"]["MeetingDetailResponse"];
 export type MeetingPhase =
   | "idle"
   | "recording"
+  | "review"
   | "compressing"
   | "transcribing"
   | "running_hook"
@@ -104,6 +105,31 @@ export class MeetingStore {
   async stopMeeting(): Promise<void> {
     try {
       const { error } = await daemon.POST("/meetings/stop", {});
+      if (error) throw new Error(formatError(error));
+    } catch (e) {
+      runInAction(() => {
+        this.lastError = e instanceof Error ? e.message : String(e);
+      });
+    } finally {
+      this.schedulePoll(0);
+    }
+  }
+
+  /**
+   * Confirm the recording awaiting review and send it for transcription,
+   * optionally trimming to `[startSeconds, endSeconds)`. Either bound omitted
+   * keeps that edge. Seconds are sent as floats so the daemon can trim the
+   * lossless WAV sample-accurately.
+   */
+  async confirmMeeting(
+    startSeconds?: number,
+    endSeconds?: number,
+  ): Promise<void> {
+    try {
+      const body: { start_seconds?: number; end_seconds?: number } = {};
+      if (typeof startSeconds === "number") body.start_seconds = startSeconds;
+      if (typeof endSeconds === "number") body.end_seconds = endSeconds;
+      const { error } = await daemon.POST("/meetings/confirm", { body });
       if (error) throw new Error(formatError(error));
     } catch (e) {
       runInAction(() => {
@@ -303,6 +329,7 @@ export class MeetingStore {
       // list may have changed (title saved, meeting recorded, etc.).
       if (
         (prevPhase === "recording" ||
+          prevPhase === "review" ||
           prevPhase === "compressing" ||
           prevPhase === "transcribing" ||
           prevPhase === "running_hook") &&
@@ -354,6 +381,7 @@ function normalizePhase(raw: string): MeetingPhase {
   const known: MeetingPhase[] = [
     "idle",
     "recording",
+    "review",
     "compressing",
     "transcribing",
     "running_hook",

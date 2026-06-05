@@ -60,8 +60,13 @@ regex = "1.10"
 # HTTP server. `multipart` enables the file-upload extractor used by
 # `POST /api/meetings/import`.
 axum = { version = "0.7", features = ["multipart"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors"] }
+# `util` provides `ServiceExt::oneshot`, used to drive `ServeFile` from the
+# meeting-audio handler. 0.5 unifies with the tower that tower-http pulls in.
+tower = { version = "0.5", features = ["util"] }
+# `fs` provides `ServeFile`, used to stream meeting audio (with HTTP Range
+# support so the browser <audio> element can seek) from
+# `GET /api/meetings/:id/audio`.
+tower-http = { version = "0.5", features = ["cors", "fs"] }
 
 # OpenAPI spec generation
 utoipa = { version = "5.4", features = ["axum_extras"] }

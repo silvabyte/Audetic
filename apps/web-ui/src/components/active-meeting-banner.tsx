@@ -5,10 +5,12 @@ import { Button } from "@/components/ui/button";
 import { useStore } from "@/stores/root-store";
 import type { CaptureState, MeetingPhase } from "@/stores/meeting-store";
 import { MEETING_INTENTS } from "@/routes/meetings";
+import { MeetingReviewPanel } from "@/components/meeting-review-panel";
 import { cn } from "@/lib/utils";
 
 const PHASE_ORDER: MeetingPhase[] = [
   "recording",
+  "review",
   "compressing",
   "transcribing",
   "running_hook",
@@ -18,6 +20,7 @@ const PHASE_ORDER: MeetingPhase[] = [
 const PHASE_LABEL: Record<MeetingPhase, string> = {
   idle: "Idle",
   recording: "Recording",
+  review: "Review",
   compressing: "Compressing",
   transcribing: "Transcribing",
   running_hook: "Running hook",
@@ -38,6 +41,19 @@ export function ActiveMeetingBanner() {
     <Observer>
       {() => {
         const { meetings } = store;
+
+        // A stopped meeting waiting for the user to trim/confirm gets its own
+        // richer panel (audio playback + trim controls).
+        if (meetings.phase === "review" && meetings.meetingId !== null) {
+          return (
+            <MeetingReviewPanel
+              meetingId={meetings.meetingId}
+              durationSeconds={meetings.durationSeconds ?? 0}
+              title={meetings.title}
+            />
+          );
+        }
+
         const live =
           meetings.active ||
           meetings.phase === "compressing" ||

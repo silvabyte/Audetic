@@ -154,6 +154,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/meetings/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["confirm_meeting"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/meetings/import": {
         parameters: {
             query?: never;
@@ -256,6 +272,29 @@ export interface paths {
             cookie?: never;
         };
         get: operations["get_meeting"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/meetings/{id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stream a meeting's audio file for in-browser playback. Used by the review
+         *     UI so the user can listen back before choosing trim points. Resolves the
+         *     file actually on disk — the row points at the `.wav` while review is
+         *     pending and the `.mp3` after processing. Served via `ServeFile`, which
+         *     honours HTTP Range requests so the `<audio>` element can seek.
+         */
+        get: operations["meeting_audio"];
         put?: never;
         post?: never;
         delete?: never;
@@ -376,6 +415,48 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/provider/config": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Get the raw `WhisperConfig` (including any API key) so the CLI wizard can
+         *     pre-fill existing values. Loopback-only, same trust boundary as reading
+         *     `~/.config/audetic/config.toml` directly.
+         */
+        get: operations["get_provider_raw_config"];
+        /**
+         * Replace the provider configuration. Backs up the existing `config.toml`
+         *     before writing.
+         */
+        put: operations["set_raw_config"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/provider/reset": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reset the provider configuration to defaults. Backs up first. */
+        post: operations["reset_config"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/provider/status": {
         parameters: {
             query?: never;
@@ -387,6 +468,23 @@ export interface paths {
         get: operations["get_provider_status"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/provider/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Test the currently-configured provider, optionally against an audio file. */
+        post: operations["run_test"];
         delete?: never;
         options?: never;
         head?: never;
@@ -720,6 +818,22 @@ export interface components {
             /** @description Recent transcription entries */
             transcriptions: components["schemas"]["HistoryEntry"][];
         };
+        /**
+         * @description Request body for the confirm endpoint. Both bounds are optional; omitting
+         *     one keeps that edge of the recording. Both omitted sends it untouched.
+         */
+        MeetingConfirmRequest: {
+            /**
+             * Format: double
+             * @description New end of the recording, in seconds (clamped to the recording).
+             */
+            end_seconds?: number | null;
+            /**
+             * Format: double
+             * @description New start of the recording, in seconds (clamped to the recording).
+             */
+            start_seconds?: number | null;
+        };
         /** @description Full meeting record including transcript text when available. */
         MeetingDetailResponse: {
             audio_path: string;
@@ -871,6 +985,28 @@ export interface components {
             /** @enum {string} */
             status: "not_configured";
         };
+        /** @description Request body for `POST /provider/test`. */
+        ProviderTestRequest: {
+            /**
+             * @description Optional path to an audio file to transcribe. When omitted, the daemon
+             *     only validates that the configured provider initializes.
+             */
+            file?: string | null;
+        };
+        /** @description Result of testing a provider */
+        ProviderTestResult: {
+            /**
+             * Format: double
+             * @description Time taken in seconds
+             */
+            duration_secs: number;
+            /** @description Error message (if failed) */
+            error?: string | null;
+            /** @description Whether the test succeeded */
+            success: boolean;
+            /** @description Transcription result (if successful) */
+            transcription?: string | null;
+        };
         /**
          * @description Default (non-waybar) recording status snapshot. The waybar variant
          *     is a different shape — see the union response on the handler.
@@ -961,6 +1097,22 @@ export interface components {
         VersionInfo: {
             name: string;
             version: string;
+        };
+        WhisperConfig: {
+            /** @default null */
+            api_endpoint: string | null;
+            /** @default null */
+            api_key: string | null;
+            /** @default null */
+            command_path: string | null;
+            /** @default en */
+            language: string | null;
+            /** @default base */
+            model: string | null;
+            /** @default null */
+            model_path: string | null;
+            /** @default audetic-api */
+            provider: string | null;
         };
     };
     responses: never;
@@ -1187,6 +1339,44 @@ export interface operations {
             };
         };
     };
+    confirm_meeting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MeetingConfirmRequest"];
+            };
+        };
+        responses: {
+            /** @description Meeting confirmed; transcription queued */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeetingStopResponse"];
+                };
+            };
+            /** @description Invalid trim range */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No meeting awaiting review */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     import_meeting: {
         parameters: {
             query?: never;
@@ -1289,7 +1479,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Meeting stopped and transcription queued */
+            /** @description Meeting stopped; awaiting review before transcription */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1353,6 +1543,34 @@ export interface operations {
                 };
             };
             /** @description Meeting not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    meeting_audio: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Meeting id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Audio bytes (supports Range) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Meeting or audio file not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1630,6 +1848,70 @@ export interface operations {
             };
         };
     };
+    get_provider_raw_config: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Raw whisper/provider config */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhisperConfig"];
+                };
+            };
+        };
+    };
+    set_raw_config: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WhisperConfig"];
+            };
+        };
+        responses: {
+            /** @description The persisted provider config */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhisperConfig"];
+                };
+            };
+        };
+    };
+    reset_config: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The reset provider config */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WhisperConfig"];
+                };
+            };
+        };
+    };
     get_provider_status: {
         parameters: {
             query?: never;
@@ -1646,6 +1928,30 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProviderStatus"];
+                };
+            };
+        };
+    };
+    run_test: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ProviderTestRequest"];
+            };
+        };
+        responses: {
+            /** @description Provider test result */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderTestResult"];
                 };
             };
         };

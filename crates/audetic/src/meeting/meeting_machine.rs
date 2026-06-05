@@ -8,7 +8,7 @@
 //! processing are forwarded to the singleton `MeetingStatusHandle` and the
 //! `Indicator` via `LiveProgressObserver`.
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use hound::{WavSpec, WavWriter};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -208,11 +208,12 @@ impl MeetingMachine {
 
     /// Stop the meeting recording.
     ///
-    /// Halts audio sources, mixes the captured samples, writes the WAV file,
-    /// and spawns a background task to handle compression + transcription +
-    /// post-processing dispatch. Returns `MeetingStopResult` immediately
-    /// after the WAV is written so the HTTP caller unblocks within
-    /// milliseconds.
+    /// Halts audio sources, mixes the captured samples, and writes the WAV
+    /// file, then transitions the meeting into the `Review` phase. The
+    /// recording is **not** sent for transcription yet — the user reviews it
+    /// (and may trim the start/end) and then calls `confirm`, or discards it
+    /// with `cancel`. Returns `MeetingStopResult` immediately after the WAV is
+    /// written so the HTTP caller unblocks within milliseconds.
     pub async fn stop(&mut self) -> Result<MeetingStopResult> {
         let state = self.status.get().await;
         if state.phase != MeetingPhase::Recording {
@@ -225,7 +226,6 @@ impl MeetingMachine {
         let meeting_id = state.meeting_id.unwrap_or(0);
         let duration_seconds = state.duration_seconds().unwrap_or(0);
         let audio_path = state.audio_path.clone().unwrap_or_default();
-        let title = state.title.clone();
 
         // Stop audio sources and collect samples
         let mic_samples = match self.mic_source.stop() {
@@ -282,25 +282,100 @@ impl MeetingMachine {
         // Write WAV file
         self.write_wav(&audio_path, &mixed, target_rate)?;
 
-        // Transition to Compressing phase and notify the user that processing
-        // has started. Both happen before the background task so the status is
-        // coherent when the HTTP handler returns.
+        // Pause for user review instead of transcribing immediately. Persist
+        // the captured duration and freeze the live timer so the UI shows the
+        // recording's length (and the trim end bound). The user proceeds via
+        // `confirm` (optionally trimming) or discards via `cancel`.
+        if let Ok(conn) = db::init_db() {
+            if let Err(e) = MeetingRepository::set_review(&conn, meeting_id, duration_seconds as i64)
+            {
+                warn!(
+                    "Failed to persist review status for meeting {}: {}",
+                    meeting_id, e
+                );
+            }
+        }
+        self.status.enter_review(duration_seconds).await;
+        if let Err(e) = self.indicator.show_review().await {
+            warn!("Failed to show review indicator: {}", e);
+        }
+
+        Ok(MeetingStopResult {
+            meeting_id,
+            duration_seconds,
+        })
+    }
+
+    /// Confirm a meeting that is awaiting review and send it for
+    /// transcription, optionally trimming the recording to the half-open range
+    /// `[start_seconds, end_seconds)` first. Either bound may be omitted to
+    /// keep that edge; both omitted sends the recording untouched. Trimming
+    /// slices the lossless WAV by sample index, so the cut is exactly
+    /// sample-accurate. Returns an error unless a meeting is currently
+    /// awaiting review.
+    pub async fn confirm(
+        &mut self,
+        start_seconds: Option<f64>,
+        end_seconds: Option<f64>,
+    ) -> Result<MeetingStopResult> {
+        let state = self.status.get().await;
+        if state.phase != MeetingPhase::Review {
+            bail!(
+                "No meeting awaiting review (current phase: {})",
+                state.phase.as_str()
+            );
+        }
+
+        let meeting_id = state.meeting_id.unwrap_or(0);
+        let audio_path = state.audio_path.clone().unwrap_or_default();
+        let title = state.title.clone();
+        let mut duration_seconds = state.duration_seconds().unwrap_or(0);
+
+        // Apply the trim if either boundary was provided.
+        if start_seconds.is_some() || end_seconds.is_some() {
+            let trimmed = Self::trim_wav(&audio_path, start_seconds, end_seconds)
+                .context("Failed to trim meeting audio")?;
+            duration_seconds = trimmed.round().max(0.0) as u64;
+            info!(
+                "Meeting {} trimmed to {:.3}s (start={:?}, end={:?})",
+                meeting_id, trimmed, start_seconds, end_seconds
+            );
+        }
+
+        self.spawn_processing(meeting_id, audio_path, title, duration_seconds)
+            .await;
+
+        Ok(MeetingStopResult {
+            meeting_id,
+            duration_seconds,
+        })
+    }
+
+    /// Build and spawn the compress → transcribe → dispatch pipeline for a
+    /// meeting whose WAV is already on disk. Transitions the live status to
+    /// `Compressing` and shows the processing indicator first so the status is
+    /// coherent the moment this returns; the pipeline itself runs detached.
+    /// `LiveProgressObserver` forwards later phase transitions to the
+    /// singleton status handle and the indicator.
+    async fn spawn_processing(
+        &self,
+        meeting_id: i64,
+        audio_path: PathBuf,
+        title: Option<String>,
+        duration_seconds: u64,
+    ) {
         self.status.set_phase(MeetingPhase::Compressing).await;
         if let Err(e) = self.indicator.show_processing().await {
             warn!("Failed to show processing indicator: {}", e);
         }
 
-        // Spawn the compress → transcribe → dispatch pipeline so the caller
-        // doesn't have to wait for it. `LiveProgressObserver` forwards phase
-        // transitions to the singleton status handle and the Hyprland
-        // indicator; the pipeline itself is oblivious to either.
         let observer = Arc::new(LiveProgressObserver::new(
             self.status.clone(),
             self.indicator.clone(),
         ));
         let args = ProcessingArgs {
             meeting_id,
-            audio_path: audio_path.clone(),
+            audio_path,
             title,
             duration_seconds,
             services: ProcessingServices {
@@ -310,23 +385,19 @@ impl MeetingMachine {
             observer,
         };
         tokio::spawn(async move { process_meeting(args).await });
-
-        Ok(MeetingStopResult {
-            meeting_id,
-            duration_seconds,
-        })
     }
 
-    /// Cancel a meeting in progress without running the transcription pipeline.
+    /// Cancel a meeting without running the transcription pipeline.
     ///
-    /// Halts audio sources, discards captured samples, deletes any partial
-    /// WAV file, and marks the meeting as `cancelled` in the DB. Returns an
-    /// error if no meeting is currently recording.
+    /// Works while still `Recording` (discards captured samples) or while
+    /// awaiting `Review` (discards the recorded WAV). Deletes any WAV on disk
+    /// and marks the meeting `cancelled` in the DB. Returns an error if no
+    /// meeting is recording or awaiting review.
     pub async fn cancel(&mut self) -> Result<MeetingStopResult> {
         let state = self.status.get().await;
-        if state.phase != MeetingPhase::Recording {
+        if !matches!(state.phase, MeetingPhase::Recording | MeetingPhase::Review) {
             bail!(
-                "No meeting recording in progress to cancel (current phase: {})",
+                "No meeting recording or awaiting review to cancel (current phase: {})",
                 state.phase.as_str()
             );
         }
@@ -335,18 +406,17 @@ impl MeetingMachine {
         let duration_seconds = state.duration_seconds().unwrap_or(0);
         let audio_path = state.audio_path.clone().unwrap_or_default();
 
-        // Stop sources and throw away whatever samples we collected.
-        let _ = self.mic_source.stop();
-        let _ = self.system_source.stop();
+        // Stop sources only if still recording — from Review they were already
+        // halted by `stop()` and the WAV is finalized on disk.
+        if state.phase == MeetingPhase::Recording {
+            let _ = self.mic_source.stop();
+            let _ = self.system_source.stop();
+        }
 
-        // If the partial WAV file was created (unlikely since we write on
-        // stop, but we may in the future), clean it up.
+        // Remove the recorded WAV if present (always present in Review).
         if audio_path.exists() {
             if let Err(e) = std::fs::remove_file(&audio_path) {
-                warn!(
-                    "Failed to remove partial meeting WAV {:?}: {}",
-                    audio_path, e
-                );
+                warn!("Failed to remove meeting WAV {:?}: {}", audio_path, e);
             }
         }
 
@@ -413,6 +483,59 @@ impl MeetingMachine {
             samples.len()
         );
         Ok(())
+    }
+
+    /// Trim a mono float WAV in place to the half-open range
+    /// `[start_seconds, end_seconds)`. Missing bounds default to the start/end
+    /// of the file; out-of-range values are clamped. Because the source is
+    /// lossless PCM, slicing by sample index (`round(seconds * sample_rate)`)
+    /// is exactly sample-accurate — there is no ffmpeg keyframe seeking
+    /// involved. Returns the trimmed duration in seconds.
+    fn trim_wav(path: &Path, start_seconds: Option<f64>, end_seconds: Option<f64>) -> Result<f64> {
+        let mut reader = hound::WavReader::open(path)
+            .with_context(|| format!("Failed to open WAV for trimming: {path:?}"))?;
+        let spec = reader.spec();
+        let sample_rate = spec.sample_rate;
+
+        let samples: Vec<f32> = reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<f32>, _>>()
+            .context("Failed to read WAV samples")?;
+        let total = samples.len();
+
+        let to_index = |secs: f64| -> usize {
+            ((secs.max(0.0) * sample_rate as f64).round() as usize).min(total)
+        };
+        let start_idx = start_seconds.map(to_index).unwrap_or(0);
+        let end_idx = end_seconds.map(to_index).unwrap_or(total);
+
+        if start_idx >= end_idx {
+            bail!(
+                "Invalid trim range: start ({:?}s) is at or after end ({:?}s)",
+                start_seconds,
+                end_seconds
+            );
+        }
+
+        let trimmed = &samples[start_idx..end_idx];
+
+        let mut writer = WavWriter::create(path, spec)
+            .with_context(|| format!("Failed to rewrite trimmed WAV: {path:?}"))?;
+        for &sample in trimmed {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
+
+        info!(
+            "Trimmed WAV {:?}: {} → {} samples ([{}, {}))",
+            path,
+            total,
+            trimmed.len(),
+            start_idx,
+            end_idx
+        );
+
+        Ok(trimmed.len() as f64 / sample_rate as f64)
     }
 
     fn generate_audio_path(&self) -> PathBuf {
@@ -497,5 +620,84 @@ pub async fn retry_meeting_transcription(
                 let _ = MeetingRepository::fail(&conn, meeting_id, &error_msg, duration_seconds);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_test_wav(path: &Path, samples: &[f32], sample_rate: u32) {
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = WavWriter::create(path, spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn read_wav(path: &Path) -> Vec<f32> {
+        let mut reader = hound::WavReader::open(path).unwrap();
+        reader.samples::<f32>().map(|s| s.unwrap()).collect()
+    }
+
+    fn temp_wav_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "audetic-trim-test-{}.wav",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    #[test]
+    fn test_trim_wav_slices_by_sample_index() {
+        let sample_rate = 16000u32;
+        // 4 seconds of a ramp so we can assert exact sample boundaries.
+        let samples: Vec<f32> = (0..sample_rate * 4).map(|i| i as f32).collect();
+        let path = temp_wav_path();
+        write_test_wav(&path, &samples, sample_rate);
+
+        // Trim to [1.0s, 3.0s) → exactly 2 seconds == 32000 samples.
+        let dur = MeetingMachine::trim_wav(&path, Some(1.0), Some(3.0)).unwrap();
+        assert!((dur - 2.0).abs() < 1e-9);
+
+        let out = read_wav(&path);
+        assert_eq!(out.len(), (sample_rate * 2) as usize);
+        // First kept sample is index 16000, last is index 47999 of the ramp.
+        assert_eq!(out[0], sample_rate as f32);
+        assert_eq!(out[out.len() - 1], (sample_rate * 3 - 1) as f32);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_trim_wav_defaults_and_clamps_out_of_range_end() {
+        let sample_rate = 16000u32;
+        let samples: Vec<f32> = (0..sample_rate * 2).map(|i| i as f32).collect();
+        let path = temp_wav_path();
+        write_test_wav(&path, &samples, sample_rate);
+
+        // Only an end is given, past the end of the file → clamps to full length.
+        let dur = MeetingMachine::trim_wav(&path, None, Some(99.0)).unwrap();
+        assert!((dur - 2.0).abs() < 1e-9);
+        assert_eq!(read_wav(&path).len(), (sample_rate * 2) as usize);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_trim_wav_rejects_inverted_range() {
+        let sample_rate = 16000u32;
+        let samples: Vec<f32> = (0..sample_rate * 2).map(|i| i as f32).collect();
+        let path = temp_wav_path();
+        write_test_wav(&path, &samples, sample_rate);
+
+        assert!(MeetingMachine::trim_wav(&path, Some(1.5), Some(1.0)).is_err());
+
+        std::fs::remove_file(&path).ok();
     }
 }
