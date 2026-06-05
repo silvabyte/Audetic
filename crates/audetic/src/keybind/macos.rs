@@ -9,7 +9,7 @@
 use super::{InstallResult, KeybindStatus, UninstallResult};
 use crate::config::Config;
 use crate::hotkey::{self, HotkeyCommand, DEFAULT_HOTKEY};
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 /// Report whether the global hotkey is active (and how it reads) or disabled.
 pub fn get_status() -> Result<KeybindStatus> {
@@ -39,11 +39,16 @@ pub fn install(key: Option<&str>) -> Result<Option<InstallResult>> {
     // rejected with a clear error and leaves config untouched.
     let parsed = hotkey::parse_chord(&chord)?;
 
+    // Register on the live loop FIRST and only persist if the OS accepted it.
+    // On failure the previous (working) binding stays active and the error
+    // propagates to the caller — config, status, and the live hotkey can never
+    // disagree, and we never report success for a binding that isn't running.
+    hotkey::register_sync(parsed.hotkey)
+        .with_context(|| format!("Failed to register hotkey '{chord}'"))?;
+
     let mut cfg = Config::load()?;
     cfg.macos.hotkey = Some(chord);
     cfg.save()?;
-
-    hotkey::request(HotkeyCommand::Register(parsed.hotkey));
 
     Ok(Some(InstallResult {
         backup_path: None,

@@ -15,6 +15,7 @@
 
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use global_hotkey::hotkey::{Code, HotKey, Modifiers};
@@ -33,8 +34,14 @@ pub struct ParsedHotkey {
 
 /// Commands the keybind API sends to the running hotkey loop.
 pub enum HotkeyCommand {
-    /// Register `hotkey`, replacing any currently-registered one.
-    Register(HotKey),
+    /// Register `hotkey`, replacing any currently-registered one. The loop
+    /// registers the new binding *before* dropping the old one and reports the
+    /// outcome on `reply`, so a rejected hotkey (reserved / already taken)
+    /// leaves the previous binding intact and surfaces the error to the caller.
+    Register {
+        hotkey: HotKey,
+        reply: Sender<Result<(), String>>,
+    },
     /// Unregister the current hotkey (disable).
     Unregister,
 }
@@ -42,8 +49,9 @@ pub enum HotkeyCommand {
 /// Sender into the live [`run_main_loop`]. Set once the loop starts.
 static CONTROL_TX: OnceLock<Sender<HotkeyCommand>> = OnceLock::new();
 
-/// Send a command to the running hotkey loop. No-op (with a warning) if the
-/// loop hasn't started yet or has gone away.
+/// Send a fire-and-forget command to the running hotkey loop. No-op (with a
+/// warning) if the loop hasn't started yet or has gone away. Used for
+/// [`HotkeyCommand::Unregister`]; registration goes through [`register_sync`].
 pub fn request(cmd: HotkeyCommand) {
     match CONTROL_TX.get() {
         Some(tx) => {
@@ -53,6 +61,32 @@ pub fn request(cmd: HotkeyCommand) {
         }
         None => warn!("hotkey loop not started yet; command dropped"),
     }
+}
+
+/// Register `hotkey` on the live loop and wait for the result.
+///
+/// Returns `Err` if the loop isn't running, doesn't respond, or the OS rejects
+/// the hotkey — in which case the *previous* binding is left untouched. Callers
+/// (the install path) should only persist/report success when this returns
+/// `Ok`, so config, status, and the live binding never disagree.
+///
+/// Blocks the calling thread until the loop's next tick (≤ the run-loop slice),
+/// which is fine for a rare, user-initiated config change.
+pub fn register_sync(hotkey: HotKey) -> Result<()> {
+    let tx = CONTROL_TX
+        .get()
+        .ok_or_else(|| anyhow!("hotkey controller is not running"))?;
+    let (reply_tx, reply_rx) = mpsc::channel();
+    tx.send(HotkeyCommand::Register {
+        hotkey,
+        reply: reply_tx,
+    })
+    .map_err(|_| anyhow!("hotkey controller is gone"))?;
+
+    reply_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| anyhow!("hotkey controller did not respond"))?
+        .map_err(|e| anyhow!("could not register hotkey: {e}"))
 }
 
 /// Resolve the configured chord from config. `None` => disabled; `Some(chord)`
@@ -141,17 +175,33 @@ pub fn run_main_loop(rt: Handle, initial: Option<HotKey>) -> ! {
 
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
-                HotkeyCommand::Register(hk) => {
-                    if let Some(old) = current.take() {
-                        let _ = manager.unregister(old);
-                    }
-                    match manager.register(hk) {
-                        Ok(()) => {
-                            current = Some(hk);
-                            info!("re-registered global hotkey");
+                HotkeyCommand::Register { hotkey, reply } => {
+                    // Already the active binding — nothing to do (and re-registering
+                    // the same combo on this manager would spuriously fail).
+                    let result = if current == Some(hotkey) {
+                        Ok(())
+                    } else {
+                        // Register the NEW binding first; only drop the old one
+                        // once the new is live, so a rejected hotkey leaves the
+                        // previous (working) binding intact.
+                        match manager.register(hotkey) {
+                            Ok(()) => {
+                                if let Some(old) = current.replace(hotkey) {
+                                    let _ = manager.unregister(old);
+                                }
+                                info!("registered global hotkey");
+                                Ok(())
+                            }
+                            Err(e) => {
+                                error!(
+                                    "failed to register hotkey {hotkey:?}: {e}; \
+                                     keeping previous binding"
+                                );
+                                Err(e.to_string())
+                            }
                         }
-                        Err(e) => error!("failed to register hotkey: {e}"),
-                    }
+                    };
+                    let _ = reply.send(result);
                 }
                 HotkeyCommand::Unregister => {
                     if let Some(old) = current.take() {
