@@ -14,7 +14,7 @@
 //! hotkey in the UI takes effect without restarting the daemon.
 
 use std::sync::mpsc::{self, Sender};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -40,14 +40,45 @@ pub enum HotkeyCommand {
     /// leaves the previous binding intact and surfaces the error to the caller.
     Register {
         hotkey: HotKey,
+        /// Human-readable label (`⌘R`) published to [`live_status`] on success.
+        display: String,
         reply: Sender<Result<(), String>>,
     },
     /// Unregister the current hotkey (disable).
     Unregister,
 }
 
+/// What the loop has *actually* registered with the OS — published so the API
+/// reports the live state, not just what config says. The config and the live
+/// registration can diverge when the OS rejects a configured/default chord at
+/// startup (e.g. another app already owns it).
+#[derive(Debug, Clone)]
+pub enum LiveStatus {
+    /// A hotkey is registered and live; `display` is its label (`⌘R`).
+    Active { display: String },
+    /// No hotkey is registered (config disables it).
+    Disabled,
+    /// The configured chord could not be registered with the OS.
+    Failed { display: String, error: String },
+}
+
 /// Sender into the live [`run_main_loop`]. Set once the loop starts.
 static CONTROL_TX: OnceLock<Sender<HotkeyCommand>> = OnceLock::new();
+
+/// The loop's last-published registration outcome. `None` until the loop has
+/// run its startup registration.
+static LIVE_STATUS: OnceLock<Mutex<LiveStatus>> = OnceLock::new();
+
+fn publish_status(status: LiveStatus) {
+    let cell = LIVE_STATUS.get_or_init(|| Mutex::new(LiveStatus::Disabled));
+    *cell.lock().unwrap() = status;
+}
+
+/// The loop's actual registration state, or `None` if the loop hasn't published
+/// yet (e.g. queried in the brief window before startup registration completes).
+pub fn live_status() -> Option<LiveStatus> {
+    LIVE_STATUS.get().map(|m| m.lock().unwrap().clone())
+}
 
 /// Send a fire-and-forget command to the running hotkey loop. No-op (with a
 /// warning) if the loop hasn't started yet or has gone away. Used for
@@ -72,13 +103,14 @@ pub fn request(cmd: HotkeyCommand) {
 ///
 /// Blocks the calling thread until the loop's next tick (≤ the run-loop slice),
 /// which is fine for a rare, user-initiated config change.
-pub fn register_sync(hotkey: HotKey) -> Result<()> {
+pub fn register_sync(hotkey: HotKey, display: &str) -> Result<()> {
     let tx = CONTROL_TX
         .get()
         .ok_or_else(|| anyhow!("hotkey controller is not running"))?;
     let (reply_tx, reply_rx) = mpsc::channel();
     tx.send(HotkeyCommand::Register {
         hotkey,
+        display: display.to_string(),
         reply: reply_tx,
     })
     .map_err(|_| anyhow!("hotkey controller is gone"))?;
@@ -100,8 +132,9 @@ pub fn resolve_chord(cfg: &crate::config::Config) -> Option<String> {
 }
 
 /// Resolve the hotkey to register at startup, reading config. Returns `None`
-/// when the hotkey is disabled or the configured chord is invalid.
-pub fn initial_hotkey() -> Option<HotKey> {
+/// when the hotkey is disabled or the configured chord is invalid (the latter
+/// is published as a [`LiveStatus::Failed`] so the UI can surface it).
+pub fn initial_hotkey() -> Option<ParsedHotkey> {
     let cfg = match crate::config::Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -111,9 +144,13 @@ pub fn initial_hotkey() -> Option<HotKey> {
     };
     let chord = resolve_chord(&cfg)?;
     match parse_chord(&chord) {
-        Ok(p) => Some(p.hotkey),
+        Ok(p) => Some(p),
         Err(e) => {
             warn!("invalid macos hotkey {chord:?}: {e:#}");
+            publish_status(LiveStatus::Failed {
+                display: chord,
+                error: e.to_string(),
+            });
             None
         }
     }
@@ -124,11 +161,15 @@ pub fn initial_hotkey() -> Option<HotKey> {
 /// Pumps the CFRunLoop in short slices so Carbon can deliver hotkey presses,
 /// then drains both the hotkey-event channel (→ toggle dictation) and the
 /// control channel (→ re-register/unregister from the API).
-pub fn run_main_loop(rt: Handle, initial: Option<HotKey>) -> ! {
+pub fn run_main_loop(rt: Handle, initial: Option<ParsedHotkey>) -> ! {
     let manager = match GlobalHotKeyManager::new() {
         Ok(m) => m,
         Err(e) => {
             error!("failed to initialize global hotkey manager: {e}; hotkeys disabled");
+            publish_status(LiveStatus::Failed {
+                display: initial.map(|p| p.display).unwrap_or_default(),
+                error: format!("global hotkey manager unavailable: {e}"),
+            });
             park_forever();
         }
     };
@@ -139,16 +180,33 @@ pub fn run_main_loop(rt: Handle, initial: Option<HotKey>) -> ! {
     }
 
     let mut current: Option<HotKey> = None;
-    if let Some(hk) = initial {
-        match manager.register(hk) {
+    match initial {
+        Some(parsed) => match manager.register(parsed.hotkey) {
             Ok(()) => {
-                current = Some(hk);
+                current = Some(parsed.hotkey);
+                publish_status(LiveStatus::Active {
+                    display: parsed.display,
+                });
                 info!("registered global hotkey (toggles dictation)");
             }
-            Err(e) => error!("failed to register global hotkey: {e}"),
+            Err(e) => {
+                error!("failed to register global hotkey: {e}");
+                publish_status(LiveStatus::Failed {
+                    display: parsed.display,
+                    error: e.to_string(),
+                });
+            }
+        },
+        None => {
+            // `initial_hotkey` already published `Failed` for an invalid chord;
+            // only fall back to `Disabled` (and say so) when nothing else was.
+            if live_status().is_none() {
+                publish_status(LiveStatus::Disabled);
+                info!("global hotkey disabled");
+            } else {
+                warn!("global hotkey not registered — see prior error");
+            }
         }
-    } else {
-        info!("global hotkey disabled");
     }
 
     let toggle_url = audetic_core::url::api_url(audetic_core::url::paths::TOGGLE);
@@ -175,10 +233,15 @@ pub fn run_main_loop(rt: Handle, initial: Option<HotKey>) -> ! {
 
         while let Ok(cmd) = rx.try_recv() {
             match cmd {
-                HotkeyCommand::Register { hotkey, reply } => {
+                HotkeyCommand::Register {
+                    hotkey,
+                    display,
+                    reply,
+                } => {
                     // Already the active binding — nothing to do (and re-registering
                     // the same combo on this manager would spuriously fail).
                     let result = if current == Some(hotkey) {
+                        publish_status(LiveStatus::Active { display });
                         Ok(())
                     } else {
                         // Register the NEW binding first; only drop the old one
@@ -189,10 +252,12 @@ pub fn run_main_loop(rt: Handle, initial: Option<HotKey>) -> ! {
                                 if let Some(old) = current.replace(hotkey) {
                                     let _ = manager.unregister(old);
                                 }
+                                publish_status(LiveStatus::Active { display });
                                 info!("registered global hotkey");
                                 Ok(())
                             }
                             Err(e) => {
+                                // Keep the previous binding *and* its live status.
                                 error!(
                                     "failed to register hotkey {hotkey:?}: {e}; \
                                      keeping previous binding"
@@ -210,6 +275,7 @@ pub fn run_main_loop(rt: Handle, initial: Option<HotKey>) -> ! {
                             Err(e) => error!("failed to unregister hotkey: {e}"),
                         }
                     }
+                    publish_status(LiveStatus::Disabled);
                 }
             }
         }

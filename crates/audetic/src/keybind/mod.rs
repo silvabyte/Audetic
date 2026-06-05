@@ -91,6 +91,10 @@ pub enum KeybindStatus {
     NoConfig,
     /// macOS only: the global hotkey is turned off.
     Disabled,
+    /// macOS only: the configured hotkey could not be registered with the OS
+    /// (e.g. another app already owns the combination). `display_key` is the
+    /// chord that failed; `error` explains why.
+    Failed { display_key: String, error: String },
 }
 
 /// [`KeybindStatus`] plus the platform it came from. Flattened on the wire, so

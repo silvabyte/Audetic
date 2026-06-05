@@ -220,6 +220,28 @@ function KeybindStatusCard() {
                 </CardHeader>
               </Card>
             );
+          // macOS: the OS rejected the configured chord (e.g. already taken).
+          case "failed":
+            return (
+              <Card>
+                <CardHeader>
+                  <CardTitle className="text-base flex items-center gap-2">
+                    <XCircle className="h-4 w-4 text-destructive" />
+                    Couldn't register
+                  </CardTitle>
+                  <CardDescription>
+                    <kbd className="rounded border px-1.5 py-0.5 font-mono text-xs">
+                      {kb.display_key}
+                    </kbd>{" "}
+                    couldn't be registered — another app may already use it. Pick
+                    a different shortcut below.
+                    <span className="mt-1 block text-xs text-muted-foreground">
+                      {kb.error}
+                    </span>
+                  </CardDescription>
+                </CardHeader>
+              </Card>
+            );
           case "not_installed":
             return (
               <Card>

@@ -57,6 +57,19 @@ async fn status() -> Result<()> {
             println!("The global hotkey is turned off.");
             println!("Run 'audetic keybind install' to enable it (default ⌘R).");
         }
+        // macOS: the OS rejected the configured chord (e.g. already taken).
+        Some("failed") => {
+            println!("Status: NOT REGISTERED");
+            println!();
+            if let Some(display_key) = body.get("display_key").and_then(|v| v.as_str()) {
+                println!("Keybinding: {display_key} (could not be registered)");
+            }
+            if let Some(error) = body.get("error").and_then(|v| v.as_str()) {
+                println!("Reason: {error}");
+            }
+            println!();
+            println!("Another app may already use it. Run 'audetic keybind install <KEY>' to pick another.");
+        }
         Some("not_installed") => {
             println!("Status: NOT INSTALLED");
             println!();

@@ -8,21 +8,40 @@
 
 use super::{InstallResult, KeybindStatus, UninstallResult};
 use crate::config::Config;
-use crate::hotkey::{self, HotkeyCommand, DEFAULT_HOTKEY};
+use crate::hotkey::{self, HotkeyCommand, LiveStatus, DEFAULT_HOTKEY};
 use anyhow::{Context, Result};
 
-/// Report whether the global hotkey is active (and how it reads) or disabled.
+/// Report the global hotkey status.
+///
+/// Reflects the *live* registration the controller actually performed (not just
+/// config), so a chord the OS rejected at startup shows as `Failed` rather than
+/// a misleading `Installed`. Falls back to config in the brief window before the
+/// controller publishes its first result.
 pub fn get_status() -> Result<KeybindStatus> {
+    match hotkey::live_status() {
+        Some(LiveStatus::Active { display }) => Ok(KeybindStatus::Installed {
+            display_key: display,
+            command: None,
+            config_path: Some(config_path_string()?),
+        }),
+        Some(LiveStatus::Disabled) => Ok(KeybindStatus::Disabled),
+        Some(LiveStatus::Failed { display, error }) => Ok(KeybindStatus::Failed {
+            display_key: display,
+            error,
+        }),
+        // Controller hasn't published yet — fall back to the configured intent.
+        None => status_from_config(),
+    }
+}
+
+fn status_from_config() -> Result<KeybindStatus> {
     let cfg = Config::load()?;
     match hotkey::resolve_chord(&cfg) {
-        Some(chord) => {
-            let parsed = hotkey::parse_chord(&chord)?;
-            Ok(KeybindStatus::Installed {
-                display_key: parsed.display,
-                command: None,
-                config_path: Some(config_path_string()?),
-            })
-        }
+        Some(chord) => Ok(KeybindStatus::Installed {
+            display_key: hotkey::parse_chord(&chord)?.display,
+            command: None,
+            config_path: Some(config_path_string()?),
+        }),
         None => Ok(KeybindStatus::Disabled),
     }
 }
@@ -43,7 +62,7 @@ pub fn install(key: Option<&str>) -> Result<Option<InstallResult>> {
     // On failure the previous (working) binding stays active and the error
     // propagates to the caller — config, status, and the live hotkey can never
     // disagree, and we never report success for a binding that isn't running.
-    hotkey::register_sync(parsed.hotkey)
+    hotkey::register_sync(parsed.hotkey, &parsed.display)
         .with_context(|| format!("Failed to register hotkey '{chord}'"))?;
 
     let mut cfg = Config::load()?;

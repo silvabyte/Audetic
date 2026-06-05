@@ -817,6 +817,11 @@ export interface components {
         } | {
             /** @enum {string} */
             status: "disabled";
+        } | {
+            display_key: string;
+            error: string;
+            /** @enum {string} */
+            status: "failed";
         };
         /**
          * @description [`KeybindStatus`] plus the platform it came from. Flattened on the wire, so
