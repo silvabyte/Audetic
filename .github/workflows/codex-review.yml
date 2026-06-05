@@ -1,0 +1,157 @@
+name: Codex PR review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to review
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Run Codex review
+    permissions:
+      contents: read
+      pull-requests: read
+    # Hard gate. This is a public repo running on a self-hosted runner, so an
+    # untrusted PR must never reach the "checkout PR head + run codex" steps
+    # below — that would execute attacker-controlled code on the maintainer's
+    # Mac. Only PRs opened by `matsilva` (the maintainer's account; the repo
+    # owner is the `silvabyte` org, not a usable login here) are allowed, and
+    # only from same-repo branches. The workflow_dispatch path can only be
+    # triggered by collaborators with write access, and it is additionally
+    # author-gated inside codex-resolve-pr.ts (where the pull_request context
+    # is empty). Keep `matsilva` in sync with ALLOWED_PR_AUTHOR below.
+    if: >
+      (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.user.login == 'matsilva' &&
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.draft == false
+      ) ||
+      github.event_name == 'workflow_dispatch'
+    # Self-hosted Linux runner where the codex CLI is installed and already
+    # authenticated.
+    runs-on: [self-hosted, Linux]
+    outputs:
+      pr_number: ${{ steps.pr.outputs.number }}
+      review_body: ${{ steps.output.outputs.review_body }}
+    steps:
+      # Initial shallow checkout at the workflow ref so scripts/ci/ is on disk.
+      # The resolve step decides what to actually review; the second checkout
+      # below re-clones at the PR head_sha.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - name: Resolve PR context
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_PR_NUMBER: ${{ inputs.pr }}
+          # Only this account may have its PRs reviewed. Guards the
+          # workflow_dispatch path, where the job-level `if` above cannot see
+          # the PR author. Keep in sync with the `if` condition.
+          ALLOWED_PR_AUTHOR: matsilva
+        run: bun scripts/ci/codex-resolve-pr.ts
+
+      # Check the PR head out into a SEPARATE directory, never over the root.
+      # The root checkout (trusted, at the workflow ref) keeps owning the
+      # scripts/ci helpers we execute below; codex only *reads* this PR tree.
+      # If we let the PR head replace the root, `bun scripts/ci/codex-run.ts`
+      # would run the PR's copy of the helper — which breaks on any branch that
+      # predates, removes, or modifies these scripts.
+      - uses: actions/checkout@v4
+        if: steps.pr.outputs.skip != 'true'
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+          path: pr-head
+
+      - name: Verify PR base branch
+        if: steps.pr.outputs.skip != 'true'
+        working-directory: pr-head
+        env:
+          PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          git rev-parse --verify "origin/${PR_BASE_REF}"
+
+      - name: Run Codex
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          # Trusted helper (root checkout) drives codex against the PR tree.
+          PR_DIR: ${{ github.workspace }}/pr-head
+          PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+        run: bun scripts/ci/codex-run.ts
+
+      - name: Prepare review output
+        id: output
+        if: always()
+        env:
+          SKIP: ${{ steps.pr.outputs.skip }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: bun scripts/ci/codex-prepare-output.ts
+
+  comment:
+    name: Post sticky review comment
+    needs: review
+    if: always() && needs.review.outputs.pr_number != ''
+    runs-on: [self-hosted, Linux]
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Upsert PR comment
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.review.outputs.pr_number }}
+          REVIEW_BODY: ${{ needs.review.outputs.review_body }}
+        with:
+          script: |
+            const marker = '<!-- codex-pr-review -->';
+            const prNumber = Number(process.env.PR_NUMBER);
+            const reviewBody = process.env.REVIEW_BODY?.trim()
+              || 'Codex PR review did not produce output. Check the workflow logs.';
+            const body = [marker, '## Codex PR review', '', reviewBody].join('\n');
+
+            const { owner, repo } = context.repo;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
