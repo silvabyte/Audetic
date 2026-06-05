@@ -10,8 +10,10 @@
 //! thread**. The daemon's main thread is otherwise occupied by the Tokio
 //! runtime, so `main()` flips it: the async service runs on a worker thread and
 //! the main thread runs [`run_main_loop`]. The keybind API mutates the live
-//! registration through [`request`] (a channel into the loop), so changing the
-//! hotkey in the UI takes effect without restarting the daemon.
+//! registration through [`register_sync`] / [`unregister_sync`] (a channel into
+//! the loop that waits for the result), so changing the hotkey in the UI takes
+//! effect without restarting the daemon — and only reports success once the OS
+//! has actually accepted the change.
 
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Mutex, OnceLock};
@@ -44,8 +46,10 @@ pub enum HotkeyCommand {
         display: String,
         reply: Sender<Result<(), String>>,
     },
-    /// Unregister the current hotkey (disable).
-    Unregister,
+    /// Unregister the current hotkey (disable). Reports the outcome on `reply`
+    /// so a failed unregister isn't reported as "disabled" — the old hotkey may
+    /// still be live.
+    Unregister { reply: Sender<Result<(), String>> },
 }
 
 /// What the loop has *actually* registered with the OS — published so the API
@@ -80,18 +84,24 @@ pub fn live_status() -> Option<LiveStatus> {
     LIVE_STATUS.get().map(|m| m.lock().unwrap().clone())
 }
 
-/// Send a fire-and-forget command to the running hotkey loop. No-op (with a
-/// warning) if the loop hasn't started yet or has gone away. Used for
-/// [`HotkeyCommand::Unregister`]; registration goes through [`register_sync`].
-pub fn request(cmd: HotkeyCommand) {
-    match CONTROL_TX.get() {
-        Some(tx) => {
-            if tx.send(cmd).is_err() {
-                warn!("hotkey loop is gone; command dropped");
-            }
-        }
-        None => warn!("hotkey loop not started yet; command dropped"),
-    }
+/// Unregister the live hotkey and wait for the result.
+///
+/// Returns `Err` if the loop isn't running, doesn't respond, or the OS fails to
+/// unregister — in which case the previous binding is left intact (and still
+/// reported as active). Callers should only persist/report "disabled" when this
+/// returns `Ok`.
+pub fn unregister_sync() -> Result<()> {
+    let tx = CONTROL_TX
+        .get()
+        .ok_or_else(|| anyhow!("hotkey controller is not running"))?;
+    let (reply_tx, reply_rx) = mpsc::channel();
+    tx.send(HotkeyCommand::Unregister { reply: reply_tx })
+        .map_err(|_| anyhow!("hotkey controller is gone"))?;
+
+    reply_rx
+        .recv_timeout(Duration::from_secs(2))
+        .map_err(|_| anyhow!("hotkey controller did not respond"))?
+        .map_err(|e| anyhow!("could not unregister hotkey: {e}"))
 }
 
 /// Register `hotkey` on the live loop and wait for the result.
@@ -268,14 +278,31 @@ pub fn run_main_loop(rt: Handle, initial: Option<ParsedHotkey>) -> ! {
                     };
                     let _ = reply.send(result);
                 }
-                HotkeyCommand::Unregister => {
-                    if let Some(old) = current.take() {
-                        match manager.unregister(old) {
-                            Ok(()) => info!("global hotkey disabled"),
-                            Err(e) => error!("failed to unregister hotkey: {e}"),
+                HotkeyCommand::Unregister { reply } => {
+                    let result = match current {
+                        Some(old) => match manager.unregister(old) {
+                            Ok(()) => {
+                                current = None;
+                                publish_status(LiveStatus::Disabled);
+                                info!("global hotkey disabled");
+                                Ok(())
+                            }
+                            Err(e) => {
+                                // Old hotkey is still live — keep tracking it and
+                                // its status; don't claim we're disabled.
+                                error!(
+                                    "failed to unregister hotkey: {e}; \
+                                     keeping previous binding"
+                                );
+                                Err(e.to_string())
+                            }
+                        },
+                        None => {
+                            publish_status(LiveStatus::Disabled);
+                            Ok(())
                         }
-                    }
-                    publish_status(LiveStatus::Disabled);
+                    };
+                    let _ = reply.send(result);
                 }
             }
         }

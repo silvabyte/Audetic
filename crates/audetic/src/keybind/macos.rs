@@ -8,7 +8,7 @@
 
 use super::{InstallResult, KeybindStatus, UninstallResult};
 use crate::config::Config;
-use crate::hotkey::{self, HotkeyCommand, LiveStatus, DEFAULT_HOTKEY};
+use crate::hotkey::{self, LiveStatus, DEFAULT_HOTKEY};
 use anyhow::{Context, Result};
 
 /// Report the global hotkey status.
@@ -58,16 +58,25 @@ pub fn install(key: Option<&str>) -> Result<Option<InstallResult>> {
     // rejected with a clear error and leaves config untouched.
     let parsed = hotkey::parse_chord(&chord)?;
 
+    // Load config first: a load failure aborts before any live change, and we
+    // need the previous binding for rollback if saving fails below.
+    let mut cfg = Config::load()?;
+    let previous = hotkey::resolve_chord(&cfg);
+
     // Register on the live loop FIRST and only persist if the OS accepted it.
-    // On failure the previous (working) binding stays active and the error
-    // propagates to the caller — config, status, and the live hotkey can never
-    // disagree, and we never report success for a binding that isn't running.
+    // On registration failure the previous (working) binding stays active and
+    // the error propagates — we never report success for a non-running binding.
     hotkey::register_sync(parsed.hotkey, &parsed.display)
         .with_context(|| format!("Failed to register hotkey '{chord}'"))?;
 
-    let mut cfg = Config::load()?;
-    cfg.macos.hotkey = Some(chord);
-    cfg.save()?;
+    // Persist. If the save fails (read-only config, full disk, …), roll the live
+    // registration back to the previous binding so the live hotkey, status, and
+    // the still-on-disk config all agree.
+    cfg.macos.hotkey = Some(chord.clone());
+    if let Err(e) = cfg.save() {
+        rollback_live(previous);
+        return Err(e).with_context(|| format!("Failed to persist hotkey '{chord}'; rolled back"));
+    }
 
     Ok(Some(InstallResult {
         backup_path: None,
@@ -76,19 +85,43 @@ pub fn install(key: Option<&str>) -> Result<Option<InstallResult>> {
     }))
 }
 
-/// Disable the global hotkey: persist an empty chord and unregister it live.
+/// Disable the global hotkey: unregister it live, then persist the disabled
+/// state. Mirrors [`install`]'s ordering and rollback.
 pub fn uninstall() -> Result<Option<UninstallResult>> {
     let mut cfg = Config::load()?;
-    cfg.macos.hotkey = Some(String::new());
-    cfg.save()?;
+    let previous = hotkey::resolve_chord(&cfg);
 
-    hotkey::request(HotkeyCommand::Unregister);
+    // Unregister live FIRST; only persist "disabled" if the OS actually dropped
+    // the binding (a failed unregister leaves the old hotkey live and errors).
+    hotkey::unregister_sync().context("Failed to disable hotkey")?;
+
+    cfg.macos.hotkey = Some(String::new());
+    if let Err(e) = cfg.save() {
+        rollback_live(previous);
+        return Err(e).context("Failed to persist disabled state; rolled back");
+    }
 
     Ok(Some(UninstallResult {
         removed: true,
         backup_path: None,
         config_path: crate::global::config_file()?,
     }))
+}
+
+/// Best-effort: restore the live registration to `previous` after a failed
+/// persist, so the live hotkey matches the still-on-disk config. Errors here are
+/// logged, not propagated — we're already returning the original failure.
+fn rollback_live(previous: Option<String>) {
+    let restored = match previous.as_deref() {
+        Some(chord) => match hotkey::parse_chord(chord) {
+            Ok(p) => hotkey::register_sync(p.hotkey, &p.display),
+            Err(e) => Err(e),
+        },
+        None => hotkey::unregister_sync(),
+    };
+    if let Err(e) = restored {
+        tracing::error!("failed to roll back hotkey to previous state: {e:#}");
+    }
 }
 
 fn config_path_string() -> Result<String> {
