@@ -34,7 +34,7 @@ function buildBody(
 	prNumber: string | undefined,
 ) {
 	if (skip === "true") {
-		return "Codex PR review skipped because this workflow only runs on same-repository PR branches.";
+		return "Codex PR review skipped: this workflow only runs for same-repository PR branches opened by the maintainer.";
 	}
 	const reviewFile = join(runnerTemp, "codex-review.md");
 	if (existsSync(reviewFile) && statSync(reviewFile).size > 0) {

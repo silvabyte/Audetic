@@ -22,12 +22,23 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+    # Hard gate. This is a public repo running on a self-hosted runner, so an
+    # untrusted PR must never reach the "checkout PR head + run codex" steps
+    # below — that would execute attacker-controlled code on the maintainer's
+    # Mac. Only PRs opened by `matsilva` (the maintainer's account; the repo
+    # owner is the `silvabyte` org, not a usable login here) are allowed, and
+    # only from same-repo branches. The workflow_dispatch path can only be
+    # triggered by collaborators with write access, and it is additionally
+    # author-gated inside codex-resolve-pr.ts (where the pull_request context
+    # is empty). Keep `matsilva` in sync with ALLOWED_PR_AUTHOR below.
     if: >
-      github.event_name == 'workflow_dispatch' ||
       (
+        github.event_name == 'pull_request' &&
+        github.event.pull_request.user.login == 'matsilva' &&
         github.event.pull_request.head.repo.full_name == github.repository &&
         github.event.pull_request.draft == false
-      )
+      ) ||
+      github.event_name == 'workflow_dispatch'
     # Self-hosted runner registered on a maintainer's Mac, where the codex CLI
     # is installed and already authenticated. See: rust.yml for the same label.
     runs-on: [self-hosted, macOS]
@@ -50,6 +61,10 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
           INPUT_PR_NUMBER: ${{ inputs.pr }}
+          # Only this account may have its PRs reviewed. Guards the
+          # workflow_dispatch path, where the job-level `if` above cannot see
+          # the PR author. Keep in sync with the `if` condition.
+          ALLOWED_PR_AUTHOR: matsilva
         run: bun scripts/ci/codex-resolve-pr.ts
 
       - uses: actions/checkout@v4

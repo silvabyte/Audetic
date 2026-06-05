@@ -4,16 +4,22 @@
 // message listing every missing var, so debugging a broken workflow doesn't
 // require trial-and-error.
 
-export function requireEnv(names: string[]): Record<string, string> {
+// The `const` type parameter infers `names` as a tuple of string literals, so
+// the returned record has each requested var as a known `string` property
+// rather than a `string | undefined` index access. That keeps call sites clean
+// under the repo's `noUncheckedIndexedAccess` tsconfig setting.
+export function requireEnv<const T extends readonly string[]>(
+	names: T,
+): Record<T[number], string> {
 	const missing: string[] = [];
-	const out: Record<string, string> = {};
+	const out = {} as Record<T[number], string>;
 
 	for (const name of names) {
 		const value = process.env[name];
 		if (!value || value.length === 0) {
 			missing.push(name);
 		} else {
-			out[name] = value;
+			out[name as T[number]] = value;
 		}
 	}
 

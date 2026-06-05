@@ -32,6 +32,7 @@ function fail(msg: string): never {
 interface PullPayload {
 	head: { sha: string; repo: { full_name: string } };
 	base: { ref: string; repo: { full_name: string } };
+	user: { login: string };
 	title: string;
 }
 
@@ -41,6 +42,7 @@ async function main() {
 		"GITHUB_REPOSITORY",
 		"GITHUB_OUTPUT",
 		"EVENT_NAME",
+		"ALLOWED_PR_AUTHOR",
 	]);
 
 	const raw =
@@ -71,6 +73,21 @@ async function main() {
 		payload = JSON.parse(result.stdout.toString()) as PullPayload;
 	} catch (e) {
 		fail(`failed to parse PR payload: ${(e as Error).message}`);
+	}
+
+	// Author gate. The job-level `if` already enforces this for `pull_request`
+	// events, but on a `workflow_dispatch` the pull_request context is empty,
+	// so this is the only thing standing between an untrusted PR branch and
+	// `codex exec` on the self-hosted runner. Skip (don't fail) so a curious
+	// dispatch just no-ops instead of looking like a broken workflow.
+	const author = payload.user.login;
+	if (author !== env.ALLOWED_PR_AUTHOR) {
+		log(
+			`Skipping PR ${prNumber}: author ${author} is not ${env.ALLOWED_PR_AUTHOR}.`,
+		);
+		appendFileSync(env.GITHUB_OUTPUT, `skip=true\n`);
+		appendFileSync(env.GITHUB_OUTPUT, `number=${prNumber}\n`);
+		return;
 	}
 
 	const headRepo = payload.head.repo.full_name;
