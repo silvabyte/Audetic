@@ -34,6 +34,7 @@ import { getRootStore } from "@/stores/singleton";
 export const MEETING_INTENTS = {
   start: "start-meeting",
   stop: "stop-meeting",
+  confirm: "confirm-meeting",
   cancel: "cancel-meeting",
 } as const;
 
@@ -99,6 +100,21 @@ export const meetingsRoute: RouteObject = {
         }
         return null;
       }
+      case MEETING_INTENTS.confirm: {
+        const start = parseOptionalSeconds(form.get("start_seconds"));
+        const end = parseOptionalSeconds(form.get("end_seconds"));
+        const errBefore = root.meetings.lastError;
+        await root.meetings.confirmMeeting(start, end);
+        const errAfter = root.meetings.lastError;
+        if (errAfter && errAfter !== errBefore) {
+          toast.error("Couldn't send for transcription", {
+            description: errAfter,
+          });
+        } else {
+          toast.success("Sent for transcription");
+        }
+        return null;
+      }
       case MEETING_INTENTS.cancel: {
         const errBefore = root.meetings.lastError;
         await root.meetings.cancelMeeting();
@@ -116,6 +132,19 @@ export const meetingsRoute: RouteObject = {
   },
   Component: MeetingsRoute,
 };
+
+/**
+ * Parse a form field into seconds, or `undefined` when blank/absent. Used by
+ * the confirm intent — an absent bound means "keep that edge of the
+ * recording" rather than trimming to zero.
+ */
+function parseOptionalSeconds(raw: FormDataEntryValue | null): number | undefined {
+  if (raw == null) return undefined;
+  const s = String(raw).trim();
+  if (s === "") return undefined;
+  const n = Number(s);
+  return Number.isFinite(n) ? n : undefined;
+}
 
 function MeetingsRoute() {
   return (
@@ -314,6 +343,7 @@ function StartMeetingButton() {
         const { active, phase } = store.meetings;
         const inProgress =
           active ||
+          phase === "review" ||
           phase === "compressing" ||
           phase === "transcribing" ||
           phase === "running_hook";
@@ -330,8 +360,8 @@ function StartMeetingButton() {
               <DialogHeader>
                 <DialogTitle>Start a meeting</DialogTitle>
                 <DialogDescription>
-                  Optional title helps find it later. Transcription runs
-                  after you press Stop.
+                  Optional title helps find it later. After you press Stop you
+                  can trim the recording before it's transcribed.
                 </DialogDescription>
               </DialogHeader>
               <form onSubmit={handleSubmit} className="space-y-4">

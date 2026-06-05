@@ -23,6 +23,7 @@ pub async fn handle_meeting_command(args: MeetingCliArgs) -> Result<()> {
     match args.command {
         MeetingCommand::Start { title } => start_meeting(title).await,
         MeetingCommand::Stop => stop_meeting().await,
+        MeetingCommand::Confirm { start, end } => confirm_meeting(start, end).await,
         MeetingCommand::Cancel => cancel_meeting().await,
         MeetingCommand::Status => show_status().await,
         MeetingCommand::List { limit } => list_meetings(limit).await,
@@ -109,6 +110,73 @@ async fn stop_meeting() -> Result<()> {
             .unwrap_or(0)
     );
     println!(
+        "Recording saved for review. Run 'audetic meeting confirm' to transcribe \
+         (optionally --start/--end to trim), or 'audetic meeting cancel' to discard."
+    );
+
+    Ok(())
+}
+
+/// Parse a timecode into seconds. Accepts `SS`, `MM:SS`, or `HH:MM:SS`, with
+/// optional fractional seconds (e.g. `1:05.5`).
+fn parse_timecode(s: &str) -> Result<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("empty time value");
+    }
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() > 3 {
+        bail!("invalid time '{}': expected SS, MM:SS, or HH:MM:SS", s);
+    }
+    let mut seconds = 0f64;
+    for part in &parts {
+        let value: f64 = part
+            .parse()
+            .with_context(|| format!("invalid time '{}': '{}' is not a number", s, part))?;
+        if value < 0.0 {
+            bail!("invalid time '{}': components must be non-negative", s);
+        }
+        seconds = seconds * 60.0 + value;
+    }
+    Ok(seconds)
+}
+
+async fn confirm_meeting(start: Option<String>, end: Option<String>) -> Result<()> {
+    let start_seconds = start.as_deref().map(parse_timecode).transpose()?;
+    let end_seconds = end.as_deref().map(parse_timecode).transpose()?;
+
+    if let (Some(s), Some(e)) = (start_seconds, end_seconds) {
+        if s >= e {
+            bail!("--start ({s}s) must be before --end ({e}s)");
+        }
+    }
+
+    let client = reqwest::Client::new();
+    let mut body = serde_json::Map::new();
+    if let Some(s) = start_seconds {
+        body.insert("start_seconds".to_string(), Value::from(s));
+    }
+    if let Some(e) = end_seconds {
+        body.insert("end_seconds".to_string(), Value::from(e));
+    }
+
+    let response = client
+        .post(format!("{}/meetings/confirm", base_url()))
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to connect to Audetic service. Is it running?")?;
+
+    let json = json_or_error(response, "confirm meeting").await?;
+
+    println!(
+        "Meeting confirmed (id: {}, duration: {}s)",
+        json.get("meeting_id").and_then(|v| v.as_i64()).unwrap_or(0),
+        json.get("duration_seconds")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+    );
+    println!(
         "Transcription running in background. Run 'audetic meeting status' to watch progress."
     );
 
@@ -178,6 +246,23 @@ async fn show_status() -> Result<()> {
             if let Some(path) = audio_path {
                 println!("Audio: {}", path);
             }
+        }
+        "review" => {
+            let minutes = duration / 60;
+            let seconds = duration % 60;
+            println!(
+                "Meeting #{}: awaiting review ({:02}:{:02} recorded)",
+                meeting_id.unwrap_or(0),
+                minutes,
+                seconds
+            );
+            if let Some(path) = audio_path {
+                println!("Audio: {}", path);
+            }
+            println!(
+                "Run 'audetic meeting confirm' to transcribe (optionally --start/--end to trim), \
+                 or 'audetic meeting cancel' to discard."
+            );
         }
         "compressing" => {
             println!("Meeting #{}: compressing audio...", meeting_id.unwrap_or(0));

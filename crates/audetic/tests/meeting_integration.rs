@@ -272,7 +272,7 @@ async fn test_meeting_cancel_when_idle_errors() {
     assert!(result.is_err());
     let msg = format!("{}", result.unwrap_err());
     assert!(
-        msg.contains("No meeting recording in progress"),
+        msg.contains("No meeting recording or awaiting review"),
         "unexpected error: {}",
         msg
     );
@@ -295,6 +295,13 @@ async fn test_meeting_happy_path() {
     let stop = machine.stop().await.expect("stop");
     assert_eq!(stop.meeting_id, start.meeting_id);
 
+    // Stop now pauses for review — nothing is transcribed until confirmed.
+    assert_eq!(status.get().await.phase, MeetingPhase::Review);
+    assert_eq!(call_count.load(Ordering::SeqCst), 0);
+
+    // Confirm without trimming sends it down the pipeline.
+    machine.confirm(None, None).await.expect("confirm");
+
     // Background task finishes quickly with mocks.
     let phase = wait_for_terminal(&status, Duration::from_secs(5)).await;
     assert_eq!(
@@ -315,6 +322,7 @@ async fn test_meeting_transcription_failure() {
 
     let _start = machine.start(None).await.expect("start");
     let _stop = machine.stop().await.expect("stop");
+    machine.confirm(None, None).await.expect("confirm");
 
     let phase = wait_for_terminal(&status, Duration::from_secs(5)).await;
     assert_eq!(
@@ -329,4 +337,65 @@ async fn test_meeting_transcription_failure() {
         state.last_error.is_some(),
         "failing transcription should set last_error"
     );
+}
+
+#[tokio::test]
+async fn test_confirm_when_not_in_review_errors() {
+    let (transcription, _count) = MockTranscription::ok("ignored");
+    let (mut machine, _status) =
+        build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription));
+
+    // No meeting recorded yet — confirm has nothing to act on.
+    let result = machine.confirm(None, None).await;
+    assert!(result.is_err());
+    let msg = format!("{}", result.unwrap_err());
+    assert!(
+        msg.contains("No meeting awaiting review"),
+        "unexpected error: {}",
+        msg
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_from_review_discards_recording() {
+    let (transcription, count) = MockTranscription::ok("should not be called");
+    let (mut machine, status) =
+        build_test_machine(fake_audio(0.5), fake_audio(0.5), Arc::new(transcription));
+
+    let _start = machine.start(None).await.expect("start");
+    let stop = machine.stop().await.expect("stop");
+
+    // We're parked in Review with the WAV on disk.
+    let review_state = status.get().await;
+    assert_eq!(review_state.phase, MeetingPhase::Review);
+    let audio_path = review_state.audio_path.clone().expect("audio path");
+    assert!(audio_path.exists(), "WAV should exist while in review");
+
+    let cancel = machine.cancel().await.expect("cancel from review");
+    assert_eq!(cancel.meeting_id, stop.meeting_id);
+
+    // Recording discarded: file removed, status reset, nothing transcribed.
+    assert!(!audio_path.exists(), "WAV should be removed on cancel");
+    assert_eq!(status.get().await.phase, MeetingPhase::Idle);
+    assert_eq!(count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_confirm_with_trim_shortens_duration() {
+    let (transcription, _count) = MockTranscription::ok("trimmed");
+    // 2 seconds of audio so a [0.5, 1.0) trim is well within range.
+    let (mut machine, status) =
+        build_test_machine(fake_audio(2.0), fake_audio(2.0), Arc::new(transcription));
+
+    let _start = machine.start(None).await.expect("start");
+    machine.stop().await.expect("stop");
+    assert_eq!(status.get().await.phase, MeetingPhase::Review);
+
+    let confirmed = machine
+        .confirm(Some(0.25), Some(1.25))
+        .await
+        .expect("confirm with trim");
+
+    // [0.25s, 1.25s) == exactly 1.0s of audio.
+    assert_eq!(confirmed.duration_seconds, 1);
 }

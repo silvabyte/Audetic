@@ -19,6 +19,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
+use tower::util::ServiceExt;
+use tower_http::services::ServeFile;
 use tracing::{error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
@@ -161,6 +163,7 @@ pub fn router(state: MeetingState) -> Router {
     Router::new()
         .route("/meetings/start", post(start_meeting))
         .route("/meetings/stop", post(stop_meeting))
+        .route("/meetings/confirm", post(confirm_meeting))
         .route("/meetings/cancel", post(cancel_meeting))
         .route("/meetings/toggle", post(toggle_meeting))
         .route("/meetings/status", get(meeting_status))
@@ -174,6 +177,7 @@ pub fn router(state: MeetingState) -> Router {
             post(import_meeting).layer(DefaultBodyLimit::disable()),
         )
         .route("/meetings/:id", get(get_meeting))
+        .route("/meetings/:id/audio", get(meeting_audio))
         .route("/meetings/:id/retry", post(retry_meeting))
         .with_state(state)
 }
@@ -191,11 +195,16 @@ pub struct MeetingRetryResponse {
 /// HTTP response. Conflict-style errors (already recording / not recording)
 /// map to 409; everything else is 500.
 fn error_response(err: anyhow::Error, context: &str) -> Response {
-    let msg = err.to_string();
-    let status_code = if msg.contains("already in progress")
-        || msg.contains("No meeting recording in progress")
-        || msg.contains("No meeting recording in progress to cancel")
-    {
+    // Use the full anyhow chain so wrapped causes (e.g. "Invalid trim range"
+    // behind "Failed to trim meeting audio") are visible for both the status
+    // mapping below and the client message.
+    let msg = format!("{err:#}");
+    let status_code = if msg.contains("Invalid trim range") {
+        StatusCode::BAD_REQUEST
+    } else if msg.contains("already in progress") || msg.contains("No meeting") {
+        // Covers "No meeting recording in progress" (stop), "No meeting
+        // recording or awaiting review to cancel" (cancel) and "No meeting
+        // awaiting review" (confirm).
         StatusCode::CONFLICT
     } else {
         StatusCode::INTERNAL_SERVER_ERROR
@@ -284,7 +293,7 @@ pub async fn start_meeting(
     path = "/meetings/stop",
     tag = "meetings",
     responses(
-        (status = 200, description = "Meeting stopped and transcription queued", body = MeetingStopResponse),
+        (status = 200, description = "Meeting stopped; awaiting review before transcription", body = MeetingStopResponse),
         (status = 409, description = "No meeting recording in progress"),
     ),
 )]
@@ -299,7 +308,57 @@ pub async fn stop_meeting(State(state): State<MeetingState>) -> Response {
             success: true,
             meeting_id: result.meeting_id,
             duration_seconds: result.duration_seconds,
-            message: "Meeting recording stopped, transcription started in background".to_string(),
+            message: "Meeting recording stopped; review and confirm to transcribe".to_string(),
+        })
+        .into_response(),
+        Err(resp) => resp,
+    }
+}
+
+/// Request body for the confirm endpoint. Both bounds are optional; omitting
+/// one keeps that edge of the recording. Both omitted sends it untouched.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct MeetingConfirmRequest {
+    /// New start of the recording, in seconds (clamped to the recording).
+    pub start_seconds: Option<f64>,
+    /// New end of the recording, in seconds (clamped to the recording).
+    pub end_seconds: Option<f64>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/meetings/confirm",
+    tag = "meetings",
+    request_body = MeetingConfirmRequest,
+    responses(
+        (status = 200, description = "Meeting confirmed; transcription queued", body = MeetingStopResponse),
+        (status = 400, description = "Invalid trim range"),
+        (status = 409, description = "No meeting awaiting review"),
+    ),
+)]
+pub async fn confirm_meeting(
+    State(state): State<MeetingState>,
+    body: Option<Json<MeetingConfirmRequest>>,
+) -> Response {
+    info!("Meeting confirm command received via API");
+
+    let (start_seconds, end_seconds) = body
+        .map(|Json(r)| (r.start_seconds, r.end_seconds))
+        .unwrap_or((None, None));
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let command = ApiCommand::MeetingConfirm {
+        start_seconds,
+        end_seconds,
+        reply: reply_tx,
+    };
+
+    match dispatch(&state.tx, reply_rx, command, "confirm meeting").await {
+        Ok(result) => Json(MeetingStopResponse {
+            success: true,
+            meeting_id: result.meeting_id,
+            duration_seconds: result.duration_seconds,
+            message: "Meeting confirmed, transcription started in background".to_string(),
         })
         .into_response(),
         Err(resp) => resp,
@@ -370,12 +429,11 @@ pub async fn toggle_meeting(
             crate::meeting::ToggleOutcome::Stopped(r) => Json(MeetingToggleResponse {
                 success: true,
                 meeting_id: r.meeting_id,
-                phase: "compressing".to_string(),
+                phase: "review".to_string(),
                 audio_path: None,
                 capture_state: None,
                 duration_seconds: Some(r.duration_seconds),
-                message: "Meeting recording stopped, transcription started in background"
-                    .to_string(),
+                message: "Meeting recording stopped; review and confirm to transcribe".to_string(),
             })
             .into_response(),
         },
@@ -537,6 +595,94 @@ pub async fn get_meeting(
         )
             .into_response()),
     }
+}
+
+/// Stream a meeting's audio file for in-browser playback. Used by the review
+/// UI so the user can listen back before choosing trim points. Resolves the
+/// file actually on disk — the row points at the `.wav` while review is
+/// pending and the `.mp3` after processing. Served via `ServeFile`, which
+/// honours HTTP Range requests so the `<audio>` element can seek.
+#[utoipa::path(
+    get,
+    path = "/meetings/{id}/audio",
+    tag = "meetings",
+    params(
+        ("id" = i64, Path, description = "Meeting id"),
+    ),
+    responses(
+        (status = 200, description = "Audio bytes (supports Range)"),
+        (status = 404, description = "Meeting or audio file not found"),
+    ),
+)]
+pub async fn meeting_audio(
+    Path(id): Path<i64>,
+    State(_state): State<MeetingState>,
+    request: axum::extract::Request,
+) -> Response {
+    let lookup = tokio::task::spawn_blocking(move || {
+        let conn = crate::db::init_db()?;
+        crate::db::meetings::MeetingRepository::get(&conn, id)
+    })
+    .await;
+
+    let meeting = match lookup {
+        Ok(Ok(Some(m))) => m,
+        Ok(Ok(None)) => return audio_not_found(id),
+        Ok(Err(e)) => {
+            error!("Failed to load meeting {} for audio: {}", id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": e.to_string() })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("DB task panicked loading meeting {} audio: {}", id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": "db task panicked" })),
+            )
+                .into_response();
+        }
+    };
+
+    // Resolve the file on disk: pending-review rows point at the .wav, while
+    // processed rows point at the .mp3 (and older rows may have a stale .wav
+    // path whose .mp3 sibling is the real file).
+    let stored = std::path::PathBuf::from(&meeting.audio_path);
+    let resolved = if stored.exists() {
+        stored
+    } else {
+        let mp3 = stored.with_extension("mp3");
+        if mp3.exists() {
+            mp3
+        } else {
+            return audio_not_found(id);
+        }
+    };
+
+    match ServeFile::new(resolved).oneshot(request).await {
+        Ok(res) => res.into_response(),
+        Err(e) => {
+            error!("Failed to serve meeting {} audio: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": "failed to read audio file" })),
+            )
+                .into_response()
+        }
+    }
+}
+
+fn audio_not_found(id: i64) -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(json!({
+            "success": false,
+            "message": format!("Audio for meeting {} not found", id),
+        })),
+    )
+        .into_response()
 }
 
 /// Re-run transcription on the durable mp3 from a previously failed

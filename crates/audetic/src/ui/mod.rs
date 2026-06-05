@@ -48,6 +48,19 @@ impl Indicator {
         Ok(())
     }
 
+    pub async fn show_review(&self) -> Result<()> {
+        info!("Showing review indicator");
+
+        if let Err(e) = self.hyprland_notify("󰏤 Recording saved — review before transcribing") {
+            debug!("Hyprland notification failed: {}", e);
+        }
+
+        // Reuse the recording-stop tone so the user hears the capture ended.
+        self.play_sound("stop").await;
+
+        Ok(())
+    }
+
     pub async fn show_processing(&self) -> Result<()> {
         info!("Showing processing indicator");
 

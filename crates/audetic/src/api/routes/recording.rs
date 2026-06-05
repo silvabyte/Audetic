@@ -85,6 +85,13 @@ pub enum ApiCommand {
     MeetingCancel {
         reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
     },
+    /// Confirm a meeting awaiting review, optionally trimming `[start, end)`
+    /// seconds, then send it for transcription.
+    MeetingConfirm {
+        start_seconds: Option<f64>,
+        end_seconds: Option<f64>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
+    },
     /// Toggle meeting recording
     MeetingToggle {
         options: Option<crate::meeting::MeetingStartOptions>,

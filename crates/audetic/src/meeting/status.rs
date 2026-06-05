@@ -11,6 +11,11 @@ use tokio::sync::Mutex;
 pub enum MeetingPhase {
     Idle,
     Recording,
+    /// Recording has stopped and the WAV is on disk, but the user has not yet
+    /// confirmed it for transcription. They can play it back and trim the
+    /// start/end before sending it on (or discard it). See
+    /// `MeetingMachine::confirm`.
+    Review,
     Compressing,
     Transcribing,
     Completed,
@@ -23,6 +28,7 @@ impl MeetingPhase {
         match self {
             Self::Idle => "idle",
             Self::Recording => "recording",
+            Self::Review => "review",
             Self::Compressing => "compressing",
             Self::Transcribing => "transcribing",
             Self::Completed => "completed",
@@ -47,6 +53,10 @@ pub struct MeetingState {
     pub title: Option<String>,
     pub audio_path: Option<PathBuf>,
     pub last_error: Option<String>,
+    /// Recorded length frozen at stop. Once set (Review onward), it is the
+    /// duration reported to clients so the timer stops climbing and the trim
+    /// UI has an accurate end bound.
+    pub recorded_duration_seconds: Option<u64>,
 }
 
 impl Default for MeetingState {
@@ -58,13 +68,19 @@ impl Default for MeetingState {
             title: None,
             audio_path: None,
             last_error: None,
+            recorded_duration_seconds: None,
         }
     }
 }
 
 impl MeetingState {
-    /// Duration since recording started, in seconds.
+    /// Duration of the meeting in seconds. While recording this is the live
+    /// elapsed time; once the recording is frozen (Review onward) it is the
+    /// captured length set at stop.
     pub fn duration_seconds(&self) -> Option<u64> {
+        if let Some(frozen) = self.recorded_duration_seconds {
+            return Some(frozen);
+        }
         self.started_at.map(|started| {
             let elapsed = chrono::Utc::now() - started;
             elapsed.num_seconds().max(0) as u64
@@ -103,6 +119,15 @@ impl MeetingStatusHandle {
         state.phase = phase;
     }
 
+    /// Transition into the Review phase, freezing the recorded duration so the
+    /// reported timer stops climbing and the trim UI knows the end bound.
+    pub async fn enter_review(&self, duration_seconds: u64) {
+        let mut state = self.inner.lock().await;
+        state.phase = MeetingPhase::Review;
+        state.recorded_duration_seconds = Some(duration_seconds);
+        state.last_error = None;
+    }
+
     pub async fn set_error(&self, error: String) {
         let mut state = self.inner.lock().await;
         state.phase = MeetingPhase::Error;
@@ -133,6 +158,7 @@ mod tests {
     fn test_meeting_phase_as_str() {
         assert_eq!(MeetingPhase::Idle.as_str(), "idle");
         assert_eq!(MeetingPhase::Recording.as_str(), "recording");
+        assert_eq!(MeetingPhase::Review.as_str(), "review");
         assert_eq!(MeetingPhase::Compressing.as_str(), "compressing");
         assert_eq!(MeetingPhase::Transcribing.as_str(), "transcribing");
         assert_eq!(MeetingPhase::Completed.as_str(), "completed");

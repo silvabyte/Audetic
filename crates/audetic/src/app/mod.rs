@@ -179,6 +179,21 @@ pub async fn run_service() -> Result<()> {
                 }
                 let _ = reply.send(result);
             }
+            ApiCommand::MeetingConfirm {
+                start_seconds,
+                end_seconds,
+                reply,
+            } => {
+                let result = meeting_machine.confirm(start_seconds, end_seconds).await;
+                match &result {
+                    Ok(r) => info!(
+                        "Meeting {} confirmed for transcription ({}s)",
+                        r.meeting_id, r.duration_seconds
+                    ),
+                    Err(e) => error!("Failed to confirm meeting: {}", e),
+                }
+                let _ = reply.send(result);
+            }
             ApiCommand::MeetingToggle { options, reply } => {
                 let result = meeting_machine.toggle(options).await;
                 match &result {

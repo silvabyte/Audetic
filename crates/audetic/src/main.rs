@@ -18,6 +18,7 @@ use anyhow::Result;
 use audetic::{app, install};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
+use utoipa::OpenApi;
 
 #[derive(Parser)]
 #[command(name = "audeticd", version, about = "The Audetic voice-to-text daemon")]
@@ -38,6 +39,10 @@ enum Command {
         #[arg(long)]
         no_launch: bool,
     },
+    /// Print the OpenAPI spec (JSON) to stdout and exit. Lets the web UI run
+    /// `codegen` against a freshly built daemon without starting the service
+    /// or contending for port 3737.
+    Openapi,
 }
 
 #[tokio::main]
@@ -54,6 +59,11 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Command::Install { no_launch }) => {
             install::run(install::InstallOptions { no_launch }).await
+        }
+        Some(Command::Openapi) => {
+            let spec = audetic::api::docs::ApiDoc::openapi();
+            println!("{}", spec.to_pretty_json()?);
+            Ok(())
         }
         None => app::run_service().await,
     }
