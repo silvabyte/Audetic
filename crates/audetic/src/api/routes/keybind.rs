@@ -1,7 +1,7 @@
 //! Keybind API routes.
 
 use crate::api::error::{ApiError, ApiResult};
-use crate::keybind::{self, InstallResult, KeybindStatus, UninstallResult};
+use crate::keybind::{self, InstallResult, KeybindStatusResponse, UninstallResult};
 use axum::{
     response::Json,
     routing::{delete, get, post},
@@ -53,11 +53,11 @@ pub fn router() -> Router {
     tag = "keybind",
     operation_id = "get_keybind_status",
     responses(
-        (status = 200, description = "Current keybind installation state", body = KeybindStatus),
+        (status = 200, description = "Current keybind installation state", body = KeybindStatusResponse),
     ),
 )]
-pub async fn get_status() -> ApiResult<Json<KeybindStatus>> {
-    let status = keybind::get_status().map_err(ApiError::from)?;
+pub async fn get_status() -> ApiResult<Json<KeybindStatusResponse>> {
+    let status = keybind::status_response().map_err(ApiError::from)?;
     Ok(Json(status))
 }
 
@@ -85,7 +85,7 @@ pub async fn install_keybind(
             success: true,
             message: format!("Installed keybinding: {}", display_key),
             display_key: Some(display_key),
-            backup_path: Some(backup_path.to_string_lossy().into_owned()),
+            backup_path: backup_path.map(|p| p.to_string_lossy().into_owned()),
             config_path: Some(config_path.to_string_lossy().into_owned()),
         },
         None => InstallResponse {

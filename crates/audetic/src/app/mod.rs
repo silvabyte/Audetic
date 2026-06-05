@@ -112,11 +112,18 @@ pub async fn run_service() -> Result<()> {
     spawn_update_manager();
 
     let toggle_url = crate::api::url::api_url(crate::api::url::paths::TOGGLE);
-    let meetings_toggle_url = crate::api::url::api_url(crate::api::url::paths::MEETINGS_TOGGLE);
     info!("Audetic is ready!");
-    info!("Add this to your Hyprland config:");
-    info!("bindd = SUPER, R, Audetic, exec, curl -X POST {toggle_url}");
-    info!("bindd = SUPER SHIFT, R, Audetic Meeting, exec, curl -X POST {meetings_toggle_url}");
+    #[cfg(not(target_os = "macos"))]
+    {
+        let meetings_toggle_url = crate::api::url::api_url(crate::api::url::paths::MEETINGS_TOGGLE);
+        info!("Add this to your Hyprland config:");
+        info!("bindd = SUPER, R, Audetic, exec, curl -X POST {toggle_url}");
+        info!("bindd = SUPER SHIFT, R, Audetic Meeting, exec, curl -X POST {meetings_toggle_url}");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        info!("Global hotkey is managed by the daemon (default ⌘R) — change it in Settings → Keybind.");
+    }
     info!("Or test manually: curl -X POST {toggle_url}");
 
     while let Some(command) = rx.recv().await {

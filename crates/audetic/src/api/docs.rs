@@ -87,6 +87,8 @@ use super::routes::{
         crate::history::HistoryEntry,
         // Keybind
         crate::keybind::KeybindStatus,
+        crate::keybind::KeybindStatusResponse,
+        crate::keybind::Platform,
         keybind::InstallRequest,
         keybind::InstallResponse,
         keybind::UninstallResponse,

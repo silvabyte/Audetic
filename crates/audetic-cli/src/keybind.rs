@@ -34,6 +34,8 @@ async fn status() -> Result<()> {
     println!("=========================");
     println!();
 
+    let is_macos = body.get("platform").and_then(|v| v.as_str()) == Some("macos");
+
     match body.get("status").and_then(|v| v.as_str()) {
         Some("installed") => {
             println!("Status: INSTALLED");
@@ -48,6 +50,13 @@ async fn status() -> Result<()> {
                 println!("Command: {command}");
             }
         }
+        // macOS: the daemon owns a system-wide global hotkey that's turned off.
+        Some("disabled") => {
+            println!("Status: DISABLED");
+            println!();
+            println!("The global hotkey is turned off.");
+            println!("Run 'audetic keybind install' to enable it (default ⌘R).");
+        }
         Some("not_installed") => {
             println!("Status: NOT INSTALLED");
             println!();
@@ -58,6 +67,11 @@ async fn status() -> Result<()> {
             } else {
                 println!("No Hyprland config found.");
             }
+        }
+        _ if is_macos => {
+            println!("Status: DISABLED");
+            println!();
+            println!("Run 'audetic keybind install' to enable the global hotkey.");
         }
         _ => {
             println!("Status: NO CONFIG");

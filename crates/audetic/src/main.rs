@@ -45,8 +45,7 @@ enum Command {
     Openapi,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let cli = Cli::parse();
     let log_level = if cli.verbose { "debug" } else { "info" };
     let env_filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
@@ -56,15 +55,52 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
+    // Build the async runtime explicitly (rather than `#[tokio::main]`) because
+    // on macOS the service runs on a worker thread and the *main* thread is
+    // reserved for the global-hotkey CFRunLoop — see `run_service`.
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
     match cli.command {
         Some(Command::Install { no_launch }) => {
-            install::run(install::InstallOptions { no_launch }).await
+            runtime.block_on(install::run(install::InstallOptions { no_launch }))
         }
         Some(Command::Openapi) => {
             let spec = audetic::api::docs::ApiDoc::openapi();
             println!("{}", spec.to_pretty_json()?);
             Ok(())
         }
-        None => app::run_service().await,
+        None => run_service(runtime),
     }
+}
+
+/// Run the long-lived daemon service. On every platform but macOS this just
+/// drives the async service on the main thread.
+#[cfg(not(target_os = "macos"))]
+fn run_service(runtime: tokio::runtime::Runtime) -> Result<()> {
+    runtime.block_on(app::run_service())
+}
+
+/// macOS: the async service runs on a dedicated worker thread so the main
+/// thread can host the global-hotkey CFRunLoop (Carbon `RegisterEventHotKey`
+/// requires the run loop to be pumped on the main thread). The hotkey loop
+/// blocks forever; if the service thread exits we bring the process down so
+/// launchd's `KeepAlive` restarts us.
+#[cfg(target_os = "macos")]
+fn run_service(runtime: tokio::runtime::Runtime) -> Result<()> {
+    use tracing::error;
+
+    let handle = runtime.handle().clone();
+    std::thread::Builder::new()
+        .name("audetic-service".into())
+        .spawn(move || {
+            if let Err(e) = runtime.block_on(app::run_service()) {
+                error!("Audetic service exited with error: {e:?}");
+            }
+            std::process::exit(1);
+        })?;
+
+    let initial = audetic::hotkey::initial_hotkey();
+    audetic::hotkey::run_main_loop(handle, initial)
 }

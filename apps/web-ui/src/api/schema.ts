@@ -794,12 +794,16 @@ export interface components {
         JobsListResponse: {
             jobs: components["schemas"]["Job"][];
         };
-        /** @description Status of Audetic keybinding installation */
+        /**
+         * @description Status of the Audetic toggle keybinding.
+         *
+         *     `command`/`config_path` are populated on Linux (the Hyprland binding and the
+         *     file it lives in) and `None` on macOS, where the daemon owns the binding
+         *     directly. `Disabled` is macOS-only; `NotInstalled`/`NoConfig` are Linux-only.
+         */
         KeybindStatus: {
-            /** @description The command bound to the key */
-            command: string;
-            config_path: string;
-            /** @description Display string for the keybinding (e.g., "SUPER + R") */
+            command?: string | null;
+            config_path?: string | null;
             display_key: string;
             /** @enum {string} */
             status: "installed";
@@ -810,6 +814,17 @@ export interface components {
         } | {
             /** @enum {string} */
             status: "no_config";
+        } | {
+            /** @enum {string} */
+            status: "disabled";
+        };
+        /**
+         * @description [`KeybindStatus`] plus the platform it came from. Flattened on the wire, so
+         *     the JSON stays `{ "platform": …, "status": …, … }` — the top-level `status`
+         *     string the CLI reads is preserved.
+         */
+        KeybindStatusResponse: components["schemas"]["KeybindStatus"] & {
+            platform: components["schemas"]["Platform"];
         };
         /** @description Combined logs result containing both app logs and transcription history. */
         LogsResult: {
@@ -959,6 +974,12 @@ export interface components {
             event: components["schemas"]["EventKind"];
             name: string;
         };
+        /**
+         * @description Which platform's keybind mechanism this daemon build uses. Lets the web UI
+         *     render the right affordances (Hyprland config vs. native global hotkey).
+         * @enum {string}
+         */
+        Platform: "macos" | "linux";
         /** @description Get a summary of the current provider configuration. */
         ProviderInfo: {
             api_endpoint?: string | null;
@@ -1261,7 +1282,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["KeybindStatus"];
+                    "application/json": components["schemas"]["KeybindStatusResponse"];
                 };
             };
         };
