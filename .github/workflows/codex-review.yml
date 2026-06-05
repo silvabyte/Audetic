@@ -39,9 +39,9 @@ jobs:
         github.event.pull_request.draft == false
       ) ||
       github.event_name == 'workflow_dispatch'
-    # Self-hosted runner registered on a maintainer's Mac, where the codex CLI
-    # is installed and already authenticated. See: rust.yml for the same label.
-    runs-on: [self-hosted, macOS]
+    # Self-hosted Linux runner where the codex CLI is installed and already
+    # authenticated.
+    runs-on: [self-hosted, Linux]
     outputs:
       pr_number: ${{ steps.pr.outputs.number }}
       review_body: ${{ steps.output.outputs.review_body }}
@@ -102,7 +102,7 @@ jobs:
     name: Post sticky review comment
     needs: review
     if: always() && needs.review.outputs.pr_number != ''
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, Linux]
     permissions:
       contents: read
       issues: write
