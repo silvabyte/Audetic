@@ -1,0 +1,132 @@
+name: Codex PR review
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to review
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Run Codex review
+    permissions:
+      contents: read
+      pull-requests: read
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (
+        github.event.pull_request.head.repo.full_name == github.repository &&
+        github.event.pull_request.draft == false
+      )
+    # Self-hosted runner registered on a maintainer's Mac, where the codex CLI
+    # is installed and already authenticated. See: rust.yml for the same label.
+    runs-on: [self-hosted, macOS]
+    outputs:
+      pr_number: ${{ steps.pr.outputs.number }}
+      review_body: ${{ steps.output.outputs.review_body }}
+    steps:
+      # Initial shallow checkout at the workflow ref so scripts/ci/ is on disk.
+      # The resolve step decides what to actually review; the second checkout
+      # below re-clones at the PR head_sha.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - name: Resolve PR context
+        id: pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PR_NUMBER: ${{ github.event.pull_request.number }}
+          INPUT_PR_NUMBER: ${{ inputs.pr }}
+        run: bun scripts/ci/codex-resolve-pr.ts
+
+      - uses: actions/checkout@v4
+        if: steps.pr.outputs.skip != 'true'
+        with:
+          ref: ${{ steps.pr.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify PR base branch
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
+        run: |
+          set -euo pipefail
+          git rev-parse --verify "origin/${PR_BASE_REF}"
+
+      - name: Run Codex
+        if: steps.pr.outputs.skip != 'true'
+        env:
+          PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+          PR_TITLE: ${{ steps.pr.outputs.title }}
+        run: bun scripts/ci/codex-run.ts
+
+      - name: Prepare review output
+        id: output
+        if: always()
+        env:
+          SKIP: ${{ steps.pr.outputs.skip }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: bun scripts/ci/codex-prepare-output.ts
+
+  comment:
+    name: Post sticky review comment
+    needs: review
+    if: always() && needs.review.outputs.pr_number != ''
+    runs-on: [self-hosted, macOS]
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Upsert PR comment
+        uses: actions/github-script@v7
+        env:
+          PR_NUMBER: ${{ needs.review.outputs.pr_number }}
+          REVIEW_BODY: ${{ needs.review.outputs.review_body }}
+        with:
+          script: |
+            const marker = '<!-- codex-pr-review -->';
+            const prNumber = Number(process.env.PR_NUMBER);
+            const reviewBody = process.env.REVIEW_BODY?.trim()
+              || 'Codex PR review did not produce output. Check the workflow logs.';
+            const body = [marker, '## Codex PR review', '', reviewBody].join('\n');
+
+            const { owner, repo } = context.repo;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: prNumber,
+                body,
+              });
+            }
