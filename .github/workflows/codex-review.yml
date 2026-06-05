@@ -67,15 +67,23 @@ jobs:
           ALLOWED_PR_AUTHOR: matsilva
         run: bun scripts/ci/codex-resolve-pr.ts
 
+      # Check the PR head out into a SEPARATE directory, never over the root.
+      # The root checkout (trusted, at the workflow ref) keeps owning the
+      # scripts/ci helpers we execute below; codex only *reads* this PR tree.
+      # If we let the PR head replace the root, `bun scripts/ci/codex-run.ts`
+      # would run the PR's copy of the helper — which breaks on any branch that
+      # predates, removes, or modifies these scripts.
       - uses: actions/checkout@v4
         if: steps.pr.outputs.skip != 'true'
         with:
           ref: ${{ steps.pr.outputs.head_sha }}
           fetch-depth: 0
           persist-credentials: false
+          path: pr-head
 
       - name: Verify PR base branch
         if: steps.pr.outputs.skip != 'true'
+        working-directory: pr-head
         env:
           PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
         run: |
@@ -85,6 +93,8 @@ jobs:
       - name: Run Codex
         if: steps.pr.outputs.skip != 'true'
         env:
+          # Trusted helper (root checkout) drives codex against the PR tree.
+          PR_DIR: ${{ github.workspace }}/pr-head
           PR_BASE_REF: ${{ steps.pr.outputs.base_ref }}
           PR_NUMBER: ${{ steps.pr.outputs.number }}
           PR_TITLE: ${{ steps.pr.outputs.title }}

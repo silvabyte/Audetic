@@ -30,6 +30,7 @@ function log(msg: string) {
 async function main() {
 	const env = requireEnv([
 		"RUNNER_TEMP",
+		"PR_DIR",
 		"PR_BASE_REF",
 		"PR_NUMBER",
 		"PR_TITLE",
@@ -40,8 +41,13 @@ async function main() {
 
 	await $`codex --version`;
 
+	// Run codex inside the PR-head checkout (PR_DIR) so it reviews the PR's
+	// tree, while this helper itself runs from the trusted root checkout. The
+	// review markdown is written to RUNNER_TEMP, outside both checkouts.
 	const result =
-		await $`codex exec review --base ${baseRef} --title ${title} --full-auto --ephemeral --output-last-message ${reviewFile}`.nothrow();
+		await $`codex exec review --base ${baseRef} --title ${title} --full-auto --ephemeral --output-last-message ${reviewFile}`
+			.cwd(env.PR_DIR)
+			.nothrow();
 
 	if (result.exitCode !== 0) {
 		const hasOutput = existsSync(reviewFile) && statSync(reviewFile).size > 0;
