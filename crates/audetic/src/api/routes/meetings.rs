@@ -176,7 +176,7 @@ pub fn router(state: MeetingState) -> Router {
             // memory usage stays bounded regardless of body size.
             post(import_meeting).layer(DefaultBodyLimit::disable()),
         )
-        .route("/meetings/:id", get(get_meeting))
+        .route("/meetings/:id", get(get_meeting).delete(delete_meeting))
         .route("/meetings/:id/audio", get(meeting_audio))
         .route("/meetings/:id/retry", post(retry_meeting))
         .with_state(state)
@@ -186,6 +186,16 @@ pub fn router(state: MeetingState) -> Router {
 /// re-queued; the actual work runs in the background.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingRetryResponse {
+    pub success: bool,
+    pub meeting_id: i64,
+    pub message: String,
+}
+
+/// Confirmation that a meeting has been deleted. The delete is *soft*: the
+/// meeting is hidden from every API surface but its row and on-disk audio
+/// survive.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeetingDeleteResponse {
     pub success: bool,
     pub meeting_id: i64,
     pub message: String,
@@ -803,6 +813,52 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
         }
     };
 
+    // Atomically flip error → transcribing *before* returning 202. The status
+    // check above and the spawned task's own transition leave a window where
+    // the row is still `error`; a DELETE arriving then would treat this
+    // already-accepted retry as a terminal, deletable meeting and hide it. Do
+    // the transition here (last, after the file-missing 409s, so a bail can't
+    // strand the row in `transcribing`) and reject if the row is no longer the
+    // failed meeting we loaded — e.g. a concurrent retry or delete won.
+    let marked = tokio::task::spawn_blocking(move || {
+        let conn = crate::db::init_db()?;
+        crate::db::meetings::MeetingRepository::begin_retry(&conn, id)
+    })
+    .await;
+
+    match marked {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "success": false,
+                    "message": format!(
+                        "Meeting {} is no longer eligible for retry; its state changed",
+                        id
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            error!("Failed to mark meeting {} retry in-flight: {}", id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": e.to_string() })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("DB task panicked marking meeting {} retry: {}", id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": "db task panicked" })),
+            )
+                .into_response();
+        }
+    }
+
     let duration = meeting.duration_seconds.unwrap_or(0);
     let transcription = state.transcription.clone();
     tokio::spawn(async move {
@@ -819,6 +875,100 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
         }),
     )
         .into_response()
+}
+
+/// Soft-delete a meeting.
+///
+/// The user-facing label is "Delete", but the row is only hidden — we stamp
+/// `deleted_at` so it drops out of every API surface (list, detail, audio,
+/// retry) while the recording stays on disk. Recovery is a manual DB edit.
+/// If the live status handle still describes this meeting (it keeps the most
+/// recent terminal meeting so the UI can show the outcome), it is reset too,
+/// so `GET /meetings/status` doesn't keep reporting a deleted meeting.
+///
+/// In-flight meetings (recording / review / processing) are refused with 409:
+/// their id is still owned by the meeting machine and background pipeline, so
+/// hiding the row would 404 the active/review UI and break completion
+/// auto-nav. Stop or cancel the meeting first. Returns 404 if the meeting
+/// doesn't exist or was already deleted.
+#[utoipa::path(
+    delete,
+    path = "/meetings/{id}",
+    tag = "meetings",
+    params(
+        ("id" = i64, Path, description = "Meeting id"),
+    ),
+    responses(
+        (status = 200, description = "Meeting deleted (hidden from all views)", body = MeetingDeleteResponse),
+        (status = 404, description = "Meeting not found or already deleted"),
+        (status = 409, description = "Meeting is still in progress; stop or cancel it first"),
+    ),
+)]
+pub async fn delete_meeting(Path(id): Path<i64>, State(state): State<MeetingState>) -> Response {
+    info!("Meeting {} delete requested", id);
+
+    let outcome = tokio::task::spawn_blocking(move || {
+        let conn = crate::db::init_db()?;
+        crate::db::meetings::MeetingRepository::soft_delete(&conn, id)
+    })
+    .await;
+
+    use crate::db::meetings::SoftDeleteOutcome;
+    match outcome {
+        Ok(Ok(SoftDeleteOutcome::Deleted)) => {
+            // The DB row is hidden, but the most recent meeting also lives on
+            // in the shared status handle (terminal phases keep id/title/error
+            // there so the UI can show the outcome). Clear it if it still
+            // points at this meeting, or GET /meetings/status would keep
+            // reporting the deleted meeting until the next recording starts.
+            if state.status.clear_if_current(id).await {
+                info!("Meeting {} cleared from live status after delete", id);
+            }
+            (
+                StatusCode::OK,
+                Json(MeetingDeleteResponse {
+                    success: true,
+                    meeting_id: id,
+                    message: format!("Meeting {id} deleted"),
+                }),
+            )
+                .into_response()
+        }
+        Ok(Ok(SoftDeleteOutcome::NotFound)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "message": format!("Meeting {id} not found"),
+            })),
+        )
+            .into_response(),
+        Ok(Ok(SoftDeleteOutcome::InFlight)) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "success": false,
+                "message": format!(
+                    "Meeting {id} is still in progress; stop or cancel it before deleting"
+                ),
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            error!("Failed to delete meeting {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": e.to_string() })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!("DB task panicked deleting meeting {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": "db task panicked" })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Import a media file as a new meeting.

@@ -26,6 +26,19 @@ export type MeetingPhase =
 
 export type CaptureState = "both" | "mic_only" | "system_only" | "unknown";
 
+/**
+ * Whether a meeting in this phase is settled and therefore safe to delete.
+ * In-flight phases (recording, review, compressing, transcribing,
+ * running_hook) are still owned by the daemon's meeting machine — the backend
+ * rejects deleting them with 409, so we also hide the control for them.
+ * Mirrors `MeetingPhase::is_terminal` in
+ * crates/audetic/src/meeting/status.rs.
+ */
+export function isDeletableMeetingStatus(status: string): boolean {
+  const s = status.toLowerCase();
+  return s === "completed" || s === "error" || s === "cancelled";
+}
+
 const ACTIVE_POLL_MS = 1000;
 
 type ListStatus = "idle" | "loading" | "loaded" | "error";
@@ -238,6 +251,33 @@ export class MeetingStore {
           };
         }
       });
+    }
+  }
+
+  /**
+   * Delete a meeting. The label is "Delete" but the daemon soft-deletes it:
+   * the row is hidden everywhere and the audio stays on disk. On success we
+   * drop it from the in-memory list and detail caches so the UI updates
+   * without a refetch. Returns whether it succeeded so callers can navigate
+   * and toast. Failures land on `lastError`.
+   */
+  async deleteMeeting(id: number): Promise<boolean> {
+    try {
+      const { error } = await daemon.DELETE("/meetings/{id}", {
+        params: { path: { id } },
+      });
+      if (error) throw new Error(formatError(error));
+      runInAction(() => {
+        this.list = this.list.filter((m) => m.id !== id);
+        delete this.detailCache[id];
+        delete this.detailStatus[id];
+      });
+      return true;
+    } catch (e) {
+      runInAction(() => {
+        this.lastError = e instanceof Error ? e.message : String(e);
+      });
+      return false;
     }
   }
 

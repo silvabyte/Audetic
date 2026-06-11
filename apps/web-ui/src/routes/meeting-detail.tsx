@@ -3,12 +3,13 @@ import { useEffect } from "react";
 import {
   Form,
   NavLink,
+  useNavigate,
   useParams,
   type ActionFunctionArgs,
   type LoaderFunctionArgs,
   type RouteObject,
 } from "react-router-dom";
-import { ArrowLeft, Copy, FolderOpen, Loader2, RefreshCcw, Wrench } from "lucide-react";
+import { ArrowLeft, Copy, FolderOpen, Loader2, RefreshCcw, Trash2, Wrench } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import {
@@ -26,7 +27,10 @@ import {
 } from "@/components/ui/tooltip";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
-import type { MeetingDetail } from "@/stores/meeting-store";
+import {
+  isDeletableMeetingStatus,
+  type MeetingDetail,
+} from "@/stores/meeting-store";
 
 const DETAIL_INTENTS = {
   copyTranscript: "copy-transcript",
@@ -136,23 +140,53 @@ function MeetingDetailBody({
   meetingId: number;
 }) {
   const store = useStore();
+  const navigate = useNavigate();
   const isTranscribing =
     detail.status === "transcribing" || detail.status === "compressing";
 
+  const handleDelete = async (): Promise<void> => {
+    const label = detail.title ?? "this meeting";
+    if (!window.confirm(`Delete "${label}"? This hides it from all views.`)) {
+      return;
+    }
+    const ok = await store.meetings.deleteMeeting(meetingId);
+    if (ok) {
+      toast.success("Meeting deleted");
+      navigate("/meetings");
+    } else {
+      toast.error("Could not delete meeting");
+    }
+  };
+
   return (
     <>
-      <header>
-        <h1 className="text-2xl font-semibold">
-          {detail.title ?? <span className="text-muted-foreground">Untitled meeting</span>}
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          {new Date(detail.started_at).toLocaleString()}
-          {typeof detail.duration_seconds === "number"
-            ? ` · ${formatDuration(detail.duration_seconds)}`
-            : ""}
-          {" · "}
-          <span className="font-mono text-xs">{detail.status}</span>
-        </p>
+      <header className="flex items-start justify-between gap-4">
+        <div className="min-w-0">
+          <h1 className="text-2xl font-semibold">
+            {detail.title ?? <span className="text-muted-foreground">Untitled meeting</span>}
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            {new Date(detail.started_at).toLocaleString()}
+            {typeof detail.duration_seconds === "number"
+              ? ` · ${formatDuration(detail.duration_seconds)}`
+              : ""}
+            {" · "}
+            <span className="font-mono text-xs">{detail.status}</span>
+          </p>
+        </div>
+        {isDeletableMeetingStatus(detail.status) && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="shrink-0 text-muted-foreground hover:text-destructive"
+            onClick={() => {
+              void handleDelete();
+            }}
+          >
+            <Trash2 className="mr-1 h-3.5 w-3.5" />
+            Delete
+          </Button>
+        )}
       </header>
 
       {isTranscribing && (

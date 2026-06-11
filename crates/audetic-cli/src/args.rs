@@ -150,6 +150,11 @@ pub enum MeetingCommand {
         /// Meeting ID
         id: i64,
     },
+    /// Delete a meeting (hides it from all views; audio stays on disk)
+    Delete {
+        /// Meeting ID
+        id: i64,
+    },
     /// Import an existing audio or video file as a new meeting
     Import {
         /// Path to the media file (audio or video) to import

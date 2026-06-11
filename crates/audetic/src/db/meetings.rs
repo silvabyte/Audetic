@@ -4,9 +4,22 @@
 //! `operations.rs` — raw SQL with rusqlite, no ORM.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::meeting::status::MeetingPhase;
+
+/// Result of a soft-delete attempt, so the API can answer with the right
+/// status code (200 / 404 / 409).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftDeleteOutcome {
+    /// The row was stamped `deleted_at` and is now hidden from all views.
+    Deleted,
+    /// No live row with that id — unknown, or already deleted.
+    NotFound,
+    /// The meeting is still in-flight (recording / review / processing), so
+    /// deletion was refused; stop or cancel it first.
+    InFlight,
+}
 
 /// A meeting record from the database.
 #[derive(Debug, Clone)]
@@ -22,6 +35,10 @@ pub struct MeetingRecord {
     pub completed_at: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
+    /// When set, the meeting has been soft-deleted and is hidden from every
+    /// API surface (list, detail, audio, retry). The row and on-disk audio
+    /// survive; recovery is a manual DB edit.
+    pub deleted_at: Option<String>,
 }
 
 /// Repository for meeting records.
@@ -112,6 +129,30 @@ impl MeetingRepository {
         Ok(())
     }
 
+    /// Atomically move a failed meeting into `transcribing` as a retry starts.
+    ///
+    /// Only succeeds if the row is still live and `error`, so a single SQL
+    /// statement both rejects a double-retry and — critically — flips the row
+    /// out of a terminal state *before* the retry endpoint returns 202. Without
+    /// this, the row stays `error` until the spawned task gets around to
+    /// updating it, and a DELETE landing in that window would see a terminal
+    /// row and hide an already-accepted retry. Returns false if the row wasn't
+    /// in the expected state.
+    pub fn begin_retry(conn: &Connection, id: i64) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE meetings SET status = ?1 \
+                 WHERE id = ?2 AND status = ?3 AND deleted_at IS NULL",
+                params![
+                    MeetingPhase::Transcribing.as_str(),
+                    id,
+                    MeetingPhase::Error.as_str(),
+                ],
+            )
+            .context("Failed to mark meeting retry in-flight")?;
+        Ok(affected > 0)
+    }
+
     /// Mark meeting as cancelled with the recorded duration.
     pub fn cancel(conn: &Connection, id: i64, duration_seconds: i64) -> Result<()> {
         conn.execute(
@@ -123,13 +164,73 @@ impl MeetingRepository {
         Ok(())
     }
 
-    /// Get a meeting by ID.
+    /// Soft-delete a meeting: stamp `deleted_at` so it disappears from every
+    /// API surface (list, detail, audio, retry) while the row and the on-disk
+    /// audio survive.
+    ///
+    /// Refuses in-flight meetings (recording / review / processing): those ids
+    /// are still owned by the meeting machine and background pipeline, so
+    /// hiding the row would 404 the active/review UI and break completion
+    /// auto-nav.
+    ///
+    /// The terminal-status predicate lives **inside** the `UPDATE`, so the
+    /// guard and the write are one atomic statement. A separate
+    /// SELECT-then-UPDATE would leave a window where a concurrent
+    /// `POST /meetings/:id/retry` could flip `error` → `transcribing` after the
+    /// check but before the write, hiding an in-flight retry despite the 409
+    /// contract. Returns [`SoftDeleteOutcome`] so the caller can map it to
+    /// 200 / 404 / 409.
+    ///
+    /// This only hides DB-backed reads. On `Deleted`, the caller must also
+    /// clear the in-memory live status if it still references this meeting
+    /// (`MeetingStatusHandle::clear_if_current`), or `GET /meetings/status`
+    /// keeps reporting the deleted meeting until the next recording.
+    pub fn soft_delete(conn: &Connection, id: i64) -> Result<SoftDeleteOutcome> {
+        // Build the IN-list from the single terminal-status source. The values
+        // are compile-time constants (never user input), so interpolating them
+        // is injection-safe; `id` is still bound as a parameter.
+        let terminal = MeetingPhase::TERMINAL_STATUSES.join("', '");
+        let affected = conn
+            .execute(
+                &format!(
+                    "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP \
+                     WHERE id = ?1 AND deleted_at IS NULL AND status IN ('{terminal}')"
+                ),
+                params![id],
+            )
+            .context("Failed to soft-delete meeting")?;
+
+        if affected > 0 {
+            return Ok(SoftDeleteOutcome::Deleted);
+        }
+
+        // Nothing was hidden — read the live row only to choose between 404 and
+        // 409. This is advisory: the guarded UPDATE above already guarantees we
+        // never stamp an in-flight meeting, regardless of how this read races.
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to look up meeting after delete")?;
+
+        Ok(match status {
+            Some(s) if !MeetingPhase::is_terminal(&s) => SoftDeleteOutcome::InFlight,
+            // Either gone (no live row) or a terminal row a concurrent delete
+            // claimed first — nothing live remains for us to remove.
+            _ => SoftDeleteOutcome::NotFound,
+        })
+    }
+
+    /// Get a meeting by ID. Soft-deleted meetings are treated as absent.
     pub fn get(conn: &Connection, id: i64) -> Result<Option<MeetingRecord>> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at \
-                 FROM meetings WHERE id = ?1",
+                 duration_seconds, started_at, completed_at, error, created_at, deleted_at \
+                 FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
             )
             .context("Failed to prepare meeting query")?;
 
@@ -147,6 +248,7 @@ impl MeetingRepository {
                     completed_at: row.get(8)?,
                     error: row.get(9)?,
                     created_at: row.get(10)?,
+                    deleted_at: row.get(11)?,
                 })
             })
             .context("Failed to query meeting")?;
@@ -158,13 +260,14 @@ impl MeetingRepository {
         }
     }
 
-    /// List meetings, newest first.
+    /// List meetings, newest first. Soft-deleted meetings are excluded.
     pub fn list(conn: &Connection, limit: usize) -> Result<Vec<MeetingRecord>> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at \
-                 FROM meetings ORDER BY started_at DESC, id DESC LIMIT ?1",
+                 duration_seconds, started_at, completed_at, error, created_at, deleted_at \
+                 FROM meetings WHERE deleted_at IS NULL \
+                 ORDER BY started_at DESC, id DESC LIMIT ?1",
             )
             .context("Failed to prepare meetings list query")?;
 
@@ -182,6 +285,7 @@ impl MeetingRepository {
                     completed_at: row.get(8)?,
                     error: row.get(9)?,
                     created_at: row.get(10)?,
+                    deleted_at: row.get(11)?,
                 })
             })
             .context("Failed to list meetings")?;
@@ -308,5 +412,143 @@ mod tests {
         let conn = setup_db();
         let meetings = MeetingRepository::list(&conn, 10).unwrap();
         assert!(meetings.is_empty());
+    }
+
+    /// Insert a meeting already in a terminal (deletable) state. `insert`
+    /// always starts at `recording`, which is in-flight, so terminal-state
+    /// tests move it to `completed` first.
+    fn insert_completed(conn: &Connection, title: &str, path: &str) -> i64 {
+        let id = MeetingRepository::insert(conn, Some(title), path).unwrap();
+        MeetingRepository::complete(conn, id, "/tmp/t.txt", "transcript", 10).unwrap();
+        id
+    }
+
+    #[test]
+    fn test_soft_delete_hides_from_get_and_list() {
+        let conn = setup_db();
+        let keep = insert_completed(&conn, "Keep", "/tmp/keep.wav");
+        let drop = insert_completed(&conn, "Drop", "/tmp/drop.wav");
+
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, drop).unwrap(),
+            SoftDeleteOutcome::Deleted
+        );
+
+        // Hidden from get()
+        assert!(MeetingRepository::get(&conn, drop).unwrap().is_none());
+        // Still retrievable: the surviving meeting
+        assert!(MeetingRepository::get(&conn, keep).unwrap().is_some());
+        // Hidden from list()
+        let listed = MeetingRepository::list(&conn, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, keep);
+    }
+
+    #[test]
+    fn test_soft_delete_is_idempotent() {
+        let conn = setup_db();
+        let id = insert_completed(&conn, "Test", "/tmp/test.wav");
+
+        // First delete affects the row, second finds nothing live.
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, id).unwrap(),
+            SoftDeleteOutcome::Deleted
+        );
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, id).unwrap(),
+            SoftDeleteOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn test_soft_delete_unknown_id() {
+        let conn = setup_db();
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, 9999).unwrap(),
+            SoftDeleteOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn test_soft_delete_rejects_in_flight() {
+        let conn = setup_db();
+        // `insert` starts at `recording` — an in-flight phase.
+        let id = MeetingRepository::insert(&conn, Some("Live"), "/tmp/live.wav").unwrap();
+
+        for phase in [
+            MeetingPhase::Recording,
+            MeetingPhase::Review,
+            MeetingPhase::Compressing,
+            MeetingPhase::Transcribing,
+        ] {
+            MeetingRepository::update_status(&conn, id, phase).unwrap();
+            assert_eq!(
+                MeetingRepository::soft_delete(&conn, id).unwrap(),
+                SoftDeleteOutcome::InFlight,
+                "phase {} should be refused",
+                phase.as_str()
+            );
+            // Still visible — not hidden.
+            assert!(MeetingRepository::get(&conn, id).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn test_begin_retry_only_from_error() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, Some("Test"), "/tmp/test.wav").unwrap();
+
+        // Fresh meeting is `recording`, not retry-eligible.
+        assert!(!MeetingRepository::begin_retry(&conn, id).unwrap());
+
+        // After a failure it is — and the transition flips it to transcribing.
+        MeetingRepository::fail(&conn, id, "boom", 10).unwrap();
+        assert!(MeetingRepository::begin_retry(&conn, id).unwrap());
+        assert_eq!(
+            MeetingRepository::get(&conn, id).unwrap().unwrap().status,
+            "transcribing"
+        );
+
+        // A second concurrent retry finds it already in-flight.
+        assert!(!MeetingRepository::begin_retry(&conn, id).unwrap());
+    }
+
+    #[test]
+    fn test_begin_retry_blocks_delete_window() {
+        // Reproduces the race the guard closes: once a retry is accepted, the
+        // meeting must not be deletable even though it was just `error`.
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, Some("Test"), "/tmp/test.wav").unwrap();
+        MeetingRepository::fail(&conn, id, "boom", 10).unwrap();
+
+        // Before retry: terminal, so deletable.
+        // (Don't actually delete — just assert begin_retry then flips it.)
+        assert!(MeetingRepository::begin_retry(&conn, id).unwrap());
+
+        // After retry is accepted the delete guard refuses it.
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, id).unwrap(),
+            SoftDeleteOutcome::InFlight
+        );
+        assert!(MeetingRepository::get(&conn, id).unwrap().is_some());
+    }
+
+    #[test]
+    fn test_soft_delete_keeps_row_on_disk() {
+        let conn = setup_db();
+        let id = insert_completed(&conn, "Test", "/tmp/test.wav");
+
+        MeetingRepository::soft_delete(&conn, id).unwrap();
+
+        // The physical row survives with deleted_at stamped — only the
+        // repository's filtered reads hide it.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meetings WHERE id = ?1 AND deleted_at IS NOT NULL",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

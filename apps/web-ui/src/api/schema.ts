@@ -274,7 +274,19 @@ export interface paths {
         get: operations["get_meeting"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Soft-delete a meeting.
+         * @description The user-facing label is "Delete", but the row is only hidden — we stamp
+         *     `deleted_at` so it drops out of every API surface (list, detail, audio,
+         *     retry) while the recording stays on disk. Recovery is a manual DB edit.
+         *
+         *     In-flight meetings (recording / review / processing) are refused with 409:
+         *     their id is still owned by the meeting machine and background pipeline, so
+         *     hiding the row would 404 the active/review UI and break completion
+         *     auto-nav. Stop or cancel the meeting first. Returns 404 if the meeting
+         *     doesn't exist or was already deleted.
+         */
+        delete: operations["delete_meeting"];
         options?: never;
         head?: never;
         patch?: never;
@@ -833,6 +845,17 @@ export interface components {
              * @description New start of the recording, in seconds (clamped to the recording).
              */
             start_seconds?: number | null;
+        };
+        /**
+         * @description Confirmation that a meeting has been deleted. The delete is *soft*: the
+         *     meeting is hidden from every API surface but its row and on-disk audio
+         *     survive.
+         */
+        MeetingDeleteResponse: {
+            /** Format: int64 */
+            meeting_id: number;
+            message: string;
+            success: boolean;
         };
         /** @description Full meeting record including transcript text when available. */
         MeetingDetailResponse: {
@@ -1544,6 +1567,43 @@ export interface operations {
             };
             /** @description Meeting not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_meeting: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Meeting id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Meeting deleted (hidden from all views) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeetingDeleteResponse"];
+                };
+            };
+            /** @description Meeting not found or already deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Meeting is still in progress; stop or cancel it first */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
