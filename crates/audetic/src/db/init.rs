@@ -56,11 +56,17 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
             error TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            deleted_at TIMESTAMP
         )",
         [],
     )
     .context("Failed to create meetings table")?;
+
+    // Soft-delete column for meetings created before `deleted_at` existed.
+    // `CREATE TABLE IF NOT EXISTS` above is a no-op on those DBs, so backfill
+    // the column here. Idempotent — skips the ALTER if it's already present.
+    add_column_if_missing(conn, "meetings", "deleted_at", "TIMESTAMP")?;
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at DESC)",
@@ -73,6 +79,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         [],
     )
     .context("Failed to create meetings status index")?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_meetings_deleted_at ON meetings(deleted_at)",
+        [],
+    )
+    .context("Failed to create meetings deleted_at index")?;
 
     // Post-processing jobs: user-defined commands fired on daemon events
     // (e.g. dictation.completed, meeting.completed). `action_config` is a
@@ -100,5 +112,26 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create post_processing_jobs event index")?;
 
+    Ok(())
+}
+
+/// Add `column` to `table` only if it isn't already there. SQLite has no
+/// `ADD COLUMN IF NOT EXISTS`, and there's no versioned-migration system here,
+/// so we inspect `PRAGMA table_info` first and `ALTER` only when missing —
+/// keeping `migrate()` safe to run on every startup against any DB vintage.
+fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .with_context(|| format!("Failed to inspect columns of {table}"))?;
+    let exists = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .with_context(|| format!("Failed to read columns of {table}"))?
+        .filter_map(|c| c.ok())
+        .any(|c| c == column);
+
+    if !exists {
+        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])
+            .with_context(|| format!("Failed to add column {column} to {table}"))?;
+    }
     Ok(())
 }

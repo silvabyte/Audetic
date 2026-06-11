@@ -22,6 +22,10 @@ pub struct MeetingRecord {
     pub completed_at: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
+    /// When set, the meeting has been soft-deleted and is hidden from every
+    /// API surface (list, detail, audio, retry). The row and on-disk audio
+    /// survive; recovery is a manual DB edit.
+    pub deleted_at: Option<String>,
 }
 
 /// Repository for meeting records.
@@ -123,13 +127,28 @@ impl MeetingRepository {
         Ok(())
     }
 
-    /// Get a meeting by ID.
+    /// Soft-delete a meeting: stamp `deleted_at` so it disappears from every
+    /// API surface (list, detail, audio, retry) while the row and the on-disk
+    /// audio survive. Returns `false` when no live row matched — an unknown id
+    /// or one already deleted — so the API can answer 404.
+    pub fn soft_delete(conn: &Connection, id: i64) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP \
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                params![id],
+            )
+            .context("Failed to soft-delete meeting")?;
+        Ok(affected > 0)
+    }
+
+    /// Get a meeting by ID. Soft-deleted meetings are treated as absent.
     pub fn get(conn: &Connection, id: i64) -> Result<Option<MeetingRecord>> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at \
-                 FROM meetings WHERE id = ?1",
+                 duration_seconds, started_at, completed_at, error, created_at, deleted_at \
+                 FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
             )
             .context("Failed to prepare meeting query")?;
 
@@ -147,6 +166,7 @@ impl MeetingRepository {
                     completed_at: row.get(8)?,
                     error: row.get(9)?,
                     created_at: row.get(10)?,
+                    deleted_at: row.get(11)?,
                 })
             })
             .context("Failed to query meeting")?;
@@ -158,13 +178,14 @@ impl MeetingRepository {
         }
     }
 
-    /// List meetings, newest first.
+    /// List meetings, newest first. Soft-deleted meetings are excluded.
     pub fn list(conn: &Connection, limit: usize) -> Result<Vec<MeetingRecord>> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at \
-                 FROM meetings ORDER BY started_at DESC, id DESC LIMIT ?1",
+                 duration_seconds, started_at, completed_at, error, created_at, deleted_at \
+                 FROM meetings WHERE deleted_at IS NULL \
+                 ORDER BY started_at DESC, id DESC LIMIT ?1",
             )
             .context("Failed to prepare meetings list query")?;
 
@@ -182,6 +203,7 @@ impl MeetingRepository {
                     completed_at: row.get(8)?,
                     error: row.get(9)?,
                     created_at: row.get(10)?,
+                    deleted_at: row.get(11)?,
                 })
             })
             .context("Failed to list meetings")?;
@@ -308,5 +330,58 @@ mod tests {
         let conn = setup_db();
         let meetings = MeetingRepository::list(&conn, 10).unwrap();
         assert!(meetings.is_empty());
+    }
+
+    #[test]
+    fn test_soft_delete_hides_from_get_and_list() {
+        let conn = setup_db();
+        let keep = MeetingRepository::insert(&conn, Some("Keep"), "/tmp/keep.wav").unwrap();
+        let drop = MeetingRepository::insert(&conn, Some("Drop"), "/tmp/drop.wav").unwrap();
+
+        assert!(MeetingRepository::soft_delete(&conn, drop).unwrap());
+
+        // Hidden from get()
+        assert!(MeetingRepository::get(&conn, drop).unwrap().is_none());
+        // Still retrievable: the surviving meeting
+        assert!(MeetingRepository::get(&conn, keep).unwrap().is_some());
+        // Hidden from list()
+        let listed = MeetingRepository::list(&conn, 10).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, keep);
+    }
+
+    #[test]
+    fn test_soft_delete_is_idempotent() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, Some("Test"), "/tmp/test.wav").unwrap();
+
+        // First delete affects the row, second finds nothing live.
+        assert!(MeetingRepository::soft_delete(&conn, id).unwrap());
+        assert!(!MeetingRepository::soft_delete(&conn, id).unwrap());
+    }
+
+    #[test]
+    fn test_soft_delete_unknown_id() {
+        let conn = setup_db();
+        assert!(!MeetingRepository::soft_delete(&conn, 9999).unwrap());
+    }
+
+    #[test]
+    fn test_soft_delete_keeps_row_on_disk() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, Some("Test"), "/tmp/test.wav").unwrap();
+
+        MeetingRepository::soft_delete(&conn, id).unwrap();
+
+        // The physical row survives with deleted_at stamped — only the
+        // repository's filtered reads hide it.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meetings WHERE id = ?1 AND deleted_at IS NOT NULL",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

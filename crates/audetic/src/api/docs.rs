@@ -62,6 +62,7 @@ use super::routes::{
         meetings::meeting_status,
         meetings::list_meetings,
         meetings::get_meeting,
+        meetings::delete_meeting,
         meetings::meeting_audio,
         meetings::retry_meeting,
         meetings::import_meeting,
@@ -119,6 +120,7 @@ use super::routes::{
         meetings::MeetingsListResponse,
         meetings::MeetingDetailResponse,
         meetings::MeetingRetryResponse,
+        meetings::MeetingDeleteResponse,
         meetings::MeetingImportResponse,
         // Post-processing
         crate::post_processing::Action,

@@ -241,6 +241,33 @@ export class MeetingStore {
     }
   }
 
+  /**
+   * Delete a meeting. The label is "Delete" but the daemon soft-deletes it:
+   * the row is hidden everywhere and the audio stays on disk. On success we
+   * drop it from the in-memory list and detail caches so the UI updates
+   * without a refetch. Returns whether it succeeded so callers can navigate
+   * and toast. Failures land on `lastError`.
+   */
+  async deleteMeeting(id: number): Promise<boolean> {
+    try {
+      const { error } = await daemon.DELETE("/meetings/{id}", {
+        params: { path: { id } },
+      });
+      if (error) throw new Error(formatError(error));
+      runInAction(() => {
+        this.list = this.list.filter((m) => m.id !== id);
+        delete this.detailCache[id];
+        delete this.detailStatus[id];
+      });
+      return true;
+    } catch (e) {
+      runInAction(() => {
+        this.lastError = e instanceof Error ? e.message : String(e);
+      });
+      return false;
+    }
+  }
+
   // ---------------------------------------------------------------
   // List + detail fetches
   // ---------------------------------------------------------------

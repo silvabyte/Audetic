@@ -28,6 +28,7 @@ pub async fn handle_meeting_command(args: MeetingCliArgs) -> Result<()> {
         MeetingCommand::Status => show_status().await,
         MeetingCommand::List { limit } => list_meetings(limit).await,
         MeetingCommand::Show { id } => show_meeting(id).await,
+        MeetingCommand::Delete { id } => delete_meeting(id).await,
         MeetingCommand::Import { path, title } => import_meeting(path, title).await,
     }
 }
@@ -385,6 +386,24 @@ async fn show_meeting(id: i64) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Delete a meeting. The daemon soft-deletes it (hidden from all views, audio
+/// kept on disk); a missing/already-deleted meeting comes back as a friendly
+/// 404 via `json_or_error`.
+async fn delete_meeting(id: i64) -> Result<()> {
+    let client = reqwest::Client::new();
+
+    let response = client
+        .delete(format!("{}/meetings/{}", base_url(), id))
+        .send()
+        .await
+        .context("Failed to connect to Audetic service. Is it running?")?;
+
+    json_or_error(response, "delete meeting").await?;
+
+    println!("Meeting #{} deleted.", id);
     Ok(())
 }
 

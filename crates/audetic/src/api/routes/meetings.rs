@@ -176,7 +176,7 @@ pub fn router(state: MeetingState) -> Router {
             // memory usage stays bounded regardless of body size.
             post(import_meeting).layer(DefaultBodyLimit::disable()),
         )
-        .route("/meetings/:id", get(get_meeting))
+        .route("/meetings/:id", get(get_meeting).delete(delete_meeting))
         .route("/meetings/:id/audio", get(meeting_audio))
         .route("/meetings/:id/retry", post(retry_meeting))
         .with_state(state)
@@ -186,6 +186,16 @@ pub fn router(state: MeetingState) -> Router {
 /// re-queued; the actual work runs in the background.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingRetryResponse {
+    pub success: bool,
+    pub meeting_id: i64,
+    pub message: String,
+}
+
+/// Confirmation that a meeting has been deleted. The delete is *soft*: the
+/// meeting is hidden from every API surface but its row and on-disk audio
+/// survive.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeetingDeleteResponse {
     pub success: bool,
     pub meeting_id: i64,
     pub message: String,
@@ -819,6 +829,73 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
         }),
     )
         .into_response()
+}
+
+/// Soft-delete a meeting.
+///
+/// The user-facing label is "Delete", but the row is only hidden — we stamp
+/// `deleted_at` so it drops out of every API surface (list, detail, audio,
+/// retry) while the recording stays on disk. Recovery is a manual DB edit.
+/// Returns 404 if the meeting doesn't exist or was already deleted.
+#[utoipa::path(
+    delete,
+    path = "/meetings/{id}",
+    tag = "meetings",
+    params(
+        ("id" = i64, Path, description = "Meeting id"),
+    ),
+    responses(
+        (status = 200, description = "Meeting deleted (hidden from all views)", body = MeetingDeleteResponse),
+        (status = 404, description = "Meeting not found or already deleted"),
+    ),
+)]
+pub async fn delete_meeting(
+    Path(id): Path<i64>,
+    State(_state): State<MeetingState>,
+) -> Response {
+    info!("Meeting {} delete requested", id);
+
+    let deleted = tokio::task::spawn_blocking(move || {
+        let conn = crate::db::init_db()?;
+        crate::db::meetings::MeetingRepository::soft_delete(&conn, id)
+    })
+    .await;
+
+    match deleted {
+        Ok(Ok(true)) => (
+            StatusCode::OK,
+            Json(MeetingDeleteResponse {
+                success: true,
+                meeting_id: id,
+                message: format!("Meeting {id} deleted"),
+            }),
+        )
+            .into_response(),
+        Ok(Ok(false)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "success": false,
+                "message": format!("Meeting {id} not found"),
+            })),
+        )
+            .into_response(),
+        Ok(Err(e)) => {
+            error!("Failed to delete meeting {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": e.to_string() })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            error!("DB task panicked deleting meeting {}: {}", id, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": "db task panicked" })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Import a media file as a new meeting.

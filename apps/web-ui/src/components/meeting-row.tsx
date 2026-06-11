@@ -1,10 +1,36 @@
 import { NavLink } from "react-router-dom";
-import { Radio, CheckCircle2, TriangleAlert, Loader2, XCircle } from "lucide-react";
+import { Radio, CheckCircle2, TriangleAlert, Loader2, XCircle, Trash2 } from "lucide-react";
+import { toast } from "sonner";
 import { Card, CardContent } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import type { MeetingSummary } from "@/stores/meeting-store";
+import { getRootStore } from "@/stores/singleton";
 import { cn } from "@/lib/utils";
 
 export function MeetingRow({ meeting }: { meeting: MeetingSummary }) {
+  const label = meeting.title ?? "Untitled";
+
+  const handleDelete = async (
+    e: React.MouseEvent<HTMLButtonElement>,
+  ): Promise<void> => {
+    // The row is a NavLink — stop the click from navigating into the detail
+    // page we're about to delete out from under.
+    e.preventDefault();
+    e.stopPropagation();
+    if (!window.confirm(`Delete "${label}"? This hides it from all views.`)) {
+      return;
+    }
+    const ok = await getRootStore().meetings.deleteMeeting(meeting.id);
+    toast[ok ? "success" : "error"](
+      ok ? "Meeting deleted" : "Could not delete meeting",
+    );
+  };
+
   return (
     <NavLink
       to={`/meetings/${meeting.id}`}
@@ -27,6 +53,20 @@ export function MeetingRow({ meeting }: { meeting: MeetingSummary }) {
             </div>
           </div>
           <StatusPill status={meeting.status} />
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                variant="ghost"
+                size="icon"
+                className="text-muted-foreground hover:text-destructive"
+                aria-label="Delete meeting"
+                onClick={handleDelete}
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>Delete meeting</TooltipContent>
+          </Tooltip>
         </CardContent>
       </Card>
     </NavLink>
