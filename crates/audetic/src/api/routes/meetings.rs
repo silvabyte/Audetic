@@ -813,6 +813,52 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
         }
     };
 
+    // Atomically flip error → transcribing *before* returning 202. The status
+    // check above and the spawned task's own transition leave a window where
+    // the row is still `error`; a DELETE arriving then would treat this
+    // already-accepted retry as a terminal, deletable meeting and hide it. Do
+    // the transition here (last, after the file-missing 409s, so a bail can't
+    // strand the row in `transcribing`) and reject if the row is no longer the
+    // failed meeting we loaded — e.g. a concurrent retry or delete won.
+    let marked = tokio::task::spawn_blocking(move || {
+        let conn = crate::db::init_db()?;
+        crate::db::meetings::MeetingRepository::begin_retry(&conn, id)
+    })
+    .await;
+
+    match marked {
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "success": false,
+                    "message": format!(
+                        "Meeting {} is no longer eligible for retry; its state changed",
+                        id
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            error!("Failed to mark meeting {} retry in-flight: {}", id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": e.to_string() })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            error!("DB task panicked marking meeting {} retry: {}", id, e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "success": false, "message": "db task panicked" })),
+            )
+                .into_response();
+        }
+    }
+
     let duration = meeting.duration_seconds.unwrap_or(0);
     let transcription = state.transcription.clone();
     tokio::spawn(async move {
