@@ -180,6 +180,11 @@ impl MeetingRepository {
     /// check but before the write, hiding an in-flight retry despite the 409
     /// contract. Returns [`SoftDeleteOutcome`] so the caller can map it to
     /// 200 / 404 / 409.
+    ///
+    /// This only hides DB-backed reads. On `Deleted`, the caller must also
+    /// clear the in-memory live status if it still references this meeting
+    /// (`MeetingStatusHandle::clear_if_current`), or `GET /meetings/status`
+    /// keeps reporting the deleted meeting until the next recording.
     pub fn soft_delete(conn: &Connection, id: i64) -> Result<SoftDeleteOutcome> {
         // Build the IN-list from the single terminal-status source. The values
         // are compile-time constants (never user input), so interpolating them

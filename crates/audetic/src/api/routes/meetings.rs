@@ -882,6 +882,9 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
 /// The user-facing label is "Delete", but the row is only hidden — we stamp
 /// `deleted_at` so it drops out of every API surface (list, detail, audio,
 /// retry) while the recording stays on disk. Recovery is a manual DB edit.
+/// If the live status handle still describes this meeting (it keeps the most
+/// recent terminal meeting so the UI can show the outcome), it is reset too,
+/// so `GET /meetings/status` doesn't keep reporting a deleted meeting.
 ///
 /// In-flight meetings (recording / review / processing) are refused with 409:
 /// their id is still owned by the meeting machine and background pipeline, so
@@ -901,7 +904,7 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
         (status = 409, description = "Meeting is still in progress; stop or cancel it first"),
     ),
 )]
-pub async fn delete_meeting(Path(id): Path<i64>, State(_state): State<MeetingState>) -> Response {
+pub async fn delete_meeting(Path(id): Path<i64>, State(state): State<MeetingState>) -> Response {
     info!("Meeting {} delete requested", id);
 
     let outcome = tokio::task::spawn_blocking(move || {
@@ -912,15 +915,25 @@ pub async fn delete_meeting(Path(id): Path<i64>, State(_state): State<MeetingSta
 
     use crate::db::meetings::SoftDeleteOutcome;
     match outcome {
-        Ok(Ok(SoftDeleteOutcome::Deleted)) => (
-            StatusCode::OK,
-            Json(MeetingDeleteResponse {
-                success: true,
-                meeting_id: id,
-                message: format!("Meeting {id} deleted"),
-            }),
-        )
-            .into_response(),
+        Ok(Ok(SoftDeleteOutcome::Deleted)) => {
+            // The DB row is hidden, but the most recent meeting also lives on
+            // in the shared status handle (terminal phases keep id/title/error
+            // there so the UI can show the outcome). Clear it if it still
+            // points at this meeting, or GET /meetings/status would keep
+            // reporting the deleted meeting until the next recording starts.
+            if state.status.clear_if_current(id).await {
+                info!("Meeting {} cleared from live status after delete", id);
+            }
+            (
+                StatusCode::OK,
+                Json(MeetingDeleteResponse {
+                    success: true,
+                    meeting_id: id,
+                    message: format!("Meeting {id} deleted"),
+                }),
+            )
+                .into_response()
+        }
         Ok(Ok(SoftDeleteOutcome::NotFound)) => (
             StatusCode::NOT_FOUND,
             Json(json!({

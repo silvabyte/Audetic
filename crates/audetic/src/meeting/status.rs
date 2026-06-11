@@ -156,6 +156,24 @@ impl MeetingStatusHandle {
         *state = MeetingState::default();
     }
 
+    /// Reset to Idle, but only if the state still describes the given meeting.
+    ///
+    /// Called after a soft-delete so `GET /meetings/status` stops reporting a
+    /// meeting that is hidden everywhere else. Check-and-reset happens under a
+    /// single lock acquisition: meeting ids are never reused and the delete's
+    /// SQL guard only hides terminal rows, so an id match here can only be the
+    /// settled meeting the machine has finished with — never a live recording
+    /// that started after the delete was accepted. Returns whether the state
+    /// was cleared.
+    pub async fn clear_if_current(&self, meeting_id: i64) -> bool {
+        let mut state = self.inner.lock().await;
+        if state.meeting_id != Some(meeting_id) {
+            return false;
+        }
+        *state = MeetingState::default();
+        true
+    }
+
     pub async fn complete(&self) {
         let mut state = self.inner.lock().await;
         state.phase = MeetingPhase::Completed;
@@ -279,6 +297,44 @@ mod tests {
         let state = handle.get().await;
         assert_eq!(state.phase, MeetingPhase::Idle);
         assert!(state.meeting_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_if_current_resets_matching_meeting() {
+        let handle = MeetingStatusHandle::default();
+        handle
+            .start_recording(7, Some("Test".to_string()), PathBuf::from("/tmp/test.wav"))
+            .await;
+        handle.complete().await;
+
+        // The terminal meeting lingers in the handle; deleting it clears it.
+        assert!(handle.clear_if_current(7).await);
+        let state = handle.get().await;
+        assert_eq!(state.phase, MeetingPhase::Idle);
+        assert!(state.meeting_id.is_none());
+        assert!(state.title.is_none());
+        assert!(state.audio_path.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_clear_if_current_ignores_other_meeting() {
+        let handle = MeetingStatusHandle::default();
+        handle
+            .start_recording(8, Some("Live".to_string()), PathBuf::from("/tmp/live.wav"))
+            .await;
+
+        // Deleting an older meeting must not disturb the current one.
+        assert!(!handle.clear_if_current(7).await);
+        let state = handle.get().await;
+        assert_eq!(state.phase, MeetingPhase::Recording);
+        assert_eq!(state.meeting_id, Some(8));
+    }
+
+    #[tokio::test]
+    async fn test_clear_if_current_noop_when_idle() {
+        let handle = MeetingStatusHandle::default();
+        assert!(!handle.clear_if_current(7).await);
+        assert_eq!(handle.get().await.phase, MeetingPhase::Idle);
     }
 
     #[tokio::test]
