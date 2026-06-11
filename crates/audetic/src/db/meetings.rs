@@ -147,10 +147,37 @@ impl MeetingRepository {
     /// Refuses in-flight meetings (recording / review / processing): those ids
     /// are still owned by the meeting machine and background pipeline, so
     /// hiding the row would 404 the active/review UI and break completion
-    /// auto-nav. The status check and the update run on the same connection so
-    /// the decision can't straddle a concurrent writer. Returns [`SoftDeleteOutcome`]
-    /// so the caller can map it to 200 / 404 / 409.
+    /// auto-nav.
+    ///
+    /// The terminal-status predicate lives **inside** the `UPDATE`, so the
+    /// guard and the write are one atomic statement. A separate
+    /// SELECT-then-UPDATE would leave a window where a concurrent
+    /// `POST /meetings/:id/retry` could flip `error` → `transcribing` after the
+    /// check but before the write, hiding an in-flight retry despite the 409
+    /// contract. Returns [`SoftDeleteOutcome`] so the caller can map it to
+    /// 200 / 404 / 409.
     pub fn soft_delete(conn: &Connection, id: i64) -> Result<SoftDeleteOutcome> {
+        // Build the IN-list from the single terminal-status source. The values
+        // are compile-time constants (never user input), so interpolating them
+        // is injection-safe; `id` is still bound as a parameter.
+        let terminal = MeetingPhase::TERMINAL_STATUSES.join("', '");
+        let affected = conn
+            .execute(
+                &format!(
+                    "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP \
+                     WHERE id = ?1 AND deleted_at IS NULL AND status IN ('{terminal}')"
+                ),
+                params![id],
+            )
+            .context("Failed to soft-delete meeting")?;
+
+        if affected > 0 {
+            return Ok(SoftDeleteOutcome::Deleted);
+        }
+
+        // Nothing was hidden — read the live row only to choose between 404 and
+        // 409. This is advisory: the guarded UPDATE above already guarantees we
+        // never stamp an in-flight meeting, regardless of how this read races.
         let status: Option<String> = conn
             .query_row(
                 "SELECT status FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
@@ -158,31 +185,13 @@ impl MeetingRepository {
                 |row| row.get(0),
             )
             .optional()
-            .context("Failed to look up meeting for delete")?;
+            .context("Failed to look up meeting after delete")?;
 
-        let status = match status {
-            Some(s) => s,
-            None => return Ok(SoftDeleteOutcome::NotFound),
-        };
-
-        if !MeetingPhase::is_terminal(&status) {
-            return Ok(SoftDeleteOutcome::InFlight);
-        }
-
-        let affected = conn
-            .execute(
-                "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP \
-                 WHERE id = ?1 AND deleted_at IS NULL",
-                params![id],
-            )
-            .context("Failed to soft-delete meeting")?;
-
-        // A zero count means a concurrent delete won the race between the
-        // lookup above and this update — treat it as already gone.
-        Ok(if affected > 0 {
-            SoftDeleteOutcome::Deleted
-        } else {
-            SoftDeleteOutcome::NotFound
+        Ok(match status {
+            Some(s) if !MeetingPhase::is_terminal(&s) => SoftDeleteOutcome::InFlight,
+            // Either gone (no live row) or a terminal row a concurrent delete
+            // claimed first — nothing live remains for us to remove.
+            _ => SoftDeleteOutcome::NotFound,
         })
     }
 

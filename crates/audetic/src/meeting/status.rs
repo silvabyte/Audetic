@@ -37,16 +37,21 @@ impl MeetingPhase {
         }
     }
 
+    /// Stored `status` strings considered terminal (settled) and therefore safe
+    /// to soft-delete. Single source of truth shared by [`Self::is_terminal`]
+    /// and the guarded `DELETE` SQL in `MeetingRepository::soft_delete`, so the
+    /// Rust check and the SQL predicate can't drift apart. Recording, review,
+    /// and the processing phases are deliberately absent: while in-flight, the
+    /// meeting machine and background pipeline still hold the id, so hiding the
+    /// row would 404 the active/review UI (`/meetings/:id/audio` and detail)
+    /// and break completion auto-nav.
+    pub const TERMINAL_STATUSES: [&'static str; 3] = ["completed", "error", "cancelled"];
+
     /// Whether a meeting with this stored `status` is settled and therefore
-    /// safe to soft-delete. Recording, review, and the processing phases are
-    /// *in-flight* — the meeting machine and background pipeline still hold the
-    /// id, so deleting would 404 the active/review UI (`/meetings/:id/audio`
-    /// and detail) and break completion auto-nav. Allow-list terminal states so
-    /// any future in-flight phase defaults to non-deletable.
+    /// safe to soft-delete. Allow-lists terminal states so any future in-flight
+    /// phase defaults to non-deletable.
     pub fn is_terminal(status: &str) -> bool {
-        status == Self::Completed.as_str()
-            || status == Self::Error.as_str()
-            || status == Self::Cancelled.as_str()
+        Self::TERMINAL_STATUSES.contains(&status)
     }
 }
 
@@ -175,6 +180,36 @@ mod tests {
         assert_eq!(MeetingPhase::Transcribing.as_str(), "transcribing");
         assert_eq!(MeetingPhase::Completed.as_str(), "completed");
         assert_eq!(MeetingPhase::Error.as_str(), "error");
+    }
+
+    #[test]
+    fn test_terminal_statuses_stay_aligned() {
+        // Every terminal variant's stored string is in the set...
+        for phase in [
+            MeetingPhase::Completed,
+            MeetingPhase::Error,
+            MeetingPhase::Cancelled,
+        ] {
+            assert!(
+                MeetingPhase::is_terminal(phase.as_str()),
+                "{} should be terminal",
+                phase.as_str()
+            );
+        }
+        // ...and every in-flight variant is excluded, so deletion is refused.
+        for phase in [
+            MeetingPhase::Idle,
+            MeetingPhase::Recording,
+            MeetingPhase::Review,
+            MeetingPhase::Compressing,
+            MeetingPhase::Transcribing,
+        ] {
+            assert!(
+                !MeetingPhase::is_terminal(phase.as_str()),
+                "{} should be in-flight",
+                phase.as_str()
+            );
+        }
     }
 
     #[test]
