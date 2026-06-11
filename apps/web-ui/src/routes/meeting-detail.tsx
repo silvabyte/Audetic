@@ -27,7 +27,10 @@ import {
 } from "@/components/ui/tooltip";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
-import type { MeetingDetail } from "@/stores/meeting-store";
+import {
+  isDeletableMeetingStatus,
+  type MeetingDetail,
+} from "@/stores/meeting-store";
 
 const DETAIL_INTENTS = {
   copyTranscript: "copy-transcript",
@@ -171,17 +174,19 @@ function MeetingDetailBody({
             <span className="font-mono text-xs">{detail.status}</span>
           </p>
         </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          className="shrink-0 text-muted-foreground hover:text-destructive"
-          onClick={() => {
-            void handleDelete();
-          }}
-        >
-          <Trash2 className="mr-1 h-3.5 w-3.5" />
-          Delete
-        </Button>
+        {isDeletableMeetingStatus(detail.status) && (
+          <Button
+            variant="ghost"
+            size="sm"
+            className="shrink-0 text-muted-foreground hover:text-destructive"
+            onClick={() => {
+              void handleDelete();
+            }}
+          >
+            <Trash2 className="mr-1 h-3.5 w-3.5" />
+            Delete
+          </Button>
+        )}
       </header>
 
       {isTranscribing && (

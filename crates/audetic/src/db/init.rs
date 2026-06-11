@@ -130,8 +130,11 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
         .any(|c| c == column);
 
     if !exists {
-        conn.execute(&format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"), [])
-            .with_context(|| format!("Failed to add column {column} to {table}"))?;
+        conn.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+            [],
+        )
+        .with_context(|| format!("Failed to add column {column} to {table}"))?;
     }
     Ok(())
 }

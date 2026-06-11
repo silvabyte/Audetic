@@ -36,6 +36,18 @@ impl MeetingPhase {
             Self::Cancelled => "cancelled",
         }
     }
+
+    /// Whether a meeting with this stored `status` is settled and therefore
+    /// safe to soft-delete. Recording, review, and the processing phases are
+    /// *in-flight* — the meeting machine and background pipeline still hold the
+    /// id, so deleting would 404 the active/review UI (`/meetings/:id/audio`
+    /// and detail) and break completion auto-nav. Allow-list terminal states so
+    /// any future in-flight phase defaults to non-deletable.
+    pub fn is_terminal(status: &str) -> bool {
+        status == Self::Completed.as_str()
+            || status == Self::Error.as_str()
+            || status == Self::Cancelled.as_str()
+    }
 }
 
 /// Options for starting a meeting.

@@ -4,9 +4,22 @@
 //! `operations.rs` — raw SQL with rusqlite, no ORM.
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::meeting::status::MeetingPhase;
+
+/// Result of a soft-delete attempt, so the API can answer with the right
+/// status code (200 / 404 / 409).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SoftDeleteOutcome {
+    /// The row was stamped `deleted_at` and is now hidden from all views.
+    Deleted,
+    /// No live row with that id — unknown, or already deleted.
+    NotFound,
+    /// The meeting is still in-flight (recording / review / processing), so
+    /// deletion was refused; stop or cancel it first.
+    InFlight,
+}
 
 /// A meeting record from the database.
 #[derive(Debug, Clone)]
@@ -129,9 +142,33 @@ impl MeetingRepository {
 
     /// Soft-delete a meeting: stamp `deleted_at` so it disappears from every
     /// API surface (list, detail, audio, retry) while the row and the on-disk
-    /// audio survive. Returns `false` when no live row matched — an unknown id
-    /// or one already deleted — so the API can answer 404.
-    pub fn soft_delete(conn: &Connection, id: i64) -> Result<bool> {
+    /// audio survive.
+    ///
+    /// Refuses in-flight meetings (recording / review / processing): those ids
+    /// are still owned by the meeting machine and background pipeline, so
+    /// hiding the row would 404 the active/review UI and break completion
+    /// auto-nav. The status check and the update run on the same connection so
+    /// the decision can't straddle a concurrent writer. Returns [`SoftDeleteOutcome`]
+    /// so the caller can map it to 200 / 404 / 409.
+    pub fn soft_delete(conn: &Connection, id: i64) -> Result<SoftDeleteOutcome> {
+        let status: Option<String> = conn
+            .query_row(
+                "SELECT status FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("Failed to look up meeting for delete")?;
+
+        let status = match status {
+            Some(s) => s,
+            None => return Ok(SoftDeleteOutcome::NotFound),
+        };
+
+        if !MeetingPhase::is_terminal(&status) {
+            return Ok(SoftDeleteOutcome::InFlight);
+        }
+
         let affected = conn
             .execute(
                 "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP \
@@ -139,7 +176,14 @@ impl MeetingRepository {
                 params![id],
             )
             .context("Failed to soft-delete meeting")?;
-        Ok(affected > 0)
+
+        // A zero count means a concurrent delete won the race between the
+        // lookup above and this update — treat it as already gone.
+        Ok(if affected > 0 {
+            SoftDeleteOutcome::Deleted
+        } else {
+            SoftDeleteOutcome::NotFound
+        })
     }
 
     /// Get a meeting by ID. Soft-deleted meetings are treated as absent.
@@ -332,13 +376,25 @@ mod tests {
         assert!(meetings.is_empty());
     }
 
+    /// Insert a meeting already in a terminal (deletable) state. `insert`
+    /// always starts at `recording`, which is in-flight, so terminal-state
+    /// tests move it to `completed` first.
+    fn insert_completed(conn: &Connection, title: &str, path: &str) -> i64 {
+        let id = MeetingRepository::insert(conn, Some(title), path).unwrap();
+        MeetingRepository::complete(conn, id, "/tmp/t.txt", "transcript", 10).unwrap();
+        id
+    }
+
     #[test]
     fn test_soft_delete_hides_from_get_and_list() {
         let conn = setup_db();
-        let keep = MeetingRepository::insert(&conn, Some("Keep"), "/tmp/keep.wav").unwrap();
-        let drop = MeetingRepository::insert(&conn, Some("Drop"), "/tmp/drop.wav").unwrap();
+        let keep = insert_completed(&conn, "Keep", "/tmp/keep.wav");
+        let drop = insert_completed(&conn, "Drop", "/tmp/drop.wav");
 
-        assert!(MeetingRepository::soft_delete(&conn, drop).unwrap());
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, drop).unwrap(),
+            SoftDeleteOutcome::Deleted
+        );
 
         // Hidden from get()
         assert!(MeetingRepository::get(&conn, drop).unwrap().is_none());
@@ -353,23 +409,56 @@ mod tests {
     #[test]
     fn test_soft_delete_is_idempotent() {
         let conn = setup_db();
-        let id = MeetingRepository::insert(&conn, Some("Test"), "/tmp/test.wav").unwrap();
+        let id = insert_completed(&conn, "Test", "/tmp/test.wav");
 
         // First delete affects the row, second finds nothing live.
-        assert!(MeetingRepository::soft_delete(&conn, id).unwrap());
-        assert!(!MeetingRepository::soft_delete(&conn, id).unwrap());
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, id).unwrap(),
+            SoftDeleteOutcome::Deleted
+        );
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, id).unwrap(),
+            SoftDeleteOutcome::NotFound
+        );
     }
 
     #[test]
     fn test_soft_delete_unknown_id() {
         let conn = setup_db();
-        assert!(!MeetingRepository::soft_delete(&conn, 9999).unwrap());
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, 9999).unwrap(),
+            SoftDeleteOutcome::NotFound
+        );
+    }
+
+    #[test]
+    fn test_soft_delete_rejects_in_flight() {
+        let conn = setup_db();
+        // `insert` starts at `recording` — an in-flight phase.
+        let id = MeetingRepository::insert(&conn, Some("Live"), "/tmp/live.wav").unwrap();
+
+        for phase in [
+            MeetingPhase::Recording,
+            MeetingPhase::Review,
+            MeetingPhase::Compressing,
+            MeetingPhase::Transcribing,
+        ] {
+            MeetingRepository::update_status(&conn, id, phase).unwrap();
+            assert_eq!(
+                MeetingRepository::soft_delete(&conn, id).unwrap(),
+                SoftDeleteOutcome::InFlight,
+                "phase {} should be refused",
+                phase.as_str()
+            );
+            // Still visible — not hidden.
+            assert!(MeetingRepository::get(&conn, id).unwrap().is_some());
+        }
     }
 
     #[test]
     fn test_soft_delete_keeps_row_on_disk() {
         let conn = setup_db();
-        let id = MeetingRepository::insert(&conn, Some("Test"), "/tmp/test.wav").unwrap();
+        let id = insert_completed(&conn, "Test", "/tmp/test.wav");
 
         MeetingRepository::soft_delete(&conn, id).unwrap();
 

@@ -279,7 +279,12 @@ export interface paths {
          * @description The user-facing label is "Delete", but the row is only hidden — we stamp
          *     `deleted_at` so it drops out of every API surface (list, detail, audio,
          *     retry) while the recording stays on disk. Recovery is a manual DB edit.
-         *     Returns 404 if the meeting doesn't exist or was already deleted.
+         *
+         *     In-flight meetings (recording / review / processing) are refused with 409:
+         *     their id is still owned by the meeting machine and background pipeline, so
+         *     hiding the row would 404 the active/review UI and break completion
+         *     auto-nav. Stop or cancel the meeting first. Returns 404 if the meeting
+         *     doesn't exist or was already deleted.
          */
         delete: operations["delete_meeting"];
         options?: never;
@@ -1592,6 +1597,13 @@ export interface operations {
             };
             /** @description Meeting not found or already deleted */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Meeting is still in progress; stop or cancel it first */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };

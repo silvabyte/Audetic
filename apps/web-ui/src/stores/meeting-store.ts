@@ -26,6 +26,19 @@ export type MeetingPhase =
 
 export type CaptureState = "both" | "mic_only" | "system_only" | "unknown";
 
+/**
+ * Whether a meeting in this phase is settled and therefore safe to delete.
+ * In-flight phases (recording, review, compressing, transcribing,
+ * running_hook) are still owned by the daemon's meeting machine — the backend
+ * rejects deleting them with 409, so we also hide the control for them.
+ * Mirrors `MeetingPhase::is_terminal` in
+ * crates/audetic/src/meeting/status.rs.
+ */
+export function isDeletableMeetingStatus(status: string): boolean {
+  const s = status.toLowerCase();
+  return s === "completed" || s === "error" || s === "cancelled";
+}
+
 const ACTIVE_POLL_MS = 1000;
 
 type ListStatus = "idle" | "loading" | "loaded" | "error";

@@ -8,12 +8,16 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { MeetingSummary } from "@/stores/meeting-store";
+import {
+  isDeletableMeetingStatus,
+  type MeetingSummary,
+} from "@/stores/meeting-store";
 import { getRootStore } from "@/stores/singleton";
 import { cn } from "@/lib/utils";
 
 export function MeetingRow({ meeting }: { meeting: MeetingSummary }) {
   const label = meeting.title ?? "Untitled";
+  const deletable = isDeletableMeetingStatus(meeting.status);
 
   const handleDelete = async (
     e: React.MouseEvent<HTMLButtonElement>,
@@ -53,20 +57,22 @@ export function MeetingRow({ meeting }: { meeting: MeetingSummary }) {
             </div>
           </div>
           <StatusPill status={meeting.status} />
-          <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="text-muted-foreground hover:text-destructive"
-                aria-label="Delete meeting"
-                onClick={handleDelete}
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
-            </TooltipTrigger>
-            <TooltipContent>Delete meeting</TooltipContent>
-          </Tooltip>
+          {deletable && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="text-muted-foreground hover:text-destructive"
+                  aria-label="Delete meeting"
+                  onClick={handleDelete}
+                >
+                  <Trash2 className="h-4 w-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent>Delete meeting</TooltipContent>
+            </Tooltip>
+          )}
         </CardContent>
       </Card>
     </NavLink>
