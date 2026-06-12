@@ -7,27 +7,36 @@ Basically superwhisper for Omarchy, Audetic is a voice to text application for W
 
 - **[View Documentation](./docs/index.md)** - Detailed guides and configuration
 
-## Quick Install (Recommended)
+## Install
 
-Audetic ships pre-built, signed binaries for Linux and macOS.
+Audetic installs from source: clone the repo, run `make install`, and accept
+the permission prompts. Everything lives under `$HOME` — no sudo.
+
+Prerequisites: [Rust](https://rustup.rs) and [bun](https://bun.sh) (the web UI
+is built and embedded into the daemon automatically).
 
 ```bash
-curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
+git clone https://github.com/silvabyte/Audetic.git
+cd Audetic
+make install
 ```
 
-The installer detects your platform and hands off to `audetic install`.
-Everything lives under `$HOME` — no sudo.
+To update later, pull and re-run the same command:
+
+```bash
+git pull && make install
+```
 
 ### Linux
 
-Copies the binary to `~/.local/share/audetic/bin/`, installs a systemd
-**user** service at `~/.config/systemd/user/audetic.service`,
-`enable --now`s it, waits for it to bind `127.0.0.1:3737`, and opens the
-web UI in your browser. Pass `--no-launch` to skip opening the browser.
+Builds the release binary, copies it to `~/.local/share/audetic/bin/`,
+installs a systemd **user** service at
+`~/.config/systemd/user/audeticd.service`, `enable --now`s it, waits for
+it to bind `127.0.0.1:3737`, and opens the web UI in your browser.
 
 ### macOS
 
-Unpacks the signed and notarized `Audetic.app` to `~/Applications/`,
+Builds and ad-hoc signs `Audetic.app`, copies it to `~/Applications/`,
 drops a LaunchAgent plist at
 `~/Library/LaunchAgents/ai.audetic.daemon.plist`, `launchctl bootstrap`s
 it, waits for `127.0.0.1:3737`, and opens the web UI.
@@ -55,6 +64,10 @@ launchctl kickstart -k gui/$(id -u)/ai.audetic.daemon
 
 System audio capture requires macOS **14.6 or later** (Core Audio Tap
 API). On older versions, meetings fall back to mic-only.
+
+Local builds are ad-hoc signed, so macOS ties permission grants to the
+exact binary — expect to re-approve Microphone / Screen Recording after
+a `git pull && make install`.
 
 **After installation:**
 
@@ -129,11 +142,16 @@ Files already in MP3 or Opus format are sent as-is. Use `--no-compress` to skip.
 
 ## Updates
 
-Audetic includes an auto-updater plus manual controls:
+Updates come from the repo:
 
 ```bash
-audetic update
+git pull && make install
 ```
+
+The daemon also has a built-in updater that can pull published binaries
+from the release channel, but it's **disabled by default** — source
+checkouts are the install path. `audetic update --enable` opts back in;
+`audetic update` runs a one-off manual check.
 
 ## Uninstall — macOS
 
@@ -147,10 +165,10 @@ tccutil reset Microphone ai.audetic.daemon
 tccutil reset ScreenCapture ai.audetic.daemon
 ```
 
-## Uninstall
+## Uninstall — Linux
 
 ```bash
-curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash
+bash release/cli/uninstall.sh
 ```
 
 Use `--dry-run` to preview, or `--keep-database` to preserve transcription history. See [Installation Guide](./docs/installation.md#uninstalling) for all options.
