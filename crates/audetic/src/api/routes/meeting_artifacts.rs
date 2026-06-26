@@ -47,7 +47,7 @@ pub async fn list_meeting_artifacts(
 ) -> ApiResult<Json<MeetingArtifactsResponse>> {
     let artifacts = tokio::task::spawn_blocking(move || {
         let conn = crate::db::init_db()?;
-        MeetingArtifactRepository::list_for_meeting(&conn, id)
+        MeetingArtifactRepository::list_for_live_meeting(&conn, id)
     })
     .await
     .map_err(|e| ApiError::internal(format!("db task panicked: {e}")))?
@@ -95,8 +95,7 @@ pub async fn get_meeting_artifact(
     let artifact =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MeetingArtifact>> {
             let conn = crate::db::init_db()?;
-            let artifact = MeetingArtifactRepository::get(&conn, artifact_id)?;
-            Ok(artifact.filter(|a| a.meeting_id == id))
+            MeetingArtifactRepository::get_for_live_meeting(&conn, id, artifact_id)
         })
         .await
         .map_err(|e| ApiError::internal(format!("db task panicked: {e}")))?
@@ -123,7 +122,7 @@ pub async fn delete_meeting_artifact(
 ) -> ApiResult<Json<DeleteArtifactResponse>> {
     let deleted = tokio::task::spawn_blocking(move || {
         let conn = crate::db::init_db()?;
-        MeetingArtifactRepository::delete_for_meeting(&conn, id, artifact_id)
+        MeetingArtifactRepository::delete_for_live_meeting(&conn, id, artifact_id)
     })
     .await
     .map_err(|e| ApiError::internal(format!("db task panicked: {e}")))?

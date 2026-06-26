@@ -141,6 +141,29 @@ impl MeetingArtifactRepository {
         Ok(artifacts)
     }
 
+    pub fn list_for_live_meeting(
+        conn: &Connection,
+        meeting_id: i64,
+    ) -> Result<Vec<MeetingArtifact>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT a.id, a.meeting_id, a.kind, a.title, a.template_id, a.agent_profile_id, a.status, \
+                 a.content_markdown, a.error, a.stdout, a.stderr, a.created_at, a.updated_at, a.completed_at \
+                 FROM meeting_artifacts a \
+                 INNER JOIN meetings m ON m.id = a.meeting_id AND m.deleted_at IS NULL \
+                 WHERE a.meeting_id = ?1 ORDER BY a.created_at DESC, a.id DESC",
+            )
+            .context("Failed to prepare live meeting artifact list")?;
+        let rows = stmt
+            .query_map(params![meeting_id], row_to_artifact)
+            .context("Failed to query live meeting artifacts")?;
+        let mut artifacts = Vec::new();
+        for row in rows {
+            artifacts.push(row??);
+        }
+        Ok(artifacts)
+    }
+
     pub fn get(conn: &Connection, id: i64) -> Result<Option<MeetingArtifact>> {
         conn.query_row(
             "SELECT id, meeting_id, kind, title, template_id, agent_profile_id, status, \
@@ -154,6 +177,25 @@ impl MeetingArtifactRepository {
         .transpose()
     }
 
+    pub fn get_for_live_meeting(
+        conn: &Connection,
+        meeting_id: i64,
+        id: i64,
+    ) -> Result<Option<MeetingArtifact>> {
+        conn.query_row(
+            "SELECT a.id, a.meeting_id, a.kind, a.title, a.template_id, a.agent_profile_id, a.status, \
+             a.content_markdown, a.error, a.stdout, a.stderr, a.created_at, a.updated_at, a.completed_at \
+             FROM meeting_artifacts a \
+             INNER JOIN meetings m ON m.id = a.meeting_id AND m.deleted_at IS NULL \
+             WHERE a.id = ?1 AND a.meeting_id = ?2",
+            params![id, meeting_id],
+            row_to_artifact,
+        )
+        .optional()
+        .context("Failed to query live meeting artifact")?
+        .transpose()
+    }
+
     pub fn delete_for_meeting(conn: &Connection, meeting_id: i64, id: i64) -> Result<bool> {
         let n = conn
             .execute(
@@ -161,6 +203,18 @@ impl MeetingArtifactRepository {
                 params![id, meeting_id],
             )
             .context("Failed to delete meeting artifact")?;
+        Ok(n > 0)
+    }
+
+    pub fn delete_for_live_meeting(conn: &Connection, meeting_id: i64, id: i64) -> Result<bool> {
+        let n = conn
+            .execute(
+                "DELETE FROM meeting_artifacts \
+                 WHERE id = ?1 AND meeting_id = ?2 \
+                 AND EXISTS (SELECT 1 FROM meetings WHERE id = ?2 AND deleted_at IS NULL)",
+                params![id, meeting_id],
+            )
+            .context("Failed to delete live meeting artifact")?;
         Ok(n > 0)
     }
 }
@@ -185,4 +239,65 @@ fn row_to_artifact(row: &Row) -> rusqlite::Result<Result<MeetingArtifact>> {
             completed_at: row.get(13)?,
         })
     })())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MeetingArtifactRepository;
+    use crate::db::{meetings::MeetingRepository, migrate};
+    use anyhow::Result;
+    use rusqlite::Connection;
+
+    fn setup_db() -> Result<Connection> {
+        let conn = Connection::open_in_memory()?;
+        migrate(&conn)?;
+        Ok(conn)
+    }
+
+    #[test]
+    fn live_meeting_queries_hide_artifacts_after_soft_delete() -> Result<()> {
+        let conn = setup_db()?;
+        let meeting_id = MeetingRepository::insert(&conn, Some("Standup"), "/tmp/meeting.wav")?;
+        MeetingRepository::complete(
+            &conn,
+            meeting_id,
+            "/tmp/meeting.txt",
+            "we made a decision",
+            30,
+        )?;
+
+        let artifact_id = MeetingArtifactRepository::insert_pending(
+            &conn,
+            meeting_id,
+            "summary",
+            "Summary",
+            Some("standard_meeting"),
+            None,
+        )?;
+        MeetingArtifactRepository::complete(&conn, artifact_id, "# Summary", "# Summary", "")?;
+
+        assert_eq!(
+            MeetingArtifactRepository::list_for_live_meeting(&conn, meeting_id)?.len(),
+            1
+        );
+        assert!(
+            MeetingArtifactRepository::get_for_live_meeting(&conn, meeting_id, artifact_id)?
+                .is_some()
+        );
+
+        MeetingRepository::soft_delete(&conn, meeting_id)?;
+
+        assert!(MeetingArtifactRepository::list_for_live_meeting(&conn, meeting_id)?.is_empty());
+        assert!(
+            MeetingArtifactRepository::get_for_live_meeting(&conn, meeting_id, artifact_id)?
+                .is_none()
+        );
+        assert!(!MeetingArtifactRepository::delete_for_live_meeting(
+            &conn,
+            meeting_id,
+            artifact_id
+        )?);
+        assert!(MeetingArtifactRepository::get(&conn, artifact_id)?.is_some());
+        Ok(())
+    }
 }
