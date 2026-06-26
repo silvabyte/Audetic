@@ -643,7 +643,10 @@ impl Default for UpdateState {
             channel: DEFAULT_CHANNEL.to_string(),
             last_check_epoch: None,
             last_error: None,
-            auto_update: true,
+            // Off by default: installs come from a source checkout (`git pull`
+            // + `make install`), so the daemon shouldn't swap in published
+            // binaries on its own. `audetic update --enable` opts back in.
+            auto_update: false,
             last_downloaded_version: None,
             last_known_remote: None,
             pending_restart: false,

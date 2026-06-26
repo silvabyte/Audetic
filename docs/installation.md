@@ -2,40 +2,42 @@
 
 Complete installation instructions for different operating systems and environments.
 
-## Quick Install (Recommended)
+## Install (from source)
 
-Audetic ships verified, pre-built binaries. Install with one command—no Rust toolchain, git clone, or manual builds required, and no sudo:
+Audetic installs from a source checkout: clone, `make install`, accept the
+permission prompts. No sudo — everything lands under `$HOME`.
 
 ```bash
-curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
+git clone https://github.com/silvabyte/Audetic.git
+cd Audetic
+make install
 ```
 
-The installer:
+`make install`:
 
-- Detects your OS/architecture, downloads the matching artifact, and verifies its SHA-256.
-- Hands off to `audetic install`, which copies the binary to `~/.local/share/audetic/bin/audetic`.
-- Writes a systemd **user** unit at `~/.config/systemd/user/audetic.service` and `enable --now`s it.
-- Waits for the daemon to bind `127.0.0.1:3737`, then opens the web UI (`http://127.0.0.1:3737/`) in your default browser so you can finish onboarding (ffmpeg install, provider config) in the SPA.
-- Everything lives under `$HOME` — no `/usr/local/bin`, no sudo.
+- Builds the release binaries (`audeticd` daemon + `audetic` CLI); the web UI
+  is built with bun and embedded into the daemon automatically.
+- On **Linux**: copies the daemon to `~/.local/share/audetic/bin/audeticd`,
+  writes a systemd **user** unit at `~/.config/systemd/user/audeticd.service`,
+  and `enable --now`s it.
+- On **macOS**: assembles and ad-hoc signs `Audetic.app`, copies it to
+  `~/Applications/`, writes a LaunchAgent at
+  `~/Library/LaunchAgents/ai.audetic.daemon.plist`, and bootstraps it.
+- Puts the `audetic` CLI on PATH at `~/.local/bin/audetic`.
+- Waits for the daemon to bind `127.0.0.1:3737`, then opens the web UI
+  (`http://127.0.0.1:3737/`) in your default browser so you can finish
+  onboarding (ffmpeg install, provider config) in the SPA.
 
-### Useful flags
-
-```
-latest.sh --channel beta            # jump to another release channel
-latest.sh --version <v>             # pin a specific version
-latest.sh --no-launch               # don't open the web UI in a browser after install
-```
+Build prerequisites on every platform: the **Rust toolchain**
+([rustup.rs](https://rustup.rs)) and **bun** ([bun.sh](https://bun.sh)).
 
 After install:
-1. The installer already enabled/started the systemd **user** service. Use `systemctl --user status audetic.service` to confirm.
+1. Confirm the service: `systemctl --user status audeticd.service` (Linux) or `launchctl print gui/$(id -u)/ai.audetic.daemon` (macOS).
 2. Finish provider and ffmpeg setup in the web UI the installer opened (or visit `http://127.0.0.1:3737/`).
 3. Add a keybind in Hyprland (or your compositor) that calls `curl -X POST http://127.0.0.1:3737/api/toggle`.
 4. Edit `~/.config/audetic/config.toml` if you need custom providers, models, or behavior tweaks.
 
-## Manual Installation
-
-> **When should I use this?**  
-> Only when you need to hack on Audetic itself or build for a platform that doesn't have pre-built binaries yet. Everyone else should stick with the `latest.sh` installer above.
+## Linux System Dependencies
 
 ### Prerequisites
 
@@ -124,17 +126,17 @@ make
 
 ## Building Audetic
 
-```bash
-# Clone the repository
-git clone https://github.com/silvabyte/Audetic.git
-cd Audetic
+`make install` (see top of this guide) is the whole flow. The pieces, if you
+want them separately:
 
-# Build release version
-cargo build --release
+```bash
+# Build release binaries (also builds + embeds the web UI via bun)
+make release
 
 # Install into the user-local layout (~/.local/share/audetic/bin + systemd
-# user unit). No sudo needed — this is the same path `latest.sh` takes.
-./target/release/audetic install
+# user unit on Linux; ~/Applications/Audetic.app + LaunchAgent on macOS,
+# where you'd use `make macos-app-install` instead). No sudo needed.
+./target/release/audeticd install
 ```
 
 ## Configuration
@@ -209,18 +211,18 @@ audio_feedback = true
 
 ## Systemd Service Setup
 
-The `latest.sh` installer (via `audetic install`) already sets this up: it
-writes a systemd **user** unit to `~/.config/systemd/user/audetic.service` with
-`ExecStart` pointed at `~/.local/share/audetic/bin/audetic`, runs
-`systemctl --user daemon-reload`, and `systemctl --user enable --now audetic.service`.
+`make install` (via `audeticd install`) already sets this up: it writes a
+systemd **user** unit to `~/.config/systemd/user/audeticd.service` with
+`ExecStart` pointed at `~/.local/share/audetic/bin/audeticd`, runs
+`systemctl --user daemon-reload`, and `systemctl --user enable --now audeticd.service`.
 
-If you built Audetic manually and want to wire up the service by hand:
+If you want to wire up the service by hand instead:
 
 ```bash
 mkdir -p ~/.config/systemd/user
 ```
 
-Create `~/.config/systemd/user/audetic.service`:
+Create `~/.config/systemd/user/audeticd.service`:
 
 ```ini
 [Unit]
@@ -229,7 +231,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/share/audetic/bin/audetic
+ExecStart=%h/.local/share/audetic/bin/audeticd
 Restart=always
 RestartSec=5
 Environment="RUST_LOG=info"
@@ -244,7 +246,7 @@ Enable and start the service:
 
 ```bash
 systemctl --user daemon-reload
-systemctl --user enable --now audetic.service
+systemctl --user enable --now audeticd.service
 ```
 
 > **Audio groups:** User services cannot add supplemental groups the account does not already have. Most setups that use PipeWire/ALSA through the desktop stack work without any extra privileges. If you need direct ALSA device access, add yourself to the `audio` group (followed by a re-login) or add `SupplementaryGroups=audio` via a systemd drop-in.
@@ -298,7 +300,7 @@ source ~/.bashrc
 # Enable services
 systemctl --user daemon-reload
 systemctl --user enable --now ydotoold.service
-systemctl --user enable --now audetic.service
+systemctl --user enable --now audeticd.service
 ```
 
 ### 2. Configure Audetic for GNOME
@@ -318,16 +320,16 @@ input_method = "ydotool"  # Recommended (auto-detected first)
 
 ## Testing Installation
 
-1. **Test service**: `systemctl --user status audetic.service`
+1. **Test service**: `systemctl --user status audeticd.service`
 2. **Test API**: `curl -X POST http://127.0.0.1:3737/api/toggle`
 3. **Test provider**: `audetic provider test` (validates transcription setup)
 4. **Test recording**: Press your configured keybind
-5. **Check logs**: `make logs` or `journalctl --user -u audetic.service -f`
+5. **Check logs**: `make logs` or `journalctl --user -u audeticd.service -f`
 
 ## Troubleshooting
 
 ### Service fails to start
-- Check logs: `make logs` or `journalctl --user -u audetic.service -e`
+- Check logs: `make logs` or `journalctl --user -u audeticd.service -e`
 - Check status: `make status`
 - Verify binary path: `which audetic`
 - Test config: `audetic --verbose`
@@ -354,65 +356,83 @@ input_method = "ydotool"  # Recommended (auto-detected first)
 
 ## Updating
 
-Audetic now includes two parallel update paths:
+Updates come from the repo — pull and reinstall:
 
-1. **Background auto-updater**: runs inside the daemon, checks `https://install.audetic.ai/cli/version` every few hours, downloads new binaries into `~/.local/share/audetic/updates`, swaps them atomically, and restarts the service (unless `AUDETIC_DISABLE_AUTO_RESTART=1` is set). Auto-updates respect `~/.config/audetic/update_state.json` and can be disabled.
+```bash
+git pull && make install
+```
 
-2. **Manual CLI control** via the built-in subcommand:
+The daemon also ships a background updater that can pull published binaries
+from the release channel, but it is **disabled by default**: source checkouts
+are the install path, and a published binary silently replacing your local
+build would be a surprise. Manual controls via the built-in subcommand:
 
 ```bash
 # Show current vs remote version without installing
 audetic update --check
 
-# Force an immediate install (even if versions appear equal)
+# Force an immediate install of the published binary (even if versions appear equal)
 audetic update --force
 
 # Switch channels for subsequent checks
 audetic update --channel beta
 
-# Toggle background updates
-audetic update --disable
+# Toggle background updates (off by default)
 audetic update --enable
+audetic update --disable
 ```
 
-You can also rerun the installer at any time to jump to a specific channel or repair a broken install:
-
-```bash
-curl -fsSL https://install.audetic.ai/cli/latest.sh | bash -s -- --channel beta
-```
+State lives in `~/.config/audetic/update_state.json`; downloaded binaries go
+to `~/.local/share/audetic/updates` and are swapped atomically before the
+service restarts (unless `AUDETIC_DISABLE_AUTO_RESTART=1` is set).
 
 ## Uninstalling
 
-Remove Audetic with the dedicated uninstall script:
+### Linux
+
+Remove Audetic with the uninstall script from the repo:
 
 ```bash
-curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash
+bash release/cli/uninstall.sh
 ```
 
-### Uninstall options
+#### Uninstall options
 
 ```bash
 # Preview what will be removed (no changes made)
-curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash -s -- --dry-run
+bash release/cli/uninstall.sh --dry-run
 
 # Skip confirmation prompt
-curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash -s -- --yes
+bash release/cli/uninstall.sh --yes
 
 # Keep your config and transcription history
-curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash -s -- --keep-config --keep-database
+bash release/cli/uninstall.sh --keep-config --keep-database
 
 # Also remove temp audio files from /tmp
-curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash -s -- --remove-temp
+bash release/cli/uninstall.sh --remove-temp
 ```
 
-### What gets removed
+#### What gets removed
 
 By default, the uninstaller removes:
 - `~/.local/share/audetic/bin/` (binary + `audetic-*.bak` files from auto-updates)
-- `~/.config/systemd/user/audetic.service` (systemd unit)
+- `~/.config/systemd/user/audeticd.service` (systemd unit)
 - `~/.config/audetic/` (config and update state)
 - `~/.local/share/audetic/audetic.db*` (transcription history)
 - `~/.local/share/audetic/updates/`, `update.lock` (auto-update cache)
 - `~/.local/share/audetic/meetings/`, `keybind-backups/`
 
 Use `--keep-config`, `--keep-database`, or `--keep-updates` to preserve specific artifacts.
+
+### macOS
+
+```bash
+launchctl bootout gui/$(id -u)/ai.audetic.daemon
+rm -rf ~/Applications/Audetic.app
+rm ~/Library/LaunchAgents/ai.audetic.daemon.plist
+rm -rf "$HOME/Library/Application Support/audetic"
+rm -rf ~/Library/Logs/Audetic
+rm -f ~/.local/bin/audetic
+tccutil reset Microphone ai.audetic.daemon
+tccutil reset ScreenCapture ai.audetic.daemon
+```

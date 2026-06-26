@@ -14,12 +14,14 @@ AUTO_COMMIT ?= 1
 .PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix quality deploy deploy-beta deploy-stable \
         ui-install ui-dev ui-build ui-preview ui-typecheck codegen \
         installer-lint deploy-setup \
-        macos-sign macos-sign-release macos-app macos-app-debug \
+        macos-sign macos-sign-release macos-app macos-app-debug macos-app-install \
         macos-notarize macos-tarball macos-release
 
 # Default target
 help:
 	@echo "🦀 Audetic Development Commands"
+	@echo ""
+	@echo "  make install   - Build from source and install on this machine (daemon + CLI + service)"
 	@echo ""
 	@echo "  make build     - Build debug binary"
 	@echo "  make release   - Build optimized release binary"
@@ -64,6 +66,19 @@ build:
 
 release:
 	cargo build --release
+
+# Build from source and install on this machine — the supported install path
+# (clone, `git pull`, `make install`, accept the permission prompts). macOS
+# routes through the app bundle because TCC attributes mic/screen permissions
+# to the .app identity; Linux installs the bare binary + systemd user unit.
+UNAME_S := $(shell uname -s)
+install:
+ifeq ($(UNAME_S),Darwin)
+	@$(MAKE) macos-app-install
+else
+	@$(MAKE) release
+	./target/release/audeticd install
+endif
 
 check:
 	cargo check
@@ -216,6 +231,12 @@ macos-app: release
 
 macos-app-debug: build
 	@$(MAKE) _macos-app-build MACOS_APP_PROFILE=debug
+
+# Build the bundle and install it on this machine: copies Audetic.app to
+# ~/Applications/, puts the `audetic` CLI on PATH, (re)writes the LaunchAgent,
+# bootstraps the daemon, and opens the web UI once it's up.
+macos-app-install: macos-app
+	./$(MACOS_APP_DIR)/Contents/MacOS/audeticd install
 
 # Internal: assemble + sign the bundle. Don't call directly — go through
 # macos-app / macos-app-debug so the underlying cargo build runs first.
