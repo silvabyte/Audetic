@@ -114,6 +114,9 @@ impl ApiServer {
             .nest("/provider", routes::provider::router())
             .nest("/system", routes::system::router())
             .nest("/update", routes::update::router())
+            .merge(routes::agents::router())
+            .merge(routes::summary_templates::router())
+            .merge(routes::meeting_artifacts::router())
             .merge(routes::post_processing::router(self.post_processing_state));
 
         let has_meeting = self.meeting_state.is_some();

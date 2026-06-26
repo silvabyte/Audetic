@@ -287,7 +287,8 @@ impl MeetingMachine {
         // recording's length (and the trim end bound). The user proceeds via
         // `confirm` (optionally trimming) or discards via `cancel`.
         if let Ok(conn) = db::init_db() {
-            if let Err(e) = MeetingRepository::set_review(&conn, meeting_id, duration_seconds as i64)
+            if let Err(e) =
+                MeetingRepository::set_review(&conn, meeting_id, duration_seconds as i64)
             {
                 warn!(
                     "Failed to persist review status for meeting {}: {}",

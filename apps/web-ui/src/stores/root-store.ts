@@ -3,6 +3,7 @@ import { createContext, useContext } from "react";
 import { ConfigStore } from "./config-store";
 import { HistoryStore } from "./history-store";
 import { MeetingStore } from "./meeting-store";
+import { MeetingArtifactsStore } from "./meeting-artifacts-store";
 import { MetaStore } from "./meta-store";
 import { OnboardingStore } from "./onboarding-store";
 import { PostProcessingStore } from "./post-processing-store";
@@ -19,6 +20,7 @@ export class RootStore {
   meta: MetaStore;
   history: HistoryStore;
   meetings: MeetingStore;
+  meetingArtifacts: MeetingArtifactsStore;
   config: ConfigStore;
   postProcessing: PostProcessingStore;
   onboarding: OnboardingStore;
@@ -29,6 +31,7 @@ export class RootStore {
     this.meta = new MetaStore(this);
     this.history = new HistoryStore(this);
     this.meetings = new MeetingStore(this);
+    this.meetingArtifacts = new MeetingArtifactsStore(this);
     this.config = new ConfigStore(this);
     this.postProcessing = new PostProcessingStore(this);
     this.onboarding = new OnboardingStore(this);

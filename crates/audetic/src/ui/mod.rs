@@ -51,7 +51,8 @@ impl Indicator {
     pub async fn show_review(&self) -> Result<()> {
         info!("Showing review indicator");
 
-        if let Err(e) = self.hyprland_notify("󰏤 Recording saved — review before transcribing") {
+        if let Err(e) = self.hyprland_notify("󰏤 Recording saved — review before transcribing")
+        {
             debug!("Hyprland notification failed: {}", e);
         }
 

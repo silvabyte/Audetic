@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod api;
 pub mod app;
 pub mod audio;
@@ -13,8 +14,10 @@ pub use audetic_core::{config, global};
 pub mod keybind;
 pub mod logs;
 pub mod meeting;
+pub mod meeting_artifacts;
 pub mod normalizer;
 pub mod post_processing;
+pub mod summary_templates;
 pub mod system;
 pub mod text_io;
 pub mod transcription;
