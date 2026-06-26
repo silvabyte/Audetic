@@ -5,7 +5,10 @@ import type { components } from "@/api/schema";
 
 export type ProviderInfo = components["schemas"]["ProviderInfo"];
 export type ProviderStatus = components["schemas"]["ProviderStatus"];
-export type KeybindStatus = components["schemas"]["KeybindStatus"];
+// The keybind status the daemon serves is platform-tagged (`platform` plus the
+// status union), so the UI can render macOS (native global hotkey) vs. Linux
+// (Hyprland config) affordances.
+export type KeybindStatus = components["schemas"]["KeybindStatusResponse"];
 export type UpdateReport = components["schemas"]["UpdateReport"];
 
 type Status = "idle" | "loading" | "loaded" | "error";

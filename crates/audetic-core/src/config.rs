@@ -11,6 +11,7 @@ pub struct Config {
     pub ui: UiConfig,
     pub wayland: WaylandConfig,
     pub behavior: BehaviorConfig,
+    pub macos: MacosConfig,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -56,6 +57,18 @@ pub struct BehaviorConfig {
     pub delete_audio_files: bool,
     #[serde(default = "default_audio_feedback")]
     pub audio_feedback: bool,
+}
+
+/// macOS-only knobs. Present in the shared config so serialization is stable
+/// across platforms; only the daemon running on macOS acts on it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MacosConfig {
+    /// Global hotkey that toggles dictation, as a chord string like `"CMD+R"`
+    /// or `"CMD+SHIFT+R"`. `None` (the default) means use the built-in default
+    /// (`CMD+R`); an empty string disables the hotkey entirely. On macOS the
+    /// daemon registers this as a system-wide shortcut.
+    pub hotkey: Option<String>,
 }
 
 fn default_audio_feedback() -> bool {

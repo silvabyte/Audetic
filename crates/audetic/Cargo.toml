@@ -121,3 +121,10 @@ objc2-av-foundation = { version = "0.3", features = [
     "AVMediaFormat",
     "block2",
 ] }
+
+# System-wide global hotkey (default ⌘R) that toggles dictation. Uses Carbon
+# `RegisterEventHotKey` under the hood (no Accessibility/Input-Monitoring grant
+# required), driven from a CFRunLoop pumped on the main thread — see
+# `src/hotkey/mod.rs`. `core-foundation-sys` gives us `CFRunLoopRunInMode`.
+global-hotkey = "0.6"
+core-foundation-sys = "0.8"

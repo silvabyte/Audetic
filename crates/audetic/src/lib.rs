@@ -10,6 +10,10 @@ pub mod install;
 // sites (`crate::config`, `crate::global`) keep compiling unchanged. The
 // standalone `audetic` CLI depends on `audetic-core` directly.
 pub use audetic_core::{config, global};
+// macOS registers a system-wide global hotkey from the daemon's main thread;
+// see `hotkey` and `main.rs`. Linux drives the toggle via Hyprland keybinds.
+#[cfg(target_os = "macos")]
+pub mod hotkey;
 pub mod keybind;
 pub mod logs;
 pub mod meeting;
