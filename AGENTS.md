@@ -30,105 +30,57 @@
 - `src/transcription/` - Transcription providers
 - `src/db/` - SQLite database operations
 
-## Issue Tracking with bd (beads)
+## Agent skills
 
-**IMPORTANT**: This project uses **bd (beads)** for ALL issue tracking. Do NOT use markdown TODOs, task lists, or other tracking methods.
+### Issue tracker
 
-### Why bd?
+Issues and PRDs are tracked as Fizzy cards on the Audetic board; external PRs are not a triage surface. See `docs/agents/issue-tracker.md`.
 
-- Dependency-aware: Track blockers and relationships between issues
-- Git-friendly: Auto-syncs to JSONL for version control
-- Agent-optimized: JSON output, ready work detection, discovered-from links
-- Prevents duplicate tracking systems and confusion
+### Triage labels
 
-### Quick Start
+Triage uses Fizzy tags with the canonical default role strings: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, and `wontfix`. See `docs/agents/triage-labels.md`.
 
-**Check for ready work:**
+### Domain docs
 
-```bash
-bd ready --json
-```
+Domain docs use a multi-context layout with root `CONTEXT-MAP.md` pointing to context-specific `CONTEXT.md` files. See `docs/agents/domain.md`.
 
-**Create new issues:**
+## Issue Tracking with Fizzy
 
-```bash
-bd create "Issue title" -t bug|feature|task -p 0-4 --json
-bd create "Issue title" -p 1 --deps discovered-from:bd-123 --json
-bd create "Subtask" --parent <epic-id> --json  # Hierarchical subtask (gets ID like epic-id.1)
-```
+This project uses **Fizzy** for issue tracking. Do not use beads, markdown TODO files, or GitHub Issues unless the user explicitly asks.
 
-**Claim and update:**
+### Board
+
+- Account: `6100722`
+- Board: `Audetic`
+- Board ID: `03ge61jjq6tmkyjv39tu6eom3`
+- URL: `https://app.fizzy.do/6100722/boards/03ge61jjq6tmkyjv39tu6eom3`
+
+### Common Commands
 
 ```bash
-bd update bd-42 --status in_progress --json
-bd update bd-42 --priority 1 --json
+fizzy card list --account 6100722 --board 03ge61jjq6tmkyjv39tu6eom3 --all
+fizzy card show <number> --account 6100722
+fizzy card create --account 6100722 --board 03ge61jjq6tmkyjv39tu6eom3 --title "Title" --description "<p>Description</p>"
+fizzy card close <number> --account 6100722
 ```
-
-**Complete work:**
-
-```bash
-bd close bd-42 --reason "Completed" --json
-```
-
-### Issue Types
-
-- `bug` - Something broken
-- `feature` - New functionality
-- `task` - Work item (tests, docs, refactoring)
-- `epic` - Large feature with subtasks
-- `chore` - Maintenance (dependencies, tooling)
-
-### Priorities
-
-- `0` - Critical (security, data loss, broken builds)
-- `1` - High (major features, important bugs)
-- `2` - Medium (default, nice-to-have)
-- `3` - Low (polish, optimization)
-- `4` - Backlog (future ideas)
 
 ### Workflow for AI Agents
 
-1. **Check ready work**: `bd ready` shows unblocked issues
-2. **Claim your task**: `bd update <id> --status in_progress`
-3. **Work on it**: Implement, test, document
-4. **Discover new work?** Create linked issue:
-   - `bd create "Found bug" -p 1 --deps discovered-from:<parent-id>`
-5. **Complete**: `bd close <id> --reason "Done"`
-6. **Commit together**: Always commit the `.beads/issues.jsonl` file together with the code changes so issue state stays in sync with code state
+1. Check existing work with `fizzy card list`.
+2. Create new work as Fizzy cards on the Audetic board.
+3. Use card numbers, not internal card IDs, for card commands.
+4. Track triage state with Fizzy tags matching `docs/agents/triage-labels.md`.
+5. Add implementation notes as card comments.
+6. Close cards when work is complete.
 
-### Auto-Sync
+### Important Rules
 
-bd automatically syncs with git:
-
-- Exports to `.beads/issues.jsonl` after changes (5s debounce)
-- Imports from JSONL when newer (e.g., after `git pull`)
-- No manual export/import needed!
-
-### GitHub Copilot Integration
-
-If using GitHub Copilot, also create `.github/copilot-instructions.md` for automatic instruction loading.
-Run `bd onboard` to get the content, or see step 2 of the onboard instructions.
-
-### MCP Server (Recommended)
-
-If using Claude or MCP-compatible clients, install the beads MCP server:
-
-```bash
-pip install beads-mcp
-```
-
-Add to MCP config (e.g., `~/.config/claude/config.json`):
-
-```json
-{
-  "beads": {
-    "command": "beads-mcp",
-    "args": []
-  }
-}
-```
-
-Then use `mcp__beads__*` functions instead of CLI commands.
+- Use Fizzy cards for project work tracking.
+- Use the `--account 6100722` flag unless `FIZZY_ACCOUNT` is configured.
+- Use the Audetic board ID for new project cards.
+- Do not create `.scratch/` issue files for project work.
+- Do not duplicate issues in beads or GitHub Issues.
+- If the `fizzy` shim is unavailable, do not modify global `mise` config without asking the user first.
 
 ### Managing AI-Generated Planning Documents
 
@@ -161,23 +113,3 @@ history/
 - Easy to exclude from version control if desired
 - Preserves planning history for archeological research
 - Reduces noise when browsing the project
-
-### CLI Help
-
-Run `bd <command> --help` to see all available flags for any command.
-For example: `bd create --help` shows `--parent`, `--deps`, `--assignee`, etc.
-
-### Important Rules
-
-- Use bd for ALL task tracking
-- Always use `--json` flag for programmatic use
-- Link discovered work with `discovered-from` dependencies
-- Check `bd ready` before asking "what should I work on?"
-- Store AI planning docs in `history/` directory
-- Run `bd <cmd> --help` to discover available flags
-- Do NOT create markdown TODO lists
-- Do NOT use external issue trackers
-- Do NOT duplicate tracking systems
-- Do NOT clutter repo root with planning documents
-
-For more details, see README.md and QUICKSTART.md.
