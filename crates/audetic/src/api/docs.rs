@@ -7,7 +7,8 @@
 use utoipa::OpenApi;
 
 use super::routes::{
-    history, keybind, logs, meetings, post_processing, provider, recording, system, update,
+    agents, history, keybind, logs, meeting_artifacts, meetings, post_processing, provider,
+    recording, summary_templates, system, update,
 };
 
 #[derive(OpenApi)]
@@ -66,6 +67,14 @@ use super::routes::{
         meetings::meeting_audio,
         meetings::retry_meeting,
         meetings::import_meeting,
+        // Meeting intelligence
+        agents::list_agent_profiles,
+        agents::test_agent_profile,
+        summary_templates::list_summary_templates,
+        meeting_artifacts::list_meeting_artifacts,
+        meeting_artifacts::generate_artifact,
+        meeting_artifacts::get_meeting_artifact,
+        meeting_artifacts::delete_meeting_artifact,
         // Post-processing jobs
         post_processing::list_events,
         post_processing::list_jobs,
@@ -122,6 +131,20 @@ use super::routes::{
         meetings::MeetingRetryResponse,
         meetings::MeetingDeleteResponse,
         meetings::MeetingImportResponse,
+        // Meeting intelligence
+        crate::db::agent_profiles::AgentProfile,
+        crate::db::agent_profiles::PromptMode,
+        agents::AgentProfilesResponse,
+        agents::AgentProfileTestResponse,
+        crate::summary_templates::SummaryTemplate,
+        crate::summary_templates::SummaryTemplateSection,
+        summary_templates::SummaryTemplatesResponse,
+        crate::db::meeting_artifacts::ArtifactStatus,
+        crate::db::meeting_artifacts::MeetingArtifact,
+        crate::meeting_artifacts::GenerateArtifactRequest,
+        crate::meeting_artifacts::GenerateArtifactResponse,
+        meeting_artifacts::MeetingArtifactsResponse,
+        meeting_artifacts::DeleteArtifactResponse,
         // Post-processing
         crate::post_processing::Action,
         crate::post_processing::Job,
@@ -138,6 +161,9 @@ use super::routes::{
         (name = "service", description = "Service identity and liveness"),
         (name = "recording", description = "Dictation (voice-to-text) control"),
         (name = "meetings", description = "Long-form meeting recording"),
+        (name = "meeting_artifacts", description = "Generated meeting summaries and notes"),
+        (name = "agents", description = "Local coding-agent CLI profiles"),
+        (name = "summary_templates", description = "Built-in meeting artifact templates"),
         (name = "history", description = "Past transcriptions"),
         (name = "keybind", description = "Hyprland keybinding management"),
         (name = "provider", description = "Transcription provider configuration"),
@@ -192,6 +218,8 @@ mod tests {
             paths::TOGGLE,
             paths::MEETINGS_TOGGLE,
             paths::MEETINGS_IMPORT,
+            paths::AGENT_PROFILES,
+            paths::SUMMARY_TEMPLATES,
             paths::POST_PROCESSING_JOBS,
             paths::POST_PROCESSING_EVENTS,
             paths::PROVIDER,

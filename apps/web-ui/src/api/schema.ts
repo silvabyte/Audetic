@@ -20,6 +20,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agent-profiles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_agent_profiles"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/agent-profiles/{id}/test": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["test_agent_profile"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/history": {
         parameters: {
             query?: never;
@@ -279,6 +311,9 @@ export interface paths {
          * @description The user-facing label is "Delete", but the row is only hidden — we stamp
          *     `deleted_at` so it drops out of every API surface (list, detail, audio,
          *     retry) while the recording stays on disk. Recovery is a manual DB edit.
+         *     If the live status handle still describes this meeting (it keeps the most
+         *     recent terminal meeting so the UI can show the outcome), it is reset too,
+         *     so `GET /meetings/status` doesn't keep reporting a deleted meeting.
          *
          *     In-flight meetings (recording / review / processing) are refused with 409:
          *     their id is still owned by the meeting machine and background pipeline, so
@@ -287,6 +322,38 @@ export interface paths {
          *     doesn't exist or was already deleted.
          */
         delete: operations["delete_meeting"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/meetings/{id}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_meeting_artifacts"];
+        put?: never;
+        post: operations["generate_artifact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/meetings/{id}/artifacts/{artifact_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_meeting_artifact"];
+        put?: never;
+        post?: never;
+        delete: operations["delete_meeting_artifact"];
         options?: never;
         head?: never;
         patch?: never;
@@ -523,6 +590,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/summary/templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_summary_templates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/system/deps": {
         parameters: {
             query?: never;
@@ -687,6 +770,33 @@ export interface components {
             /** @enum {string} */
             type: "command";
         };
+        AgentProfile: {
+            args: string[];
+            available: boolean;
+            created_at: string;
+            default_profile: boolean;
+            enabled: boolean;
+            executable: string;
+            /** Format: int64 */
+            id: number;
+            kind: string;
+            name: string;
+            prompt_mode: components["schemas"]["PromptMode"];
+            updated_at: string;
+        };
+        AgentProfileTestResponse: {
+            available: boolean;
+            executable: string;
+            /** Format: int64 */
+            id: number;
+            message: string;
+            resolved_path?: string | null;
+        };
+        AgentProfilesResponse: {
+            profiles: components["schemas"]["AgentProfile"][];
+        };
+        /** @enum {string} */
+        ArtifactStatus: "pending" | "running" | "completed" | "error";
         /** @description Request body for auto-update toggle. */
         AutoUpdateRequest: {
             /** @description Enable or disable auto-update */
@@ -709,6 +819,11 @@ export interface components {
             history_id?: number | null;
             job_id: string;
             text: string;
+        };
+        DeleteArtifactResponse: {
+            /** Format: int64 */
+            id: number;
+            success: boolean;
         };
         DeleteResponse: {
             /** Format: int64 */
@@ -735,6 +850,16 @@ export interface components {
         EventKind: "dictation.completed" | "meeting.completed";
         EventsListResponse: {
             events: components["schemas"]["EventDescriptor"][];
+        };
+        GenerateArtifactRequest: {
+            /** Format: int64 */
+            agent_profile_id?: number | null;
+            custom_context?: string | null;
+            kind?: string;
+            template_id?: string;
+        };
+        GenerateArtifactResponse: {
+            artifact: components["schemas"]["MeetingArtifact"];
         };
         /** @description A single history entry with formatted display data. */
         HistoryEntry: {
@@ -829,6 +954,28 @@ export interface components {
             app_logs: string[];
             /** @description Recent transcription entries */
             transcriptions: components["schemas"]["HistoryEntry"][];
+        };
+        MeetingArtifact: {
+            /** Format: int64 */
+            agent_profile_id?: number | null;
+            completed_at?: string | null;
+            content_markdown?: string | null;
+            created_at: string;
+            error?: string | null;
+            /** Format: int64 */
+            id: number;
+            kind: string;
+            /** Format: int64 */
+            meeting_id: number;
+            status: components["schemas"]["ArtifactStatus"];
+            stderr?: string | null;
+            stdout?: string | null;
+            template_id?: string | null;
+            title: string;
+            updated_at: string;
+        };
+        MeetingArtifactsResponse: {
+            artifacts: components["schemas"]["MeetingArtifact"][];
         };
         /**
          * @description Request body for the confirm endpoint. Both bounds are optional; omitting
@@ -982,6 +1129,11 @@ export interface components {
             event: components["schemas"]["EventKind"];
             name: string;
         };
+        /**
+         * @description How the rendered meeting prompt is delivered to the agent CLI.
+         * @enum {string}
+         */
+        PromptMode: "stdin" | "arg" | "file_arg";
         /** @description Get a summary of the current provider configuration. */
         ProviderInfo: {
             api_endpoint?: string | null;
@@ -1046,6 +1198,21 @@ export interface components {
             service: string;
             status: string;
             version: string;
+        };
+        SummaryTemplate: {
+            description: string;
+            id: string;
+            name: string;
+            sections: components["schemas"]["SummaryTemplateSection"][];
+        };
+        SummaryTemplateSection: {
+            format: string;
+            instruction: string;
+            item_format?: string | null;
+            title: string;
+        };
+        SummaryTemplatesResponse: {
+            templates: components["schemas"]["SummaryTemplate"][];
         };
         /** @description Availability of external tools the daemon depends on. */
         SystemDeps: {
@@ -1163,6 +1330,56 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ServiceInfo"];
                 };
+            };
+        };
+    };
+    list_agent_profiles: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Configured local agent CLI profiles */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentProfilesResponse"];
+                };
+            };
+        };
+    };
+    test_agent_profile: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Agent executable availability */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentProfileTestResponse"];
+                };
+            };
+            /** @description Agent profile not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -1611,6 +1828,127 @@ export interface operations {
             };
         };
     };
+    list_meeting_artifacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Meeting id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifacts generated for a meeting */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeetingArtifactsResponse"];
+                };
+            };
+        };
+    };
+    generate_artifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Meeting id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GenerateArtifactRequest"];
+            };
+        };
+        responses: {
+            /** @description Generated artifact */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GenerateArtifactResponse"];
+                };
+            };
+            /** @description Meeting is not eligible or request is invalid */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_meeting_artifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Meeting id */
+                id: number;
+                /** @description Artifact id */
+                artifact_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Meeting artifact */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeetingArtifact"];
+                };
+            };
+            /** @description Artifact not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_meeting_artifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Meeting id */
+                id: number;
+                /** @description Artifact id */
+                artifact_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted artifact */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeleteArtifactResponse"];
+                };
+            };
+            /** @description Artifact not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     meeting_audio: {
         parameters: {
             query?: never;
@@ -2035,6 +2373,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RecordingStatusResponse"];
+                };
+            };
+        };
+    };
+    list_summary_templates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Built-in summary templates */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SummaryTemplatesResponse"];
                 };
             };
         };

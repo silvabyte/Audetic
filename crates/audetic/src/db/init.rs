@@ -112,6 +112,75 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     )
     .context("Failed to create post_processing_jobs event index")?;
 
+    // Agent profiles describe local coding-agent CLIs (Claude Code, Codex,
+    // OpenCode, Cursor Agent, etc.) that can turn a meeting transcript into a
+    // persisted artifact. The args are stored as JSON argv tokens — not a shell
+    // command — so execution can avoid `sh -c` quoting/injection hazards.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS agent_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            executable TEXT NOT NULL,
+            args_json TEXT NOT NULL,
+            prompt_mode TEXT NOT NULL DEFAULT 'stdin',
+            default_profile INTEGER NOT NULL DEFAULT 0,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(kind, executable)
+        )",
+        [],
+    )
+    .context("Failed to create agent_profiles table")?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_profiles_enabled \
+         ON agent_profiles(enabled)",
+        [],
+    )
+    .context("Failed to create agent_profiles enabled index")?;
+
+    // Durable outputs generated from meetings (summaries, action-item reports,
+    // notes). Agent runs move pending → running → completed/error so the UI can
+    // show useful failures and preserve stdout/stderr for debugging.
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meeting_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            meeting_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            template_id TEXT,
+            agent_profile_id INTEGER,
+            status TEXT NOT NULL,
+            content_markdown TEXT,
+            error TEXT,
+            stdout TEXT,
+            stderr TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            FOREIGN KEY(meeting_id) REFERENCES meetings(id),
+            FOREIGN KEY(agent_profile_id) REFERENCES agent_profiles(id)
+        )",
+        [],
+    )
+    .context("Failed to create meeting_artifacts table")?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_meeting_artifacts_meeting_created \
+         ON meeting_artifacts(meeting_id, created_at DESC)",
+        [],
+    )
+    .context("Failed to create meeting_artifacts meeting index")?;
+
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_meeting_artifacts_status \
+         ON meeting_artifacts(status)",
+        [],
+    )
+    .context("Failed to create meeting_artifacts status index")?;
+
     Ok(())
 }
 

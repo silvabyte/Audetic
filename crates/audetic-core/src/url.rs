@@ -34,6 +34,8 @@ pub mod paths {
     pub const TOGGLE: &str = "/toggle";
     pub const MEETINGS_TOGGLE: &str = "/meetings/toggle";
     pub const MEETINGS_IMPORT: &str = "/meetings/import";
+    pub const AGENT_PROFILES: &str = "/agent-profiles";
+    pub const SUMMARY_TEMPLATES: &str = "/summary/templates";
     pub const POST_PROCESSING_JOBS: &str = "/post-processing/jobs";
     pub const POST_PROCESSING_EVENTS: &str = "/post-processing/events";
     pub const PROVIDER: &str = "/provider";
@@ -49,6 +51,21 @@ pub mod paths {
     pub const UPDATE_CHECK: &str = "/update/check";
     pub const UPDATE_INSTALL: &str = "/update/install";
     pub const UPDATE_AUTO: &str = "/update/auto";
+}
+
+/// Path to one agent profile test endpoint: `AGENT_PROFILES/{id}/test`.
+pub fn agent_profile_test_path(id: i64) -> String {
+    format!("{}/{id}/test", paths::AGENT_PROFILES)
+}
+
+/// Path to a meeting's generated artifacts: `/meetings/{id}/artifacts`.
+pub fn meeting_artifacts_path(id: i64) -> String {
+    format!("/meetings/{id}/artifacts")
+}
+
+/// Path to one generated meeting artifact: `/meetings/{id}/artifacts/{artifact_id}`.
+pub fn meeting_artifact_path(id: i64, artifact_id: i64) -> String {
+    format!("/meetings/{id}/artifacts/{artifact_id}")
 }
 
 /// Path to one job: `POST_PROCESSING_JOBS/{id}`.
