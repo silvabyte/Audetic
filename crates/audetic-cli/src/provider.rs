@@ -165,6 +165,7 @@ async fn handle_configure(dry_run: bool) -> Result<()> {
         ProviderSelection::OpenAiApi => configure_openai_api(&theme, &mut whisper)?,
         ProviderSelection::OpenAiCli => configure_openai_cli(&theme, &mut whisper)?,
         ProviderSelection::WhisperCpp => configure_whisper_cpp(&theme, &mut whisper)?,
+        ProviderSelection::Local => configure_local(&theme, &mut whisper)?,
     }
 
     println!();
@@ -195,6 +196,29 @@ async fn handle_configure(dry_run: bool) -> Result<()> {
         "Provider updated to '{}'.",
         whisper.provider.as_deref().unwrap_or_default()
     );
+
+    // The local engine needs its model on disk before it can transcribe — offer
+    // to download it now so the provider is usable immediately.
+    if matches!(selection, ProviderSelection::Local) {
+        if let Some(model_id) = whisper.model.clone() {
+            if !audetic_core::local_models::is_installed(
+                &audetic_core::global::data_dir()?,
+                audetic_core::local_models::find(&model_id)
+                    .expect("configure_local sets a catalog id"),
+            ) {
+                let download = Confirm::with_theme(&theme)
+                    .with_prompt(format!("Download model '{model_id}' now?"))
+                    .default(true)
+                    .interact()?;
+                if download {
+                    crate::models::ensure_downloaded(&model_id).await?;
+                } else {
+                    println!("Run `audetic models download {model_id}` when ready.");
+                }
+            }
+        }
+    }
+
     println!();
     println!("Next steps:");
     println!("  audetic provider test    - Verify the provider works");
@@ -501,6 +525,49 @@ fn configure_openai_cli(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> R
     Ok(())
 }
 
+fn configure_local(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> Result<()> {
+    // The embedded engine needs none of the API/binary fields.
+    whisper.api_key = None;
+    whisper.api_endpoint = None;
+    whisper.command_path = None;
+    whisper.model_path = None;
+
+    let catalog = audetic_core::local_models::catalog();
+    let items: Vec<String> = catalog
+        .iter()
+        .map(|m| {
+            let star = if m.recommended { " (recommended)" } else { "" };
+            format!("{:<24} - {}{star}", m.id, m.label)
+        })
+        .collect();
+
+    let default_index = whisper
+        .model
+        .as_deref()
+        .and_then(|id| catalog.iter().position(|m| m.id == id))
+        .or_else(|| catalog.iter().position(|m| m.recommended))
+        .unwrap_or(0);
+
+    let selection = Select::with_theme(theme)
+        .with_prompt("Select a local model")
+        .items(&items)
+        .default(default_index)
+        .interact()?;
+
+    let model = &catalog[selection];
+    whisper.model = Some(model.id.to_string());
+
+    // Parakeet auto-detects language; Whisper honors it. Only prompt when the
+    // chosen model actually uses the setting.
+    if model.supports_language_selection {
+        prompt_language_choice(theme, whisper, "en")?;
+    } else {
+        whisper.language = Some("auto".to_string());
+        println!("(Parakeet auto-detects language — no language setting needed.)");
+    }
+    Ok(())
+}
+
 fn configure_whisper_cpp(theme: &ColorfulTheme, whisper: &mut WhisperConfig) -> Result<()> {
     whisper.api_key = None;
     whisper.api_endpoint = None;
@@ -554,6 +621,10 @@ fn prompt_provider_selection(
         (
             "whisper-cpp",
             "Local whisper.cpp binary (requires local install)",
+        ),
+        (
+            "local",
+            "On-device engine — Parakeet/Whisper (embedded, downloads a model)",
         ),
     ];
 
@@ -726,6 +797,7 @@ enum ProviderSelection {
     OpenAiApi,
     OpenAiCli,
     WhisperCpp,
+    Local,
 }
 
 impl ProviderSelection {
@@ -736,6 +808,7 @@ impl ProviderSelection {
             ProviderSelection::OpenAiApi => "openai-api",
             ProviderSelection::OpenAiCli => "openai-cli",
             ProviderSelection::WhisperCpp => "whisper-cpp",
+            ProviderSelection::Local => "local",
         }
     }
 
@@ -745,7 +818,8 @@ impl ProviderSelection {
             1 => ProviderSelection::AssemblyAi,
             2 => ProviderSelection::OpenAiApi,
             3 => ProviderSelection::OpenAiCli,
-            _ => ProviderSelection::WhisperCpp,
+            4 => ProviderSelection::WhisperCpp,
+            _ => ProviderSelection::Local,
         }
     }
 }

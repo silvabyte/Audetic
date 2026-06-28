@@ -7,6 +7,7 @@ export type ProviderInfo = components["schemas"]["ProviderInfo"];
 export type ProviderStatus = components["schemas"]["ProviderStatus"];
 export type KeybindStatus = components["schemas"]["KeybindStatus"];
 export type UpdateReport = components["schemas"]["UpdateReport"];
+export type ModelDescriptor = components["schemas"]["ModelDescriptor"];
 
 type Status = "idle" | "loading" | "loaded" | "error";
 
@@ -36,10 +37,15 @@ export class ConfigStore {
   autoUpdate: boolean = false;
   autoUpdateState: Status = "idle";
 
+  /** On-device transcription models (catalog + install/download state). */
+  models: ModelDescriptor[] = [];
+  modelsState: Status = "idle";
+
   /** Error stashed for the last explicitly user-triggered op. */
   lastError: string | null = null;
 
   private root: RootStore;
+  private modelPolls = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor(root: RootStore) {
     this.root = root;
@@ -51,10 +57,72 @@ export class ConfigStore {
     await Promise.allSettled([
       this.loadProvider(),
       this.loadProviderStatus(),
+      this.loadModels(),
       this.loadKeybind(),
       this.loadUpdate(),
       this.loadAutoUpdate(),
     ]);
+  }
+
+  async loadModels(): Promise<void> {
+    runInAction(() => {
+      this.modelsState = "loading";
+    });
+    try {
+      const { data, error } = await daemon.GET("/models");
+      if (error || !data) throw new Error(formatError(error ?? "empty response"));
+      runInAction(() => {
+        this.models = data.models;
+        this.modelsState = "loaded";
+      });
+    } catch {
+      runInAction(() => {
+        this.modelsState = "error";
+      });
+    }
+  }
+
+  /** Start a model download and poll its status until it finishes or errors. */
+  async downloadModel(id: string): Promise<void> {
+    try {
+      const { data, error } = await daemon.POST("/models/{id}/download", {
+        params: { path: { id } },
+      });
+      if (error) throw new Error(formatError(error));
+      if (data) this.mergeModel(data);
+    } catch (e) {
+      runInAction(() => {
+        this.lastError = e instanceof Error ? e.message : String(e);
+      });
+      return;
+    }
+    this.pollModel(id);
+  }
+
+  private pollModel(id: string): void {
+    if (this.modelPolls.has(id)) return;
+    const handle = setInterval(async () => {
+      const { data } = await daemon.GET("/models/{id}", {
+        params: { path: { id } },
+      });
+      if (!data) return;
+      this.mergeModel(data);
+      const done =
+        data.installed ||
+        data.download?.state === "completed" ||
+        data.download?.state === "error";
+      if (done) {
+        clearInterval(handle);
+        this.modelPolls.delete(id);
+      }
+    }, 1000);
+    this.modelPolls.set(id, handle);
+  }
+
+  private mergeModel(model: ModelDescriptor): void {
+    runInAction(() => {
+      this.models = this.models.map((m) => (m.id === model.id ? model : m));
+    });
   }
 
   async loadProvider(): Promise<void> {

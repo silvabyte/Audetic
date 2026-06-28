@@ -10,6 +10,12 @@ license.workspace = true
 name = "audeticd"
 path = "src/main.rs"
 
+[features]
+# Opt-in Vulkan acceleration for Whisper on Linux (e.g. `vulkan-intel` or a
+# discrete GPU). Off by default — the stock Linux build is CPU-only, which is
+# the right call for integrated graphics where Parakeet on CPU already wins.
+vulkan = ["transcribe-rs/whisper-vulkan"]
+
 [dependencies]
 # Shared, daemon-independent building blocks (config, URLs, jobs client,
 # ffmpeg, clipboard). `schema` adds the utoipa derives the API surface needs.
@@ -29,6 +35,13 @@ hound = "3.5"
 # Sample-rate conversion (macOS loopback delivers samples at the output
 # device's native rate, typically 48 kHz; the VTT pipeline wants 16 kHz).
 rubato = "0.16"
+
+# On-device transcription engine. `onnx` pulls ONNX Runtime (Parakeet — the
+# CPU-fast default) and `whisper-cpp` pulls whisper.cpp (Whisper — accuracy
+# option). GPU backends are opt-in: `whisper-metal` is enabled on macOS below;
+# Linux stays CPU by default with the workspace `vulkan` feature available for
+# users with a capable GPU. ONNX/Parakeet always runs on CPU.
+transcribe-rs = { version = "0.3.8", default-features = false, features = ["onnx", "whisper-cpp"] }
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
@@ -113,6 +126,9 @@ arboard = "3.3"
 # audio/system_source/permissions.rs) for the mic. objc2/block2/objc2-foundation
 # are already in the tree transitively via cpal's CoreAudio backend.
 [target.'cfg(target_os = "macos")'.dependencies]
+# Metal GPU acceleration for Whisper on macOS. Auto-applies to the same
+# transcribe-rs dependency declared above (cargo unions target features).
+transcribe-rs = { version = "0.3.8", default-features = false, features = ["whisper-metal"] }
 objc2 = "0.6"
 objc2-foundation = "0.3"
 block2 = "0.6"

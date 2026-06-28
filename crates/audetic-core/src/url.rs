@@ -45,6 +45,8 @@ pub mod paths {
     pub const PROVIDER_TEST: &str = "/provider/test";
     pub const HISTORY: &str = "/history";
     pub const LOGS: &str = "/logs";
+    pub const MODELS: &str = "/models";
+    pub const TRANSCRIBE: &str = "/transcribe";
     pub const KEYBIND_STATUS: &str = "/keybind/status";
     pub const KEYBIND_INSTALL: &str = "/keybind/install";
     pub const KEYBIND: &str = "/keybind";
@@ -66,6 +68,16 @@ pub fn meeting_artifacts_path(id: i64) -> String {
 /// Path to one generated meeting artifact: `/meetings/{id}/artifacts/{artifact_id}`.
 pub fn meeting_artifact_path(id: i64, artifact_id: i64) -> String {
     format!("/meetings/{id}/artifacts/{artifact_id}")
+}
+
+/// Path to one model's status: `MODELS/{id}`.
+pub fn model_path(id: &str) -> String {
+    format!("{}/{id}", paths::MODELS)
+}
+
+/// Path to start a model download: `MODELS/{id}/download`.
+pub fn model_download_path(id: &str) -> String {
+    format!("{}/{id}/download", paths::MODELS)
 }
 
 /// Path to one job: `POST_PROCESSING_JOBS/{id}`.

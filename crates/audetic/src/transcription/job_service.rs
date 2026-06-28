@@ -11,6 +11,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use super::jobs_client::{status, JobsClient, Segment};
+use super::TranscriptionService;
 
 /// Result of a completed transcription job.
 pub struct TranscriptionJobResult {
@@ -123,6 +124,38 @@ impl TranscriptionJobService for RemoteTranscriptionJobService {
             "Transcription timed out after {} seconds",
             self.timeout.as_secs()
         );
+    }
+}
+
+/// Implementation that transcribes on-device via the local engine (`local`
+/// provider). Wraps the same [`TranscriptionService`] the dictation pipeline
+/// uses, so meetings reuse the one in-memory model load. There's no remote job
+/// to poll — it transcribes synchronously and returns the result.
+pub struct LocalTranscriptionJobService {
+    service: TranscriptionService,
+}
+
+impl LocalTranscriptionJobService {
+    pub fn new(service: TranscriptionService) -> Self {
+        Self { service }
+    }
+}
+
+#[async_trait]
+impl TranscriptionJobService for LocalTranscriptionJobService {
+    async fn submit_and_poll(
+        &self,
+        file_path: &Path,
+        _language: Option<&str>,
+    ) -> Result<TranscriptionJobResult> {
+        info!("Transcribing meeting locally: {:?}", file_path);
+        let text = self.service.transcribe(&file_path.to_path_buf()).await?;
+        info!("Local meeting transcription complete: {} chars", text.len());
+        Ok(TranscriptionJobResult {
+            text,
+            // Segment timestamps aren't surfaced by the local provider yet.
+            segments: None,
+        })
     }
 }
 

@@ -9,7 +9,9 @@ use crate::config::Config;
 use crate::meeting::{FfprobeMediaInspector, MediaInspector, MeetingMachine, MeetingStatusHandle};
 use crate::post_processing::PostProcessingService;
 use crate::text_io::TextIoService;
-use crate::transcription::job_service::RemoteTranscriptionJobService;
+use crate::transcription::job_service::{
+    LocalTranscriptionJobService, RemoteTranscriptionJobService,
+};
 use crate::transcription::{ProviderConfig, Transcriber, TranscriptionService};
 use crate::ui::Indicator;
 use crate::update::{UpdateConfig, UpdateEngine};
@@ -225,6 +227,22 @@ pub async fn run_service() -> Result<()> {
 fn build_meeting_transcription_service(
     config: &Config,
 ) -> Arc<dyn crate::transcription::job_service::TranscriptionJobService> {
+    // On-device transcription: run the configured local engine directly instead
+    // of submitting to the cloud jobs API. Falls back to remote if the local
+    // engine can't be constructed (so a misconfigured local provider doesn't
+    // wedge the meeting pipeline at startup).
+    if config.whisper.provider.as_deref() == Some("local") {
+        match build_transcriber(config).and_then(TranscriptionService::new) {
+            Ok(service) => {
+                info!("Meetings will transcribe on-device (local engine)");
+                return Arc::new(LocalTranscriptionJobService::new(service));
+            }
+            Err(e) => {
+                warn!("Failed to build local meeting transcription, falling back to remote: {e:#}")
+            }
+        }
+    }
+
     let jobs_url = config
         .whisper
         .api_endpoint
