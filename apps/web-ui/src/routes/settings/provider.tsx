@@ -1,10 +1,17 @@
+import { useEffect } from "react";
 import { Observer } from "mobx-react-lite";
 import {
   useFetcher,
   type ActionFunctionArgs,
   type RouteObject,
 } from "react-router-dom";
-import { CheckCircle2, RefreshCcw, TriangleAlert } from "lucide-react";
+import {
+  CheckCircle2,
+  Download,
+  Loader2,
+  RefreshCcw,
+  TriangleAlert,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Card,
@@ -56,8 +63,126 @@ function SettingsProvider() {
 
       <ProviderInfoCard />
       <ProviderStatusCard />
+      <ModelsCard />
     </div>
   );
+}
+
+function ModelsCard() {
+  const store = useStore();
+
+  useEffect(() => {
+    if (store.config.modelsState === "idle") {
+      void store.config.loadModels();
+    }
+  }, [store]);
+
+  return (
+    <Observer>
+      {() => {
+        const models = store.config.models;
+        const loading = store.config.modelsState === "loading" && models.length === 0;
+        return (
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">On-device models</CardTitle>
+              <CardDescription>
+                Download a model to transcribe locally (no cloud). Used when the
+                provider is set to{" "}
+                <code className="font-mono text-xs">local</code>. Parakeet runs
+                fast on CPU; Whisper is higher accuracy.
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {loading ? (
+                [0, 1, 2, 3].map((i) => <Skeleton key={i} className="h-12 w-full" />)
+              ) : models.length === 0 ? (
+                <p className="text-sm text-muted-foreground">No models available.</p>
+              ) : (
+                models.map((model) => <ModelRow key={model.id} model={model} />)
+              )}
+            </CardContent>
+          </Card>
+        );
+      }}
+    </Observer>
+  );
+}
+
+function ModelRow({
+  model,
+}: {
+  model: ReturnType<typeof useStore>["config"]["models"][number];
+}) {
+  const store = useStore();
+  const download = model.download;
+  const downloading = download?.state === "downloading";
+  const errored = download?.state === "error";
+  const percent =
+    download?.state === "downloading" && download.total_bytes > 0
+      ? Math.min(100, Math.round((download.downloaded_bytes / download.total_bytes) * 100))
+      : 0;
+
+  return (
+    <div className="rounded-md border p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-medium">{model.label}</span>
+            {model.recommended ? (
+              <span className="rounded bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                recommended
+              </span>
+            ) : null}
+          </div>
+          <p className="text-xs text-muted-foreground">{model.description}</p>
+          <p className="font-mono text-[11px] text-muted-foreground">
+            {model.id} · {formatGb(model.size_bytes)}
+          </p>
+        </div>
+        <div className="shrink-0">
+          {model.installed ? (
+            <span className="flex items-center gap-1 text-sm text-primary">
+              <CheckCircle2 className="h-4 w-4" /> Installed
+            </span>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={downloading}
+              onClick={() => void store.config.downloadModel(model.id)}
+            >
+              {downloading ? (
+                <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Download className="mr-1 h-3.5 w-3.5" />
+              )}
+              {downloading ? `${percent}%` : "Download"}
+            </Button>
+          )}
+        </div>
+      </div>
+      {downloading ? (
+        <div className="mt-2 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+          <div
+            className="h-full bg-primary transition-all"
+            style={{ width: `${percent}%` }}
+          />
+        </div>
+      ) : null}
+      {errored ? (
+        <p className="mt-2 text-xs text-destructive">
+          {download?.state === "error" ? download.message : "Download failed."}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function formatGb(bytes: number): string {
+  const gb = bytes / 1_000_000_000;
+  if (gb >= 1) return `${gb.toFixed(2)} GB`;
+  return `${Math.round(bytes / 1_000_000)} MB`;
 }
 
 function ProviderInfoCard() {

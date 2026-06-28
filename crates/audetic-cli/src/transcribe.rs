@@ -24,6 +24,16 @@ pub async fn handle_transcribe_command(args: TranscribeCliArgs) -> Result<()> {
     // 1. Validate file exists and is supported format
     validate_file(&args.file)?;
 
+    // On-device transcription routes through the daemon — the slim CLI can't
+    // link the engine (crate boundary). Cloud providers go direct to the jobs
+    // API below, no daemon required.
+    if Config::load()
+        .map(|c| c.whisper.provider.as_deref() == Some("local"))
+        .unwrap_or(false)
+    {
+        return transcribe_via_daemon(&args).await;
+    }
+
     // 2. Check file size and compress if needed
     let (file_to_upload, temp_file) = prepare_file_for_upload(&args.file, args.no_compress)?;
 
@@ -101,6 +111,72 @@ pub async fn handle_transcribe_command(args: TranscribeCliArgs) -> Result<()> {
         eprintln!("Copied to clipboard");
     }
 
+    Ok(())
+}
+
+/// Transcribe a file on-device by uploading it to the daemon's `/transcribe`
+/// endpoint, which runs the configured local engine. Returns plain text (no
+/// segment timestamps), so `--format json/srt` degrade to text here.
+async fn transcribe_via_daemon(args: &TranscribeCliArgs) -> Result<()> {
+    use audetic_core::url::{api_url, paths};
+
+    let pb = if args.no_progress {
+        None
+    } else {
+        let pb = create_progress_bar();
+        pb.set_message("Transcribing on-device...");
+        Some(pb)
+    };
+
+    let bytes = tokio::fs::read(&args.file)
+        .await
+        .context("Failed to read input file")?;
+    let filename = args
+        .file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("audio.wav")
+        .to_string();
+    let part = reqwest::multipart::Part::bytes(bytes).file_name(filename);
+    let form = reqwest::multipart::Form::new().part("file", part);
+
+    let response = reqwest::Client::new()
+        .post(api_url(paths::TRANSCRIBE))
+        .multipart(form)
+        .send()
+        .await
+        .context(
+            "Failed to reach the Audetic daemon. Local transcription needs the daemon running.",
+        )?;
+    let body = crate::client::json_or_error(response, "transcribe").await?;
+
+    if let Some(pb) = pb {
+        pb.finish_and_clear();
+    }
+
+    let text = body
+        .get("text")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    let result = TranscriptionResult {
+        text,
+        segments: None,
+    };
+    let output_text = format_output(&result, &args.format, args.timestamps);
+
+    if let Some(output_path) = &args.output {
+        std::fs::write(output_path, &output_text).context("Failed to write output file")?;
+        eprintln!("Transcription saved to: {}", output_path.display());
+    } else {
+        println!("{output_text}");
+    }
+
+    if args.copy {
+        copy_to_clipboard_sync(&output_text)?;
+        eprintln!("Copied to clipboard");
+    }
     Ok(())
 }
 

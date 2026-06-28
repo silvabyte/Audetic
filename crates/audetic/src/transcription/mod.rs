@@ -17,9 +17,11 @@ pub mod providers;
 pub use audetic_core::jobs_client;
 
 pub use providers::{
-    AssemblyAIProvider, AudeticProvider, OpenAIProvider, OpenAIWhisperCliProvider,
-    TranscriptionProvider, WhisperCppProvider,
+    AssemblyAIProvider, AudeticProvider, LocalEngineProvider, OpenAIProvider,
+    OpenAIWhisperCliProvider, TranscriptionProvider, WhisperCppProvider,
 };
+
+pub mod models;
 
 pub use transcription_service::TranscriptionService;
 
@@ -61,8 +63,14 @@ impl Transcriber {
                     config.model_path,
                 )?)
             }
+            "local" => {
+                let model = config
+                    .model
+                    .unwrap_or_else(|| audetic_core::local_models::DEFAULT_MODEL_ID.to_string());
+                Box::new(LocalEngineProvider::new(&model)?)
+            }
             _ => bail!(
-                "Unknown transcription provider '{}'. Supported providers: audetic-api, assembly-ai, openai-api, openai-cli, whisper-cpp",
+                "Unknown transcription provider '{}'. Supported providers: audetic-api, assembly-ai, openai-api, openai-cli, whisper-cpp, local",
                 provider_name
             ),
         };
@@ -157,6 +165,22 @@ pub struct ProviderTestResult {
     pub duration_secs: f64,
 }
 
+/// Transcribe a file using whatever provider is configured, returning the
+/// normalized text. Provider-agnostic — backs `POST /transcribe` so the slim
+/// CLI (which can't link the engine) can transcribe on-device through the
+/// daemon. The daemon must be running.
+pub async fn transcribe_with_configured_provider(audio_path: &Path) -> Result<String> {
+    let config = Config::load()?;
+    let provider = config
+        .whisper
+        .provider
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("No transcription provider configured"))?;
+    let transcriber = Transcriber::with_provider(provider, ProviderConfig::from(&config.whisper))?;
+    let service = TranscriptionService::new(transcriber)?;
+    service.transcribe(&audio_path.to_path_buf()).await
+}
+
 /// Get the current provider status from config.
 pub fn get_provider_status() -> Result<ProviderStatus> {
     let config = Config::load()?;
@@ -224,6 +248,26 @@ pub fn validate_provider_config(provider: &str, whisper: &WhisperConfig) -> Opti
                 Some("Model path required for whisper.cpp".to_string())
             } else {
                 None
+            }
+        }
+        "local" => {
+            // A model is selected by id and downloaded into the data dir; the
+            // engine is linked in-process, so no command/model path is needed.
+            let model_id = whisper
+                .model
+                .as_deref()
+                .unwrap_or(audetic_core::local_models::DEFAULT_MODEL_ID);
+            match audetic_core::local_models::find(model_id) {
+                Some(model) => match audetic_core::global::data_dir() {
+                    Ok(data_dir) if audetic_core::local_models::is_installed(&data_dir, model) => {
+                        None
+                    }
+                    Ok(_) => Some(format!(
+                        "Local model '{model_id}' is not downloaded yet. Run `audetic models download {model_id}`."
+                    )),
+                    Err(e) => Some(format!("Could not resolve data directory: {e}")),
+                },
+                None => Some(format!("Unknown local model '{model_id}'.")),
             }
         }
         _ => Some(format!("Unknown provider: {}", provider)),

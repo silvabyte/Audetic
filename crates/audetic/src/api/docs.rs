@@ -7,8 +7,8 @@
 use utoipa::OpenApi;
 
 use super::routes::{
-    agents, history, keybind, logs, meeting_artifacts, meetings, post_processing, provider,
-    recording, summary_templates, system, update,
+    agents, history, keybind, logs, meeting_artifacts, meetings, models, post_processing, provider,
+    recording, summary_templates, system, transcribe, update,
 };
 
 #[derive(OpenApi)]
@@ -45,6 +45,11 @@ use super::routes::{
         provider::set_raw_config,
         provider::reset_config,
         provider::run_test,
+        // Local models + on-device transcription
+        models::list_models,
+        models::get_model,
+        models::download_model,
+        transcribe::transcribe,
         // System
         system::get_deps,
         system::start_install_ffmpeg,
@@ -108,6 +113,11 @@ use super::routes::{
         crate::transcription::ProviderTestResult,
         crate::config::WhisperConfig,
         provider::ProviderTestRequest,
+        // Local models + on-device transcription
+        crate::transcription::models::ModelDescriptor,
+        crate::transcription::models::DownloadProgress,
+        models::ModelsListResponse,
+        transcribe::TranscribeResponse,
         // System
         system::SystemDeps,
         system::InstallPhase,
@@ -167,6 +177,8 @@ use super::routes::{
         (name = "history", description = "Past transcriptions"),
         (name = "keybind", description = "Hyprland keybinding management"),
         (name = "provider", description = "Transcription provider configuration"),
+        (name = "models", description = "On-device transcription model management"),
+        (name = "transcribe", description = "One-shot file transcription"),
         (name = "system", description = "External tool / dependency availability"),
         (name = "update", description = "Daemon self-update"),
         (name = "logs", description = "Application and transcription logs"),
@@ -227,6 +239,8 @@ mod tests {
             paths::PROVIDER_CONFIG,
             paths::PROVIDER_RESET,
             paths::PROVIDER_TEST,
+            paths::MODELS,
+            paths::TRANSCRIBE,
         ] {
             assert!(
                 spec_paths.contains(known),

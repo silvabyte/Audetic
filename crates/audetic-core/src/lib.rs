@@ -15,4 +15,5 @@ pub mod config;
 pub mod ffmpeg;
 pub mod global;
 pub mod jobs_client;
+pub mod local_models;
 pub mod url;

@@ -28,6 +28,8 @@ pub enum CliCommand {
     Keybind(KeybindCliArgs),
     /// Transcribe a local audio or video file
     Transcribe(TranscribeCliArgs),
+    /// Manage on-device transcription models (list, download)
+    Models(ModelsCliArgs),
     /// Record and transcribe meetings
     Meeting(MeetingCliArgs),
     /// Manage post-processing jobs (run commands on daemon events)
@@ -106,6 +108,23 @@ pub enum PostProcessingCommand {
     },
     /// List the supported event kinds
     Events,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct ModelsCliArgs {
+    #[command(subcommand)]
+    pub command: ModelsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ModelsCommand {
+    /// List available local models and their download status
+    List,
+    /// Download a model by id (e.g. `parakeet-tdt-0.6b-v3`)
+    Download {
+        /// Model id from `audetic models list`
+        id: String,
+    },
 }
 
 #[derive(ClapArgs, Debug)]

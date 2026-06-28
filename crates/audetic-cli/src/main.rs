@@ -14,6 +14,7 @@ mod history;
 mod keybind;
 mod logs;
 mod meeting;
+mod models;
 mod post_processing;
 mod provider;
 mod transcribe;
@@ -46,6 +47,7 @@ async fn main() -> Result<()> {
         Some(CliCommand::Logs(args)) => logs::handle_logs_command(args).await,
         Some(CliCommand::Keybind(args)) => keybind::handle_keybind_command(args).await,
         Some(CliCommand::Transcribe(args)) => transcribe::handle_transcribe_command(args).await,
+        Some(CliCommand::Models(args)) => models::handle_models_command(args).await,
         Some(CliCommand::Meeting(args)) => meeting::handle_meeting_command(args).await,
         Some(CliCommand::PostProcessing(args)) => {
             post_processing::handle_post_processing_command(args).await

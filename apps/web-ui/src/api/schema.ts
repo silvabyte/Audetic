@@ -406,6 +406,60 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/models": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List all local-transcription models with install + download status. */
+        get: operations["list_models"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/models/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get one model's status (poll for download progress). */
+        get: operations["get_model"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/models/{id}/download": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Start downloading a model in the background. Idempotent — returns the
+         *     model's current status; poll `GET /models/{id}` for progress.
+         */
+        post: operations["download_model"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/post-processing/events": {
         parameters: {
             query?: never;
@@ -683,6 +737,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/transcribe": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Transcribe an uploaded audio file using the configured provider. */
+        post: operations["transcribe_file"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/update/auto": {
         parameters: {
             query?: never;
@@ -829,6 +900,22 @@ export interface components {
             /** Format: int64 */
             id: number;
             success: boolean;
+        };
+        /** @description Progress of a model download. */
+        DownloadProgress: {
+            /** Format: int64 */
+            downloaded_bytes: number;
+            /** @enum {string} */
+            state: "downloading";
+            /** Format: int64 */
+            total_bytes: number;
+        } | {
+            /** @enum {string} */
+            state: "completed";
+        } | {
+            message: string;
+            /** @enum {string} */
+            state: "error";
         };
         /** @description One supported event in the `events` listing. */
         EventDescriptor: {
@@ -1120,6 +1207,33 @@ export interface components {
             meetings: components["schemas"]["MeetingSummary"][];
         };
         /**
+         * @description Public, serializable view of a catalog model plus its on-disk + download
+         *     state. This is what `GET /models` returns.
+         */
+        ModelDescriptor: {
+            description: string;
+            download?: null | components["schemas"]["DownloadProgress"];
+            /** @description "parakeet" or "whisper". */
+            engine: string;
+            id: string;
+            /** @description Whether the model is fully present on disk. */
+            installed: boolean;
+            label: string;
+            multilingual: boolean;
+            recommended: boolean;
+            /**
+             * Format: int64
+             * @description Total download size across all files, in bytes.
+             */
+            size_bytes: number;
+            /** @description Whether an explicit language can be set (Whisper) vs auto-detect (Parakeet). */
+            supports_language_selection: boolean;
+        };
+        /** @description Response for `GET /models`. */
+        ModelsListResponse: {
+            models: components["schemas"]["ModelDescriptor"][];
+        };
+        /**
          * @description Request body for `POST /api/post-processing/jobs`. Same shape the
          *     CLI builds when piping args from `audetic post-processing add`.
          */
@@ -1250,6 +1364,10 @@ export interface components {
             message: string;
             phase: string;
             success: boolean;
+        };
+        /** @description Response for `POST /transcribe`. */
+        TranscribeResponse: {
+            text: string;
         };
         /** @description Result of removing an Audetic-managed hyprland binding. */
         UninstallResponse: {
@@ -2014,6 +2132,86 @@ export interface operations {
             };
         };
     };
+    list_models: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Available local models */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelsListResponse"];
+                };
+            };
+        };
+    };
+    get_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Model id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Model status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelDescriptor"];
+                };
+            };
+            /** @description Unknown model */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    download_model: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Model id */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Download started or already present */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ModelDescriptor"];
+                };
+            };
+            /** @description Unknown model */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     list_events: {
         parameters: {
             query?: never;
@@ -2497,6 +2695,38 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ToggleResponse"];
                 };
+            };
+        };
+    };
+    transcribe_file: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description multipart/form-data with a `file` part */
+        requestBody: {
+            content: {
+                "multipart/form-data": string;
+            };
+        };
+        responses: {
+            /** @description Transcribed text */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TranscribeResponse"];
+                };
+            };
+            /** @description Missing or unreadable file */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
