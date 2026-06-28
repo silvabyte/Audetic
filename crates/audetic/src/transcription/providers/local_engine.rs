@@ -25,14 +25,15 @@ use tracing::{info, warn};
 
 use transcribe_rs::{
     onnx::{
-        parakeet::{ParakeetModel, ParakeetParams},
+        parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity},
         Quantization,
     },
     whisper_cpp::{WhisperEngine, WhisperInferenceParams},
 };
 
-use super::TranscriptionProvider;
+use super::{TranscriptionOutput, TranscriptionProvider};
 use crate::normalizer::TranscriptionNormalizer;
+use audetic_core::jobs_client::Segment;
 use audetic_core::local_models::{self, Engine, ModelInfo};
 
 /// A loaded engine, ready to transcribe. Held behind a `Mutex` because the
@@ -69,6 +70,29 @@ impl LocalEngineProvider {
         let data_dir = audetic_core::global::data_dir()?;
         Ok(Self { model, data_dir })
     }
+
+    /// Run inference off the async runtime, returning text + segments. Both
+    /// `transcribe` and `transcribe_detailed` go through here.
+    fn run<'a>(
+        &'a self,
+        audio_path: &'a Path,
+        language: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<TranscriptionOutput>> + Send + 'a>> {
+        let model = self.model;
+        let data_dir = self.data_dir.clone();
+        let audio_path = audio_path.to_path_buf();
+        let language = language.to_string();
+
+        Box::pin(async move {
+            // Loading and inference are both blocking + CPU-heavy; keep them off
+            // the async runtime.
+            tokio::task::spawn_blocking(move || {
+                transcribe_blocking(model, &data_dir, &audio_path, &language)
+            })
+            .await
+            .context("local transcription task panicked")?
+        })
+    }
 }
 
 impl TranscriptionProvider for LocalEngineProvider {
@@ -85,20 +109,16 @@ impl TranscriptionProvider for LocalEngineProvider {
         audio_path: &'a Path,
         language: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
-        let model = self.model;
-        let data_dir = self.data_dir.clone();
-        let audio_path = audio_path.to_path_buf();
-        let language = language.to_string();
+        let fut = self.run(audio_path, language);
+        Box::pin(async move { Ok(fut.await?.text) })
+    }
 
-        Box::pin(async move {
-            // Loading and inference are both blocking + CPU-heavy; keep them off
-            // the async runtime.
-            tokio::task::spawn_blocking(move || {
-                transcribe_blocking(model, &data_dir, &audio_path, &language)
-            })
-            .await
-            .context("local transcription task panicked")?
-        })
+    fn transcribe_detailed<'a>(
+        &'a self,
+        audio_path: &'a Path,
+        language: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<TranscriptionOutput>> + Send + 'a>> {
+        self.run(audio_path, language)
     }
 
     fn normalizer(&self) -> Result<Box<dyn TranscriptionNormalizer>> {
@@ -109,13 +129,13 @@ impl TranscriptionProvider for LocalEngineProvider {
 }
 
 /// Synchronous transcription: load (or reuse) the engine, decode audio to
-/// 16 kHz mono f32, run inference, return text.
+/// 16 kHz mono f32, run inference, return text + per-segment timestamps.
 fn transcribe_blocking(
     model: &'static ModelInfo,
     data_dir: &Path,
     audio_path: &Path,
     language: &str,
-) -> Result<String> {
+) -> Result<TranscriptionOutput> {
     let samples = load_audio_16k_mono(audio_path)
         .with_context(|| format!("Failed to decode audio: {audio_path:?}"))?;
 
@@ -126,7 +146,15 @@ fn transcribe_blocking(
 
     let result = match &mut *engine {
         LoadedEngine::Parakeet(parakeet) => parakeet
-            .transcribe_with(&samples, &ParakeetParams::default())
+            .transcribe_with(
+                &samples,
+                // Segment granularity yields sentence-ish chunks — the right
+                // unit for clickable transcript lines (token-level is too fine).
+                &ParakeetParams {
+                    timestamp_granularity: Some(TimestampGranularity::Segment),
+                    ..Default::default()
+                },
+            )
             .map_err(|e| anyhow!("Parakeet transcription failed: {e}"))?,
         LoadedEngine::Whisper(whisper) => {
             // "auto"/empty → let Whisper detect; otherwise honor the setting.
@@ -144,12 +172,28 @@ fn transcribe_blocking(
         }
     };
 
+    // Map transcribe-rs segments (f32 seconds) into the shared Segment type.
+    let segments = result
+        .segments
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| Segment {
+            start: s.start as f64,
+            end: s.end as f64,
+            text: s.text.trim().to_string(),
+        })
+        .filter(|s| !s.text.is_empty())
+        .collect();
+
     info!(
         "Local transcription complete ({}): {} chars",
         model.id,
         result.text.len()
     );
-    Ok(result.text.trim().to_string())
+    Ok(TranscriptionOutput {
+        text: result.text.trim().to_string(),
+        segments,
+    })
 }
 
 /// Fetch a cached engine or load it. The cache lock is held across the (rare)

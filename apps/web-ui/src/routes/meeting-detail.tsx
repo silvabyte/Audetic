@@ -1,5 +1,5 @@
 import { Observer, observer } from "mobx-react-lite";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Form,
   NavLink,
@@ -37,6 +37,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
 import {
@@ -281,9 +282,11 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
         <CardContent className="space-y-3">
           {detail.transcript_text ? (
             <>
-              <pre className="whitespace-pre-wrap text-sm font-sans">
-                {detail.transcript_text}
-              </pre>
+              <TranscriptPlayer
+                meetingId={meetingId}
+                text={detail.transcript_text}
+                segments={detail.transcript_segments}
+              />
               <Form method="post" replace>
                 <input
                   type="hidden"
@@ -329,6 +332,97 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
     </>
   );
 });
+
+type TranscriptSegment = NonNullable<MeetingDetail["transcript_segments"]>[number];
+
+/// Renders the transcript. With segment timestamps it shows an audio player and
+/// clickable lines that seek + highlight as the audio plays; without them it
+/// falls back to a plain text block.
+function TranscriptPlayer({
+  meetingId,
+  text,
+  segments,
+}: {
+  meetingId: number;
+  text: string;
+  segments: TranscriptSegment[] | null | undefined;
+}) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const activeRef = useRef<HTMLButtonElement>(null);
+  const [currentTime, setCurrentTime] = useState(0);
+
+  const hasSegments = Boolean(segments && segments.length > 0);
+
+  // The active line is the last segment whose start is at/under the playhead.
+  const activeIndex = useMemo(() => {
+    if (!segments) return -1;
+    let idx = -1;
+    for (let i = 0; i < segments.length; i += 1) {
+      const segment = segments[i];
+      if (segment && currentTime + 0.15 >= segment.start) idx = i;
+      else break;
+    }
+    return idx;
+  }, [segments, currentTime]);
+
+  // Keep the active line in view as playback advances.
+  useEffect(() => {
+    activeRef.current?.scrollIntoView({ block: "nearest" });
+  }, [activeIndex]);
+
+  if (!hasSegments) {
+    return <pre className="whitespace-pre-wrap text-sm font-sans">{text}</pre>;
+  }
+
+  const seekTo = (seconds: number): void => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.currentTime = seconds;
+    void audio.play();
+  };
+
+  return (
+    <div className="space-y-3">
+      <audio
+        ref={audioRef}
+        controls
+        preload="metadata"
+        className="w-full"
+        src={`/api/meetings/${meetingId}/audio`}
+        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+      />
+      <div className="max-h-[28rem] divide-y overflow-auto rounded-md border">
+        {segments!.map((segment, i) => (
+          <button
+            key={i}
+            ref={i === activeIndex ? activeRef : undefined}
+            type="button"
+            onClick={() => seekTo(segment.start)}
+            className={cn(
+              "flex w-full gap-3 px-3 py-2 text-left text-sm transition-colors hover:bg-muted/60",
+              i === activeIndex && "bg-primary/10",
+            )}
+          >
+            <span className="shrink-0 pt-0.5 font-mono text-xs tabular-nums text-muted-foreground">
+              {formatTimestamp(segment.start)}
+            </span>
+            <span className="min-w-0">{segment.text}</span>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function formatTimestamp(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = h > 0 ? String(m).padStart(2, "0") : String(m);
+  const ss = String(s).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
 
 function FileRow({ label, path }: { label: string; path: string }) {
   return (

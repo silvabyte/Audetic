@@ -30,6 +30,9 @@ pub struct MeetingRecord {
     pub audio_path: String,
     pub transcript_path: Option<String>,
     pub transcript_text: Option<String>,
+    /// JSON array of `{start,end,text}` segment timestamps, or `None` for
+    /// meetings transcribed before timestamps were captured.
+    pub transcript_segments: Option<String>,
     pub duration_seconds: Option<i64>,
     pub started_at: String,
     pub completed_at: Option<String>,
@@ -101,15 +104,18 @@ impl MeetingRepository {
         id: i64,
         transcript_path: &str,
         transcript_text: &str,
+        transcript_segments: Option<&str>,
         duration_seconds: i64,
     ) -> Result<()> {
         conn.execute(
             "UPDATE meetings SET status = ?1, transcript_path = ?2, transcript_text = ?3, \
-             duration_seconds = ?4, error = NULL, completed_at = CURRENT_TIMESTAMP WHERE id = ?5",
+             transcript_segments = ?4, duration_seconds = ?5, error = NULL, \
+             completed_at = CURRENT_TIMESTAMP WHERE id = ?6",
             params![
                 MeetingPhase::Completed.as_str(),
                 transcript_path,
                 transcript_text,
+                transcript_segments,
                 duration_seconds,
                 id,
             ],
@@ -229,7 +235,8 @@ impl MeetingRepository {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at, deleted_at \
+                 duration_seconds, started_at, completed_at, error, created_at, deleted_at, \
+                 transcript_segments \
                  FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
             )
             .context("Failed to prepare meeting query")?;
@@ -249,6 +256,7 @@ impl MeetingRepository {
                     error: row.get(9)?,
                     created_at: row.get(10)?,
                     deleted_at: row.get(11)?,
+                    transcript_segments: row.get(12)?,
                 })
             })
             .context("Failed to query meeting")?;
@@ -265,7 +273,8 @@ impl MeetingRepository {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at, deleted_at \
+                 duration_seconds, started_at, completed_at, error, created_at, deleted_at, \
+                 transcript_segments \
                  FROM meetings WHERE deleted_at IS NULL \
                  ORDER BY started_at DESC, id DESC LIMIT ?1",
             )
@@ -286,6 +295,7 @@ impl MeetingRepository {
                     error: row.get(9)?,
                     created_at: row.get(10)?,
                     deleted_at: row.get(11)?,
+                    transcript_segments: row.get(12)?,
                 })
             })
             .context("Failed to list meetings")?;
@@ -352,8 +362,15 @@ mod tests {
         let conn = setup_db();
         let id = MeetingRepository::insert(&conn, Some("Meeting"), "/tmp/test.wav").unwrap();
 
-        MeetingRepository::complete(&conn, id, "/tmp/test.txt", "Hello world transcript", 3600)
-            .unwrap();
+        MeetingRepository::complete(
+            &conn,
+            id,
+            "/tmp/test.txt",
+            "Hello world transcript",
+            None,
+            3600,
+        )
+        .unwrap();
 
         let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
         assert_eq!(meeting.status, "completed");
@@ -419,7 +436,7 @@ mod tests {
     /// tests move it to `completed` first.
     fn insert_completed(conn: &Connection, title: &str, path: &str) -> i64 {
         let id = MeetingRepository::insert(conn, Some(title), path).unwrap();
-        MeetingRepository::complete(conn, id, "/tmp/t.txt", "transcript", 10).unwrap();
+        MeetingRepository::complete(conn, id, "/tmp/t.txt", "transcript", None, 10).unwrap();
         id
     }
 

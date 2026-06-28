@@ -1105,6 +1105,11 @@ export interface components {
             status: string;
             title?: string | null;
             transcript_path?: string | null;
+            /**
+             * @description Per-segment timestamps for clickable transcript lines. `None` for
+             *     meetings transcribed before timestamps were captured.
+             */
+            transcript_segments?: components["schemas"]["Segment"][] | null;
             transcript_text?: string | null;
         };
         /**
@@ -1306,6 +1311,14 @@ export interface components {
             last_error?: string | null;
             phase: string;
             recording: boolean;
+        };
+        /** @description A segment of transcription with timestamps. */
+        Segment: {
+            /** Format: double */
+            end: number;
+            /** Format: double */
+            start: number;
+            text: string;
         };
         /** @description Response for GET / — service identity and basic status. */
         ServiceInfo: {

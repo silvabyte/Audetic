@@ -72,6 +72,7 @@ pub struct TranscriptionResult {
 
 /// A segment of transcription with timestamps.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 pub struct Segment {
     pub start: f64,
     pub end: f64,

@@ -52,6 +52,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             audio_path TEXT NOT NULL,
             transcript_path TEXT,
             transcript_text TEXT,
+            transcript_segments TEXT,
             duration_seconds INTEGER,
             started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             completed_at TIMESTAMP,
@@ -67,6 +68,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // `CREATE TABLE IF NOT EXISTS` above is a no-op on those DBs, so backfill
     // the column here. Idempotent — skips the ALTER if it's already present.
     add_column_if_missing(conn, "meetings", "deleted_at", "TIMESTAMP")?;
+
+    // Per-segment timestamps (JSON array of {start,end,text}) for clickable
+    // transcript lines. Backfilled for meetings created before this column —
+    // older rows just have NULL and the UI falls back to plain text.
+    add_column_if_missing(conn, "meetings", "transcript_segments", "TEXT")?;
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at DESC)",

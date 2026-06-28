@@ -18,7 +18,7 @@ pub use audetic_core::jobs_client;
 
 pub use providers::{
     AssemblyAIProvider, AudeticProvider, LocalEngineProvider, OpenAIProvider,
-    OpenAIWhisperCliProvider, TranscriptionProvider, WhisperCppProvider,
+    OpenAIWhisperCliProvider, TranscriptionOutput, TranscriptionProvider, WhisperCppProvider,
 };
 
 pub mod models;
@@ -88,6 +88,18 @@ impl Transcriber {
         );
         self.provider
             .transcribe(audio_path.as_path(), &self.language)
+            .await
+    }
+
+    /// Transcribe and also return per-segment timestamps when available.
+    pub async fn transcribe_detailed(&self, audio_path: &PathBuf) -> Result<TranscriptionOutput> {
+        info!(
+            "Transcribing audio file (detailed): {:?} with {}",
+            audio_path,
+            self.provider.name()
+        );
+        self.provider
+            .transcribe_detailed(audio_path.as_path(), &self.language)
             .await
     }
 

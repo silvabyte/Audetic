@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-use super::Transcriber;
+use super::{Transcriber, TranscriptionOutput};
 use crate::normalizer::TranscriptionNormalizer;
 
 /// Service that orchestrates transcription and normalization
@@ -41,6 +41,21 @@ impl TranscriptionService {
         );
 
         Ok(normalized)
+    }
+
+    /// Transcribe and return normalized text plus per-segment timestamps (empty
+    /// when the provider doesn't surface them).
+    pub async fn transcribe_detailed(&self, audio_path: &PathBuf) -> Result<TranscriptionOutput> {
+        info!(
+            "Starting detailed transcription pipeline for: {:?}",
+            audio_path
+        );
+        let raw = self.transcriber.transcribe_detailed(audio_path).await?;
+        let text = self.normalizer.normalize(&raw.text);
+        Ok(TranscriptionOutput {
+            text,
+            segments: raw.segments,
+        })
     }
 }
 

@@ -149,12 +149,22 @@ impl TranscriptionJobService for LocalTranscriptionJobService {
         _language: Option<&str>,
     ) -> Result<TranscriptionJobResult> {
         info!("Transcribing meeting locally: {:?}", file_path);
-        let text = self.service.transcribe(&file_path.to_path_buf()).await?;
-        info!("Local meeting transcription complete: {} chars", text.len());
+        let output = self
+            .service
+            .transcribe_detailed(&file_path.to_path_buf())
+            .await?;
+        info!(
+            "Local meeting transcription complete: {} chars, {} segments",
+            output.text.len(),
+            output.segments.len()
+        );
         Ok(TranscriptionJobResult {
-            text,
-            // Segment timestamps aren't surfaced by the local provider yet.
-            segments: None,
+            text: output.text,
+            segments: if output.segments.is_empty() {
+                None
+            } else {
+                Some(output.segments)
+            },
         })
     }
 }
