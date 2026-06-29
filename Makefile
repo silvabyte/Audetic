@@ -12,7 +12,7 @@ EXTRA_FEATURES ?=
 AUTO_COMMIT ?= 1
 
 .PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix quality deploy deploy-beta deploy-stable \
-        ui-install ui-dev ui-build ui-preview ui-typecheck codegen \
+        ui-install ui-dev ui-build ui-preview ui-typecheck ui-lint codegen \
         installer-lint deploy-setup \
         macos-sign macos-sign-release macos-app macos-app-debug \
         macos-notarize macos-tarball macos-release
@@ -53,6 +53,7 @@ help:
 	@echo "  make ui-build          - Build the web UI to static files (dist/)"
 	@echo "  make ui-preview        - Preview the production build locally"
 	@echo "  make ui-typecheck      - Typecheck the web UI"
+	@echo "  make ui-lint           - Lint the web UI (ESLint) + run custom rule tests"
 	@echo "  make codegen           - Regenerate apps/web-ui TS types from daemon /api/openapi.json"
 	@echo ""
 	@echo "  Installer:"
@@ -88,6 +89,8 @@ quality:
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo test
 	cd apps/web-ui && bun run typecheck
+	cd apps/web-ui && bun run lint
+	cd apps/web-ui && bun run test
 	@echo "✓ quality checks passed (rust + web-ui)"
 
 deploy:
@@ -161,6 +164,10 @@ ui-preview:
 
 ui-typecheck:
 	cd apps/web-ui && bun run typecheck
+
+ui-lint:
+	cd apps/web-ui && bun run lint
+	cd apps/web-ui && bun run test
 
 codegen:
 	cd apps/web-ui && bun run codegen

@@ -50,7 +50,6 @@ export const settingsProviderRoute: RouteObject = {
 };
 
 function SettingsProvider() {
-  const store = useStore();
   return (
     <div className="space-y-6">
       <header>

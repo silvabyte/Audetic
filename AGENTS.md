@@ -30,6 +30,16 @@
 - `src/transcription/` - Transcription providers
 - `src/db/` - SQLite database operations
 
+## Frontend (apps/web-ui)
+
+The browser SPA is a separate React/TypeScript package. **Before touching it,
+read `apps/web-ui/NOTES.md`** — frontend conventions live there, not in this
+file. In particular, MobX uses the `<Observer>` render-prop convention
+(`apps/web-ui/feedback_mobx.md`), enforced by `cd apps/web-ui && bun run lint`
+(ESLint + a custom `local/observer-boundary` rule). Run `bun run lint` and
+`bun run typecheck` there before committing web-ui changes; `make quality` runs
+both alongside the Rust gates.
+
 ## Agent skills
 
 ### Issue tracker

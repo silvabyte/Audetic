@@ -15,6 +15,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "node --test \"eslint-rules/*.test.js\"",
     "codegen": "openapi-typescript http://127.0.0.1:3737/api/openapi.json -o src/api/schema.ts"
   },
   "dependencies": {
@@ -38,14 +40,20 @@
     "tw-animate-css": "^1.2.0"
   },
   "devDependencies": {
+    "@eslint/js": "^10.0.1",
     "@tailwindcss/vite": "^4.0.0",
     "@types/node": "^22.10.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.4",
+    "eslint": "^10.6.0",
+    "eslint-plugin-mobx": "^0.0.14",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.7.0",
     "openapi-typescript": "^7.4.4",
     "tailwindcss": "^4.0.0",
     "typescript": "^5.7.2",
+    "typescript-eslint": "^8.62.0",
     "vite": "^5.4.11"
   }
 }
