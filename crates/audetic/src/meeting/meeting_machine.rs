@@ -602,6 +602,7 @@ pub async fn retry_meeting_transcription(
                     meeting_id,
                     &transcript_path.to_string_lossy(),
                     &r.text,
+                    r.segments.as_deref(),
                     duration_seconds,
                 ) {
                     error!("Failed to mark meeting {} completed: {}", meeting_id, e);

@@ -263,6 +263,7 @@ mod tests {
             meeting_id,
             "/tmp/meeting.txt",
             "we made a decision",
+            None,
             30,
         )?;
 

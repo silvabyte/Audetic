@@ -135,6 +135,9 @@ pub struct MeetingDetailResponse {
     pub audio_path: String,
     pub transcript_path: Option<String>,
     pub transcript_text: Option<String>,
+    /// Per-segment timestamps for clickable transcript lines. `None` for
+    /// meetings transcribed before timestamps were captured.
+    pub transcript_segments: Option<Vec<audetic_core::jobs_client::Segment>>,
     pub duration_seconds: Option<i64>,
     pub started_at: String,
     pub completed_at: Option<String>,
@@ -590,6 +593,7 @@ pub async fn get_meeting(
             audio_path: m.audio_path,
             transcript_path: m.transcript_path,
             transcript_text: m.transcript_text,
+            transcript_segments: m.transcript_segments,
             duration_seconds: m.duration_seconds,
             started_at: m.started_at,
             completed_at: m.completed_at,

@@ -1,5 +1,5 @@
 import { Observer, observer } from "mobx-react-lite";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Form,
   NavLink,
@@ -37,6 +37,7 @@ import {
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
+import { cn } from "@/lib/utils";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
 import {
@@ -281,9 +282,11 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
         <CardContent className="space-y-3">
           {detail.transcript_text ? (
             <>
-              <pre className="whitespace-pre-wrap text-sm font-sans">
-                {detail.transcript_text}
-              </pre>
+              <TranscriptPlayer
+                meetingId={meetingId}
+                text={detail.transcript_text}
+                segments={detail.transcript_segments}
+              />
               <Form method="post" replace>
                 <input
                   type="hidden"
@@ -329,6 +332,112 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
     </>
   );
 });
+
+type TranscriptSegment = NonNullable<MeetingDetail["transcript_segments"]>[number];
+
+/// Renders the transcript. With segment timestamps it shows an audio player and
+/// clickable lines that seek + highlight as the audio plays; without them it
+/// falls back to a plain text block.
+function TranscriptPlayer({
+  meetingId,
+  text,
+  segments,
+}: {
+  meetingId: number;
+  text: string;
+  segments: TranscriptSegment[] | null | undefined;
+}) {
+  const audioRef = useRef<HTMLAudioElement>(null);
+  // Last index we scrolled to, so the follow-the-playhead scroll fires only when
+  // the active line actually changes — not on every timeupdate re-render.
+  const lastScrolledIndex = useRef(-1);
+  const [currentTime, setCurrentTime] = useState(0);
+
+  const seekTo = (seconds: number): void => {
+    const audio = audioRef.current;
+    if (!audio) return;
+    audio.currentTime = seconds;
+    // play() rejects when the media can't start (audio 404, autoplay policy).
+    // Swallow it: the seek already happened and there's nothing to recover.
+    audio.play().catch(() => {});
+  };
+
+  // The segment fields (`segments[..].start/.text`) are MobX observables, so the
+  // render that reads them must run inside a reactive context — otherwise it
+  // won't re-render when the meeting detail loads/changes. Reads stay inside
+  // <Observer>; the hooks above are plain React state and stay outside it.
+  return (
+    <Observer>
+      {() => {
+        if (!segments || segments.length === 0) {
+          return (
+            <pre className="whitespace-pre-wrap text-sm font-sans">{text}</pre>
+          );
+        }
+
+        // The active line is the last segment whose start is at/under the playhead.
+        let activeIndex = -1;
+        for (let i = 0; i < segments.length; i += 1) {
+          if (currentTime + 0.15 >= segments[i]!.start) activeIndex = i;
+          else break;
+        }
+
+        // Keep the active line in view as playback advances. Gate on actual
+        // playback so loading the page (currentTime 0 → first line active)
+        // doesn't scroll-jack the transcript into view before the user presses
+        // play, and only scroll when the active line changes.
+        const followPlayhead = (el: HTMLButtonElement | null): void => {
+          if (!el || lastScrolledIndex.current === activeIndex) return;
+          lastScrolledIndex.current = activeIndex;
+          const audio = audioRef.current;
+          if (audio && !audio.paused) el.scrollIntoView({ block: "nearest" });
+        };
+
+        return (
+          <div className="space-y-3">
+            <audio
+              ref={audioRef}
+              controls
+              preload="metadata"
+              className="w-full"
+              src={`/api/meetings/${meetingId}/audio`}
+              onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+            />
+            <div className="max-h-[28rem] divide-y overflow-auto rounded-md border">
+              {segments.map((segment, i) => (
+                <button
+                  key={i}
+                  ref={i === activeIndex ? followPlayhead : undefined}
+                  type="button"
+                  onClick={() => seekTo(segment.start)}
+                  className={cn(
+                    "flex w-full gap-3 px-3 py-2 text-left text-sm transition-colors hover:bg-muted/60",
+                    i === activeIndex && "bg-primary/10",
+                  )}
+                >
+                  <span className="shrink-0 pt-0.5 font-mono text-xs tabular-nums text-muted-foreground">
+                    {formatTimestamp(segment.start)}
+                  </span>
+                  <span className="min-w-0">{segment.text}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      }}
+    </Observer>
+  );
+}
+
+function formatTimestamp(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = h > 0 ? String(m).padStart(2, "0") : String(m);
+  const ss = String(s).padStart(2, "0");
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
 
 function FileRow({ label, path }: { label: string; path: string }) {
   return (

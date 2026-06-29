@@ -138,6 +138,7 @@ use super::routes::{
         meetings::MeetingSummary,
         meetings::MeetingsListResponse,
         meetings::MeetingDetailResponse,
+        audetic_core::jobs_client::Segment,
         meetings::MeetingRetryResponse,
         meetings::MeetingDeleteResponse,
         meetings::MeetingImportResponse,

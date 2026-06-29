@@ -143,6 +143,7 @@ pub async fn process_meeting(args: ProcessingArgs) {
                     meeting_id,
                     &transcript_path.to_string_lossy(),
                     &result.text,
+                    result.segments.as_deref(),
                     duration_seconds as i64,
                 );
             }

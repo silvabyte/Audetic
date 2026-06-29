@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::meeting::status::MeetingPhase;
+use audetic_core::jobs_client::Segment;
 
 /// Result of a soft-delete attempt, so the API can answer with the right
 /// status code (200 / 404 / 409).
@@ -30,6 +31,11 @@ pub struct MeetingRecord {
     pub audio_path: String,
     pub transcript_path: Option<String>,
     pub transcript_text: Option<String>,
+    /// Per-segment `{start,end,text}` timestamps, or `None` for meetings
+    /// transcribed before timestamps were captured (or whose stored JSON was
+    /// malformed). Stored as a JSON array in the `transcript_segments` column;
+    /// the repository owns that encoding so callers work with typed segments.
+    pub transcript_segments: Option<Vec<Segment>>,
     pub duration_seconds: Option<i64>,
     pub started_at: String,
     pub completed_at: Option<String>,
@@ -101,15 +107,25 @@ impl MeetingRepository {
         id: i64,
         transcript_path: &str,
         transcript_text: &str,
+        transcript_segments: Option<&[Segment]>,
         duration_seconds: i64,
     ) -> Result<()> {
+        // Encode segments as the JSON array stored in `transcript_segments`.
+        // Empty or absent segments (and any serialization hiccup) store NULL so
+        // the UI falls back to plain text — this is the one place that knows the
+        // column's on-disk encoding.
+        let segments_json = transcript_segments
+            .filter(|s| !s.is_empty())
+            .and_then(|s| serde_json::to_string(s).ok());
         conn.execute(
             "UPDATE meetings SET status = ?1, transcript_path = ?2, transcript_text = ?3, \
-             duration_seconds = ?4, error = NULL, completed_at = CURRENT_TIMESTAMP WHERE id = ?5",
+             transcript_segments = ?4, duration_seconds = ?5, error = NULL, \
+             completed_at = CURRENT_TIMESTAMP WHERE id = ?6",
             params![
                 MeetingPhase::Completed.as_str(),
                 transcript_path,
                 transcript_text,
+                segments_json,
                 duration_seconds,
                 id,
             ],
@@ -229,7 +245,8 @@ impl MeetingRepository {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at, deleted_at \
+                 duration_seconds, started_at, completed_at, error, created_at, deleted_at, \
+                 transcript_segments \
                  FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
             )
             .context("Failed to prepare meeting query")?;
@@ -249,6 +266,12 @@ impl MeetingRepository {
                     error: row.get(9)?,
                     created_at: row.get(10)?,
                     deleted_at: row.get(11)?,
+                    // Tolerate malformed/legacy JSON by decoding to None, so a
+                    // bad value just drops back to the plain-text transcript.
+                    transcript_segments: row
+                        .get::<_, Option<String>>(12)?
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str(json).ok()),
                 })
             })
             .context("Failed to query meeting")?;
@@ -265,7 +288,8 @@ impl MeetingRepository {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at, deleted_at \
+                 duration_seconds, started_at, completed_at, error, created_at, deleted_at, \
+                 transcript_segments \
                  FROM meetings WHERE deleted_at IS NULL \
                  ORDER BY started_at DESC, id DESC LIMIT ?1",
             )
@@ -286,6 +310,12 @@ impl MeetingRepository {
                     error: row.get(9)?,
                     created_at: row.get(10)?,
                     deleted_at: row.get(11)?,
+                    // Tolerate malformed/legacy JSON by decoding to None, so a
+                    // bad value just drops back to the plain-text transcript.
+                    transcript_segments: row
+                        .get::<_, Option<String>>(12)?
+                        .as_deref()
+                        .and_then(|json| serde_json::from_str(json).ok()),
                 })
             })
             .context("Failed to list meetings")?;
@@ -352,8 +382,15 @@ mod tests {
         let conn = setup_db();
         let id = MeetingRepository::insert(&conn, Some("Meeting"), "/tmp/test.wav").unwrap();
 
-        MeetingRepository::complete(&conn, id, "/tmp/test.txt", "Hello world transcript", 3600)
-            .unwrap();
+        MeetingRepository::complete(
+            &conn,
+            id,
+            "/tmp/test.txt",
+            "Hello world transcript",
+            None,
+            3600,
+        )
+        .unwrap();
 
         let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
         assert_eq!(meeting.status, "completed");
@@ -364,6 +401,52 @@ mod tests {
         );
         assert_eq!(meeting.duration_seconds, Some(3600));
         assert!(meeting.completed_at.is_some());
+        // No segments passed → column stays NULL.
+        assert!(meeting.transcript_segments.is_none());
+    }
+
+    #[test]
+    fn test_complete_persists_and_decodes_segments() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, Some("Meeting"), "/tmp/test.wav").unwrap();
+
+        let segments = vec![
+            Segment {
+                start: 0.0,
+                end: 2.5,
+                text: "Hello".into(),
+            },
+            Segment {
+                start: 2.5,
+                end: 5.0,
+                text: "world".into(),
+            },
+        ];
+        MeetingRepository::complete(&conn, id, "/tmp/t.txt", "Hello world", Some(&segments), 10)
+            .unwrap();
+
+        // Round-trips through the column as typed segments, no caller-side JSON.
+        let got = MeetingRepository::get(&conn, id)
+            .unwrap()
+            .unwrap()
+            .transcript_segments
+            .expect("segments persisted");
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].start, 0.0);
+        assert_eq!(got[1].text, "world");
+    }
+
+    #[test]
+    fn test_complete_empty_segments_stored_as_none() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, Some("Meeting"), "/tmp/test.wav").unwrap();
+
+        // An empty slice collapses to NULL so the UI falls back to plain text,
+        // rather than storing a useless "[]".
+        MeetingRepository::complete(&conn, id, "/tmp/t.txt", "txt", Some(&[]), 10).unwrap();
+
+        let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        assert!(meeting.transcript_segments.is_none());
     }
 
     #[test]
@@ -419,7 +502,7 @@ mod tests {
     /// tests move it to `completed` first.
     fn insert_completed(conn: &Connection, title: &str, path: &str) -> i64 {
         let id = MeetingRepository::insert(conn, Some(title), path).unwrap();
-        MeetingRepository::complete(conn, id, "/tmp/t.txt", "transcript", 10).unwrap();
+        MeetingRepository::complete(conn, id, "/tmp/t.txt", "transcript", None, 10).unwrap();
         id
     }
 
