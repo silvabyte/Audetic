@@ -541,10 +541,22 @@ async function assembleAndNotarizeBundle(targetId: string, rustTarget: string) {
 	// along so `audeticd install` can symlink it onto PATH.
 	await copyFile(daemonPath, path.join(macos, "audeticd"));
 	await copyFile(cliPath, path.join(macos, "audetic"));
+
+	// Build + embed the menu-bar agent as a login item. It's an independent
+	// SwiftUI HTTP client of the daemon (status + toggles + global shortcuts);
+	// `audeticd install` registers it as the `ai.audetic.menubar` LaunchAgent.
+	const menubarApp = await buildMenuBarApp(targetId);
+	const loginItems = path.join(contents, "Library", "LoginItems");
+	const embeddedMenubar = path.join(loginItems, "Audetic Menu Bar.app");
+	await mkdir(loginItems, { recursive: true });
+	await $`cp -R ${menubarApp} ${embeddedMenubar}`;
+
 	await Bun.write(path.join(contents, "PkgInfo"), "APPL????");
 
 	console.log(`==> [${targetId}] codesign (${config.macosSignIdentity})`);
-	// Sign the nested CLI first (no mic/screen entitlements), then the bundle.
+	// Sign inside-out: the embedded menu-bar app, then the CLI (no mic/screen
+	// entitlements), then the outer bundle, so the whole thing validates.
+	await $`codesign --force --sign ${config.macosSignIdentity} --options runtime --timestamp ${embeddedMenubar}`;
 	await $`codesign --force --sign ${config.macosSignIdentity} --options runtime --timestamp ${path.join(macos, "audetic")}`;
 	await $`codesign --force --sign ${config.macosSignIdentity} --options runtime --entitlements ${entitlements} --timestamp ${appPath}`;
 
@@ -567,6 +579,36 @@ async function assembleAndNotarizeBundle(targetId: string, rustTarget: string) {
 	await rm(notaryZip);
 	console.log(`==> [${targetId}] stapler staple`);
 	await $`xcrun stapler staple ${appPath}`;
+}
+
+/// Build the SwiftUI menu-bar agent and assemble it into an unsigned
+/// "Audetic Menu Bar.app" under its .build dir. Returns the bundle path; the
+/// caller embeds + signs it inside Audetic.app. Signing here would be wasted
+/// work since the embed re-signs it.
+async function buildMenuBarApp(targetId: string): Promise<string> {
+	const menubarDir = path.join(ROOT_DIR, "apps", "menubar-macos");
+	const buildDir = path.join(menubarDir, ".build");
+	const appPath = path.join(buildDir, "Audetic Menu Bar.app");
+	const contents = path.join(appPath, "Contents");
+	const macos = path.join(contents, "MacOS");
+	const infoPlistSrc = path.join(menubarDir, "macos", "Info.plist");
+	const binarySrc = path.join(buildDir, "release", "AudeticMenuBar");
+
+	await assertPath(infoPlistSrc, "menu-bar Info.plist");
+
+	console.log(`==> [${targetId}] swift build -c release (apps/menubar-macos)`);
+	await $`swift build -c release`.cwd(menubarDir);
+	await assertPath(binarySrc, "compiled menu-bar binary");
+
+	console.log(`==> [${targetId}] Assembling Audetic Menu Bar.app`);
+	await rm(appPath, { recursive: true, force: true });
+	await mkdir(macos, { recursive: true });
+	await mkdir(path.join(contents, "Resources"), { recursive: true });
+	await copyFile(infoPlistSrc, path.join(contents, "Info.plist"));
+	await copyFile(binarySrc, path.join(macos, "AudeticMenuBar"));
+	await Bun.write(path.join(contents, "PkgInfo"), "APPL????");
+
+	return appPath;
 }
 
 async function buildWebUi() {

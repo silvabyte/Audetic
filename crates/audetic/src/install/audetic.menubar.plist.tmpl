@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>ai.audetic.menubar</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__EXEC_START__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <!-- KeepAlive only while it crashes during a session; the menu bar agent
+         is a UI helper, not a critical service. A clean Quit from the menu
+         should stay quit until next login. -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>__LOG_PATH__</string>
+    <key>StandardErrorPath</key>
+    <string>__LOG_PATH__</string>
+    <key>WorkingDirectory</key>
+    <string>__HOME__</string>
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
+</dict>
+</plist>
