@@ -1,5 +1,5 @@
 import { Observer, observer } from "mobx-react-lite";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Form,
   NavLink,
@@ -348,36 +348,10 @@ function TranscriptPlayer({
   segments: TranscriptSegment[] | null | undefined;
 }) {
   const audioRef = useRef<HTMLAudioElement>(null);
-  const activeRef = useRef<HTMLButtonElement>(null);
+  // Last index we scrolled to, so the follow-the-playhead scroll fires only when
+  // the active line actually changes — not on every timeupdate re-render.
+  const lastScrolledIndex = useRef(-1);
   const [currentTime, setCurrentTime] = useState(0);
-
-  const hasSegments = Boolean(segments && segments.length > 0);
-
-  // The active line is the last segment whose start is at/under the playhead.
-  const activeIndex = useMemo(() => {
-    if (!segments) return -1;
-    let idx = -1;
-    for (let i = 0; i < segments.length; i += 1) {
-      const segment = segments[i];
-      if (segment && currentTime + 0.15 >= segment.start) idx = i;
-      else break;
-    }
-    return idx;
-  }, [segments, currentTime]);
-
-  // Keep the active line in view as playback advances. Gate on actual playback
-  // so loading the page (currentTime 0 → first line active) doesn't scroll-jack
-  // the transcript into view before the user has pressed play.
-  useEffect(() => {
-    const audio = audioRef.current;
-    if (audio && !audio.paused) {
-      activeRef.current?.scrollIntoView({ block: "nearest" });
-    }
-  }, [activeIndex]);
-
-  if (!hasSegments) {
-    return <pre className="whitespace-pre-wrap text-sm font-sans">{text}</pre>;
-  }
 
   const seekTo = (seconds: number): void => {
     const audio = audioRef.current;
@@ -388,36 +362,70 @@ function TranscriptPlayer({
     audio.play().catch(() => {});
   };
 
+  // The segment fields (`segments[..].start/.text`) are MobX observables, so the
+  // render that reads them must run inside a reactive context — otherwise it
+  // won't re-render when the meeting detail loads/changes. Reads stay inside
+  // <Observer>; the hooks above are plain React state and stay outside it.
   return (
-    <div className="space-y-3">
-      <audio
-        ref={audioRef}
-        controls
-        preload="metadata"
-        className="w-full"
-        src={`/api/meetings/${meetingId}/audio`}
-        onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-      />
-      <div className="max-h-[28rem] divide-y overflow-auto rounded-md border">
-        {segments!.map((segment, i) => (
-          <button
-            key={i}
-            ref={i === activeIndex ? activeRef : undefined}
-            type="button"
-            onClick={() => seekTo(segment.start)}
-            className={cn(
-              "flex w-full gap-3 px-3 py-2 text-left text-sm transition-colors hover:bg-muted/60",
-              i === activeIndex && "bg-primary/10",
-            )}
-          >
-            <span className="shrink-0 pt-0.5 font-mono text-xs tabular-nums text-muted-foreground">
-              {formatTimestamp(segment.start)}
-            </span>
-            <span className="min-w-0">{segment.text}</span>
-          </button>
-        ))}
-      </div>
-    </div>
+    <Observer>
+      {() => {
+        if (!segments || segments.length === 0) {
+          return (
+            <pre className="whitespace-pre-wrap text-sm font-sans">{text}</pre>
+          );
+        }
+
+        // The active line is the last segment whose start is at/under the playhead.
+        let activeIndex = -1;
+        for (let i = 0; i < segments.length; i += 1) {
+          if (currentTime + 0.15 >= segments[i]!.start) activeIndex = i;
+          else break;
+        }
+
+        // Keep the active line in view as playback advances. Gate on actual
+        // playback so loading the page (currentTime 0 → first line active)
+        // doesn't scroll-jack the transcript into view before the user presses
+        // play, and only scroll when the active line changes.
+        const followPlayhead = (el: HTMLButtonElement | null): void => {
+          if (!el || lastScrolledIndex.current === activeIndex) return;
+          lastScrolledIndex.current = activeIndex;
+          const audio = audioRef.current;
+          if (audio && !audio.paused) el.scrollIntoView({ block: "nearest" });
+        };
+
+        return (
+          <div className="space-y-3">
+            <audio
+              ref={audioRef}
+              controls
+              preload="metadata"
+              className="w-full"
+              src={`/api/meetings/${meetingId}/audio`}
+              onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+            />
+            <div className="max-h-[28rem] divide-y overflow-auto rounded-md border">
+              {segments.map((segment, i) => (
+                <button
+                  key={i}
+                  ref={i === activeIndex ? followPlayhead : undefined}
+                  type="button"
+                  onClick={() => seekTo(segment.start)}
+                  className={cn(
+                    "flex w-full gap-3 px-3 py-2 text-left text-sm transition-colors hover:bg-muted/60",
+                    i === activeIndex && "bg-primary/10",
+                  )}
+                >
+                  <span className="shrink-0 pt-0.5 font-mono text-xs tabular-nums text-muted-foreground">
+                    {formatTimestamp(segment.start)}
+                  </span>
+                  <span className="min-w-0">{segment.text}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      }}
+    </Observer>
   );
 }
 
