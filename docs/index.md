@@ -7,6 +7,7 @@ Welcome to the Audetic documentation. This directory contains detailed guides fo
 ### Installation & Setup
 
 - [Installation Guide](./installation.md) - Complete installation instructions for all platforms
+- [macOS Install Guide](./macos-install.md) - Build-from-source setup for macOS (Apple Silicon)
 - [Text Injection Setup](./text-injection-setup.md) - Set up automatic text injection methods for different environments
 - [**Configuration Guide**](./configuration.md) - Complete configuration reference covering all Audetic settings including providers, audio, UI, and behavior
 - [Waybar Integration](./waybar-integration.md) - Add Audetic status indicators to your Waybar

@@ -7,9 +7,9 @@ Basically superwhisper for Omarchy, Audetic is a voice to text application for W
 
 - **[View Documentation](./docs/index.md)** - Detailed guides and configuration
 
-## Quick Install (Recommended)
+## Quick Install
 
-Audetic ships pre-built, signed binaries for Linux and macOS.
+**Linux** ships a pre-built, signed binary:
 
 ```bash
 curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
@@ -17,6 +17,8 @@ curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
 
 The installer detects your platform and hands off to `audetic install`.
 Everything lives under `$HOME` — no sudo.
+
+**macOS** builds from source — see the [macOS Install Guide](./docs/macos-install.md).
 
 ### Linux
 
@@ -27,34 +29,17 @@ web UI in your browser. Pass `--no-launch` to skip opening the browser.
 
 ### macOS
 
-Unpacks the signed and notarized `Audetic.app` to `~/Applications/`,
-drops a LaunchAgent plist at
-`~/Library/LaunchAgents/ai.audetic.daemon.plist`, `launchctl bootstrap`s
-it, waits for `127.0.0.1:3737`, and opens the web UI.
-
-Two permission prompts on first run:
-
-- **Microphone** — needed for voice-to-text and meeting mic capture.
-  Fires automatically the first time the daemon opens the mic.
-- **Screen Recording** (called *Screen & System Audio Recording* on
-  macOS 15+) — needed for meeting *system* audio capture. The daemon
-  triggers this prompt on first launch via `CGRequestScreenCaptureAccess`.
-  After you click Allow, the daemon **auto-restarts** to pick up the
-  fresh permission (launchd's `KeepAlive` does the heavy lifting); no
-  manual restart needed.
-
-If you ever need to revoke or reset permissions, open **System
-Settings → Privacy & Security**, find Audetic, and toggle as needed.
-To force a fresh prompt:
+macOS builds from source — three commands once Xcode + `brew install cmake
+ffmpeg` are in place:
 
 ```bash
-tccutil reset Microphone ai.audetic.daemon
-tccutil reset ScreenCapture ai.audetic.daemon
-launchctl kickstart -k gui/$(id -u)/ai.audetic.daemon
+git pull
+make macos-app
+./target/release/Audetic.app/Contents/MacOS/audeticd install   # no sudo
 ```
 
-System audio capture requires macOS **14.6 or later** (Core Audio Tap
-API). On older versions, meetings fall back to mic-only.
+Full walkthrough, permissions, local models, and troubleshooting:
+**[macOS Install Guide](./docs/macos-install.md)**.
 
 **After installation:**
 
@@ -137,17 +122,9 @@ audetic update
 
 ## Uninstall — macOS
 
-```bash
-launchctl bootout gui/$(id -u)/ai.audetic.daemon
-rm -rf ~/Applications/Audetic.app
-rm  ~/Library/LaunchAgents/ai.audetic.daemon.plist
-rm -rf "~/Library/Application Support/audetic"
-rm -rf ~/Library/Logs/Audetic
-tccutil reset Microphone ai.audetic.daemon
-tccutil reset ScreenCapture ai.audetic.daemon
-```
+See the [macOS Install Guide](./docs/macos-install.md#uninstall).
 
-## Uninstall
+## Uninstall — Linux
 
 ```bash
 curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash
