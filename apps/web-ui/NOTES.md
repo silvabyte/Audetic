@@ -80,9 +80,12 @@ installer-lint` checks it.
 - **Daemon lifecycle is Linux-only.** `audetic install` assumes systemd user units and `xdg-open`.
   There's no story for macOS/Windows (launchd plist, a different launcher, etc.) — and the SPA still
   assumes the daemon is already running.
-- **No tray equivalent.** A browser tab has no system-tray idiom. The command-bar state orb covers
-  "what is it doing right now" while a tab is open, but there's nothing surfacing state when no tab
-  is open. If we still want a tray, it lives in whatever launches the daemon.
+- **Tray on macOS lives in the menu-bar agent.** `apps/menubar-macos` (SwiftUI `MenuBarExtra`) now
+  surfaces daemon status, point-and-click dictation/meeting toggles, "Open Audetic", and
+  user-customizable global keyboard shortcuts. It's an independent HTTP consumer of the daemon
+  (like the CLI), bundled inside `Audetic.app/Contents/Library/LoginItems` and registered as a
+  LaunchAgent (`ai.audetic.menubar`) by `audeticd install`. Linux still uses the Hyprland keybind;
+  Windows has no tray yet.
 - **Native dialogs are replaced per-feature.** `config-file` swapped `shell.openPath` for a Copy
   button. Other places that wanted a native picker/opener get a browser-friendly UX per-feature; no
   general replacement.

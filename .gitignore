@@ -33,4 +33,10 @@ crates/audetic/tests/fixtures/large_video.mp4
 node_modules/
 apps/web-ui/dist/
 
+# Swift (menu-bar agent) build artifacts
+apps/menubar-macos/.build/
+
+# AI planning documents + scratch screenshots (ephemeral)
+history/
+
 .env*

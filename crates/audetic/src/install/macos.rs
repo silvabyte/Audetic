@@ -16,8 +16,11 @@ use std::process::Command;
 use std::time::Duration;
 
 const PLIST_TEMPLATE: &str = include_str!("audetic.daemon.plist.tmpl");
+const MENUBAR_PLIST_TEMPLATE: &str = include_str!("audetic.menubar.plist.tmpl");
 const LABEL: &str = "ai.audetic.daemon";
+const MENUBAR_LABEL: &str = "ai.audetic.menubar";
 const BUNDLE_NAME: &str = "Audetic.app";
+const MENUBAR_APP_NAME: &str = "Audetic Menu Bar.app";
 
 pub async fn run(opts: InstallOptions) -> Result<()> {
     let paths = InstallPaths::resolve()?;
@@ -31,6 +34,10 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     bootstrap_agent(&paths)?;
     wait_for_daemon(Duration::from_secs(15)).await?;
     println!("✓ {LABEL} is active");
+
+    // Best-effort: register the embedded menu-bar agent so it starts on login
+    // and right now. Never fail the daemon install over the UI helper.
+    register_menubar_agent(&paths);
 
     if opts.no_launch {
         println!("  Open {app_url} in your browser to finish onboarding.");
@@ -254,6 +261,108 @@ fn bootstrap_agent(paths: &InstallPaths) -> Result<()> {
 
     // `bootstrap` queues the load but the daemon's first `play()` can lag a
     // beat; `kickstart` makes sure it starts immediately.
+    let _ = Command::new("launchctl")
+        .args(["kickstart", "-k", &service_target])
+        .status();
+
+    Ok(())
+}
+
+/// Register the embedded "Audetic Menu Bar.app" as a per-user LaunchAgent
+/// (`ai.audetic.menubar`) and start it. Best-effort — prints a hint and
+/// returns on any failure rather than aborting the daemon install. The menu
+/// bar is a convenience UI helper (status + toggles + global shortcuts), not a
+/// required service.
+fn register_menubar_agent(paths: &InstallPaths) {
+    let menubar_binary = paths
+        .installed_bundle
+        .join("Contents")
+        .join("Library")
+        .join("LoginItems")
+        .join(MENUBAR_APP_NAME)
+        .join("Contents")
+        .join("MacOS")
+        .join("AudeticMenuBar");
+
+    if !menubar_binary.exists() {
+        println!(
+            "  · Menu bar app not found at {}; skipping (older bundle?).",
+            menubar_binary.display()
+        );
+        return;
+    }
+
+    let plist_path = paths
+        .home
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{MENUBAR_LABEL}.plist"));
+    let log_path = paths.log_dir.join("audetic-menubar.log");
+
+    if let Err(err) = write_menubar_plist(paths, &menubar_binary, &plist_path, &log_path) {
+        println!("  · Could not write menu bar LaunchAgent ({err}); skipping.");
+        return;
+    }
+
+    match bootstrap_menubar_agent(&plist_path) {
+        Ok(()) => println!("✓ {MENUBAR_LABEL} is active (menu bar)"),
+        Err(err) => println!(
+            "  · Could not start menu bar agent ({err}); open it from {} manually.",
+            paths.installed_bundle.display()
+        ),
+    }
+}
+
+fn write_menubar_plist(
+    paths: &InstallPaths,
+    menubar_binary: &Path,
+    plist_path: &Path,
+    log_path: &Path,
+) -> Result<()> {
+    let exec = menubar_binary
+        .to_str()
+        .ok_or_else(|| anyhow!("Menu bar binary path contains non-UTF8 bytes"))?;
+    let log = log_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Menu bar log path contains non-UTF8 bytes"))?;
+    let home = paths
+        .home
+        .to_str()
+        .ok_or_else(|| anyhow!("$HOME contains non-UTF8 bytes"))?;
+
+    let plist = MENUBAR_PLIST_TEMPLATE
+        .replace("__EXEC_START__", exec)
+        .replace("__LOG_PATH__", log)
+        .replace("__HOME__", home);
+
+    fs::write(plist_path, plist)
+        .with_context(|| format!("Failed to write {}", plist_path.display()))?;
+    println!("  · Wrote {}", plist_path.display());
+    Ok(())
+}
+
+fn bootstrap_menubar_agent(plist_path: &Path) -> Result<()> {
+    let uid = current_uid()?;
+    let domain = format!("gui/{uid}");
+    let service_target = format!("{domain}/{MENUBAR_LABEL}");
+
+    // Idempotency: tear down a previous registration if present.
+    let _ = Command::new("launchctl")
+        .args(["bootout", &service_target])
+        .status();
+
+    let plist = plist_path
+        .to_str()
+        .ok_or_else(|| anyhow!("Plist path contains non-UTF8 bytes"))?;
+
+    let status = Command::new("launchctl")
+        .args(["bootstrap", &domain, plist])
+        .status()
+        .context("Failed to run `launchctl bootstrap` for the menu bar agent")?;
+    if !status.success() {
+        bail!("`launchctl bootstrap {domain} {plist}` exited with {status}");
+    }
+
     let _ = Command::new("launchctl")
         .args(["kickstart", "-k", &service_target])
         .status();

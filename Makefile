@@ -15,7 +15,7 @@ AUTO_COMMIT ?= 1
         ui-install ui-dev ui-build ui-preview ui-typecheck ui-lint codegen \
         installer-lint deploy-setup \
         macos-sign macos-sign-release macos-app macos-app-debug \
-        macos-notarize macos-tarball macos-release
+        macos-menubar macos-notarize macos-tarball macos-release
 
 # Default target
 help:
@@ -218,10 +218,37 @@ macos-sign-release: macos-sign
 MACOS_APP_PROFILE ?= release
 MACOS_APP_DIR     ?= target/$(MACOS_APP_PROFILE)/Audetic.app
 
-macos-app: release
+# macOS menu-bar agent ("Audetic Menu Bar.app"). A SwiftUI MenuBarExtra app
+# (apps/menubar-macos) that shows daemon status, offers point-and-click
+# dictation/meeting toggles, and registers user-customizable global keyboard
+# shortcuts. It is an independent HTTP consumer of the daemon — the macOS
+# analog of the Hyprland keybind. It gets embedded inside Audetic.app's
+# LoginItems by _macos-app-build so a single artifact carries everything.
+MENUBAR_DIR     ?= apps/menubar-macos
+MENUBAR_APP_DIR ?= $(MENUBAR_DIR)/.build/Audetic Menu Bar.app
+
+macos-menubar:
+	@command -v swift >/dev/null 2>&1 || { echo "✗ swift toolchain not found (install Xcode CLT)"; exit 1; }
+	@echo "→ swift build -c release ($(MENUBAR_DIR))"
+	cd $(MENUBAR_DIR) && swift build -c release
+	@echo "→ Assembling $(MENUBAR_APP_DIR)"
+	@rm -rf "$(MENUBAR_APP_DIR)"
+	@mkdir -p "$(MENUBAR_APP_DIR)/Contents/MacOS"
+	@mkdir -p "$(MENUBAR_APP_DIR)/Contents/Resources"
+	@cp $(MENUBAR_DIR)/macos/Info.plist "$(MENUBAR_APP_DIR)/Contents/Info.plist"
+	@cp $(MENUBAR_DIR)/.build/release/AudeticMenuBar "$(MENUBAR_APP_DIR)/Contents/MacOS/AudeticMenuBar"
+	@printf 'APPL????' > "$(MENUBAR_APP_DIR)/Contents/PkgInfo"
+	@echo "→ codesign ($(SIGN_IDENTITY)) $(MENUBAR_APP_DIR)"
+	codesign --force --sign "$(SIGN_IDENTITY)" \
+		--options runtime \
+		--timestamp=none \
+		"$(MENUBAR_APP_DIR)"
+	@echo "✓ $(MENUBAR_APP_DIR)"
+
+macos-app: release macos-menubar
 	@$(MAKE) _macos-app-build MACOS_APP_PROFILE=release
 
-macos-app-debug: build
+macos-app-debug: build macos-menubar
 	@$(MAKE) _macos-app-build MACOS_APP_PROFILE=debug
 
 # Internal: assemble + sign the bundle. Don't call directly — go through
@@ -237,9 +264,23 @@ _macos-app-build:
 	@# symlinks it onto PATH. Keeping it inside the bundle means a single
 	@# downloadable artifact still yields both the daemon and the CLI.
 	@cp target/$(MACOS_APP_PROFILE)/audetic $(MACOS_APP_DIR)/Contents/MacOS/audetic
+	@# Embed the menu-bar agent as a login item. `audeticd install` registers
+	@# it as a per-user LaunchAgent so it starts on login alongside the daemon.
+	@mkdir -p "$(MACOS_APP_DIR)/Contents/Library/LoginItems"
+	@if [ -d "$(MENUBAR_APP_DIR)" ]; then \
+		echo "  · Embedding $(MENUBAR_APP_DIR) → Contents/Library/LoginItems/"; \
+		cp -R "$(MENUBAR_APP_DIR)" "$(MACOS_APP_DIR)/Contents/Library/LoginItems/Audetic Menu Bar.app"; \
+	else \
+		echo "  ✗ $(MENUBAR_APP_DIR) missing — run \`make macos-menubar\` first"; exit 1; \
+	fi
 	@printf 'APPL????' > $(MACOS_APP_DIR)/Contents/PkgInfo
-	@# Sign the nested CLI first (no mic/screen entitlements — it never
-	@# captures), then sign the bundle so the whole thing validates.
+	@# Sign nested code inside-out so the outer bundle validates: the menu-bar
+	@# app first, then the CLI (no mic/screen entitlements — neither captures),
+	@# then the bundle itself.
+	codesign --force --sign "$(SIGN_IDENTITY)" \
+		--options runtime \
+		--timestamp=none \
+		"$(MACOS_APP_DIR)/Contents/Library/LoginItems/Audetic Menu Bar.app"
 	codesign --force --sign "$(SIGN_IDENTITY)" \
 		--options runtime \
 		--timestamp=none \
