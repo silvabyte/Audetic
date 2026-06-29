@@ -29,12 +29,23 @@ use transcribe_rs::{
         Quantization,
     },
     whisper_cpp::{WhisperEngine, WhisperInferenceParams},
+    TranscriptionResult,
 };
 
 use super::{TranscriptionOutput, TranscriptionProvider};
 use crate::normalizer::TranscriptionNormalizer;
+use crate::transcription::windowing;
 use audetic_core::jobs_client::Segment;
 use audetic_core::local_models::{self, Engine, ModelInfo};
+
+/// The exported Parakeet encoder precomputes its relative positional encoding
+/// for at most ~5000 frames; a longer sequence crashes in self-attention with a
+/// broadcast error ("axis ... 877 by 5877" — the operands always differ by
+/// exactly 5000, i.e. `T` vs `T - pos_emb_max_len`). At 12.5 encoder fps
+/// (100 fps mel ÷ 8x subsampling) 5000 frames ≈ 400 s, so window well under it:
+/// 6 min ≈ 4500 frames leaves ~40 s of headroom for the encoder's prepended
+/// silence and mel edges. See [`windowing`].
+const PARAKEET_MAX_WINDOW_SECS: f32 = 360.0;
 
 /// A loaded engine, ready to transcribe. Held behind a `Mutex` because the
 /// underlying `transcribe-rs` engines take `&mut self`.
@@ -145,17 +156,23 @@ fn transcribe_blocking(
         .map_err(|_| anyhow!("local engine mutex poisoned"))?;
 
     let result = match &mut *engine {
-        LoadedEngine::Parakeet(parakeet) => parakeet
-            .transcribe_with(
-                &samples,
-                // Segment granularity yields sentence-ish chunks — the right
-                // unit for clickable transcript lines (token-level is too fine).
-                &ParakeetParams {
-                    timestamp_granularity: Some(TimestampGranularity::Segment),
-                    ..Default::default()
-                },
-            )
-            .map_err(|e| anyhow!("Parakeet transcription failed: {e}"))?,
+        LoadedEngine::Parakeet(parakeet) => {
+            // Segment granularity yields sentence-ish chunks — the right unit
+            // for clickable transcript lines (token-level is too fine).
+            let params = ParakeetParams {
+                timestamp_granularity: Some(TimestampGranularity::Segment),
+                ..Default::default()
+            };
+            // The encoder can't ingest the whole recording past ~6.7 min, so
+            // feed it one bounded window at a time and let `windowing` merge the
+            // results back into a single timeline.
+            windowing::transcribe_windowed(&samples, PARAKEET_MAX_WINDOW_SECS, |window| {
+                let result = parakeet
+                    .transcribe_with(window, &params)
+                    .map_err(|e| anyhow!("Parakeet transcription failed: {e}"))?;
+                Ok(result_to_output(result))
+            })?
+        }
         LoadedEngine::Whisper(whisper) => {
             // "auto"/empty → let Whisper detect; otherwise honor the setting.
             let lang = match language.trim() {
@@ -166,13 +183,29 @@ fn transcribe_blocking(
                 language: lang,
                 ..Default::default()
             };
-            whisper
+            // whisper.cpp windows long audio internally, so no chunking here.
+            let result = whisper
                 .transcribe_with(&samples, &params)
-                .map_err(|e| anyhow!("Whisper transcription failed: {e}"))?
+                .map_err(|e| anyhow!("Whisper transcription failed: {e}"))?;
+            result_to_output(result)
         }
     };
 
-    // Map transcribe-rs segments (f32 seconds) into the shared Segment type.
+    info!(
+        "Local transcription complete ({}): {} chars",
+        model.id,
+        result.text.len()
+    );
+    Ok(TranscriptionOutput {
+        text: result.text.trim().to_string(),
+        segments: result.segments,
+    })
+}
+
+/// Map a transcribe-rs result (f32 seconds, optional segments) into the shared
+/// [`TranscriptionOutput`], trimming and dropping empty segments. Timestamps
+/// are window-relative here; [`windowing`] shifts them to absolute time.
+fn result_to_output(result: TranscriptionResult) -> TranscriptionOutput {
     let segments = result
         .segments
         .unwrap_or_default()
@@ -185,15 +218,10 @@ fn transcribe_blocking(
         .filter(|s| !s.text.is_empty())
         .collect();
 
-    info!(
-        "Local transcription complete ({}): {} chars",
-        model.id,
-        result.text.len()
-    );
-    Ok(TranscriptionOutput {
-        text: result.text.trim().to_string(),
+    TranscriptionOutput {
+        text: result.text,
         segments,
-    })
+    }
 }
 
 /// Fetch a cached engine or load it. The cache lock is held across the (rare)
@@ -344,5 +372,40 @@ mod tests {
     fn passthrough_normalizer_trims() {
         let n = PassthroughNormalizer;
         assert_eq!(n.normalize("  hi there \n"), "hi there");
+    }
+
+    /// End-to-end check that the windowing path transcribes audio past the
+    /// ~10 min encoder limit without the ONNX broadcast crash. Ignored by
+    /// default — needs the Parakeet model installed and a real recording:
+    ///   AUDETIC_E2E_AUDIO=/path/to/long.mp3 \
+    ///     cargo test -p audetic parakeet_transcribes_long_audio -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "requires installed Parakeet model + AUDETIC_E2E_AUDIO"]
+    async fn parakeet_transcribes_long_audio() {
+        let path = std::env::var("AUDETIC_E2E_AUDIO")
+            .expect("set AUDETIC_E2E_AUDIO to a recording longer than ~10 min");
+        let provider = LocalEngineProvider::new("parakeet-tdt-0.6b-v3").unwrap();
+        let out = provider
+            .transcribe_detailed(std::path::Path::new(&path), "en")
+            .await
+            .expect("long-audio transcription should not crash the encoder");
+        eprintln!(
+            "transcribed {} chars across {} segments",
+            out.text.len(),
+            out.segments.len()
+        );
+        assert!(!out.text.trim().is_empty(), "expected non-empty transcript");
+        assert!(out.segments.len() > 1, "expected multiple merged segments");
+        // Segments must climb in absolute time across window boundaries.
+        let mut prev = -1.0;
+        for s in &out.segments {
+            assert!(
+                s.start >= prev,
+                "segment starts increase: {} >= {}",
+                s.start,
+                prev
+            );
+            prev = s.start;
+        }
     }
 }

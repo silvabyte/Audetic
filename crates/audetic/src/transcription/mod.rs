@@ -8,6 +8,7 @@ use crate::config::{Config, WhisperConfig};
 use crate::normalizer::TranscriptionNormalizer;
 
 mod transcription_service;
+mod windowing;
 
 pub mod job_service;
 pub mod providers;
