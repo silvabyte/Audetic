@@ -137,22 +137,13 @@ pub async fn process_meeting(args: ProcessingArgs) {
                 error!("Failed to write transcript file: {}", e);
             }
 
-            // Serialize per-segment timestamps for clickable transcript lines.
-            // Best-effort: a serialization hiccup shouldn't fail the meeting, so
-            // we just store NULL and the UI falls back to plain text.
-            let segments_json = result
-                .segments
-                .as_ref()
-                .filter(|s| !s.is_empty())
-                .and_then(|s| serde_json::to_string(s).ok());
-
             if let Ok(conn) = db::init_db() {
                 let _ = MeetingRepository::complete(
                     &conn,
                     meeting_id,
                     &transcript_path.to_string_lossy(),
                     &result.text,
-                    segments_json.as_deref(),
+                    result.segments.as_deref(),
                     duration_seconds as i64,
                 );
             }

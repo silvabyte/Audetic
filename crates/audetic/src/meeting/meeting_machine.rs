@@ -596,19 +596,13 @@ pub async fn retry_meeting_transcription(
                 warn!("Failed to write transcript file: {}", e);
             }
 
-            let segments_json = r
-                .segments
-                .as_ref()
-                .filter(|s| !s.is_empty())
-                .and_then(|s| serde_json::to_string(s).ok());
-
             if let Ok(conn) = db::init_db() {
                 if let Err(e) = MeetingRepository::complete(
                     &conn,
                     meeting_id,
                     &transcript_path.to_string_lossy(),
                     &r.text,
-                    segments_json.as_deref(),
+                    r.segments.as_deref(),
                     duration_seconds,
                 ) {
                     error!("Failed to mark meeting {} completed: {}", meeting_id, e);

@@ -593,12 +593,7 @@ pub async fn get_meeting(
             audio_path: m.audio_path,
             transcript_path: m.transcript_path,
             transcript_text: m.transcript_text,
-            // Stored as a JSON array; tolerate malformed/legacy values by
-            // falling back to None so the UI just shows plain text.
-            transcript_segments: m
-                .transcript_segments
-                .as_deref()
-                .and_then(|json| serde_json::from_str(json).ok()),
+            transcript_segments: m.transcript_segments,
             duration_seconds: m.duration_seconds,
             started_at: m.started_at,
             completed_at: m.completed_at,

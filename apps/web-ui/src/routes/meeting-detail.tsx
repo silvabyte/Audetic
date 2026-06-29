@@ -365,9 +365,14 @@ function TranscriptPlayer({
     return idx;
   }, [segments, currentTime]);
 
-  // Keep the active line in view as playback advances.
+  // Keep the active line in view as playback advances. Gate on actual playback
+  // so loading the page (currentTime 0 → first line active) doesn't scroll-jack
+  // the transcript into view before the user has pressed play.
   useEffect(() => {
-    activeRef.current?.scrollIntoView({ block: "nearest" });
+    const audio = audioRef.current;
+    if (audio && !audio.paused) {
+      activeRef.current?.scrollIntoView({ block: "nearest" });
+    }
   }, [activeIndex]);
 
   if (!hasSegments) {
@@ -378,7 +383,9 @@ function TranscriptPlayer({
     const audio = audioRef.current;
     if (!audio) return;
     audio.currentTime = seconds;
-    void audio.play();
+    // play() rejects when the media can't start (audio 404, autoplay policy).
+    // Swallow it: the seek already happened and there's nothing to recover.
+    audio.play().catch(() => {});
   };
 
   return (
