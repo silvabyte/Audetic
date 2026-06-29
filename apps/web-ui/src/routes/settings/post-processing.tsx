@@ -1,5 +1,5 @@
 import { Observer } from "mobx-react-lite";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { type RouteObject } from "react-router-dom";
 import { PlayCircle, Plus, Trash2 } from "lucide-react";
 import { toast } from "sonner";
@@ -23,7 +23,12 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Switch } from "@/components/ui/switch";
-import type { EventKind, Job, NewJob } from "@/api/post-processing";
+import type {
+  EventDescriptor,
+  EventKind,
+  Job,
+  NewJob,
+} from "@/api/post-processing";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
 
@@ -257,6 +262,13 @@ interface JobFormProps {
   job?: Job;
 }
 
+// Fallback event kinds so the form still works if the events fetch failed
+// (e.g. the daemon was momentarily unreachable).
+const EVENT_FALLBACK: EventDescriptor[] = [
+  { name: "dictation.completed", label: "Dictation completed", description: "" },
+  { name: "meeting.completed", label: "Meeting completed", description: "" },
+];
+
 function JobFormDialog({
   open,
   onOpenChange,
@@ -283,26 +295,6 @@ function JobFormDialog({
       setTimeout(String(job?.action.timeout_seconds ?? 3600));
     }
   }, [open, job]);
-
-  const events = store.postProcessing.events;
-
-  const eventOptions = useMemo(() => {
-    if (events.length > 0) return events;
-    // Fall back to the two v1 kinds so the form still works if the
-    // events fetch failed (e.g. daemon was momentarily unreachable).
-    return [
-      {
-        name: "dictation.completed" as const,
-        label: "Dictation completed",
-        description: "",
-      },
-      {
-        name: "meeting.completed" as const,
-        label: "Meeting completed",
-        description: "",
-      },
-    ];
-  }, [events]);
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -400,11 +392,24 @@ function JobFormDialog({
               value={event}
               onChange={(e) => setEvent(e.target.value as EventKind)}
             >
-              {eventOptions.map((opt) => (
-                <option key={opt.name} value={opt.name}>
-                  {opt.label} ({opt.name})
-                </option>
-              ))}
+              <Observer>
+                {() => {
+                  const events = store.postProcessing.events;
+                  // Fall back to the two v1 kinds so the form still works if the
+                  // events fetch failed (e.g. daemon was momentarily unreachable).
+                  const eventOptions =
+                    events.length > 0 ? events : EVENT_FALLBACK;
+                  return (
+                    <>
+                      {eventOptions.map((opt) => (
+                        <option key={opt.name} value={opt.name}>
+                          {opt.label} ({opt.name})
+                        </option>
+                      ))}
+                    </>
+                  );
+                }}
+              </Observer>
             </select>
           </div>
 

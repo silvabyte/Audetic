@@ -51,6 +51,10 @@ jobs:
         run: cd apps/web-ui && bun install
       - name: Typecheck web-ui
         run: cd apps/web-ui && bun run typecheck
+      - name: Lint web-ui
+        run: cd apps/web-ui && bun run lint
+      - name: Test web-ui (lint rules)
+        run: cd apps/web-ui && bun run test
       - name: Build
         # `bun` is on PATH, so crates/audetic/build.rs runs `bun run build`
         # in apps/web-ui and the real dist/ is embedded via include_dir!.

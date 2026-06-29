@@ -1,5 +1,5 @@
 import { Observer } from "mobx-react-lite";
-import { Form, useFetcher } from "react-router-dom";
+import { useFetcher } from "react-router-dom";
 import { Mic, Volume2, XCircle, StopCircle, Speaker } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useStore } from "@/stores/root-store";
@@ -180,7 +180,7 @@ function PhaseRibbon({ phase }: { phase: MeetingPhase }) {
 function CaptureStatePill({ capture }: { capture: CaptureState | null }) {
   if (!capture) return null;
   let Icon = Mic;
-  let label = "Mic";
+  let label: string;
   switch (capture) {
     case "both":
       Icon = Volume2;
