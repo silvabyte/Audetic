@@ -34,6 +34,14 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
 
     println!("→ Installing audeticd as a LaunchAgent");
     ensure_runtime_dirs(&paths)?;
+
+    // Stop the agents before touching the bundle they're running out of.
+    // `place_bundle` deletes the installed bundle before re-copying it, and both
+    // LaunchAgents are `KeepAlive=true` — so a daemon that exits mid-swap gets
+    // respawned by launchd into a half-deleted bundle. Booting them out first
+    // makes the replacement quiet. No-op on a first install.
+    bootout_agents();
+
     place_bundle(&paths)?;
     place_cli(&paths);
     write_plist(&paths)?;

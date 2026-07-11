@@ -109,10 +109,8 @@ pub(crate) fn place_cli_on_path(source: &Path) {
     }
 
     // Replace any stale copy so re-installs/upgrades refresh the CLI.
-    let _ = std::fs::remove_file(&target);
-    match std::fs::copy(source, &target) {
-        Ok(_) => {
-            let _ = set_executable(&target);
+    match replace_executable(source, &target) {
+        Ok(()) => {
             println!("  · Installed `audetic` CLI → {}", target.display());
             if !on_path(&target_dir) {
                 println!(
@@ -126,6 +124,45 @@ pub(crate) fn place_cli_on_path(source: &Path) {
             target.display()
         ),
     }
+}
+
+/// Install `src` at `dest`, replacing whatever is there — even if that file is
+/// currently executing.
+///
+/// Reinstalling over a running binary is the normal case, since `make install`
+/// is also the upgrade path. Two things make that awkward:
+///
+///   - Copying straight onto a live executable fails with `ETXTBSY` ("Text file
+///     busy"): the kernel refuses to open a running binary for writing.
+///   - Unlinking it first dodges that, but leaves a window where the path does
+///     not exist. For the daemon that window is real: the systemd unit is
+///     `Restart=always`, so a process that died inside it would be respawned
+///     into a missing `ExecStart`.
+///
+/// Staging a sibling temp file and `rename`ing it over the target avoids both.
+/// `rename` swaps the directory entry atomically — the running process keeps
+/// its old inode until it exits, and the path is never absent. Staging as a
+/// *sibling* keeps the rename within one filesystem, where it is a true atomic
+/// swap rather than a copy.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn replace_executable(src: &Path, dest: &Path) -> Result<()> {
+    let staging = dest.with_extension("new");
+
+    // A previous install could have been killed between the copy and the rename.
+    let _ = std::fs::remove_file(&staging);
+
+    std::fs::copy(src, &staging)
+        .with_context(|| format!("Failed to copy {} → {}", src.display(), staging.display()))?;
+    set_executable(&staging)?;
+
+    std::fs::rename(&staging, dest).with_context(|| {
+        format!(
+            "Failed to move {} into place at {}",
+            staging.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
 }
 
 /// Whether `dir` appears in the `PATH` environment variable.

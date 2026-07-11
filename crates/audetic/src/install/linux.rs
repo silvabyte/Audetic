@@ -28,7 +28,7 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     ensure_runtime_dirs(&paths)?;
     write_unit(&paths)?;
     daemon_reload()?;
-    enable_and_start()?;
+    enable_and_restart()?;
     wait_for_daemon(Duration::from_secs(15)).await?;
     println!("✓ audeticd.service is active");
 
@@ -94,18 +94,14 @@ fn place_binary(paths: &InstallPaths) -> Result<()> {
             "  · Binary already at {} (skipping copy)",
             paths.installed_binary.display()
         );
-    } else {
-        println!("  · Copying binary → {}", paths.installed_binary.display());
-        fs::copy(&current, &paths.installed_binary).with_context(|| {
-            format!(
-                "Failed to copy {} → {}",
-                current.display(),
-                paths.installed_binary.display()
-            )
-        })?;
-        super::set_executable(&paths.installed_binary)?;
+        return Ok(());
     }
-    Ok(())
+
+    println!("  · Copying binary → {}", paths.installed_binary.display());
+
+    // Atomic swap, not a copy-in-place: the daemon we're replacing is usually
+    // running, and writing onto a live executable fails with ETXTBSY.
+    super::replace_executable(&current, &paths.installed_binary)
 }
 
 /// Best-effort: copy the standalone `audetic` CLI (shipped next to `audeticd`
@@ -148,14 +144,33 @@ fn daemon_reload() -> Result<()> {
     Ok(())
 }
 
-fn enable_and_start() -> Result<()> {
-    println!("  · systemctl --user enable --now {SERVICE_NAME}");
+/// Enable the unit at boot and make sure the *new* binary is the one running.
+///
+/// `enable --now` is not enough here. `--now` only *starts* the unit, and
+/// starting an already-active unit is a no-op — so reinstalling over a running
+/// daemon would report success while leaving the old binary serving. Since
+/// `make install` is the upgrade path (`git pull && make install`), that
+/// silently defeats the whole point.
+///
+/// `restart` is the honest verb: it picks up the new `ExecStart` inode, and it
+/// also starts a unit that isn't running, which covers first install.
+fn enable_and_restart() -> Result<()> {
+    println!("  · systemctl --user enable {SERVICE_NAME}");
     let status = Command::new("systemctl")
-        .args(["--user", "enable", "--now", SERVICE_NAME])
+        .args(["--user", "enable", SERVICE_NAME])
         .status()
-        .context("Failed to run systemctl enable --now")?;
+        .context("Failed to run systemctl enable")?;
     if !status.success() {
-        bail!("`systemctl --user enable --now {SERVICE_NAME}` exited with {status}");
+        bail!("`systemctl --user enable {SERVICE_NAME}` exited with {status}");
+    }
+
+    println!("  · systemctl --user restart {SERVICE_NAME}");
+    let status = Command::new("systemctl")
+        .args(["--user", "restart", SERVICE_NAME])
+        .status()
+        .context("Failed to run systemctl restart")?;
+    if !status.success() {
+        bail!("`systemctl --user restart {SERVICE_NAME}` exited with {status}");
     }
     Ok(())
 }
