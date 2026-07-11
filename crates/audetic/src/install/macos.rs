@@ -6,8 +6,14 @@
 //! responsible-process attribution for TCC ends up on the bundle, not on
 //! the terminal that launched it). If `current_exe()` isn't pointing
 //! inside a `.app`, install fails with a hint.
+//!
+//! Uninstall has no such requirement — it only touches `$HOME`-derived
+//! destinations, so it runs from any binary. That's why `source_bundle` is
+//! optional: install demands it, teardown doesn't.
 
-use super::{wait_for_daemon, InstallOptions};
+use super::{
+    remove_dir_if_empty, wait_for_daemon, InstallOptions, UninstallOptions, UninstallPlan,
+};
 use crate::api::url;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
@@ -51,10 +57,14 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
 }
 
 struct InstallPaths {
-    source_bundle: PathBuf,
+    /// The `Audetic.app` we were launched from, when there is one. `None` when
+    /// the daemon is invoked as a bare binary — fine for uninstall, fatal for
+    /// install (see `source_bundle()`).
+    source_bundle: Option<PathBuf>,
     installed_bundle: PathBuf,
     installed_binary: PathBuf,
     plist_path: PathBuf,
+    menubar_plist_path: PathBuf,
     log_dir: PathBuf,
     log_path: PathBuf,
     config_dir: PathBuf,
@@ -73,15 +83,7 @@ impl InstallPaths {
             .and_then(|p| p.parent())
             .and_then(|p| p.parent())
             .map(Path::to_path_buf)
-            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("app"))
-            .ok_or_else(|| {
-                anyhow!(
-                    "audeticd must be invoked from inside an `Audetic.app` bundle on macOS; \
-                     current_exe is {}. Build the bundle with `make macos-app` and run \
-                     `./target/release/Audetic.app/Contents/MacOS/audeticd install`.",
-                    current.display()
-                )
-            })?;
+            .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("app"));
 
         let home = dirs::home_dir().ok_or_else(|| anyhow!("Could not resolve $HOME"))?;
         let installed_bundle = home.join("Applications").join(BUNDLE_NAME);
@@ -89,10 +91,9 @@ impl InstallPaths {
             .join("Contents")
             .join("MacOS")
             .join("audeticd");
-        let plist_path = home
-            .join("Library")
-            .join("LaunchAgents")
-            .join(format!("{LABEL}.plist"));
+        let launch_agents = home.join("Library").join("LaunchAgents");
+        let plist_path = launch_agents.join(format!("{LABEL}.plist"));
+        let menubar_plist_path = launch_agents.join(format!("{MENUBAR_LABEL}.plist"));
         let log_dir = home.join("Library").join("Logs").join("Audetic");
         let log_path = log_dir.join("audetic.log");
 
@@ -111,11 +112,24 @@ impl InstallPaths {
             installed_bundle,
             installed_binary,
             plist_path,
+            menubar_plist_path,
             log_dir,
             log_path,
             config_dir,
             data_dir,
             home,
+        })
+    }
+
+    /// The bundle we're running from. Install requires one: TCC attributes the
+    /// Microphone / Screen Recording grants to the bundle's code signature, so
+    /// a bare binary would install a daemon that can never be granted access.
+    fn source_bundle(&self) -> Result<&Path> {
+        self.source_bundle.as_deref().ok_or_else(|| {
+            anyhow!(
+                "audeticd must be invoked from inside an `Audetic.app` bundle on macOS. \
+                 Build it with `make macos-app`, then run `make install`."
+            )
         })
     }
 }
@@ -138,7 +152,9 @@ fn ensure_runtime_dirs(paths: &InstallPaths) -> Result<()> {
 }
 
 fn place_bundle(paths: &InstallPaths) -> Result<()> {
-    if paths.source_bundle == paths.installed_bundle {
+    let source_bundle = paths.source_bundle()?;
+
+    if source_bundle == paths.installed_bundle {
         println!(
             "  · Bundle already at {} (skipping copy)",
             paths.installed_bundle.display()
@@ -148,7 +164,7 @@ fn place_bundle(paths: &InstallPaths) -> Result<()> {
 
     println!(
         "  · Copying {} → {}",
-        paths.source_bundle.display(),
+        source_bundle.display(),
         paths.installed_bundle.display()
     );
 
@@ -168,14 +184,14 @@ fn place_bundle(paths: &InstallPaths) -> Result<()> {
     // forks. Shelling out is plenty.
     let status = Command::new("cp")
         .arg("-R")
-        .arg(&paths.source_bundle)
+        .arg(source_bundle)
         .arg(&paths.installed_bundle)
         .status()
         .context("Failed to run `cp -R` to copy the bundle")?;
     if !status.success() {
         bail!(
             "`cp -R {} {}` exited with {status}",
-            paths.source_bundle.display(),
+            source_bundle.display(),
             paths.installed_bundle.display(),
         );
     }
@@ -292,11 +308,7 @@ fn register_menubar_agent(paths: &InstallPaths) {
         return;
     }
 
-    let plist_path = paths
-        .home
-        .join("Library")
-        .join("LaunchAgents")
-        .join(format!("{MENUBAR_LABEL}.plist"));
+    let plist_path = paths.menubar_plist_path.clone();
     let log_path = paths.log_dir.join("audetic-menubar.log");
 
     if let Err(err) = write_menubar_plist(paths, &menubar_binary, &plist_path, &log_path) {
@@ -379,4 +391,59 @@ fn open_url(url: &str) -> Result<()> {
         bail!("`open {url}` exited with {status}");
     }
     Ok(())
+}
+
+/// Tear down both LaunchAgents and remove everything `run` installed.
+///
+/// Runs from any binary, not just one inside `Audetic.app` — teardown only
+/// touches `$HOME`-derived destinations, so `make uninstall` works even when
+/// the bundle was never built.
+///
+/// TCC grants are deliberately left alone: `tccutil reset` would also clear
+/// permissions for any other build of Audetic on the machine, and the grants
+/// are keyed to a code signature that a reinstall reuses anyway.
+pub fn uninstall(opts: UninstallOptions) -> Result<()> {
+    let paths = InstallPaths::resolve()?;
+
+    println!("→ Uninstalling audeticd (LaunchAgents)");
+
+    let mut plan = UninstallPlan::default();
+    plan.remove(paths.installed_bundle.clone(), "Audetic.app bundle");
+    plan.remove(paths.plist_path.clone(), "Daemon LaunchAgent");
+    plan.remove(paths.menubar_plist_path.clone(), "Menu bar LaunchAgent");
+    plan.remove(paths.log_dir.clone(), "Log directory");
+    if let Some(cli) = super::cli_target_path() {
+        plan.remove(cli, "Standalone `audetic` CLI");
+    }
+    super::plan_state_dirs(&mut plan, &paths.config_dir, &paths.data_dir, &opts);
+
+    if !opts.dry_run {
+        bootout_agents();
+    }
+
+    plan.execute(&opts)?;
+
+    if !opts.dry_run {
+        remove_dir_if_empty(&paths.config_dir);
+        remove_dir_if_empty(&paths.data_dir);
+        println!("✓ Audetic has been uninstalled");
+    }
+    Ok(())
+}
+
+/// Best-effort `launchctl bootout` for the daemon and the menu-bar agent, so
+/// neither is holding the database open (or respawning) while we delete their
+/// files. `bootout` exits non-zero when nothing is registered — not an error.
+fn bootout_agents() {
+    let Ok(uid) = current_uid() else {
+        println!("  · Could not resolve uid; skipping launchctl teardown");
+        return;
+    };
+    for label in [LABEL, MENUBAR_LABEL] {
+        let target = format!("gui/{uid}/{label}");
+        println!("  · launchctl bootout {target}");
+        let _ = Command::new("launchctl")
+            .args(["bootout", &target])
+            .output();
+    }
 }

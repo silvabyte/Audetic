@@ -14,8 +14,6 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum CliCommand {
-    /// Manage updates (manual install/check/enable/disable)
-    Update(UpdateCliArgs),
     /// Print version information
     Version,
     /// Inspect or configure transcription providers
@@ -182,25 +180,6 @@ pub enum MeetingCommand {
         #[arg(short, long)]
         title: Option<String>,
     },
-}
-
-#[derive(ClapArgs, Debug)]
-pub struct UpdateCliArgs {
-    /// Only check for updates, do not download/install
-    #[arg(long)]
-    pub check: bool,
-    /// Force installation even if versions appear identical
-    #[arg(long)]
-    pub force: bool,
-    /// Override release channel (default: stable)
-    #[arg(long)]
-    pub channel: Option<String>,
-    /// Enable automatic background updates
-    #[arg(long)]
-    pub enable: bool,
-    /// Disable automatic background updates
-    #[arg(long)]
-    pub disable: bool,
 }
 
 #[derive(ClapArgs, Debug)]

@@ -18,7 +18,6 @@ mod models;
 mod post_processing;
 mod provider;
 mod transcribe;
-mod update;
 
 use anyhow::Result;
 use args::{Cli, CliCommand};
@@ -41,7 +40,6 @@ async fn main() -> Result<()> {
             println!("Audetic {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
-        Some(CliCommand::Update(args)) => update::handle_update_command(args).await,
         Some(CliCommand::Provider(args)) => provider::handle_provider_command(args).await,
         Some(CliCommand::History(args)) => history::handle_history_command(args).await,
         Some(CliCommand::Logs(args)) => logs::handle_logs_command(args).await,

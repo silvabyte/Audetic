@@ -8,7 +8,7 @@ use utoipa::OpenApi;
 
 use super::routes::{
     agents, history, keybind, logs, meeting_artifacts, meetings, models, post_processing, provider,
-    recording, summary_templates, system, transcribe, update,
+    recording, summary_templates, system, transcribe,
 };
 
 #[derive(OpenApi)]
@@ -54,11 +54,6 @@ use super::routes::{
         system::get_deps,
         system::start_install_ffmpeg,
         system::get_install_ffmpeg_status,
-        // Update
-        update::check_update,
-        update::install_update,
-        update::get_auto_update,
-        update::set_auto_update,
         // Meetings
         meetings::start_meeting,
         meetings::stop_meeting,
@@ -122,12 +117,6 @@ use super::routes::{
         system::SystemDeps,
         system::InstallPhase,
         system::InstallStatusResponse,
-        // Update
-        crate::update::UpdateReport,
-        update::UpdateInstallRequest,
-        update::AutoUpdateRequest,
-        update::AutoUpdateResponse,
-        update::AutoUpdateState,
         // Meetings
         meetings::MeetingStartRequest,
         meetings::MeetingStartResponse,

@@ -14,18 +14,18 @@ Welcome to the Audetic documentation. This directory contains detailed guides fo
 
 ### CLI Commands
 
-Audetic includes built-in commands for managing transcription providers and updates:
+Audetic includes built-in commands for managing transcription providers:
 
 ```bash
 # Provider management
 audetic provider show        # Show current provider configuration
 audetic provider configure   # Interactive provider setup wizard
 audetic provider test        # Validate provider without recording
-
-# Updates
-audetic update              # Check for and install updates
-audetic update --check      # Check version without installing
 ```
+
+Audetic is installed from source and has no auto-updater — `git pull && make
+install` is the upgrade path. See
+[ADR 0001](./adr/0001-source-only-distribution.md).
 
 See the [Configuration Guide](./configuration.md#provider-cli-helpers) for detailed provider command documentation.
 

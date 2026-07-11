@@ -754,58 +754,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/update/auto": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Read the current auto-update flag. */
-        get: operations["get_auto_update"];
-        /** Enable or disable auto-update. */
-        put: operations["set_auto_update"];
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/update/check": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** Check for available updates. */
-        get: operations["check_update"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/update/install": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Install an update. */
-        post: operations["install_update"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/version": {
         parameters: {
             query?: never;
@@ -868,21 +816,6 @@ export interface components {
         };
         /** @enum {string} */
         ArtifactStatus: "pending" | "running" | "completed" | "error";
-        /** @description Request body for auto-update toggle. */
-        AutoUpdateRequest: {
-            /** @description Enable or disable auto-update */
-            enabled: boolean;
-        };
-        /** @description Response body for the auto-update toggle endpoint. */
-        AutoUpdateResponse: {
-            auto_update: boolean;
-            message: string;
-            success: boolean;
-        };
-        /** @description Response body for the auto-update getter. */
-        AutoUpdateState: {
-            enabled: boolean;
-        };
         /** @description The `last_completed_job` nested block inside `RecordingStatusResponse`. */
         CompletedJobSummary: {
             created_at: string;
@@ -1390,13 +1323,6 @@ export interface components {
             removed?: boolean | null;
             success: boolean;
         };
-        /** @description Request body for update install. */
-        UpdateInstallRequest: {
-            /** @description Channel override (e.g., "stable", "beta") */
-            channel?: string | null;
-            /** @description Force update even if versions match */
-            force?: boolean | null;
-        };
         /**
          * @description Request body for `PATCH /api/post-processing/jobs/:id`. All fields
          *     optional — only what's supplied is updated.
@@ -1406,13 +1332,6 @@ export interface components {
             enabled?: boolean | null;
             event?: null | components["schemas"]["EventKind"];
             name?: string | null;
-        };
-        UpdateReport: {
-            current_version: string;
-            installed: boolean;
-            message: string;
-            remote_version?: string | null;
-            restart_required: boolean;
         };
         /** @description Response for GET /version. */
         VersionInfo: {
@@ -2740,94 +2659,6 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
-            };
-        };
-    };
-    get_auto_update: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Whether auto-update is enabled */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AutoUpdateState"];
-                };
-            };
-        };
-    };
-    set_auto_update: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["AutoUpdateRequest"];
-            };
-        };
-        responses: {
-            /** @description Auto-update flag after the change */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["AutoUpdateResponse"];
-                };
-            };
-        };
-    };
-    check_update: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Current vs available version info */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["UpdateReport"];
-                };
-            };
-        };
-    };
-    install_update: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["UpdateInstallRequest"];
-            };
-        };
-        responses: {
-            /** @description Result of the install attempt */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["UpdateReport"];
-                };
             };
         };
     };

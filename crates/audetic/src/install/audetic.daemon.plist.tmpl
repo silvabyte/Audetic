@@ -24,12 +24,6 @@
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>RUST_LOG</key>
         <string>info</string>
-        <!-- Auto-update flow is Linux-only today; on macOS we ship signed
-             bundles through the install script. Leaving this disabled until
-             the macOS update path lands so a stale stable channel does not
-             clobber a locally-built bundle. -->
-        <key>AUDETIC_DISABLE_AUTO_UPDATE</key>
-        <string>1</string>
     </dict>
     <!-- launchd defaults to a 10s throttle between restarts. Set lower so
          a crash during onboarding does not feel hung. KeepAlive=true means

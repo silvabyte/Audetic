@@ -67,13 +67,12 @@ runs it alongside the Rust gate. CI (`.github/workflows/rust.yml`) installs `bun
 
 ## Install story
 
-For end users: `audetic install` (`crates/audetic/src/cli/install.rs` →
-`crates/audetic/src/install/mod.rs`) — user-local, no sudo: copies the binary to
-`~/.local/share/audetic/bin/`, writes `~/.config/systemd/user/audetic.service`, `enable --now`s it,
+Build from source: `make install` → `audeticd install`
+(`crates/audetic/src/install/mod.rs`) — user-local, no sudo: copies the daemon to
+`~/.local/share/audetic/bin/`, writes `~/.config/systemd/user/audeticd.service`, `enable --now`s it,
 waits for `127.0.0.1:3737`, and opens `http://127.0.0.1:3737/` in the browser.
-`release/cli/latest.sh` (served at `https://install.audetic.ai/cli/latest.sh`) is the
-`curl … | bash` wrapper that downloads the daemon and hands off to `audetic install`; `make
-installer-lint` checks it.
+There is no hosted installer and no auto-updater — see
+`docs/adr/0001-source-only-distribution.md`. `make uninstall` reverses it.
 
 ## Things I'd revisit
 

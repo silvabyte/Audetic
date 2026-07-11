@@ -1,25 +1,26 @@
 include makefiles/shell.mk
 
-VERSION ?=
-CHANNEL ?= stable
-TARGETS ?= linux-x86_64-gnu
-ALLOW_DIRTY ?= 0
-DRY_RUN ?= 0
-SKIP_TESTS ?= 0
-SKIP_TAG ?= 0
-USE_CROSS ?= 0
-EXTRA_FEATURES ?=
-AUTO_COMMIT ?= 1
+# Distribution is clone-and-build only — there are no hosted releases and no
+# auto-updater. `make install` is the single supported install path, and since
+# it's idempotent it doubles as the upgrade path: `git pull && make install`.
+# See docs/adr/0001-source-only-distribution.md.
 
-.PHONY: help build release check test clean install uninstall run logs start restart stop status lint fmt fix quality deploy deploy-beta deploy-stable \
+# Service identity, per platform. Both are per-user — nothing here needs sudo.
+SERVICE_NAME  ?= audeticd.service
+LAUNCH_LABEL  ?= ai.audetic.daemon
+
+.PHONY: help build release check test clean run lint fmt fix quality \
+        install install-linux install-macos uninstall \
+        logs start restart stop status \
         ui-install ui-dev ui-build ui-preview ui-typecheck ui-lint codegen \
-        installer-lint deploy-setup \
-        macos-sign macos-sign-release macos-app macos-app-debug \
-        macos-menubar macos-notarize macos-tarball macos-release
+        macos-sign macos-sign-release macos-app macos-app-debug macos-menubar
 
 # Default target
 help:
 	@echo "🦀 Audetic Development Commands"
+	@echo ""
+	@echo "  make install   - Build from source and install as a service (also the upgrade path)"
+	@echo "  make uninstall - Stop the service and remove what install put on disk"
 	@echo ""
 	@echo "  make build     - Build debug binary"
 	@echo "  make release   - Build optimized release binary"
@@ -32,20 +33,12 @@ help:
 	@echo ""
 	@echo "  make run       - Run Audetic directly"
 	@echo "  make start     - Enable and start service"
-	@echo "  make logs      - Show service logs"
+	@echo "  make logs      - Follow service logs"
 	@echo "  make restart   - Restart service"
 	@echo "  make stop      - Stop service"
 	@echo "  make status    - Check service status"
 	@echo ""
-	@echo "  make clean        - Clean build artifacts"
-	@echo "  make deploy       - Build/package/publish release artifacts (auto-bumps when VERSION unset;"
-	@echo "                      env: VERSION, VERSION_AUTO_BUMP=patch|minor|major|none, TARGETS, CHANNEL, DRY_RUN=1,"
-	@echo "                      SKIP_TESTS=1, SKIP_TAG=1, ALLOW_DIRTY=1, USE_CROSS=1, EXTRA_FEATURES, AUTO_COMMIT=0,"
-	@echo "                      CONTINUE_ON_ERROR=1)"
-	@echo "  make deploy-beta  - Deploy to beta channel (convenience for CHANNEL=beta)"
-	@echo "  make deploy-stable- Deploy to stable channel (convenience for CHANNEL=stable)"
-	@echo "  make deploy-setup - One-time setup to build Linux artifacts from macOS"
-	@echo "                      (installs 'cross' from git + checks Docker; needed once per machine)"
+	@echo "  make clean     - Clean build artifacts"
 	@echo ""
 	@echo "  Web UI (apps/web-ui — bundled into the daemon binary):"
 	@echo "  make ui-install        - Install web UI dependencies (bun)"
@@ -54,10 +47,11 @@ help:
 	@echo "  make ui-preview        - Preview the production build locally"
 	@echo "  make ui-typecheck      - Typecheck the web UI"
 	@echo "  make ui-lint           - Lint the web UI (ESLint) + run custom rule tests"
-	@echo "  make codegen           - Regenerate apps/web-ui TS types from daemon /api/openapi.json"
+	@echo "  make codegen           - Regenerate apps/web-ui TS types from the daemon's OpenAPI spec"
 	@echo ""
-	@echo "  Installer:"
-	@echo "  make installer-lint    - Lint release/cli/latest.sh"
+	@echo "  macOS bundle:"
+	@echo "  make macos-app         - Build + ad-hoc sign target/release/Audetic.app"
+	@echo "  make macos-menubar     - Build the SwiftUI menu-bar agent"
 
 # Build commands
 build:
@@ -93,63 +87,104 @@ quality:
 	cd apps/web-ui && bun run test
 	@echo "✓ quality checks passed (rust + web-ui)"
 
-deploy:
-	@VERSION=$(VERSION) \
-	 CHANNEL=$(CHANNEL) \
-	 TARGETS="$(TARGETS)" \
-	 ALLOW_DIRTY=$(ALLOW_DIRTY) \
-	 DRY_RUN=$(DRY_RUN) \
-	 SKIP_TESTS=$(SKIP_TESTS) \
-	 SKIP_TAG=$(SKIP_TAG) \
-	 USE_CROSS=$(USE_CROSS) \
-	 EXTRA_FEATURES="$(EXTRA_FEATURES)" \
-	 AUTO_COMMIT=$(AUTO_COMMIT) \
-	 bun ./scripts/release/deploy.ts
+# ---------------------------------------------------------------------------
+# Install / uninstall
+#
+# `audeticd install` owns the platform-specific work (systemd user unit on
+# Linux, LaunchAgents on macOS). Make's only job is to build the right artifact
+# and hand off. macOS goes through the .app bundle because TCC attributes the
+# Microphone / Screen Recording grants to the bundle's code signature — a bare
+# binary can never be granted them.
+# ---------------------------------------------------------------------------
 
-deploy-beta:
-	@echo "🚀 Deploying to beta channel..."
-	@$(MAKE) deploy CHANNEL=beta
+install:
+	@case "$$(uname -s)" in \
+	  Darwin) $(MAKE) install-macos ;; \
+	  Linux)  $(MAKE) install-linux ;; \
+	  *) echo "✗ Unsupported platform: $$(uname -s)"; exit 1 ;; \
+	esac
 
-deploy-stable:
-	@echo "🚀 Deploying to stable channel..."
-	@$(MAKE) deploy CHANNEL=stable
+install-linux: release
+	./target/release/audeticd install
 
-# One-time per-machine setup for building the Linux release artifacts from macOS.
-# The deploy routes linux-* targets through `cross` (Docker), which builds inside
-# a Linux container that carries the GNU toolchain + system libs (see Cross.toml).
-# The published cross 0.2.5 is incompatible with rustup >= 1.28, so install from
-# git main (pinned). Requires Docker Desktop installed and running.
-deploy-setup:
-	@command -v docker >/dev/null || { echo "✗ Docker not found — install Docker Desktop first"; exit 1; }
-	@docker info >/dev/null 2>&1 || { echo "✗ Docker daemon not running — start Docker Desktop"; exit 1; }
-	@rustup target add x86_64-unknown-linux-gnu
-	cargo install cross --git https://github.com/cross-rs/cross --locked
-	@echo "✓ deploy prerequisites ready (cross + Docker). Run 'make deploy-stable'."
+install-macos: macos-app
+	"$(MACOS_APP_DIR)/Contents/MacOS/audeticd" install
 
-# Service management
+# Teardown runs from the *installed* daemon when there is one, so `make
+# uninstall` works on a checkout that was never built.
+#
+# The candidate must actually support the subcommand: a daemon installed before
+# `uninstall` existed would otherwise die on an unrecognized argument. Probe
+# with `uninstall --help` and fall back to building one that does.
+#
+# Pass flags through: `make uninstall ARGS="--dry-run"`, or `--keep-database`
+# to preserve transcription history. `audeticd uninstall --help` lists them.
+ARGS ?=
+
+uninstall:
+	@case "$$(uname -s)" in \
+	  Darwin) candidates="$$HOME/Applications/Audetic.app/Contents/MacOS/audeticd $(MACOS_APP_DIR)/Contents/MacOS/audeticd" ;; \
+	  Linux)  candidates="$$HOME/.local/share/audetic/bin/audeticd ./target/release/audeticd ./target/debug/audeticd" ;; \
+	  *) echo "✗ Unsupported platform: $$(uname -s)"; exit 1 ;; \
+	esac; \
+	bin=""; \
+	for c in $$candidates; do \
+	  if [ -x "$$c" ] && "$$c" uninstall --help >/dev/null 2>&1; then bin="$$c"; break; fi; \
+	done; \
+	if [ -z "$$bin" ]; then \
+	  echo "→ No audeticd with an \`uninstall\` subcommand found; building one"; \
+	  cargo build --release -p audetic || exit 1; \
+	  bin=./target/release/audeticd; \
+	fi; \
+	"$$bin" uninstall $(ARGS)
+
+# ---------------------------------------------------------------------------
+# Service management. systemd on Linux, launchd on macOS — one vocabulary.
+# ---------------------------------------------------------------------------
+
 run:
-	AUDETIC_DISABLE_AUTO_UPDATE=1 RUST_LOG=info cargo run --release -p audetic
-
-logs:
-	journalctl --user -u audeticd.service -f
+	RUST_LOG=info cargo run --release -p audetic
 
 start:
-	systemctl --user enable --now audeticd.service
+	@case "$$(uname -s)" in \
+	  Darwin) launchctl bootstrap "gui/$$(id -u)" "$$HOME/Library/LaunchAgents/$(LAUNCH_LABEL).plist" 2>/dev/null || true; \
+	          launchctl kickstart -k "gui/$$(id -u)/$(LAUNCH_LABEL)" ;; \
+	  Linux)  systemctl --user enable --now $(SERVICE_NAME) ;; \
+	esac
 	@echo "✓ Service enabled and started"
 
-restart:
-	systemctl --user restart audeticd.service
-	@echo "✓ Service restarted"
-
 stop:
-	systemctl --user stop audeticd.service
+	@case "$$(uname -s)" in \
+	  Darwin) launchctl bootout "gui/$$(id -u)/$(LAUNCH_LABEL)" ;; \
+	  Linux)  systemctl --user stop $(SERVICE_NAME) ;; \
+	esac
 	@echo "✓ Service stopped"
 
+restart:
+	@case "$$(uname -s)" in \
+	  Darwin) launchctl kickstart -k "gui/$$(id -u)/$(LAUNCH_LABEL)" ;; \
+	  Linux)  systemctl --user restart $(SERVICE_NAME) ;; \
+	esac
+	@echo "✓ Service restarted"
+
+logs:
+	@case "$$(uname -s)" in \
+	  Darwin) tail -f "$$HOME/Library/Logs/Audetic/audetic.log" ;; \
+	  Linux)  journalctl --user -u $(SERVICE_NAME) -f ;; \
+	esac
+
+# Two independent signals, because they can disagree: the supervisor may call a
+# crash-looping unit "active" while the daemon never actually binds the port.
 status:
-	@systemctl --user is-active audeticd.service >/dev/null 2>&1 && echo "✓ Service is running" || echo "✗ Service is not running"
+	@case "$$(uname -s)" in \
+	  Darwin) launchctl print "gui/$$(id -u)/$(LAUNCH_LABEL)" >/dev/null 2>&1 \
+	            && echo "✓ Service is loaded" || echo "✗ Service is not loaded" ;; \
+	  Linux)  systemctl --user is-active $(SERVICE_NAME) >/dev/null 2>&1 \
+	            && echo "✓ Service is running" || echo "✗ Service is not running" ;; \
+	esac
 	@curl -s http://127.0.0.1:3737/api/status 2>/dev/null | python3 -m json.tool || echo "✗ API not responding"
 
-# Web UI (apps/web-ui) — current SPA. Daemon must be running for codegen and dev.
+# Web UI (apps/web-ui) — current SPA. Daemon must be running for ui-dev.
 ui-install:
 	cd apps/web-ui && bun install
 
@@ -169,17 +204,13 @@ ui-lint:
 	cd apps/web-ui && bun run lint
 	cd apps/web-ui && bun run test
 
+# Emit the spec from a freshly built binary rather than scraping a daemon on
+# :3737 — otherwise codegen captures whatever stale version happens to be
+# listening, which is exactly how the UI drifts from the API.
 codegen:
+	cargo build -p audetic --bin audeticd
+	./target/debug/audeticd openapi > target/openapi.json
 	cd apps/web-ui && bun run codegen
-
-# Lint the user-local installer script (served at install.audetic.ai/cli/latest.sh).
-# End-to-end run hits systemd and pulls a real release; do that on a throwaway
-# profile, not in CI.
-installer-lint:
-	bash -n release/cli/latest.sh
-	bash -n release/cli/uninstall.sh
-	@if command -v shellcheck >/dev/null 2>&1; then shellcheck release/cli/latest.sh release/cli/uninstall.sh; else echo "shellcheck not installed; skipping"; fi
-	@echo "✓ release/cli/*.sh ok"
 
 # macOS code-signing. Ad-hoc-signs the local binary with the hardened runtime
 # and entitlements so the OS associates the embedded Info.plist with this
@@ -187,7 +218,10 @@ installer-lint:
 # Without this step, TCC sees an unsigned binary and either uses the wrong
 # identity or silently skips the prompt entirely.
 #
-# For shareable builds use `make macos-sign-release SIGN_IDENTITY="Developer ID Application: … (Z25737G79K)"`.
+# Ad-hoc (`-`) is the only signing path carried: builds are local, so there is
+# no Developer ID or notarization story to maintain. The cost is that the TCC
+# identity is the cdhash, so macOS may re-prompt for permissions after a
+# rebuild.
 SIGN_IDENTITY ?= -
 MACOS_BINARY  ?= target/debug/audeticd
 MACOS_ENTITLEMENTS ?= crates/audetic/macos/audetic.entitlements
@@ -205,16 +239,13 @@ macos-sign-release: MACOS_BINARY=target/release/audeticd
 macos-sign-release: macos-sign
 
 # macOS app bundle. Produces target/<profile>/Audetic.app containing the
-# daemon binary, Info.plist, and PkgInfo. Signed in place — for shareable
-# builds override SIGN_IDENTITY to a Developer ID Application identity.
+# daemon binary, Info.plist, and PkgInfo. Signed in place.
 #
 #   make macos-app                 # release bundle, ad-hoc signed
-#   make macos-app SIGN_IDENTITY="Developer ID Application: Mat Silva (Z25737G79K)"
 #   make macos-app-debug           # debug bundle for quick iteration
 #
-# An installed Audetic.app gets its TCC identity from the bundle (cdhash for
-# ad-hoc, Team ID for Developer ID), so permission grants survive across
-# rebuilds only when signed with a stable identity.
+# `make install` on macOS goes through macos-app, so this is usually a step you
+# get for free rather than one you run directly.
 MACOS_APP_PROFILE ?= release
 MACOS_APP_DIR     ?= target/$(MACOS_APP_PROFILE)/Audetic.app
 
@@ -261,8 +292,8 @@ _macos-app-build:
 	@cp crates/audetic/macos/Info.plist $(MACOS_APP_DIR)/Contents/Info.plist
 	@cp target/$(MACOS_APP_PROFILE)/audeticd $(MACOS_APP_DIR)/Contents/MacOS/audeticd
 	@# Ship the slim `audetic` CLI inside the bundle too; `audeticd install`
-	@# symlinks it onto PATH. Keeping it inside the bundle means a single
-	@# downloadable artifact still yields both the daemon and the CLI.
+	@# copies it onto PATH. Keeping it inside the bundle means the single
+	@# built artifact still yields both the daemon and the CLI.
 	@cp target/$(MACOS_APP_PROFILE)/audetic $(MACOS_APP_DIR)/Contents/MacOS/audetic
 	@# Embed the menu-bar agent as a login item. `audeticd install` registers
 	@# it as a per-user LaunchAgent so it starts on login alongside the daemon.
@@ -293,67 +324,6 @@ _macos-app-build:
 		$(MACOS_APP_DIR)
 	@echo "✓ $(MACOS_APP_DIR)"
 	@codesign -dv --verbose=2 $(MACOS_APP_DIR) 2>&1 | grep -E 'Identifier|Format|Signature|TeamIdentifier|Info.plist'
-
-# macOS notarization. Requires a notarytool keychain profile already stored
-# via `xcrun notarytool store-credentials`. The profile name defaults to
-# `audetic-notary`; override with `make macos-notarize NOTARY_PROFILE=foo`.
-#
-# This pipeline is intentionally idempotent: re-running on an already-
-# stapled bundle is a no-op (Apple's tooling detects the existing ticket).
-NOTARY_PROFILE ?= audetic-notary
-NOTARY_ZIP     ?= $(MACOS_APP_DIR).notarize.zip
-
-macos-notarize:
-	@if [ ! -d "$(MACOS_APP_DIR)" ]; then \
-		echo "✗ $(MACOS_APP_DIR) not found. Run \`make macos-app\` first." >&2; \
-		exit 1; \
-	fi
-	@echo "→ ditto -c -k --keepParent $(MACOS_APP_DIR) $(NOTARY_ZIP)"
-	@rm -f $(NOTARY_ZIP)
-	ditto -c -k --keepParent $(MACOS_APP_DIR) $(NOTARY_ZIP)
-	@echo "→ notarytool submit (profile: $(NOTARY_PROFILE))"
-	xcrun notarytool submit $(NOTARY_ZIP) --keychain-profile $(NOTARY_PROFILE) --wait
-	@rm -f $(NOTARY_ZIP)
-	@echo "→ stapler staple $(MACOS_APP_DIR)"
-	xcrun stapler staple $(MACOS_APP_DIR)
-	@echo "✓ notarized + stapled: $(MACOS_APP_DIR)"
-
-# Tarball the (signed/notarized) bundle into release/cli/releases/$(VERSION)/.
-# Used both standalone and as the final step of `make macos-release`. Reads
-# the workspace version from Cargo.toml unless MACOS_VERSION is set.
-MACOS_VERSION ?= $(shell awk -F\" '/^version *= *"/{print $$2; exit}' Cargo.toml)
-MACOS_TARGET  ?= macos-aarch64
-MACOS_RELEASE_DIR ?= release/cli/releases/$(MACOS_VERSION)
-MACOS_ARCHIVE ?= $(MACOS_RELEASE_DIR)/audetic-$(MACOS_VERSION)-$(MACOS_TARGET).tar.gz
-
-macos-tarball:
-	@if [ ! -d "$(MACOS_APP_DIR)" ]; then \
-		echo "✗ $(MACOS_APP_DIR) not found. Run \`make macos-app\` first." >&2; \
-		exit 1; \
-	fi
-	@mkdir -p $(MACOS_RELEASE_DIR)
-	@echo "→ ditto $(MACOS_APP_DIR) → /tmp/audetic-stage/Audetic.app"
-	@rm -rf /tmp/audetic-stage
-	@mkdir -p /tmp/audetic-stage
-	ditto $(MACOS_APP_DIR) /tmp/audetic-stage/Audetic.app
-	@printf 'Audetic %s (%s)\n\nInstaller: https://install.audetic.ai/cli/latest.sh\n' \
-		"$(MACOS_VERSION)" "$(MACOS_TARGET)" > /tmp/audetic-stage/README.txt
-	@echo "→ tar -czf $(MACOS_ARCHIVE)"
-	tar -C /tmp/audetic-stage -czf $(MACOS_ARCHIVE) .
-	@rm -rf /tmp/audetic-stage
-	@shasum -a 256 $(MACOS_ARCHIVE) | awk '{print $$1 "  " "$(notdir $(MACOS_ARCHIVE))"}' > $(MACOS_ARCHIVE).sha256
-	@echo "✓ $(MACOS_ARCHIVE)"
-	@cat $(MACOS_ARCHIVE).sha256
-
-# Full local release flow: build → assemble bundle → sign → notarize → staple →
-# tarball. Requires `SIGN_IDENTITY="Developer ID Application: … (TEAMID)"` and
-# a stored notarytool keychain profile.
-macos-release: macos-app macos-notarize macos-tarball
-	@echo ""
-	@echo "✓ Local macOS release ready:"
-	@echo "    bundle:  $(MACOS_APP_DIR)"
-	@echo "    archive: $(MACOS_ARCHIVE)"
-	@echo "    sha256:  $(MACOS_ARCHIVE).sha256"
 
 # Cleanup
 clean:

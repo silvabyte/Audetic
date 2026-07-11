@@ -1,8 +1,13 @@
 //! Linux install: systemd user unit at `~/.config/systemd/user/audeticd.service`,
 //! `enable --now`, readiness probe, `xdg-open` the UI. Also places the standalone
 //! `audetic` CLI on PATH (`~/.local/bin/audetic`).
+//!
+//! Uninstall stops and disables the unit, then removes what install wrote —
+//! both flows resolve paths through `InstallPaths`, so they stay in step.
 
-use super::{wait_for_daemon, InstallOptions};
+use super::{
+    remove_dir_if_empty, wait_for_daemon, InstallOptions, UninstallOptions, UninstallPlan,
+};
 use crate::api::url;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
@@ -164,6 +169,56 @@ fn open_browser(url: &str) -> Result<()> {
         bail!("`xdg-open {url}` exited with {status}");
     }
     Ok(())
+}
+
+/// Tear down the systemd user service and remove everything `run` installed.
+///
+/// Stop/disable happen before the plan is executed so the daemon isn't holding
+/// the database open while we delete it. Both are best-effort: a unit that was
+/// never installed, or a machine without systemd, is not a failure — we still
+/// want the file removal to proceed.
+pub fn uninstall(opts: UninstallOptions) -> Result<()> {
+    let paths = InstallPaths::resolve()?;
+
+    println!("→ Uninstalling audeticd (systemd user service)");
+
+    let mut plan = UninstallPlan::default();
+    plan.remove(paths.systemd_unit.clone(), "Systemd service unit");
+    if let Some(cli) = super::cli_target_path() {
+        plan.remove(cli, "Standalone `audetic` CLI");
+    }
+    super::plan_state_dirs(&mut plan, &paths.config_dir, &paths.data_dir, &opts);
+
+    if !opts.dry_run {
+        stop_and_disable();
+    }
+
+    plan.execute(&opts)?;
+
+    if !opts.dry_run {
+        daemon_reload().ok();
+        remove_dir_if_empty(&paths.config_dir);
+        remove_dir_if_empty(&paths.data_dir);
+        println!("✓ Audetic has been uninstalled");
+    }
+    Ok(())
+}
+
+/// Best-effort `systemctl --user stop`/`disable`. Absent systemd or an
+/// unregistered unit are both fine — nothing to stop means nothing to do.
+fn stop_and_disable() {
+    if Command::new("systemctl").arg("--version").output().is_err() {
+        println!("  · systemctl not available; skipping service teardown");
+        return;
+    }
+    println!("  · systemctl --user stop {SERVICE_NAME}");
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", SERVICE_NAME])
+        .status();
+    println!("  · systemctl --user disable {SERVICE_NAME}");
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", SERVICE_NAME])
+        .output();
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

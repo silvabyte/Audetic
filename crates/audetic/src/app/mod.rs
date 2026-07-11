@@ -14,7 +14,6 @@ use crate::transcription::job_service::{
 };
 use crate::transcription::{ProviderConfig, Transcriber, TranscriptionService};
 use crate::ui::Indicator;
-use crate::update::{UpdateConfig, UpdateEngine};
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,8 +109,6 @@ pub async fn run_service() -> Result<()> {
             error!("API server failed: {}", e);
         }
     });
-
-    spawn_update_manager();
 
     let toggle_url = crate::api::url::api_url(crate::api::url::paths::TOGGLE);
     let meetings_toggle_url = crate::api::url::api_url(crate::api::url::paths::MEETINGS_TOGGLE);
@@ -337,15 +334,4 @@ fn build_transcriber(config: &Config) -> Result<Transcriber> {
     };
 
     Transcriber::with_provider(provider, provider_config)
-}
-
-fn spawn_update_manager() {
-    match UpdateConfig::detect(None)
-        .and_then(UpdateEngine::new)
-        .map(|engine| engine.spawn_background(None))
-    {
-        Ok(Some(_handle)) => info!("Auto-update manager running in background"),
-        Ok(None) => info!("Auto-update manager not started (disabled or unsupported)"),
-        Err(err) => warn!("Failed to initialize auto-update manager: {err:?}"),
-    }
 }

@@ -13,4 +13,3 @@ pub mod recording;
 pub mod summary_templates;
 pub mod system;
 pub mod transcribe;
-pub mod update;

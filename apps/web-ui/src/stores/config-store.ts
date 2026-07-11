@@ -6,15 +6,13 @@ import type { components } from "@/api/schema";
 export type ProviderInfo = components["schemas"]["ProviderInfo"];
 export type ProviderStatus = components["schemas"]["ProviderStatus"];
 export type KeybindStatus = components["schemas"]["KeybindStatus"];
-export type UpdateReport = components["schemas"]["UpdateReport"];
 export type ModelDescriptor = components["schemas"]["ModelDescriptor"];
 
 type Status = "idle" | "loading" | "loaded" | "error";
 
 /**
  * ConfigStore backs the /settings/* routes. Each section tracks its
- * own load state so a slow endpoint (e.g. update check hitting the
- * network) doesn't block the rest of the page.
+ * own load state so a slow endpoint doesn't block the rest of the page.
  *
  * Everything here is read-or-toggle: the daemon exposes no generic
  * PUT /config, so [behavior] / [meeting] / [whisper] tuning happens
@@ -30,12 +28,6 @@ export class ConfigStore {
 
   keybind: KeybindStatus | null = null;
   keybindState: Status = "idle";
-
-  update: UpdateReport | null = null;
-  updateState: Status = "idle";
-
-  autoUpdate: boolean = false;
-  autoUpdateState: Status = "idle";
 
   /** On-device transcription models (catalog + install/download state). */
   models: ModelDescriptor[] = [];
@@ -59,8 +51,6 @@ export class ConfigStore {
       this.loadProviderStatus(),
       this.loadModels(),
       this.loadKeybind(),
-      this.loadUpdate(),
-      this.loadAutoUpdate(),
     ]);
   }
 
@@ -179,24 +169,6 @@ export class ConfigStore {
     }
   }
 
-  async loadUpdate(): Promise<void> {
-    runInAction(() => {
-      this.updateState = "loading";
-    });
-    try {
-      const { data, error } = await daemon.GET("/update/check");
-      if (error || !data) throw new Error(formatError(error ?? "empty response"));
-      runInAction(() => {
-        this.update = data;
-        this.updateState = "loaded";
-      });
-    } catch {
-      runInAction(() => {
-        this.updateState = "error";
-      });
-    }
-  }
-
   async installKeybind(key?: string): Promise<void> {
     try {
       const { error } = await daemon.POST("/keybind/install", {
@@ -218,68 +190,6 @@ export class ConfigStore {
       await this.loadKeybind();
     } catch (e) {
       runInAction(() => {
-        this.lastError = e instanceof Error ? e.message : String(e);
-      });
-    }
-  }
-
-  async installUpdate(force = false): Promise<void> {
-    runInAction(() => {
-      this.updateState = "loading";
-    });
-    try {
-      const { data, error } = await daemon.POST("/update/install", {
-        body: { force },
-      });
-      if (error || !data) throw new Error(formatError(error ?? "empty response"));
-      runInAction(() => {
-        this.update = data;
-        this.updateState = "loaded";
-      });
-    } catch (e) {
-      runInAction(() => {
-        this.updateState = "error";
-        this.lastError = e instanceof Error ? e.message : String(e);
-      });
-    }
-  }
-
-  async loadAutoUpdate(): Promise<void> {
-    runInAction(() => {
-      this.autoUpdateState = "loading";
-    });
-    try {
-      const { data, error } = await daemon.GET("/update/auto");
-      if (error || !data) throw new Error(formatError(error ?? "empty response"));
-      runInAction(() => {
-        this.autoUpdate = data.enabled;
-        this.autoUpdateState = "loaded";
-      });
-    } catch {
-      runInAction(() => {
-        this.autoUpdateState = "error";
-      });
-    }
-  }
-
-  async setAutoUpdate(enabled: boolean): Promise<void> {
-    const previous = this.autoUpdate;
-    runInAction(() => {
-      this.autoUpdate = enabled;
-    });
-    try {
-      const { data, error } = await daemon.PUT("/update/auto", {
-        body: { enabled },
-      });
-      if (error) throw new Error(formatError(error));
-      if (data) {
-        runInAction(() => {
-          this.autoUpdate = data.auto_update;
-        });
-      }
-    } catch (e) {
-      runInAction(() => {
-        this.autoUpdate = previous;
         this.lastError = e instanceof Error ? e.message : String(e);
       });
     }

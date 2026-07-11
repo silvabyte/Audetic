@@ -22,4 +22,3 @@ pub mod system;
 pub mod text_io;
 pub mod transcription;
 pub mod ui;
-pub mod update;
