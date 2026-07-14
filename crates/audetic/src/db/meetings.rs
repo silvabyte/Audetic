@@ -145,6 +145,46 @@ impl MeetingRepository {
         Ok(())
     }
 
+    /// Sweep meetings orphaned by a daemon crash/restart into `error`.
+    ///
+    /// The meeting machine's state is in-memory only, so if the process dies
+    /// mid-pipeline every non-terminal row (`recording`, `review`,
+    /// `compressing`, `transcribing`) is unreachable on the next boot: the
+    /// machine restarts Idle, `confirm` refuses, and nothing else ever
+    /// touches the row — it sits "transcribing" forever. Called once at
+    /// service startup, before the meeting machine or API accept work, so a
+    /// non-terminal row here can only be a crash orphan, never a live
+    /// meeting.
+    ///
+    /// Rows move to `error` (the one state with a recovery path — the retry
+    /// endpoint re-submits the audio still on disk). `duration_seconds` is
+    /// deliberately left untouched, unlike [`Self::fail`]: the in-memory
+    /// duration died with the old process and whatever the row already holds
+    /// is the best information we have. The error message embeds the prior
+    /// status via SQL so the single statement stays atomic. Returns the
+    /// number of rows swept.
+    pub fn sweep_interrupted(conn: &Connection) -> Result<usize> {
+        // Same injection-safe interpolation of the compile-time terminal
+        // status list as `soft_delete`; anything NOT terminal is in-flight,
+        // so a future new in-flight phase is swept by default instead of
+        // stranded.
+        let terminal = MeetingPhase::TERMINAL_STATUSES.join("', '");
+        let affected = conn
+            .execute(
+                &format!(
+                    "UPDATE meetings SET \
+                     error = 'Interrupted: the Audetic daemon stopped while this meeting was ' \
+                             || status, \
+                     status = ?1, \
+                     completed_at = CURRENT_TIMESTAMP \
+                     WHERE status NOT IN ('{terminal}') AND deleted_at IS NULL"
+                ),
+                params![MeetingPhase::Error.as_str()],
+            )
+            .context("Failed to sweep interrupted meetings")?;
+        Ok(affected)
+    }
+
     /// Atomically move a failed meeting into `transcribing` as a retry starts.
     ///
     /// Only succeeds if the row is still live and `error`, so a single SQL
@@ -461,6 +501,83 @@ mod tests {
         assert_eq!(meeting.error, Some("Transcription timeout".to_string()));
         assert_eq!(meeting.duration_seconds, Some(47));
         assert!(meeting.completed_at.is_some());
+    }
+
+    #[test]
+    fn test_sweep_interrupted_errors_in_flight_rows_only() {
+        let conn = setup_db();
+
+        // One row per in-flight phase a crash can strand...
+        let mut in_flight = Vec::new();
+        for phase in [
+            MeetingPhase::Recording,
+            MeetingPhase::Review,
+            MeetingPhase::Compressing,
+            MeetingPhase::Transcribing,
+        ] {
+            let id = MeetingRepository::insert(&conn, None, "/tmp/stuck.wav").unwrap();
+            MeetingRepository::update_status(&conn, id, phase).unwrap();
+            in_flight.push((id, phase));
+        }
+
+        // ...and terminal rows that must be untouched.
+        let done = MeetingRepository::insert(&conn, None, "/tmp/done.wav").unwrap();
+        MeetingRepository::complete(&conn, done, "/tmp/t.txt", "txt", None, 10).unwrap();
+        let failed = MeetingRepository::insert(&conn, None, "/tmp/failed.wav").unwrap();
+        MeetingRepository::fail(&conn, failed, "boom", 5).unwrap();
+
+        let swept = MeetingRepository::sweep_interrupted(&conn).unwrap();
+        assert_eq!(swept, in_flight.len());
+
+        for (id, phase) in in_flight {
+            let m = MeetingRepository::get(&conn, id).unwrap().unwrap();
+            assert_eq!(m.status, "error", "{} should be swept", phase.as_str());
+            // Error message records what the meeting was doing when it died.
+            let err = m.error.expect("swept row has an error message");
+            assert!(err.contains(phase.as_str()), "error should embed {phase:?}");
+            assert!(m.completed_at.is_some());
+        }
+
+        // Terminal rows keep their status and error text.
+        assert_eq!(
+            MeetingRepository::get(&conn, done).unwrap().unwrap().status,
+            "completed"
+        );
+        let failed_row = MeetingRepository::get(&conn, failed).unwrap().unwrap();
+        assert_eq!(failed_row.status, "error");
+        assert_eq!(failed_row.error, Some("boom".to_string()));
+    }
+
+    #[test]
+    fn test_sweep_interrupted_preserves_duration() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, None, "/tmp/stuck.wav").unwrap();
+        MeetingRepository::set_review(&conn, id, 4136).unwrap();
+        MeetingRepository::update_status(&conn, id, MeetingPhase::Transcribing).unwrap();
+
+        MeetingRepository::sweep_interrupted(&conn).unwrap();
+
+        // Unlike `fail`, the sweep must not clobber the recorded duration.
+        let m = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        assert_eq!(m.duration_seconds, Some(4136));
+    }
+
+    #[test]
+    fn test_sweep_interrupted_skips_soft_deleted_and_empty_db() {
+        let conn = setup_db();
+        assert_eq!(MeetingRepository::sweep_interrupted(&conn).unwrap(), 0);
+
+        // A soft-deleted row is hidden from every surface, including retry —
+        // erroring it would resurrect nothing. (Soft-delete only accepts
+        // terminal rows, so simulate legacy/manual state directly.)
+        let id = MeetingRepository::insert(&conn, None, "/tmp/gone.wav").unwrap();
+        MeetingRepository::update_status(&conn, id, MeetingPhase::Transcribing).unwrap();
+        conn.execute(
+            "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            params![id],
+        )
+        .unwrap();
+        assert_eq!(MeetingRepository::sweep_interrupted(&conn).unwrap(), 0);
     }
 
     #[test]

@@ -129,6 +129,10 @@ impl MeetingStatusHandle {
         state.title = title;
         state.audio_path = Some(audio_path);
         state.last_error = None;
+        // Clear any duration frozen by a previous meeting's Review phase;
+        // otherwise the new recording inherits the old meeting's length (the
+        // live timer freezes and the trim UI gets a bogus end bound).
+        state.recorded_duration_seconds = None;
     }
 
     pub async fn set_phase(&self, phase: MeetingPhase) {
@@ -267,6 +271,28 @@ mod tests {
         assert_eq!(state.meeting_id, Some(1));
         assert_eq!(state.title, Some("Standup".to_string()));
         assert!(state.started_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_start_recording_clears_prior_frozen_duration() {
+        let handle = MeetingStatusHandle::default();
+
+        // Meeting 1 stops and freezes its duration in Review, then errors —
+        // neither `enter_review` nor `set_error` clears the frozen value.
+        handle
+            .start_recording(1, None, PathBuf::from("/tmp/one.wav"))
+            .await;
+        handle.enter_review(654).await;
+        handle.set_error("boom".to_string()).await;
+
+        // Meeting 2 starts without an intervening reset(). Its duration must
+        // be the live elapsed time, not meeting 1's frozen 654s.
+        handle
+            .start_recording(2, None, PathBuf::from("/tmp/two.wav"))
+            .await;
+        let state = handle.get().await;
+        assert_eq!(state.recorded_duration_seconds, None);
+        assert!(state.duration_seconds().unwrap() < 654);
     }
 
     #[tokio::test]

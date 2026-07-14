@@ -72,6 +72,25 @@ pub async fn run_service() -> Result<()> {
         Arc::clone(&post_processing),
     );
 
+    // Sweep meetings a previous daemon left mid-pipeline (recording /
+    // review / compressing / transcribing) into `error` before anything can
+    // accept new work. The machine's state died with the old process, so
+    // those rows would otherwise show "transcribing" forever; as `error`
+    // they surface the interruption and the retry endpoint can re-submit
+    // the audio still on disk. Failure to sweep is non-fatal — worst case
+    // the stale rows remain, which is exactly the status quo without it.
+    match crate::db::init_db()
+        .and_then(|conn| crate::db::meetings::MeetingRepository::sweep_interrupted(&conn))
+    {
+        Ok(0) => {}
+        Ok(n) => warn!(
+            "Marked {} meeting(s) interrupted by a previous daemon shutdown as errored; \
+             they can be retried from the meetings list",
+            n
+        ),
+        Err(e) => warn!("Failed to sweep interrupted meetings: {e:#}"),
+    }
+
     // Meeting pipeline (independent from recording pipeline). `meetings_dir`,
     // the media inspector, and the post-processing service all live at the
     // app level so the live recording machine and the import endpoint share
