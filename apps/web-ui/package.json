@@ -16,7 +16,7 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "node --test \"eslint-rules/*.test.js\"",
+    "test": "node --test eslint-rules/*.test.js",
     "codegen": "openapi-typescript ../../target/openapi.json -o src/api/schema.ts"
   },
   "dependencies": {
