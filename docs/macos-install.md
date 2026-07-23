@@ -31,50 +31,41 @@ brew install cmake ffmpeg
 Sanity check: `command -v swift` should resolve and `xcode-select -p`
 should print a path inside `/Applications/Xcode.app`.
 
-## 2. Build the app
+## 2. Build and install
 
 From the repo root:
 
 ```bash
-git pull
-make macos-app
-```
-
-This compiles the daemon (release), builds the SwiftUI menu-bar app, embeds
-it inside `target/release/Audetic.app` as a login item, and ad-hoc signs the
-whole bundle.
-
-## 3. Install it
-
-```bash
-./target/release/Audetic.app/Contents/MacOS/audeticd install
+make install
 ```
 
 **Run this as yourself — never with `sudo`.** It's a per-user LaunchAgent;
 `sudo` installs into the wrong domain and leaves root-owned files that block
 the daemon from starting (see [Troubleshooting](#troubleshooting)).
 
-`install` copies the bundle to `~/Applications/`, links the `audetic` CLI
-into `~/.local/bin/`, writes the LaunchAgents, starts the daemon on
-`127.0.0.1:3737`, and opens the web UI.
+`make install` compiles the daemon (release), builds the SwiftUI menu-bar app,
+embeds it inside `target/release/Audetic.app` as a login item, ad-hoc signs the
+bundle, then hands off to `audeticd install` — which copies the bundle to
+`~/Applications/`, puts the `audetic` CLI in `~/.local/bin/`, writes the
+LaunchAgents, starts the daemon on `127.0.0.1:3737`, and opens the web UI.
 
 That's it. To confirm it's up:
 
 ```bash
-curl -s http://127.0.0.1:3737/api/status
+make status
 ```
 
 ## Updating later
 
-Same three commands — pull, rebuild, reinstall:
+Same command — it's idempotent:
 
 ```bash
-git pull && make macos-app && ./target/release/Audetic.app/Contents/MacOS/audeticd install
+git pull && make install
 ```
 
 The bundle is ad-hoc signed (tied to its cdhash), so macOS may re-prompt for
-Microphone / Screen Recording after a rebuild. The auto-updater stays off by
-default, so a rebuild never gets clobbered by a remote release.
+Microphone / Screen Recording after a rebuild. There is no auto-updater, so a
+rebuild is never clobbered by a remote release.
 
 ## Permissions
 
@@ -134,7 +125,7 @@ Usually a stale launchd registration. Clear it and reinstall:
 
 ```bash
 launchctl bootout gui/$(id -u)/ai.audetic.daemon 2>/dev/null
-./target/release/Audetic.app/Contents/MacOS/audeticd install
+make install
 ```
 
 **`Bootstrap failed: 125: Domain does not support specified action`**
@@ -146,7 +137,7 @@ sudo chown -R "$(id -un):staff" \
   ~/Applications/Audetic.app \
   ~/.local/bin/audetic \
   ~/Library/LaunchAgents/ai.audetic.daemon.plist
-./target/release/Audetic.app/Contents/MacOS/audeticd install
+make install
 ```
 
 **Check what's running**
@@ -160,13 +151,23 @@ tail -f ~/Library/Logs/Audetic/audetic.log # logs
 ## Uninstall
 
 ```bash
-launchctl bootout gui/$(id -u)/ai.audetic.daemon
-launchctl bootout gui/$(id -u)/ai.audetic.menubar
-rm -rf ~/Applications/Audetic.app
-rm ~/Library/LaunchAgents/ai.audetic.daemon.plist
-rm ~/Library/LaunchAgents/ai.audetic.menubar.plist
-rm -rf "~/Library/Application Support/audetic"
-rm -rf ~/Library/Logs/Audetic
+make uninstall
+```
+
+Boots out both LaunchAgents, then removes `~/Applications/Audetic.app`, the two
+plists, `~/Library/Logs/Audetic/`, the `audetic` CLI, and the state under
+`~/Library/Application Support/audetic`. It prints the plan and asks before
+touching anything — `make uninstall ARGS="--dry-run"` to just look, or
+`ARGS="--keep-database"` to keep your transcription history.
+
+It works even from a fresh clone: teardown runs from the *installed* daemon
+when there is one.
+
+TCC grants are left alone on purpose — resetting them would also clear
+permissions for any other build of Audetic on the machine. To clear them
+yourself:
+
+```bash
 tccutil reset Microphone ai.audetic.daemon
 tccutil reset ScreenCapture ai.audetic.daemon
 ```

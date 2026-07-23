@@ -1,5 +1,5 @@
 # Find all shell scripts
-SHELL_SCRIPTS := $(shell find scripts release f -name '*.sh' 2>/dev/null)
+SHELL_SCRIPTS := $(shell find scripts -name '*.sh' 2>/dev/null)
 
 # Lint shell scripts with ShellCheck and checkbashisms
 .PHONY: shell-lint

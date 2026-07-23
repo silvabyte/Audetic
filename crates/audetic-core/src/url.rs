@@ -50,9 +50,6 @@ pub mod paths {
     pub const KEYBIND_STATUS: &str = "/keybind/status";
     pub const KEYBIND_INSTALL: &str = "/keybind/install";
     pub const KEYBIND: &str = "/keybind";
-    pub const UPDATE_CHECK: &str = "/update/check";
-    pub const UPDATE_INSTALL: &str = "/update/install";
-    pub const UPDATE_AUTO: &str = "/update/auto";
 }
 
 /// Path to one agent profile test endpoint: `AGENT_PROFILES/{id}/test`.

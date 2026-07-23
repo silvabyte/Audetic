@@ -1,8 +1,13 @@
 //! Linux install: systemd user unit at `~/.config/systemd/user/audeticd.service`,
 //! `enable --now`, readiness probe, `xdg-open` the UI. Also places the standalone
 //! `audetic` CLI on PATH (`~/.local/bin/audetic`).
+//!
+//! Uninstall stops and disables the unit, then removes what install wrote —
+//! both flows resolve paths through `InstallPaths`, so they stay in step.
 
-use super::{wait_for_daemon, InstallOptions};
+use super::{
+    remove_dir_if_empty, wait_for_daemon, InstallOptions, UninstallOptions, UninstallPlan,
+};
 use crate::api::url;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
@@ -23,7 +28,7 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     ensure_runtime_dirs(&paths)?;
     write_unit(&paths)?;
     daemon_reload()?;
-    enable_and_start()?;
+    enable_and_restart()?;
     wait_for_daemon(Duration::from_secs(15)).await?;
     println!("✓ audeticd.service is active");
 
@@ -89,18 +94,14 @@ fn place_binary(paths: &InstallPaths) -> Result<()> {
             "  · Binary already at {} (skipping copy)",
             paths.installed_binary.display()
         );
-    } else {
-        println!("  · Copying binary → {}", paths.installed_binary.display());
-        fs::copy(&current, &paths.installed_binary).with_context(|| {
-            format!(
-                "Failed to copy {} → {}",
-                current.display(),
-                paths.installed_binary.display()
-            )
-        })?;
-        super::set_executable(&paths.installed_binary)?;
+        return Ok(());
     }
-    Ok(())
+
+    println!("  · Copying binary → {}", paths.installed_binary.display());
+
+    // Atomic swap, not a copy-in-place: the daemon we're replacing is usually
+    // running, and writing onto a live executable fails with ETXTBSY.
+    super::replace_executable(&current, &paths.installed_binary)
 }
 
 /// Best-effort: copy the standalone `audetic` CLI (shipped next to `audeticd`
@@ -143,14 +144,33 @@ fn daemon_reload() -> Result<()> {
     Ok(())
 }
 
-fn enable_and_start() -> Result<()> {
-    println!("  · systemctl --user enable --now {SERVICE_NAME}");
+/// Enable the unit at boot and make sure the *new* binary is the one running.
+///
+/// `enable --now` is not enough here. `--now` only *starts* the unit, and
+/// starting an already-active unit is a no-op — so reinstalling over a running
+/// daemon would report success while leaving the old binary serving. Since
+/// `make install` is the upgrade path (`git pull && make install`), that
+/// silently defeats the whole point.
+///
+/// `restart` is the honest verb: it picks up the new `ExecStart` inode, and it
+/// also starts a unit that isn't running, which covers first install.
+fn enable_and_restart() -> Result<()> {
+    println!("  · systemctl --user enable {SERVICE_NAME}");
     let status = Command::new("systemctl")
-        .args(["--user", "enable", "--now", SERVICE_NAME])
+        .args(["--user", "enable", SERVICE_NAME])
         .status()
-        .context("Failed to run systemctl enable --now")?;
+        .context("Failed to run systemctl enable")?;
     if !status.success() {
-        bail!("`systemctl --user enable --now {SERVICE_NAME}` exited with {status}");
+        bail!("`systemctl --user enable {SERVICE_NAME}` exited with {status}");
+    }
+
+    println!("  · systemctl --user restart {SERVICE_NAME}");
+    let status = Command::new("systemctl")
+        .args(["--user", "restart", SERVICE_NAME])
+        .status()
+        .context("Failed to run systemctl restart")?;
+    if !status.success() {
+        bail!("`systemctl --user restart {SERVICE_NAME}` exited with {status}");
     }
     Ok(())
 }
@@ -164,6 +184,56 @@ fn open_browser(url: &str) -> Result<()> {
         bail!("`xdg-open {url}` exited with {status}");
     }
     Ok(())
+}
+
+/// Tear down the systemd user service and remove everything `run` installed.
+///
+/// Stop/disable happen before the plan is executed so the daemon isn't holding
+/// the database open while we delete it. Both are best-effort: a unit that was
+/// never installed, or a machine without systemd, is not a failure — we still
+/// want the file removal to proceed.
+pub fn uninstall(opts: UninstallOptions) -> Result<()> {
+    let paths = InstallPaths::resolve()?;
+
+    println!("→ Uninstalling audeticd (systemd user service)");
+
+    let mut plan = UninstallPlan::default();
+    plan.remove(paths.systemd_unit.clone(), "Systemd service unit");
+    if let Some(cli) = super::cli_target_path() {
+        plan.remove(cli, "Standalone `audetic` CLI");
+    }
+    super::plan_state_dirs(&mut plan, &paths.config_dir, &paths.data_dir, &opts);
+
+    if !opts.dry_run {
+        stop_and_disable();
+    }
+
+    plan.execute(&opts)?;
+
+    if !opts.dry_run {
+        daemon_reload().ok();
+        remove_dir_if_empty(&paths.config_dir);
+        remove_dir_if_empty(&paths.data_dir);
+        println!("✓ Audetic has been uninstalled");
+    }
+    Ok(())
+}
+
+/// Best-effort `systemctl --user stop`/`disable`. Absent systemd or an
+/// unregistered unit are both fine — nothing to stop means nothing to do.
+fn stop_and_disable() {
+    if Command::new("systemctl").arg("--version").output().is_err() {
+        println!("  · systemctl not available; skipping service teardown");
+        return;
+    }
+    println!("  · systemctl --user stop {SERVICE_NAME}");
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", SERVICE_NAME])
+        .status();
+    println!("  · systemctl --user disable {SERVICE_NAME}");
+    let _ = Command::new("systemctl")
+        .args(["--user", "disable", SERVICE_NAME])
+        .output();
 }
 
 fn same_file(a: &Path, b: &Path) -> bool {

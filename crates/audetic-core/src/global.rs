@@ -23,18 +23,6 @@ pub fn data_dir() -> Result<PathBuf> {
     Err(anyhow!("Unable to determine data directory"))
 }
 
-pub fn updates_dir() -> Result<PathBuf> {
-    Ok(data_dir()?.join("updates"))
-}
-
-pub fn update_state_file() -> Result<PathBuf> {
-    Ok(config_dir()?.join("update_state.json"))
-}
-
-pub fn update_lock_file() -> Result<PathBuf> {
-    Ok(data_dir()?.join("update.lock"))
-}
-
 pub fn db_file() -> Result<PathBuf> {
     Ok(data_dir()?.join("audetic.db"))
 }

@@ -9,37 +9,38 @@ Basically superwhisper for Omarchy, Audetic is a voice to text application for W
 
 ## Quick Install
 
-**Linux** ships a pre-built, signed binary:
+Audetic is built from source. Clone it and run `make install` — **never with
+sudo**. Everything lives under `$HOME`.
 
 ```bash
-curl -fsSL https://install.audetic.ai/cli/latest.sh | bash
+git clone https://github.com/silvabyte/Audetic.git
+cd Audetic
+make install
 ```
 
-The installer detects your platform and hands off to `audetic install`.
-Everything lives under `$HOME` — no sudo.
+`make install` detects your platform, builds in release mode, and hands off to
+`audeticd install`, which registers the background service, puts the `audetic`
+CLI on your PATH, waits for the daemon to bind `127.0.0.1:3737`, and opens the
+web UI.
 
-**macOS** builds from source — see the [macOS Install Guide](./docs/macos-install.md).
+It's idempotent, so it's also the upgrade path:
+
+```bash
+git pull && make install
+```
 
 ### Linux
 
-Copies the binary to `~/.local/share/audetic/bin/`, installs a systemd
-**user** service at `~/.config/systemd/user/audetic.service`,
-`enable --now`s it, waits for it to bind `127.0.0.1:3737`, and opens the
-web UI in your browser. Pass `--no-launch` to skip opening the browser.
+Needs a Rust toolchain and ALSA headers (`libasound2-dev`). Copies the binary
+to `~/.local/share/audetic/bin/`, installs a systemd **user** service at
+`~/.config/systemd/user/audeticd.service`, and `enable --now`s it.
 
 ### macOS
 
-macOS builds from source — three commands once Xcode + `brew install cmake
-ffmpeg` are in place:
-
-```bash
-git pull
-make macos-app
-./target/release/Audetic.app/Contents/MacOS/audeticd install   # no sudo
-```
-
-Full walkthrough, permissions, local models, and troubleshooting:
-**[macOS Install Guide](./docs/macos-install.md)**.
+Needs full Xcode plus `brew install cmake ffmpeg`, and builds an ad-hoc-signed
+`Audetic.app` (the bundle is what macOS attaches Microphone / Screen Recording
+permissions to). Full walkthrough, permissions, local models, and
+troubleshooting: **[macOS Install Guide](./docs/macos-install.md)**.
 
 **After installation:**
 
@@ -112,25 +113,32 @@ Files already in MP3 or Opus format are sent as-is. Use `--no-compress` to skip.
 - `--no-compress` - Skip compression (send file in original format)
 - `--api-url <URL>` - Override transcription API URL
 
-## Updates
+## Updating
 
-Audetic includes an auto-updater plus manual controls:
-
-```bash
-audetic update
-```
-
-## Uninstall — macOS
-
-See the [macOS Install Guide](./docs/macos-install.md#uninstall).
-
-## Uninstall — Linux
+There is no auto-updater and no hosted release — rebuilding from source *is*
+the update:
 
 ```bash
-curl -fsSL https://install.audetic.ai/cli/uninstall.sh | bash
+git pull && make install
 ```
 
-Use `--dry-run` to preview, or `--keep-database` to preserve transcription history. See [Installation Guide](./docs/installation.md#uninstalling) for all options.
+## Uninstall
+
+```bash
+make uninstall
+```
+
+Stops the service and removes what `install` put on disk, after printing the
+plan and asking for confirmation. Pass flags through with `ARGS`:
+
+```bash
+make uninstall ARGS="--dry-run"         # preview, change nothing
+make uninstall ARGS="--keep-database"   # preserve transcription history
+make uninstall ARGS="--keep-config -y"  # preserve config.toml, skip the prompt
+```
+
+See the [Installation Guide](./docs/installation.md#uninstalling) for the full
+list.
 
 ## License
 

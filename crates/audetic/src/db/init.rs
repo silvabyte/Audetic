@@ -204,12 +204,31 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
         .filter_map(|c| c.ok())
         .any(|c| c == column);
 
-    if !exists {
-        conn.execute(
-            &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
-            [],
-        )
-        .with_context(|| format!("Failed to add column {column} to {table}"))?;
+    if exists {
+        return Ok(());
     }
-    Ok(())
+
+    match conn.execute(
+        &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
+        [],
+    ) {
+        Ok(_) => Ok(()),
+        // SQLite has no `ADD COLUMN IF NOT EXISTS`, so the check above and the
+        // ALTER below can't be one atomic step: another connection opening the
+        // same database (a second daemon, the CLI, concurrent tests) can land
+        // its migration in between. Losing that race means the column is now
+        // there, which is all we wanted — so treat it as success rather than
+        // failing startup.
+        Err(err) if is_duplicate_column(&err) => Ok(()),
+        Err(err) => Err(err).with_context(|| format!("Failed to add column {column} to {table}")),
+    }
+}
+
+/// Whether a rusqlite error is SQLite's "duplicate column name" — i.e. the
+/// column we were about to add already exists.
+fn is_duplicate_column(err: &rusqlite::Error) -> bool {
+    matches!(
+        err,
+        rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("duplicate column name")
+    )
 }

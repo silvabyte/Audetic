@@ -14,7 +14,6 @@ use crate::transcription::job_service::{
 };
 use crate::transcription::{ProviderConfig, Transcriber, TranscriptionService};
 use crate::ui::Indicator;
-use crate::update::{UpdateConfig, UpdateEngine};
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
 use std::time::Duration;
@@ -73,6 +72,25 @@ pub async fn run_service() -> Result<()> {
         Arc::clone(&post_processing),
     );
 
+    // Sweep meetings a previous daemon left mid-pipeline (recording /
+    // review / compressing / transcribing) into `error` before anything can
+    // accept new work. The machine's state died with the old process, so
+    // those rows would otherwise show "transcribing" forever; as `error`
+    // they surface the interruption and the retry endpoint can re-submit
+    // the audio still on disk. Failure to sweep is non-fatal — worst case
+    // the stale rows remain, which is exactly the status quo without it.
+    match crate::db::init_db()
+        .and_then(|conn| crate::db::meetings::MeetingRepository::sweep_interrupted(&conn))
+    {
+        Ok(0) => {}
+        Ok(n) => warn!(
+            "Marked {} meeting(s) interrupted by a previous daemon shutdown as errored; \
+             they can be retried from the meetings list",
+            n
+        ),
+        Err(e) => warn!("Failed to sweep interrupted meetings: {e:#}"),
+    }
+
     // Meeting pipeline (independent from recording pipeline). `meetings_dir`,
     // the media inspector, and the post-processing service all live at the
     // app level so the live recording machine and the import endpoint share
@@ -110,8 +128,6 @@ pub async fn run_service() -> Result<()> {
             error!("API server failed: {}", e);
         }
     });
-
-    spawn_update_manager();
 
     let toggle_url = crate::api::url::api_url(crate::api::url::paths::TOGGLE);
     let meetings_toggle_url = crate::api::url::api_url(crate::api::url::paths::MEETINGS_TOGGLE);
@@ -337,15 +353,4 @@ fn build_transcriber(config: &Config) -> Result<Transcriber> {
     };
 
     Transcriber::with_provider(provider, provider_config)
-}
-
-fn spawn_update_manager() {
-    match UpdateConfig::detect(None)
-        .and_then(UpdateEngine::new)
-        .map(|engine| engine.spawn_background(None))
-    {
-        Ok(Some(_handle)) => info!("Auto-update manager running in background"),
-        Ok(None) => info!("Auto-update manager not started (disabled or unsupported)"),
-        Err(err) => warn!("Failed to initialize auto-update manager: {err:?}"),
-    }
 }

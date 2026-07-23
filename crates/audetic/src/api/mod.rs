@@ -114,7 +114,6 @@ impl ApiServer {
             .nest("/models", routes::models::router())
             .nest("/provider", routes::provider::router())
             .nest("/system", routes::system::router())
-            .nest("/update", routes::update::router())
             .merge(routes::transcribe::router())
             .merge(routes::agents::router())
             .merge(routes::summary_templates::router())

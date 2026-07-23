@@ -1,5 +1,5 @@
 import { NavLink, Outlet, type RouteObject } from "react-router-dom";
-import { FileText, Keyboard, Mic, Palette, RefreshCcw, Zap } from "lucide-react";
+import { FileText, Keyboard, Mic, Palette, Zap } from "lucide-react";
 import { getRootStore } from "@/stores/singleton";
 import { cn } from "@/lib/utils";
 
@@ -30,7 +30,6 @@ const navItems: SettingsNavItem[] = [
   { to: "/settings", label: "Provider", icon: Mic, end: true },
   { to: "/settings/keybind", label: "Keybind", icon: Keyboard },
   { to: "/settings/post-processing", label: "Post-processing", icon: Zap },
-  { to: "/settings/updates", label: "Updates", icon: RefreshCcw },
   { to: "/settings/appearance", label: "Appearance", icon: Palette },
   { to: "/settings/config-file", label: "Config file", icon: FileText },
 ];

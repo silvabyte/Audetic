@@ -16,8 +16,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "test": "node --test \"eslint-rules/*.test.js\"",
-    "codegen": "openapi-typescript http://127.0.0.1:3737/api/openapi.json -o src/api/schema.ts"
+    "test": "node --test eslint-rules/*.test.js",
+    "codegen": "openapi-typescript ../../target/openapi.json -o src/api/schema.ts"
   },
   "dependencies": {
     "@radix-ui/react-dialog": "^1.1.15",
