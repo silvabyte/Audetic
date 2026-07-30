@@ -18,8 +18,8 @@ use crate::api::url;
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, ExitStatus};
+use std::time::{Duration, Instant};
 
 const PLIST_TEMPLATE: &str = include_str!("audetic.daemon.plist.tmpl");
 const MENUBAR_PLIST_TEMPLATE: &str = include_str!("audetic.menubar.plist.tmpl");
@@ -27,6 +27,14 @@ const LABEL: &str = "ai.audetic.daemon";
 const MENUBAR_LABEL: &str = "ai.audetic.menubar";
 const BUNDLE_NAME: &str = "Audetic.app";
 const MENUBAR_APP_NAME: &str = "Audetic Menu Bar.app";
+
+/// How long to wait for a booted-out agent to actually leave launchd's registry.
+const TEARDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const TEARDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// `bootstrap` attempts before giving up, in case launchd is still settling
+/// past `TEARDOWN_TIMEOUT`.
+const BOOTSTRAP_ATTEMPTS: u32 = 3;
+const BOOTSTRAP_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub async fn run(opts: InstallOptions) -> Result<()> {
     let paths = InstallPaths::resolve()?;
@@ -262,34 +270,82 @@ fn bootstrap_agent(paths: &InstallPaths) -> Result<()> {
     let domain = format!("gui/{uid}");
     let service_target = format!("{domain}/{LABEL}");
 
-    // Idempotency: tear down a previous registration if present. `bootout`
-    // returns non-zero when nothing is registered yet, which is fine —
-    // suppress the error and continue.
-    let _ = Command::new("launchctl")
-        .args(["bootout", &service_target])
-        .status();
-
     let plist = paths
         .plist_path
         .to_str()
         .ok_or_else(|| anyhow!("Plist path contains non-UTF8 bytes"))?;
 
     println!("  · launchctl bootstrap {domain} {plist}");
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &domain, plist])
-        .status()
-        .context("Failed to run `launchctl bootstrap`")?;
-    if !status.success() {
-        bail!("`launchctl bootstrap {domain} {plist}` exited with {status}");
+    reload_agent(&domain, &service_target, plist)
+}
+
+/// Re-register one agent: `bootout`, wait for launchd to let go of the label,
+/// then `bootstrap` and `kickstart`.
+///
+/// The wait is the point. `launchctl bootout` is asynchronous — it returns once
+/// SIGTERM is delivered, not once the job is unloaded, and `audeticd` holds a
+/// CoreAudio device plus an HTTP listener that can outlive that return.
+/// Bootstrapping a label launchd still considers alive fails with its catch-all
+/// `Bootstrap failed: 5: Input/output error`, which made `make install` fail
+/// intermittently on reinstall.
+fn reload_agent(domain: &str, service_target: &str, plist: &str) -> Result<()> {
+    // Idempotency: tear down a previous registration if present. `bootout`
+    // returns non-zero when nothing is registered yet, which is fine —
+    // suppress the error and continue.
+    let _ = Command::new("launchctl")
+        .args(["bootout", service_target])
+        .output();
+
+    if !wait_for_service_gone(service_target, TEARDOWN_TIMEOUT) {
+        println!("  · {service_target} is still unloading; bootstrapping anyway");
     }
 
-    // `bootstrap` queues the load but the daemon's first `play()` can lag a
-    // beat; `kickstart` makes sure it starts immediately.
-    let _ = Command::new("launchctl")
-        .args(["kickstart", "-k", &service_target])
-        .status();
+    let mut last_status: Option<ExitStatus> = None;
+    for attempt in 1..=BOOTSTRAP_ATTEMPTS {
+        let status = Command::new("launchctl")
+            .args(["bootstrap", domain, plist])
+            .status()
+            .context("Failed to run `launchctl bootstrap`")?;
+        if status.success() {
+            // `bootstrap` queues the load but the daemon's first `play()` can
+            // lag a beat; `kickstart` makes sure it starts immediately.
+            let _ = Command::new("launchctl")
+                .args(["kickstart", "-k", service_target])
+                .status();
+            return Ok(());
+        }
+        last_status = Some(status);
+        if attempt < BOOTSTRAP_ATTEMPTS {
+            println!(
+                "  · bootstrap exited with {status}; retrying ({attempt}/{BOOTSTRAP_ATTEMPTS})"
+            );
+            std::thread::sleep(BOOTSTRAP_RETRY_DELAY);
+        }
+    }
 
-    Ok(())
+    let status = last_status.expect("loop body runs at least once");
+    bail!("`launchctl bootstrap {domain} {plist}` exited with {status} after {BOOTSTRAP_ATTEMPTS} attempts");
+}
+
+/// Poll `launchctl print` until `service_target` is no longer registered.
+/// Returns `false` if it was still registered when `timeout` elapsed — the
+/// caller proceeds anyway, since `bootstrap` is retried regardless.
+fn wait_for_service_gone(service_target: &str, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let registered = Command::new("launchctl")
+            .args(["print", service_target])
+            .output()
+            .map(|out| out.status.success())
+            .unwrap_or(false);
+        if !registered {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(TEARDOWN_POLL_INTERVAL);
+    }
 }
 
 /// Register the embedded "Audetic Menu Bar.app" as a per-user LaunchAgent
@@ -366,28 +422,11 @@ fn bootstrap_menubar_agent(plist_path: &Path) -> Result<()> {
     let domain = format!("gui/{uid}");
     let service_target = format!("{domain}/{MENUBAR_LABEL}");
 
-    // Idempotency: tear down a previous registration if present.
-    let _ = Command::new("launchctl")
-        .args(["bootout", &service_target])
-        .status();
-
     let plist = plist_path
         .to_str()
         .ok_or_else(|| anyhow!("Plist path contains non-UTF8 bytes"))?;
 
-    let status = Command::new("launchctl")
-        .args(["bootstrap", &domain, plist])
-        .status()
-        .context("Failed to run `launchctl bootstrap` for the menu bar agent")?;
-    if !status.success() {
-        bail!("`launchctl bootstrap {domain} {plist}` exited with {status}");
-    }
-
-    let _ = Command::new("launchctl")
-        .args(["kickstart", "-k", &service_target])
-        .status();
-
-    Ok(())
+    reload_agent(&domain, &service_target, plist).context("Failed to register the menu bar agent")
 }
 
 fn open_url(url: &str) -> Result<()> {
@@ -453,5 +492,11 @@ fn bootout_agents() {
         let _ = Command::new("launchctl")
             .args(["bootout", &target])
             .output();
+        // `bootout` returns on SIGTERM delivery, not on unload — wait for the
+        // job to actually go away before the caller deletes or replaces the
+        // files it is running out of.
+        if !wait_for_service_gone(&target, TEARDOWN_TIMEOUT) {
+            println!("  · {target} did not unload within {TEARDOWN_TIMEOUT:?}; continuing");
+        }
     }
 }
