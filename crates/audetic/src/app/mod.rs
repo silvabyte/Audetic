@@ -1,6 +1,15 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use crate::api::{ApiCommand, ApiServer};
+mod command;
+
+use anyhow::{anyhow, Result};
+use tokio::sync::{mpsc, Mutex};
+use tracing::{error, info, warn};
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use crate::api::ApiServer;
 use crate::audio::{
     mic_source::MicAudioSource, system_source::SystemAudioSource, AudioStreamManager,
     BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle, ToggleResult,
@@ -14,14 +23,63 @@ use crate::transcription::job_service::{
 };
 use crate::transcription::{ProviderConfig, Transcriber, TranscriptionService};
 use crate::ui::Indicator;
-use anyhow::{anyhow, Result};
-use std::sync::Arc;
-use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, warn};
+
+pub use command::DaemonCommand;
 
 const DEFAULT_JOBS_API_URL: &str = "https://audio.audetic.link/api/v1/jobs";
 const MEETING_TRANSCRIPTION_TIMEOUT_SECS: u64 = 7200; // 2 hours
+
+#[async_trait::async_trait]
+trait DictationCommandTarget {
+    async fn toggle(&self, options: Option<crate::audio::JobOptions>) -> Result<ToggleResult>;
+    async fn default_input_switched(&self) -> Result<()>;
+}
+
+#[async_trait::async_trait]
+impl DictationCommandTarget for RecordingMachine {
+    async fn toggle(&self, options: Option<crate::audio::JobOptions>) -> Result<ToggleResult> {
+        self.toggle(options).await
+    }
+
+    async fn default_input_switched(&self) -> Result<()> {
+        self.default_input_switched().await
+    }
+}
+
+async fn handle_dictation_command(target: &impl DictationCommandTarget, command: DaemonCommand) {
+    match command {
+        DaemonCommand::ToggleRecording(job_options) => match target.toggle(job_options).await {
+            Ok(ToggleResult {
+                phase: RecordingPhase::Recording,
+                job_id,
+            }) => {
+                info!("Recording started with job_id={:?}", job_id);
+            }
+            Ok(ToggleResult {
+                phase: RecordingPhase::Processing,
+                job_id,
+            }) => {
+                info!(
+                    "Recording stopped, processing audio for job_id={:?}",
+                    job_id
+                );
+            }
+            Ok(ToggleResult { phase, job_id }) => {
+                info!(
+                    "RecordingMachine is currently {:?} (job_id={:?})",
+                    phase, job_id
+                );
+            }
+            Err(e) => error!("Failed to toggle recording: {}", e),
+        },
+        DaemonCommand::DefaultInputSwitched => {
+            if let Err(e) = target.default_input_switched().await {
+                error!("Failed to switch dictation to the current Default Input: {e}");
+            }
+        }
+        _ => unreachable!("non-dictation command passed to dictation dispatcher"),
+    }
+}
 
 pub async fn run_service() -> Result<()> {
     info!("Starting Audetic service");
@@ -40,7 +98,7 @@ pub async fn run_service() -> Result<()> {
 
     let config = Config::load()?;
 
-    let (tx, mut rx) = mpsc::channel::<ApiCommand>(10);
+    let (tx, mut rx) = mpsc::channel::<DaemonCommand>(10);
     let audio_recorder = Arc::new(Mutex::new(AudioStreamManager::new()?));
 
     let whisper = build_transcriber(&config)?;
@@ -139,33 +197,10 @@ pub async fn run_service() -> Result<()> {
 
     while let Some(command) = rx.recv().await {
         match command {
-            ApiCommand::ToggleRecording(job_options) => {
-                match recording_machine.toggle(job_options).await {
-                    Ok(ToggleResult {
-                        phase: RecordingPhase::Recording,
-                        job_id,
-                    }) => {
-                        info!("Recording started with job_id={:?}", job_id);
-                    }
-                    Ok(ToggleResult {
-                        phase: RecordingPhase::Processing,
-                        job_id,
-                    }) => {
-                        info!(
-                            "Recording stopped, processing audio for job_id={:?}",
-                            job_id
-                        );
-                    }
-                    Ok(ToggleResult { phase, job_id }) => {
-                        info!(
-                            "RecordingMachine is currently {:?} (job_id={:?})",
-                            phase, job_id
-                        );
-                    }
-                    Err(e) => error!("Failed to toggle recording: {}", e),
-                }
+            command @ (DaemonCommand::ToggleRecording(_) | DaemonCommand::DefaultInputSwitched) => {
+                handle_dictation_command(&recording_machine, command).await;
             }
-            ApiCommand::MeetingStart { options, reply } => {
+            DaemonCommand::MeetingStart { options, reply } => {
                 let result = meeting_machine.start(options).await;
                 match &result {
                     Ok(r) => info!(
@@ -178,7 +213,7 @@ pub async fn run_service() -> Result<()> {
                 }
                 let _ = reply.send(result);
             }
-            ApiCommand::MeetingStop { reply } => {
+            DaemonCommand::MeetingStop { reply } => {
                 let result = meeting_machine.stop().await;
                 match &result {
                     Ok(r) => info!("Meeting {} stopped ({}s)", r.meeting_id, r.duration_seconds),
@@ -186,7 +221,7 @@ pub async fn run_service() -> Result<()> {
                 }
                 let _ = reply.send(result);
             }
-            ApiCommand::MeetingCancel { reply } => {
+            DaemonCommand::MeetingCancel { reply } => {
                 let result = meeting_machine.cancel().await;
                 match &result {
                     Ok(r) => info!(
@@ -197,7 +232,7 @@ pub async fn run_service() -> Result<()> {
                 }
                 let _ = reply.send(result);
             }
-            ApiCommand::MeetingConfirm {
+            DaemonCommand::MeetingConfirm {
                 start_seconds,
                 end_seconds,
                 reply,
@@ -212,7 +247,7 @@ pub async fn run_service() -> Result<()> {
                 }
                 let _ = reply.send(result);
             }
-            ApiCommand::MeetingToggle { options, reply } => {
+            DaemonCommand::MeetingToggle { options, reply } => {
                 let result = meeting_machine.toggle(options).await;
                 match &result {
                     Ok(outcome) => match outcome {
@@ -353,4 +388,141 @@ fn build_transcriber(config: &Config) -> Result<Transcriber> {
     };
 
     Transcriber::with_provider(provider, provider_config)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex as StdMutex};
+
+    use crate::audio::input_device::{ActiveInput, CaptureBackend, InputDataCallback};
+
+    use super::*;
+
+    struct FakeDefaultInput {
+        sample_rate: u32,
+        samples: Vec<f32>,
+    }
+
+    struct FakeCaptureBackend {
+        defaults: StdMutex<VecDeque<FakeDefaultInput>>,
+        starts: Arc<AtomicUsize>,
+        drops: Arc<AtomicUsize>,
+    }
+
+    struct FakeStream {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Drop for FakeStream {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl CaptureBackend for FakeCaptureBackend {
+        fn start_default_input(&self, mut on_data: InputDataCallback) -> Result<ActiveInput> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let input = self
+                .defaults
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("unexpected Default Input resolution");
+            on_data(&input.samples, 1);
+            Ok(ActiveInput::new(
+                input.sample_rate,
+                FakeStream {
+                    drops: self.drops.clone(),
+                },
+            ))
+        }
+    }
+
+    struct TestDictationTarget {
+        audio: AudioStreamManager,
+        recording: StdMutex<bool>,
+        output_path: PathBuf,
+    }
+
+    #[async_trait::async_trait]
+    impl DictationCommandTarget for TestDictationTarget {
+        async fn toggle(&self, _options: Option<crate::audio::JobOptions>) -> Result<ToggleResult> {
+            let recording = *self.recording.lock().unwrap();
+            if recording {
+                self.audio.stop_recording(self.output_path.clone()).await?;
+                *self.recording.lock().unwrap() = false;
+                Ok(ToggleResult {
+                    phase: RecordingPhase::Processing,
+                    job_id: None,
+                })
+            } else {
+                self.audio.start_recording().await?;
+                *self.recording.lock().unwrap() = true;
+                Ok(ToggleResult {
+                    phase: RecordingPhase::Recording,
+                    job_id: None,
+                })
+            }
+        }
+
+        async fn default_input_switched(&self) -> Result<()> {
+            self.audio.default_input_switched()
+        }
+    }
+
+    #[tokio::test]
+    async fn command_loop_preserves_active_dictation_across_default_input_switch() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let backend = FakeCaptureBackend {
+            defaults: StdMutex::new(VecDeque::from([
+                FakeDefaultInput {
+                    sample_rate: 48_000,
+                    samples: vec![0.25; 480],
+                },
+                FakeDefaultInput {
+                    sample_rate: 44_100,
+                    samples: vec![-0.5; 441],
+                },
+            ])),
+            starts: starts.clone(),
+            drops: drops.clone(),
+        };
+        let output_dir = tempfile::tempdir().unwrap();
+        let output_path = output_dir.path().join("switched-default.wav");
+        let target = TestDictationTarget {
+            audio: AudioStreamManager::with_backend(Box::new(backend)),
+            recording: StdMutex::new(false),
+            output_path: output_path.clone(),
+        };
+        let (tx, mut rx) = mpsc::channel(10);
+
+        for command in [
+            DaemonCommand::ToggleRecording(None),
+            DaemonCommand::DefaultInputSwitched,
+            DaemonCommand::ToggleRecording(None),
+            DaemonCommand::DefaultInputSwitched,
+        ] {
+            tx.send(command).await.unwrap();
+        }
+        drop(tx);
+
+        while let Some(command) = rx.recv().await {
+            handle_dictation_command(&target, command).await;
+        }
+
+        let samples = hound::WavReader::open(output_path)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(samples.len(), 320);
+        assert!(samples[..160].iter().all(|sample| *sample > 0.0));
+        assert!(samples[160..].iter().all(|sample| *sample < 0.0));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
 }

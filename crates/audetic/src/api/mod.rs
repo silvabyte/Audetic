@@ -18,8 +18,6 @@ pub mod static_assets;
 // without depending on the daemon. Re-exported here as `crate::api::url`.
 pub use audetic_core::url;
 
-use crate::config::Config;
-use crate::post_processing::PostProcessingService;
 use anyhow::Result;
 use axum::{response::Json, routing::get, Router};
 use serde::Serialize;
@@ -29,7 +27,11 @@ use tower_http::cors::CorsLayer;
 use tracing::info;
 use utoipa::{OpenApi, ToSchema};
 
-pub use routes::recording::{ApiCommand, RecordingState, ToggleRequest};
+use crate::config::Config;
+use crate::post_processing::PostProcessingService;
+
+pub use crate::app::DaemonCommand as ApiCommand;
+pub use routes::recording::{RecordingState, ToggleRequest};
 
 /// Response for GET / — service identity and basic status.
 #[derive(Debug, Serialize, ToSchema)]
