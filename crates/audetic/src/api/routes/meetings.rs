@@ -1,10 +1,6 @@
 //! Meeting recording API endpoints. See OpenAPI spec at
 //! `/api/openapi.json` for the canonical method/path list.
 
-use crate::meeting::{
-    import_meeting_file, ImportArgs, MediaInspector, MeetingPhase, MeetingStartOptions,
-    MeetingStatusHandle, ProcessingServices,
-};
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
@@ -24,7 +20,11 @@ use tower_http::services::ServeFile;
 use tracing::{error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
-use super::recording::ApiCommand;
+use crate::app::DaemonCommand as ApiCommand;
+use crate::meeting::{
+    import_meeting_file, ImportArgs, MediaInspector, MeetingPhase, MeetingStartOptions,
+    MeetingStatusHandle, ProcessingServices,
+};
 
 /// Shared state for meeting routes.
 #[derive(Clone)]
@@ -234,7 +234,7 @@ fn error_response(err: anyhow::Error, context: &str) -> Response {
         .into_response()
 }
 
-/// Helper: send an ApiCommand and await the machine's reply.
+/// Helper: send a daemon command and await the machine's reply.
 async fn dispatch<T>(
     tx: &mpsc::Sender<ApiCommand>,
     reply: oneshot::Receiver<anyhow::Result<T>>,

@@ -1,6 +1,6 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use hound::{WavSpec, WavWriter};
 use tracing::{debug, info};
 
@@ -26,10 +26,16 @@ pub enum RecordingState {
 pub struct AudioStreamManager {
     /// Device-free adapter that resolves Default Input for each recording.
     backend: Box<dyn CaptureBackend>,
-    /// Mono samples at the *native* rate, accumulated by the cpal callback.
-    samples: Arc<Mutex<Vec<f32>>>,
-    active_input: Mutex<Option<ActiveInput>>,
+    active_segment: Mutex<Option<ActiveSegment>>,
+    /// Completed Segments normalized to the pipeline sample rate.
+    canonical_samples: Mutex<Vec<f32>>,
     state: Arc<Mutex<RecordingState>>,
+}
+
+/// One contiguous interval captured at a single native sample rate.
+struct ActiveSegment {
+    input: ActiveInput,
+    native_samples: Arc<Mutex<Vec<f32>>>,
 }
 
 impl AudioStreamManager {
@@ -45,11 +51,11 @@ impl AudioStreamManager {
         ))))
     }
 
-    fn with_backend(backend: Box<dyn CaptureBackend>) -> Self {
+    pub(crate) fn with_backend(backend: Box<dyn CaptureBackend>) -> Self {
         Self {
             backend,
-            samples: Arc::new(Mutex::new(Vec::new())),
-            active_input: Mutex::new(None),
+            active_segment: Mutex::new(None),
+            canonical_samples: Mutex::new(Vec::new()),
             state: Arc::new(Mutex::new(RecordingState::Idle)),
         }
     }
@@ -68,29 +74,23 @@ impl AudioStreamManager {
             RecordingState::Idle => {}
         }
 
-        // Stop any existing stream before starting new one
+        // Stop any existing stream before starting a new recording.
         self.cleanup_stream();
 
-        // Clear samples buffer for new recording
+        // Clear canonical audio from the previous recording.
         {
-            let mut samples = self.samples.lock().unwrap();
+            let mut samples = self.canonical_samples.lock().unwrap();
             samples.clear();
             samples.shrink_to_fit(); // Free memory from previous recordings
         }
 
         debug!("Creating new audio stream");
-
-        let samples_clone = self.samples.clone();
-        let on_data: InputDataCallback = Box::new(move |data, channels| {
-            push_mono_f32(data, channels, &samples_clone);
-        });
-
-        // Resolving Default Input stays user-initiated and lazy because the
-        // native config lookup can gate on macOS microphone permission.
-        let active_input = self.backend.start_default_input(on_data)?;
+        let segment = self
+            .start_segment()
+            .context("Failed to start initial recording Segment")?;
         info!("Started audio recording");
 
-        *self.active_input.lock().unwrap() = Some(active_input);
+        *self.active_segment.lock().unwrap() = Some(segment);
         *state = RecordingState::Recording;
 
         Ok(())
@@ -113,37 +113,26 @@ impl AudioStreamManager {
         *state = RecordingState::Stopping;
         drop(state); // Release lock before cleanup
 
-        // End this native-rate segment before reading its samples.
-        let Some(active_input) = self.active_input.lock().unwrap().take() else {
+        // End and normalize the final native-rate Segment.
+        if !self
+            .close_current_segment()
+            .context("Failed to close final recording Segment")?
+        {
             *self.state.lock().unwrap() = RecordingState::Idle;
             return Err(anyhow::anyhow!(
                 "Recording stopped but no input stream was active"
             ));
-        };
-        let native_sample_rate = active_input.native_sample_rate();
-        drop(active_input);
+        }
 
-        // Extract native-rate samples
-        let native = {
-            let samples_guard = self.samples.lock().unwrap();
-            samples_guard.clone()
-        };
-
-        if native.is_empty() {
+        let canonical = std::mem::take(&mut *self.canonical_samples.lock().unwrap());
+        if canonical.is_empty() {
             *self.state.lock().unwrap() = RecordingState::Idle;
             return Err(anyhow::anyhow!("No audio samples recorded"));
         }
 
-        // Resample from the device's native rate to the VTT target rate. This
-        // is a no-op (early return) when they already match — e.g. Linux
-        // devices that offer 16 kHz directly.
-        let resampled = resample_mono_f32(&native, native_sample_rate, TARGET_SAMPLE_RATE)?;
-
         info!(
-            "Stopping recording: {} native @ {} Hz → {} samples @ {} Hz",
-            native.len(),
-            native_sample_rate,
-            resampled.len(),
+            "Stopping recording: {} canonical samples @ {} Hz",
+            canonical.len(),
             TARGET_SAMPLE_RATE
         );
 
@@ -156,17 +145,10 @@ impl AudioStreamManager {
         };
 
         let mut writer = WavWriter::create(&output_path, spec)?;
-        for sample in resampled {
+        for sample in canonical {
             writer.write_sample(sample)?;
         }
         writer.finalize()?;
-
-        // Clear samples and reset state
-        {
-            let mut samples = self.samples.lock().unwrap();
-            samples.clear();
-            samples.shrink_to_fit();
-        }
 
         *self.state.lock().unwrap() = RecordingState::Idle;
 
@@ -174,13 +156,71 @@ impl AudioStreamManager {
         Ok(output_path)
     }
 
+    /// Follow the current Default Input while preserving the active dictation.
+    /// Idle switches are ignored so a switch queued after stop cannot reopen capture.
+    pub fn default_input_switched(&self) -> Result<()> {
+        if *self.state.lock().unwrap() != RecordingState::Recording {
+            return Ok(());
+        }
+
+        self.close_current_segment()
+            .context("Failed to close Segment for Default Input switch")?;
+        let segment = self
+            .start_segment()
+            .context("Failed to start replacement Segment after Default Input switch")?;
+        *self.active_segment.lock().unwrap() = Some(segment);
+        info!("Switched active dictation to the current Default Input");
+        Ok(())
+    }
+
+    fn start_segment(&self) -> Result<ActiveSegment> {
+        let native_samples = Arc::new(Mutex::new(Vec::new()));
+        let callback_samples = native_samples.clone();
+        let on_data: InputDataCallback = Box::new(move |data, channels| {
+            push_mono_f32(data, channels, &callback_samples);
+        });
+
+        // Resolving Default Input stays user-initiated and lazy because the
+        // native config lookup can gate on macOS microphone permission.
+        let input = self
+            .backend
+            .start_default_input(on_data)
+            .context("Failed to start Segment from current Default Input")?;
+        Ok(ActiveSegment {
+            input,
+            native_samples,
+        })
+    }
+
+    fn close_current_segment(&self) -> Result<bool> {
+        let Some(segment) = self.active_segment.lock().unwrap().take() else {
+            return Ok(false);
+        };
+
+        let native_sample_rate = segment.input.native_sample_rate();
+        drop(segment.input);
+        let native = std::mem::take(&mut *segment.native_samples.lock().unwrap());
+        let canonical = resample_mono_f32(&native, native_sample_rate, TARGET_SAMPLE_RATE)
+            .context("Failed to normalize audio Segment")?;
+
+        debug!(
+            "Closed Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
+            native.len(),
+            native_sample_rate,
+            canonical.len(),
+            TARGET_SAMPLE_RATE
+        );
+        self.canonical_samples.lock().unwrap().extend(canonical);
+        Ok(true)
+    }
+
     /// Cleanup any active stream
     fn cleanup_stream(&self) {
-        let mut active_input = self.active_input.lock().unwrap();
-        if let Some(input) = active_input.take() {
+        let mut active_segment = self.active_segment.lock().unwrap();
+        if let Some(segment) = active_segment.take() {
             debug!("Cleaning up audio stream");
             // Stream is automatically stopped when dropped
-            drop(input);
+            drop(segment);
         }
     }
 }

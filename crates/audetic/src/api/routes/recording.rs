@@ -2,8 +2,6 @@
 //! `/api/openapi.json` for the canonical method/path list — don't
 //! enumerate them here.
 
-use crate::audio::{JobOptions, RecordingPhase, RecordingStatus, RecordingStatusHandle};
-use crate::config::WaybarConfig;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -17,6 +15,10 @@ use std::collections::HashMap;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 use utoipa::ToSchema;
+
+use crate::app::DaemonCommand as ApiCommand;
+use crate::audio::{JobOptions, RecordingPhase, RecordingStatus, RecordingStatusHandle};
+use crate::config::WaybarConfig;
 
 /// Request body for the toggle recording endpoint.
 /// All fields are optional - if not provided, defaults are used from config.
@@ -58,45 +60,6 @@ pub struct RecordingStatusResponse {
     pub job_id: Option<String>,
     pub last_completed_job: Option<CompletedJobSummary>,
     pub last_error: Option<String>,
-}
-
-/// Commands dispatched from the HTTP layer to the main event loop.
-///
-/// `ToggleRecording` is fire-and-forget — the recording pipeline is driven by
-/// a keybinding where immediate return is a feature, and errors self-correct
-/// on the next keypress.
-///
-/// The meeting variants carry a `tokio::sync::oneshot` reply channel so the
-/// HTTP handler can `.await` the machine's actual `Result` and surface proper
-/// status codes / error messages to the CLI.
-pub enum ApiCommand {
-    /// Toggle recording with optional per-job options
-    ToggleRecording(Option<JobOptions>),
-    /// Start meeting recording
-    MeetingStart {
-        options: Option<crate::meeting::MeetingStartOptions>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStartResult>>,
-    },
-    /// Stop meeting recording
-    MeetingStop {
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
-    },
-    /// Cancel the in-progress meeting recording without transcribing
-    MeetingCancel {
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
-    },
-    /// Confirm a meeting awaiting review, optionally trimming `[start, end)`
-    /// seconds, then send it for transcription.
-    MeetingConfirm {
-        start_seconds: Option<f64>,
-        end_seconds: Option<f64>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
-    },
-    /// Toggle meeting recording
-    MeetingToggle {
-        options: Option<crate::meeting::MeetingStartOptions>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::ToggleOutcome>>,
-    },
 }
 
 #[derive(Clone)]

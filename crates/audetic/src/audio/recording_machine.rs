@@ -312,6 +312,11 @@ impl RecordingMachine {
         recorder.start_recording().await
     }
 
+    pub(crate) async fn default_input_switched(&self) -> Result<()> {
+        let recorder = self.audio.lock().await;
+        recorder.default_input_switched()
+    }
+
     async fn begin_processing(
         &self,
         job_id: Option<String>,
