@@ -4,6 +4,7 @@ pub enum DaemonCommand {
     // The platform watcher is a later slice; S1 injects this typed event in tests.
     #[allow(dead_code)]
     DefaultInputSwitched,
+    CaptureStreamDied(crate::audio::stream_event::StreamDeath),
     MeetingStart {
         options: Option<crate::meeting::MeetingStartOptions>,
         reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStartResult>>,

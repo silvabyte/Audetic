@@ -239,4 +239,17 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn recording_status_schema_requires_capture_health() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schema = &spec["components"]["schemas"]["RecordingStatusResponse"];
+
+        assert_eq!(schema["properties"]["capture_degraded"]["type"], "boolean");
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "capture_degraded"));
+    }
 }

@@ -1239,6 +1239,7 @@ export interface components {
          *     is a different shape — see the union response on the handler.
          */
         RecordingStatusResponse: {
+            capture_degraded: boolean;
             job_id?: string | null;
             last_completed_job?: null | components["schemas"]["CompletedJobSummary"];
             last_error?: string | null;

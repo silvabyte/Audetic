@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::ApiServer;
+use crate::audio::stream_event::{StreamDeath, StreamEventSink};
 use crate::audio::{
     mic_source::MicAudioSource, system_source::SystemAudioSource, AudioStreamManager,
     BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle, ToggleResult,
@@ -33,6 +34,7 @@ const MEETING_TRANSCRIPTION_TIMEOUT_SECS: u64 = 7200; // 2 hours
 trait DictationCommandTarget {
     async fn toggle(&self, options: Option<crate::audio::JobOptions>) -> Result<ToggleResult>;
     async fn default_input_switched(&self) -> Result<()>;
+    async fn stream_died(&self, death: StreamDeath) -> Result<()>;
 }
 
 #[async_trait::async_trait]
@@ -44,6 +46,22 @@ impl DictationCommandTarget for RecordingMachine {
     async fn default_input_switched(&self) -> Result<()> {
         self.default_input_switched().await
     }
+
+    async fn stream_died(&self, death: StreamDeath) -> Result<()> {
+        self.stream_died(death).await
+    }
+}
+
+fn dictation_stream_event_sink(tx: &mpsc::Sender<DaemonCommand>) -> StreamEventSink {
+    let tx = tx.downgrade();
+    Arc::new(move |death| {
+        let Some(tx) = tx.upgrade() else {
+            return;
+        };
+        // Audio callbacks cannot wait for capacity. A full or closed command
+        // queue drops the report; later settled switches remain recovery triggers.
+        let _ = tx.try_send(DaemonCommand::CaptureStreamDied(death));
+    })
 }
 
 async fn handle_dictation_command(target: &impl DictationCommandTarget, command: DaemonCommand) {
@@ -77,6 +95,11 @@ async fn handle_dictation_command(target: &impl DictationCommandTarget, command:
                 error!("Failed to switch dictation to the current Default Input: {e}");
             }
         }
+        DaemonCommand::CaptureStreamDied(death) => {
+            if let Err(e) = target.stream_died(death).await {
+                error!("Failed to recover dictation from stream death: {e}");
+            }
+        }
         _ => unreachable!("non-dictation command passed to dictation dispatcher"),
     }
 }
@@ -99,7 +122,9 @@ pub async fn run_service() -> Result<()> {
     let config = Config::load()?;
 
     let (tx, mut rx) = mpsc::channel::<DaemonCommand>(10);
-    let audio_recorder = Arc::new(Mutex::new(AudioStreamManager::new()?));
+    let audio_recorder = Arc::new(Mutex::new(AudioStreamManager::with_event_sink(
+        dictation_stream_event_sink(&tx),
+    )?));
 
     let whisper = build_transcriber(&config)?;
     let transcription_service = Arc::new(TranscriptionService::new(whisper)?);
@@ -197,7 +222,9 @@ pub async fn run_service() -> Result<()> {
 
     while let Some(command) = rx.recv().await {
         match command {
-            command @ (DaemonCommand::ToggleRecording(_) | DaemonCommand::DefaultInputSwitched) => {
+            command @ (DaemonCommand::ToggleRecording(_)
+            | DaemonCommand::DefaultInputSwitched
+            | DaemonCommand::CaptureStreamDied(_)) => {
                 handle_dictation_command(&recording_machine, command).await;
             }
             DaemonCommand::MeetingStart { options, reply } => {
@@ -397,7 +424,10 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
-    use crate::audio::input_device::{ActiveInput, CaptureBackend, InputDataCallback};
+    use crate::audio::input_device::{
+        ActiveInput, CaptureBackend, InputDataCallback, InputErrorCallback,
+    };
+    use crate::audio::stream_event::{CaptureSource, StreamGeneration};
 
     use super::*;
 
@@ -410,6 +440,7 @@ mod tests {
         defaults: StdMutex<VecDeque<FakeDefaultInput>>,
         starts: Arc<AtomicUsize>,
         drops: Arc<AtomicUsize>,
+        errors: Arc<StdMutex<Vec<InputErrorCallback>>>,
     }
 
     struct FakeStream {
@@ -423,15 +454,18 @@ mod tests {
     }
 
     impl CaptureBackend for FakeCaptureBackend {
-        fn start_default_input(&self, mut on_data: InputDataCallback) -> Result<ActiveInput> {
+        fn start_default_input(
+            &self,
+            mut on_data: InputDataCallback,
+            on_error: InputErrorCallback,
+        ) -> Result<ActiveInput> {
             self.starts.fetch_add(1, Ordering::SeqCst);
-            let input = self
-                .defaults
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("unexpected Default Input resolution");
+            let input =
+                self.defaults.lock().unwrap().pop_front().ok_or_else(|| {
+                    anyhow!("Default Input is unavailable for planned replacement")
+                })?;
             on_data(&input.samples, 1);
+            self.errors.lock().unwrap().push(on_error);
             Ok(ActiveInput::new(
                 input.sample_rate,
                 FakeStream {
@@ -444,6 +478,7 @@ mod tests {
     struct TestDictationTarget {
         audio: AudioStreamManager,
         recording: StdMutex<bool>,
+        status: RecordingStatusHandle,
         output_path: PathBuf,
     }
 
@@ -452,6 +487,7 @@ mod tests {
         async fn toggle(&self, _options: Option<crate::audio::JobOptions>) -> Result<ToggleResult> {
             let recording = *self.recording.lock().unwrap();
             if recording {
+                self.status.set_processing().await;
                 self.audio.stop_recording(self.output_path.clone()).await?;
                 *self.recording.lock().unwrap() = false;
                 Ok(ToggleResult {
@@ -461,6 +497,9 @@ mod tests {
             } else {
                 self.audio.start_recording().await?;
                 *self.recording.lock().unwrap() = true;
+                self.status
+                    .start_job("test-job".to_string(), crate::audio::JobOptions::default())
+                    .await;
                 Ok(ToggleResult {
                     phase: RecordingPhase::Recording,
                     job_id: None,
@@ -469,7 +508,15 @@ mod tests {
         }
 
         async fn default_input_switched(&self) -> Result<()> {
-            self.audio.default_input_switched()
+            let recovery = self.audio.default_input_switched().await?;
+            self.status.apply_capture_recovery(recovery).await;
+            Ok(())
+        }
+
+        async fn stream_died(&self, death: StreamDeath) -> Result<()> {
+            let recovery = self.audio.stream_died(death).await?;
+            self.status.apply_capture_recovery(recovery).await;
+            Ok(())
         }
     }
 
@@ -477,6 +524,7 @@ mod tests {
     async fn command_loop_preserves_active_dictation_across_default_input_switch() {
         let starts = Arc::new(AtomicUsize::new(0));
         let drops = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(StdMutex::new(Vec::new()));
         let backend = FakeCaptureBackend {
             defaults: StdMutex::new(VecDeque::from([
                 FakeDefaultInput {
@@ -490,12 +538,14 @@ mod tests {
             ])),
             starts: starts.clone(),
             drops: drops.clone(),
+            errors,
         };
         let output_dir = tempfile::tempdir().unwrap();
         let output_path = output_dir.path().join("switched-default.wav");
         let target = TestDictationTarget {
-            audio: AudioStreamManager::with_backend(Box::new(backend)),
+            audio: AudioStreamManager::with_backend(Box::new(backend), Arc::new(|_| {})),
             recording: StdMutex::new(false),
+            status: RecordingStatusHandle::default(),
             output_path: output_path.clone(),
         };
         let (tx, mut rx) = mpsc::channel(10);
@@ -524,5 +574,90 @@ mod tests {
         assert!(samples[160..].iter().all(|sample| *sample < 0.0));
         assert_eq!(starts.load(Ordering::SeqCst), 2);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn stream_death_sink_drops_reports_when_command_queue_is_full_or_closed() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let sink = dictation_stream_event_sink(&tx);
+        tx.try_send(DaemonCommand::DefaultInputSwitched).unwrap();
+        let death = StreamDeath {
+            source: CaptureSource::Dictation,
+            generation: StreamGeneration(1),
+        };
+
+        sink(death);
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(DaemonCommand::DefaultInputSwitched)
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+
+        drop(rx);
+        sink(death);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stop_queued_behind_stream_recovery_preserves_audio_without_post_stop_swap() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let starts = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let errors = Arc::new(StdMutex::new(Vec::new()));
+        let backend = FakeCaptureBackend {
+            defaults: StdMutex::new(VecDeque::from([FakeDefaultInput {
+                sample_rate: 48_000,
+                samples: vec![0.25; 480],
+            }])),
+            starts: starts.clone(),
+            drops: drops.clone(),
+            errors: errors.clone(),
+        };
+        let output_dir = tempfile::tempdir().unwrap();
+        let output_path = output_dir.path().join("stopped-after-recovery.wav");
+        let status = RecordingStatusHandle::default();
+        let target = TestDictationTarget {
+            audio: AudioStreamManager::with_backend(
+                Box::new(backend),
+                dictation_stream_event_sink(&tx),
+            ),
+            recording: StdMutex::new(false),
+            status: status.clone(),
+            output_path: output_path.clone(),
+        };
+
+        tx.send(DaemonCommand::ToggleRecording(None)).await.unwrap();
+        handle_dictation_command(&target, rx.recv().await.unwrap()).await;
+        errors.lock().unwrap()[0]();
+        errors.lock().unwrap()[0]();
+        tx.send(DaemonCommand::ToggleRecording(None)).await.unwrap();
+        tx.send(DaemonCommand::DefaultInputSwitched).await.unwrap();
+        drop(tx);
+
+        handle_dictation_command(&target, rx.recv().await.unwrap()).await;
+        assert!(status.get().await.capture_degraded);
+
+        handle_dictation_command(&target, rx.recv().await.unwrap()).await;
+        assert!(status.get().await.capture_degraded);
+        assert_eq!(starts.load(Ordering::SeqCst), 4);
+
+        handle_dictation_command(&target, rx.recv().await.unwrap()).await;
+        assert_eq!(status.get().await.phase, RecordingPhase::Processing);
+        assert!(!status.get().await.capture_degraded);
+
+        handle_dictation_command(&target, rx.recv().await.unwrap()).await;
+        assert!(rx.recv().await.is_none());
+
+        let samples = hound::WavReader::open(output_path)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(samples.len(), 160);
+        assert!(samples.iter().all(|sample| *sample > 0.0));
+        assert_eq!(starts.load(Ordering::SeqCst), 4);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 }

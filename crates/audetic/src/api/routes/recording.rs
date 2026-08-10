@@ -56,6 +56,7 @@ pub struct CompletedJobSummary {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct RecordingStatusResponse {
     pub recording: bool,
+    pub capture_degraded: bool,
     pub phase: String,
     pub job_id: Option<String>,
     pub last_completed_job: Option<CompletedJobSummary>,
@@ -166,6 +167,7 @@ pub async fn recording_status(
 
     Json(json!({
         "recording": status.phase == RecordingPhase::Recording,
+        "capture_degraded": status.capture_degraded,
         "phase": status.phase.as_str(),
         "job_id": status.current_job_id,
         "last_completed_job": last_completed_job,
@@ -205,4 +207,28 @@ fn generate_waybar_response(status: &RecordingStatus, config: &WaybarConfig) -> 
         "class": class,
         "tooltip": tooltip
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn default_status_json_exposes_capture_health() {
+        let (tx, _rx) = mpsc::channel(1);
+        let status = RecordingStatusHandle::default();
+        status
+            .start_job("job-1".to_string(), JobOptions::default())
+            .await;
+        status.set_capture_degraded(true).await;
+        let state = RecordingState {
+            tx,
+            status,
+            waybar_config: WaybarConfig::default(),
+        };
+
+        let Json(body) = recording_status(Query(HashMap::new()), State(state)).await;
+
+        assert_eq!(body["capture_degraded"], true);
+    }
 }
