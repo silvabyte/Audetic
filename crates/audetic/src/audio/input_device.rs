@@ -9,9 +9,77 @@
 //! the whole process before the API server comes up.
 
 use anyhow::{anyhow, Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::SampleFormat;
-use tracing::info;
+use tracing::{error, info};
+
+/// Delivers native-rate, interleaved input samples and their channel count.
+pub(crate) type InputDataCallback = Box<dyn FnMut(&[f32], usize) + Send + 'static>;
+
+/// Starts capture from whichever device is the Default Input at call time.
+pub(crate) trait CaptureBackend: Send + Sync {
+    fn start_default_input(&self, on_data: InputDataCallback) -> Result<ActiveInput>;
+}
+
+trait CaptureStream: Send + Sync {}
+
+impl<T: Send + Sync + 'static> CaptureStream for T {}
+
+/// One active native-rate input segment. Dropping it stops its stream.
+pub(crate) struct ActiveInput {
+    native_sample_rate: u32,
+    _stream: Box<dyn CaptureStream>,
+}
+
+impl ActiveInput {
+    pub(crate) fn new(native_sample_rate: u32, stream: impl Send + Sync + 'static) -> Self {
+        Self {
+            native_sample_rate,
+            _stream: Box::new(stream),
+        }
+    }
+
+    pub(crate) fn native_sample_rate(&self) -> u32 {
+        self.native_sample_rate
+    }
+}
+
+/// Thin cpal adapter. Construction is device-free; each start resolves the
+/// current Default Input and owns that stream for one capture segment.
+pub(crate) struct CpalCaptureBackend {
+    label: &'static str,
+}
+
+impl CpalCaptureBackend {
+    pub(crate) const fn new(label: &'static str) -> Self {
+        Self { label }
+    }
+}
+
+impl CaptureBackend for CpalCaptureBackend {
+    fn start_default_input(&self, mut on_data: InputDataCallback) -> Result<ActiveInput> {
+        let input = open_default_input(self.label)?;
+        let channels = input.channels;
+        let native_sample_rate = input.native_sample_rate;
+        let label = self.label;
+        let stream = input
+            .device
+            .build_input_stream(
+                &input.config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    on_data(data, channels);
+                },
+                move |err| error!("{label} audio stream error: {err}"),
+                None,
+            )
+            .context("Failed to build default input stream")?;
+        stream
+            .play()
+            .context("Failed to start default input stream")?;
+
+        Ok(ActiveInput::new(native_sample_rate, stream))
+    }
+}
 
 /// An opened default input device plus the native config we capture at.
 ///
