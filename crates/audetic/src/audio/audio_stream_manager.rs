@@ -1,13 +1,13 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
-use anyhow::{Context, Result};
-use cpal::traits::{DeviceTrait, StreamTrait};
+use anyhow::Result;
 use hound::{WavSpec, WavWriter};
+use tracing::{debug, info};
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, error, info};
 
-use super::input_device::{open_default_input, OpenInput};
+use super::input_device::{ActiveInput, CaptureBackend, CpalCaptureBackend, InputDataCallback};
 use super::resample::{push_mono_f32, resample_mono_f32};
 
 /// Target sample rate the VTT pipeline (Whisper) expects. The device may
@@ -24,16 +24,11 @@ pub enum RecordingState {
 
 /// Manages the lifecycle of audio streams and recordings
 pub struct AudioStreamManager {
-    /// Default input device + native config, opened lazily on first
-    /// `start_recording`. Acquiring it touches a CoreAudio audio unit which
-    /// gates on the macOS mic TCC permission — doing it eagerly at boot wedges
-    /// the whole daemon in `tccd` until the grant resolves (see
-    /// [`crate::audio::input_device`]). `Mutex` because `start_recording`
-    /// takes `&self`.
-    input: Mutex<Option<OpenInput>>,
+    /// Device-free adapter that resolves Default Input for each recording.
+    backend: Box<dyn CaptureBackend>,
     /// Mono samples at the *native* rate, accumulated by the cpal callback.
     samples: Arc<Mutex<Vec<f32>>>,
-    active_stream: Arc<Mutex<Option<cpal::Stream>>>,
+    active_input: Mutex<Option<ActiveInput>>,
     state: Arc<Mutex<RecordingState>>,
 }
 
@@ -45,12 +40,18 @@ impl AudioStreamManager {
     /// hasn't been resolved yet. Returns `Result` only to keep the call site
     /// stable; construction itself is infallible.
     pub fn new() -> Result<Self> {
-        Ok(Self {
-            input: Mutex::new(None),
+        Ok(Self::with_backend(Box::new(CpalCaptureBackend::new(
+            "Dictation",
+        ))))
+    }
+
+    fn with_backend(backend: Box<dyn CaptureBackend>) -> Self {
+        Self {
+            backend,
             samples: Arc::new(Mutex::new(Vec::new())),
-            active_stream: Arc::new(Mutex::new(None)),
+            active_input: Mutex::new(None),
             state: Arc::new(Mutex::new(RecordingState::Idle)),
-        })
+        }
     }
 
     /// Start recording audio, properly managing stream lifecycle
@@ -79,34 +80,17 @@ impl AudioStreamManager {
 
         debug!("Creating new audio stream");
 
-        // Open the device on first use. On macOS this is the call that gates on
-        // the mic TCC permission; doing it here (a user-initiated record) rather
-        // than at boot keeps the daemon responsive and lets the OS surface its
-        // permission prompt at the right moment.
-        let mut input = self.input.lock().unwrap();
-        if input.is_none() {
-            *input = Some(open_default_input("Dictation")?);
-        }
-        let input = input.as_ref().unwrap();
-
         let samples_clone = self.samples.clone();
-        let channels = input.channels;
-        let err_fn = |err| error!("Audio stream error: {}", err);
+        let on_data: InputDataCallback = Box::new(move |data, channels| {
+            push_mono_f32(data, channels, &samples_clone);
+        });
 
-        let stream = input.device.build_input_stream(
-            &input.config,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                push_mono_f32(data, channels, &samples_clone);
-            },
-            err_fn,
-            None,
-        )?;
-
-        stream.play()?;
+        // Resolving Default Input stays user-initiated and lazy because the
+        // native config lookup can gate on macOS microphone permission.
+        let active_input = self.backend.start_default_input(on_data)?;
         info!("Started audio recording");
 
-        // Store stream for proper cleanup
-        *self.active_stream.lock().unwrap() = Some(stream);
+        *self.active_input.lock().unwrap() = Some(active_input);
         *state = RecordingState::Recording;
 
         Ok(())
@@ -129,8 +113,15 @@ impl AudioStreamManager {
         *state = RecordingState::Stopping;
         drop(state); // Release lock before cleanup
 
-        // Stop and cleanup stream
-        self.cleanup_stream();
+        // End this native-rate segment before reading its samples.
+        let Some(active_input) = self.active_input.lock().unwrap().take() else {
+            *self.state.lock().unwrap() = RecordingState::Idle;
+            return Err(anyhow::anyhow!(
+                "Recording stopped but no input stream was active"
+            ));
+        };
+        let native_sample_rate = active_input.native_sample_rate();
+        drop(active_input);
 
         // Extract native-rate samples
         let native = {
@@ -142,17 +133,6 @@ impl AudioStreamManager {
             *self.state.lock().unwrap() = RecordingState::Idle;
             return Err(anyhow::anyhow!("No audio samples recorded"));
         }
-
-        // The device was opened by `start_recording`, so the native rate is
-        // known. (If we somehow recorded without it, `native` would be empty
-        // and we'd have bailed above.)
-        let native_sample_rate = self
-            .input
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|i| i.native_sample_rate)
-            .context("Recording stopped but input device was never opened")?;
 
         // Resample from the device's native rate to the VTT target rate. This
         // is a no-op (early return) when they already match — e.g. Linux
@@ -196,11 +176,11 @@ impl AudioStreamManager {
 
     /// Cleanup any active stream
     fn cleanup_stream(&self) {
-        let mut active_stream = self.active_stream.lock().unwrap();
-        if let Some(stream) = active_stream.take() {
+        let mut active_input = self.active_input.lock().unwrap();
+        if let Some(input) = active_input.take() {
             debug!("Cleaning up audio stream");
             // Stream is automatically stopped when dropped
-            drop(stream);
+            drop(input);
         }
     }
 }
@@ -214,7 +194,30 @@ impl Drop for AudioStreamManager {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::super::input_device::{ActiveInput, CaptureBackend, InputDataCallback};
     use super::*;
+
+    #[derive(Clone)]
+    struct FakeDefaultInput {
+        sample_rate: u32,
+        samples: Vec<f32>,
+    }
+
+    struct FakeCaptureBackend {
+        current_default: Arc<Mutex<FakeDefaultInput>>,
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl CaptureBackend for FakeCaptureBackend {
+        fn start_default_input(&self, mut on_data: InputDataCallback) -> Result<ActiveInput> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            let current = self.current_default.lock().unwrap().clone();
+            on_data(&current.samples, 1);
+            Ok(ActiveInput::new(current.sample_rate, ()))
+        }
+    }
 
     /// Construction must not touch the audio device — it's deferred to the
     /// first `start_recording` so the daemon boots even when no device is
@@ -228,5 +231,49 @@ mod tests {
             manager.is_ok(),
             "AudioStreamManager::new() must be infallible and device-free"
         );
+    }
+
+    #[tokio::test]
+    async fn fresh_dictation_resolves_the_current_default_input() {
+        let current_default = Arc::new(Mutex::new(FakeDefaultInput {
+            sample_rate: 48_000,
+            samples: vec![0.25; 480],
+        }));
+        let starts = Arc::new(AtomicUsize::new(0));
+        let manager = AudioStreamManager::with_backend(Box::new(FakeCaptureBackend {
+            current_default: current_default.clone(),
+            starts: starts.clone(),
+        }));
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let first_path = output_dir.path().join("default-a.wav");
+        manager.start_recording().await.unwrap();
+        manager.stop_recording(first_path.clone()).await.unwrap();
+
+        *current_default.lock().unwrap() = FakeDefaultInput {
+            sample_rate: 44_100,
+            samples: vec![-0.5; 441],
+        };
+
+        let second_path = output_dir.path().join("default-b.wav");
+        manager.start_recording().await.unwrap();
+        manager.stop_recording(second_path.clone()).await.unwrap();
+
+        let first = read_samples(&first_path);
+        let second = read_samples(&second_path);
+        assert_eq!(first.len(), 160);
+        assert_eq!(second.len(), 160);
+        assert!(first.iter().all(|sample| *sample > 0.0));
+        assert!(second.iter().all(|sample| *sample < 0.0));
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    fn read_samples(path: &std::path::Path) -> Vec<f32> {
+        hound::WavReader::open(path)
+            .unwrap()
+            .samples::<f32>()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
     }
 }
