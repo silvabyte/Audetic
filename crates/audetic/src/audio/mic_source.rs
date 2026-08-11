@@ -9,10 +9,11 @@
 //! so the meeting microphone remains aligned with the System Tap.
 
 use anyhow::{anyhow, Context, Result};
+use tracing::{debug, info, warn};
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tracing::{debug, info, warn};
 
 use super::audio_source::{AudioSource, MeetingMicSource};
 use super::capture_recovery::{start_capture_with_retries, CaptureRecovery};
@@ -139,11 +140,26 @@ impl MicAudioSource {
             }
         });
 
-        let input = self
-            .backend
-            .start_default_input(on_data, on_error)
-            .context("Failed to start meeting microphone Segment")?;
+        self.live_generation.store(generation.0, Ordering::SeqCst);
+        let input = match self.backend.start_default_input(on_data, on_error) {
+            Ok(input) => input,
+            Err(error) => {
+                let _ = self.live_generation.compare_exchange(
+                    generation.0,
+                    0,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+                return Err(error).context("Failed to start meeting microphone Segment");
+            }
+        };
         self.stream_generation = generation;
+        if self.live_generation.load(Ordering::SeqCst) != generation.0 {
+            drop(input);
+            return Err(anyhow!(
+                "Meeting microphone stream died while its Segment was starting"
+            ));
+        }
         Ok(ActiveSegment {
             input,
             native_samples,
@@ -152,8 +168,6 @@ impl MicAudioSource {
     }
 
     fn install_segment(&mut self, segment: ActiveSegment) {
-        self.live_generation
-            .store(segment.generation.0, Ordering::SeqCst);
         self.active_segment = Some(segment);
     }
 
@@ -287,6 +301,10 @@ impl AudioSource for MicAudioSource {
         self.session_active
     }
 
+    fn has_live_stream(&self) -> bool {
+        self.active_segment.is_some() && self.live_generation.load(Ordering::SeqCst) != 0
+    }
+
     fn sample_rate(&self) -> u32 {
         self.target_sample_rate
     }
@@ -300,10 +318,6 @@ impl MeetingMicSource for MicAudioSource {
 
     async fn stream_died(&mut self, death: StreamDeath) -> Result<CaptureRecovery> {
         self.replace_capture(Some(death)).await
-    }
-
-    fn has_live_stream(&self) -> bool {
-        self.active_segment.is_some() && self.live_generation.load(Ordering::SeqCst) != 0
     }
 }
 
@@ -389,6 +403,26 @@ mod tests {
 
     struct TokioClock {
         origin: tokio::time::Instant,
+    }
+
+    struct EarlyDeathBackend {
+        starts: Arc<AtomicUsize>,
+    }
+
+    impl CaptureBackend for EarlyDeathBackend {
+        fn start_default_input(
+            &self,
+            mut on_data: InputDataCallback,
+            mut on_error: InputErrorCallback,
+        ) -> Result<ActiveInput> {
+            let start = self.starts.fetch_add(1, Ordering::SeqCst);
+            if start == 0 {
+                on_error();
+            } else {
+                on_data(&vec![0.25; 480], 1);
+            }
+            Ok(ActiveInput::new(48_000, ()))
+        }
     }
 
     impl MonotonicClock for TokioClock {
@@ -677,5 +711,38 @@ mod tests {
         assert_eq!(track.len(), 4_960);
         assert!(track[..4_800].iter().all(|sample| *sample == 0.0));
         assert!(track[4_800..].iter().all(|sample| *sample > 0.0));
+    }
+
+    #[tokio::test]
+    async fn death_while_stream_starts_cannot_be_installed_as_live() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(EarlyDeathBackend {
+                starts: starts.clone(),
+            }),
+            {
+                let events = events.clone();
+                Arc::new(move |event| events.lock().unwrap().push(event))
+            },
+            Arc::new(FakeClock::default()),
+        );
+
+        assert!(mic.start().is_err());
+        assert!(!mic.has_live_stream());
+        let early_death = events.lock().unwrap().pop().unwrap();
+        assert_eq!(early_death.generation, StreamGeneration(1));
+
+        assert_eq!(
+            mic.default_input_switched().await.unwrap(),
+            CaptureRecovery::Capturing
+        );
+        assert_eq!(
+            mic.stream_died(early_death).await.unwrap(),
+            CaptureRecovery::Ignored
+        );
+        assert!(mic.has_live_stream());
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
     }
 }

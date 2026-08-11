@@ -38,6 +38,10 @@ impl AudioSource for SystemAudioSource {
         self.active
     }
 
+    fn has_live_stream(&self) -> bool {
+        false
+    }
+
     fn sample_rate(&self) -> u32 {
         self.target_sample_rate
     }

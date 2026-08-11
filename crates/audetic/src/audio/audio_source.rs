@@ -19,6 +19,11 @@ pub trait AudioSource {
     /// Whether this source is currently capturing.
     fn is_active(&self) -> bool;
 
+    /// Whether the logical source currently has a live capture stream.
+    fn has_live_stream(&self) -> bool {
+        self.is_active()
+    }
+
     /// The sample rate of captured audio.
     fn sample_rate(&self) -> u32;
 }
@@ -33,9 +38,5 @@ pub trait MeetingMicSource: AudioSource {
 
     async fn stream_died(&mut self, _death: StreamDeath) -> Result<CaptureRecovery> {
         Ok(CaptureRecovery::Ignored)
-    }
-
-    fn has_live_stream(&self) -> bool {
-        self.is_active()
     }
 }
