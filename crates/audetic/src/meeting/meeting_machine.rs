@@ -252,14 +252,14 @@ impl MeetingMachine {
         let audio_path = state.audio_path.clone().unwrap_or_default();
 
         // Stop audio sources and collect samples
-        let mic_samples = match self.mic_source.stop() {
-            Ok(s) => s,
+        let (mic_samples, mic_stop_succeeded) = match self.mic_source.stop() {
+            Ok(samples) => (samples, true),
             Err(e) => {
                 warn!("Failed to stop mic: {}", e);
-                Vec::new()
+                (Vec::new(), false)
             }
         };
-        let mic_captured_audio = self.mic_source.has_captured_audio();
+        let mic_captured_audio = mic_stop_succeeded && self.mic_source.has_captured_audio();
 
         let mic_rate = self.mic_source.sample_rate();
 
@@ -934,6 +934,45 @@ mod tests {
         let started = machine.start(None).await.unwrap();
         assert_eq!(started.capture_state, CaptureState::SystemOnly);
         clock.advance(Duration::from_millis(300));
+
+        assert!(machine.stop().await.is_err());
+        assert_eq!(status.get().await.phase, MeetingPhase::Error);
+        assert!(!started.audio_path.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_mic_normalization_does_not_count_as_captured_audio() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            0,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Input(PlannedInput {
+                    sample_rate: 48_000,
+                    samples: vec![0.25; 480],
+                    open_duration: Duration::ZERO,
+                })])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = MeetingStatusHandle::default();
+        let meetings_dir = tempfile::tempdir().unwrap();
+        let mut machine = MeetingMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: Vec::new(),
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Arc::new(PostProcessingService::new()),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            meetings_dir.path().to_path_buf(),
+        );
+
+        let started = machine.start(None).await.unwrap();
+        assert_eq!(started.capture_state, CaptureState::Both);
 
         assert!(machine.stop().await.is_err());
         assert_eq!(status.get().await.phase, MeetingPhase::Error);

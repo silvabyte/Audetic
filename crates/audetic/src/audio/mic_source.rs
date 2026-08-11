@@ -49,6 +49,7 @@ struct ActiveSegment {
     input: ActiveInput,
     native_samples: Arc<Mutex<Vec<f32>>>,
     generation: StreamGeneration,
+    started_at: Duration,
 }
 
 pub struct MicAudioSource {
@@ -156,6 +157,7 @@ impl MicAudioSource {
             }
         };
         self.stream_generation = generation;
+        let started_at = self.clock.now();
         if self.live_generation.load(Ordering::SeqCst) != generation.0 {
             drop(input);
             return Err(anyhow!(
@@ -166,6 +168,7 @@ impl MicAudioSource {
             input,
             native_samples,
             generation,
+            started_at,
         })
     }
 
@@ -179,10 +182,19 @@ impl MicAudioSource {
     }
 
     fn append_silence_fill(&mut self) -> Result<()> {
-        let Some(started_at) = self.gap_started_at.lock().unwrap().take() else {
+        let started_at = self.gap_started_at.lock().unwrap().take();
+        let Some(started_at) = started_at else {
             return Ok(());
         };
-        let elapsed = self.clock.now().saturating_sub(started_at);
+        self.append_silence_fill_between(started_at, self.clock.now())
+    }
+
+    fn append_silence_fill_between(
+        &mut self,
+        started_at: Duration,
+        ended_at: Duration,
+    ) -> Result<()> {
+        let elapsed = ended_at.saturating_sub(started_at);
         // A fractional canonical sample cannot be represented. Round each gap
         // down so Silence Fill never claims capture beyond the observed gap.
         let fill_samples = elapsed.as_nanos() * u128::from(self.target_sample_rate)
@@ -205,9 +217,9 @@ impl MicAudioSource {
         let native_sample_rate = segment.input.native_sample_rate();
         drop(segment.input);
         let native = std::mem::take(&mut *segment.native_samples.lock().unwrap());
-        self.captured_audio |= !native.is_empty();
         let canonical = resample_mono_f32(&native, native_sample_rate, self.target_sample_rate)
             .context("Failed to normalize meeting microphone Segment")?;
+        self.captured_audio |= !native.is_empty();
         debug!(
             "Closed meeting microphone Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
             native.len(),
@@ -238,19 +250,39 @@ impl MicAudioSource {
         self.begin_gap();
         self.close_current_segment()
             .context("Failed to close meeting microphone Segment for replacement")?;
+        let replacement_gap_started_at = self
+            .gap_started_at
+            .lock()
+            .unwrap()
+            .take()
+            .expect("replacement always begins a capture gap");
 
         match start_capture_with_retries("replacement meeting Default Input", || {
+            *self.gap_started_at.lock().unwrap() = None;
             self.start_segment()
         })
         .await
         {
             Ok(segment) => {
-                self.append_silence_fill()?;
+                let segment_started_at = segment.started_at;
+                self.append_silence_fill_between(replacement_gap_started_at, segment_started_at)?;
                 self.install_segment(segment);
+                if !self.has_live_stream() {
+                    self.close_current_segment().context(
+                        "Failed to close replacement Segment that died while being installed",
+                    )?;
+                    warn!("Meeting microphone remains in Degraded Capture");
+                    return Ok(CaptureRecovery::Degraded);
+                }
                 info!("Recovered meeting microphone on the current Default Input");
                 Ok(CaptureRecovery::Capturing)
             }
             Err(_) => {
+                let mut gap = self.gap_started_at.lock().unwrap();
+                *gap = Some(
+                    gap.map(|started_at| started_at.min(replacement_gap_started_at))
+                        .unwrap_or(replacement_gap_started_at),
+                );
                 warn!("Meeting microphone remains in Degraded Capture");
                 Ok(CaptureRecovery::Degraded)
             }
