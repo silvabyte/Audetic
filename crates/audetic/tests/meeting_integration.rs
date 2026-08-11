@@ -16,7 +16,7 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
-use audetic::audio::audio_source::AudioSource;
+use audetic::audio::audio_source::{AudioSource, MeetingMicSource};
 use audetic::meeting::{MeetingMachine, MeetingPhase, MeetingStartOptions, MeetingStatusHandle};
 use audetic::post_processing::PostProcessingService;
 use audetic::transcription::job_service::{TranscriptionJobResult, TranscriptionJobService};
@@ -64,6 +64,9 @@ impl AudioSource for MockAudioSource {
         self.rate
     }
 }
+
+#[async_trait(?Send)]
+impl MeetingMicSource for MockAudioSource {}
 
 // ---- mock transcription service ----
 
@@ -128,7 +131,7 @@ fn build_test_machine(
     system_samples: Vec<f32>,
     transcription: Arc<dyn TranscriptionJobService>,
 ) -> (MeetingMachine, MeetingStatusHandle) {
-    let mic: Box<dyn AudioSource> = Box::new(MockAudioSource::new(mic_samples, 16000));
+    let mic: Box<dyn MeetingMicSource> = Box::new(MockAudioSource::new(mic_samples, 16000));
     let system: Box<dyn AudioSource> = Box::new(MockAudioSource::new(system_samples, 16000));
     let indicator = Indicator::new().with_audio_feedback(false);
     let status = MeetingStatusHandle::default();

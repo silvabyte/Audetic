@@ -7,7 +7,7 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::audio::audio_stream_manager::CaptureRecovery;
+use crate::audio::capture_recovery::CaptureRecovery;
 use crate::audio::stream_event::StreamDeath;
 use crate::audio::AudioStreamManager;
 use crate::db::{self, VoiceToTextData, Workflow, WorkflowData, WorkflowType};

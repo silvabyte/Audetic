@@ -99,6 +99,7 @@ pub struct MeetingToggleResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingStatusResponse {
     pub active: bool,
+    pub capture_degraded: bool,
     pub meeting_id: Option<i64>,
     pub phase: String,
     pub duration_seconds: Option<i64>,
@@ -498,15 +499,20 @@ pub async fn meeting_status(
         }));
     }
 
-    Json(json!({
-        "active": is_active,
+    Json(default_meeting_status_json(&status))
+}
+
+fn default_meeting_status_json(status: &crate::meeting::MeetingState) -> Value {
+    json!({
+        "active": status.phase == MeetingPhase::Recording,
+        "capture_degraded": status.capture_degraded,
         "meeting_id": status.meeting_id,
         "phase": status.phase.as_str(),
         "duration_seconds": status.duration_seconds(),
         "title": status.title,
-        "audio_path": status.audio_path.map(|p| p.to_string_lossy().to_string()),
+        "audio_path": status.audio_path.as_ref().map(|p| p.to_string_lossy().to_string()),
         "last_error": status.last_error,
-    }))
+    })
 }
 
 #[utoipa::path(
@@ -1161,4 +1167,24 @@ fn import_error(status: StatusCode, message: String) -> Response {
         })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn default_status_json_exposes_capture_health() {
+        let status = MeetingStatusHandle::default();
+        status
+            .start_recording(1, None, PathBuf::from("/tmp/meeting.wav"), false, true)
+            .await;
+
+        let recording = default_meeting_status_json(&status.get().await);
+        assert_eq!(recording["capture_degraded"], true);
+
+        status.enter_review(1).await;
+        let review = default_meeting_status_json(&status.get().await);
+        assert_eq!(review["capture_degraded"], false);
+    }
 }

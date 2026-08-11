@@ -1089,6 +1089,7 @@ export interface components {
         MeetingStatusResponse: {
             active: boolean;
             audio_path?: string | null;
+            capture_degraded: boolean;
             /** Format: int64 */
             duration_seconds?: number | null;
             last_error?: string | null;

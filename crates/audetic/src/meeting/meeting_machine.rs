@@ -15,7 +15,8 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::audio::audio_mixer::AudioMixer;
-use crate::audio::audio_source::AudioSource;
+use crate::audio::audio_source::{AudioSource, MeetingMicSource};
+use crate::audio::stream_event::StreamDeath;
 use crate::db::{self, meetings::MeetingRepository};
 use crate::post_processing::PostProcessingService;
 use crate::transcription::job_service::TranscriptionJobService;
@@ -74,7 +75,7 @@ pub struct MeetingStartResult {
 }
 
 pub struct MeetingMachine {
-    mic_source: Box<dyn AudioSource>,
+    mic_source: Box<dyn MeetingMicSource>,
     system_source: Box<dyn AudioSource>,
     transcription: Arc<dyn TranscriptionJobService>,
     post_processing: Arc<PostProcessingService>,
@@ -85,7 +86,7 @@ pub struct MeetingMachine {
 
 impl MeetingMachine {
     pub fn new(
-        mic_source: Box<dyn AudioSource>,
+        mic_source: Box<dyn MeetingMicSource>,
         system_source: Box<dyn AudioSource>,
         transcription: Arc<dyn TranscriptionJobService>,
         post_processing: Arc<PostProcessingService>,
@@ -137,7 +138,7 @@ impl MeetingMachine {
         };
 
         // Start audio sources — track which ones actually came up.
-        let mic_ok = match self.mic_source.start() {
+        let mic_started = match self.mic_source.start() {
             Ok(()) => true,
             Err(e) => {
                 warn!("Failed to start mic: {}", e);
@@ -145,7 +146,7 @@ impl MeetingMachine {
             }
         };
 
-        let system_ok = match self.system_source.start() {
+        let system_started = match self.system_source.start() {
             Ok(()) => true,
             Err(e) => {
                 warn!("Failed to start system audio: {}", e);
@@ -153,11 +154,15 @@ impl MeetingMachine {
             }
         };
 
+        let mic_ok = mic_started && self.mic_source.has_live_stream();
+        let system_ok = system_started && self.system_source.is_active();
         let capture_state = match (mic_ok, system_ok) {
             (true, true) => CaptureState::Both,
             (true, false) => CaptureState::MicOnly,
             (false, true) => CaptureState::SystemOnly,
             (false, false) => {
+                let _ = self.mic_source.stop();
+                let _ = self.system_source.stop();
                 // Clean up DB row so we don't leave a dangling "recording" meeting
                 if let Ok(conn) = db::init_db() {
                     let _ = MeetingRepository::fail(
@@ -172,7 +177,13 @@ impl MeetingMachine {
         };
 
         self.status
-            .start_recording(meeting_id, opts.title.clone(), audio_path.clone())
+            .start_recording(
+                meeting_id,
+                opts.title.clone(),
+                audio_path.clone(),
+                mic_ok,
+                system_ok,
+            )
             .await;
 
         info!(
@@ -204,6 +215,18 @@ impl MeetingMachine {
             audio_path,
             capture_state,
         })
+    }
+
+    pub(crate) async fn default_input_switched(&mut self) -> Result<()> {
+        let recovery = self.mic_source.default_input_switched().await?;
+        self.status.apply_microphone_recovery(recovery).await;
+        Ok(())
+    }
+
+    pub(crate) async fn microphone_stream_died(&mut self, death: StreamDeath) -> Result<()> {
+        let recovery = self.mic_source.stream_died(death).await?;
+        self.status.apply_microphone_recovery(recovery).await;
+        Ok(())
     }
 
     /// Stop the meeting recording.
