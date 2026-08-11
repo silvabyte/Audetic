@@ -49,7 +49,15 @@ struct ActiveSegment {
     input: ActiveInput,
     native_samples: Arc<Mutex<Vec<f32>>>,
     generation: StreamGeneration,
-    started_at: Duration,
+    first_data: Arc<Mutex<Option<(Duration, usize)>>>,
+    attempt_started_at: Duration,
+    death_started_at: Arc<Mutex<Option<Duration>>>,
+    gap_before: Option<Duration>,
+}
+
+struct ClosedSegment {
+    ended_at: Duration,
+    death_started_at: Option<Duration>,
 }
 
 pub struct MicAudioSource {
@@ -60,7 +68,7 @@ pub struct MicAudioSource {
     live_generation: Arc<AtomicU64>,
     stream_event_sink: StreamEventSink,
     clock: Arc<dyn MonotonicClock>,
-    gap_started_at: Arc<Mutex<Option<Duration>>>,
+    pending_gap_started_at: Option<Duration>,
     session_active: bool,
     captured_audio: bool,
     target_sample_rate: u32,
@@ -110,7 +118,7 @@ impl MicAudioSource {
             live_generation: Arc::new(AtomicU64::new(0)),
             stream_event_sink,
             clock,
-            gap_started_at: Arc::new(Mutex::new(None)),
+            pending_gap_started_at: None,
             session_active: false,
             captured_audio: false,
             target_sample_rate: sample_rate,
@@ -122,11 +130,11 @@ impl MicAudioSource {
         self.stream_generation = generation;
         let native_samples = Arc::new(Mutex::new(Vec::new()));
         let callback_samples = native_samples.clone();
-        let segment_started_at = Arc::new(Mutex::new(None));
-        let callback_started_at = segment_started_at.clone();
+        let first_data = Arc::new(Mutex::new(None));
+        let callback_first_data = first_data.clone();
         let data_clock = self.clock.clone();
         let on_data: InputDataCallback = Box::new(move |data, channels| {
-            callback_started_at.lock().unwrap().get_or_insert_with(|| {
+            callback_first_data.lock().unwrap().get_or_insert_with(|| {
                 let frames = if channels == 0 {
                     0
                 } else {
@@ -138,7 +146,8 @@ impl MicAudioSource {
         });
 
         let live_generation = self.live_generation.clone();
-        let gap_started_at = self.gap_started_at.clone();
+        let death_started_at = Arc::new(Mutex::new(None));
+        let callback_death_started_at = death_started_at.clone();
         let clock = self.clock.clone();
         let stream_event_sink = self.stream_event_sink.clone();
         let on_error: InputErrorCallback = Box::new(move || {
@@ -146,8 +155,7 @@ impl MicAudioSource {
                 .compare_exchange(generation.0, 0, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                let mut gap = gap_started_at.lock().unwrap();
-                gap.get_or_insert_with(|| clock.now());
+                *callback_death_started_at.lock().unwrap() = Some(clock.now());
                 stream_event_sink(StreamDeath {
                     source: CaptureSource::MeetingMicrophone,
                     generation,
@@ -169,18 +177,6 @@ impl MicAudioSource {
                 return Err(error).context("Failed to start meeting microphone Segment");
             }
         };
-        let started_at = match *segment_started_at.lock().unwrap() {
-            Some((callback_at, frames)) => {
-                let buffered_nanos = frames as u128 * Duration::from_secs(1).as_nanos()
-                    / u128::from(input.native_sample_rate());
-                let buffered_nanos = u64::try_from(buffered_nanos)
-                    .context("First microphone callback duration overflowed")?;
-                callback_at
-                    .saturating_sub(Duration::from_nanos(buffered_nanos))
-                    .max(attempt_started_at)
-            }
-            None => self.clock.now(),
-        };
         if self.live_generation.load(Ordering::SeqCst) != generation.0 {
             drop(input);
             return Err(anyhow!(
@@ -191,7 +187,10 @@ impl MicAudioSource {
             input,
             native_samples,
             generation,
-            started_at,
+            first_data,
+            attempt_started_at,
+            death_started_at,
+            gap_before: None,
         })
     }
 
@@ -199,13 +198,20 @@ impl MicAudioSource {
         self.active_segment = Some(segment);
     }
 
-    fn begin_gap(&self) {
-        let mut gap = self.gap_started_at.lock().unwrap();
-        gap.get_or_insert_with(|| self.clock.now());
+    fn begin_gap(&mut self) {
+        self.set_pending_gap(self.clock.now());
+    }
+
+    fn set_pending_gap(&mut self, started_at: Duration) {
+        self.pending_gap_started_at = Some(
+            self.pending_gap_started_at
+                .map(|pending| pending.min(started_at))
+                .unwrap_or(started_at),
+        );
     }
 
     fn append_silence_fill(&mut self) -> Result<()> {
-        let started_at = self.gap_started_at.lock().unwrap().take();
+        let started_at = self.pending_gap_started_at.take();
         let Some(started_at) = started_at else {
             return Ok(());
         };
@@ -232,17 +238,53 @@ impl MicAudioSource {
         Ok(())
     }
 
-    fn close_current_segment(&mut self) -> Result<bool> {
+    fn duration_for_frames(frames: usize, sample_rate: u32) -> Result<Duration> {
+        if sample_rate == 0 {
+            return Err(anyhow!("Segment sample rate cannot be zero"));
+        }
+        let nanos = frames as u128 * Duration::from_secs(1).as_nanos() / u128::from(sample_rate);
+        Ok(Duration::from_nanos(
+            u64::try_from(nanos).context("Segment duration overflowed")?,
+        ))
+    }
+
+    fn close_current_segment(&mut self) -> Result<Option<ClosedSegment>> {
+        let close_started_at = self.clock.now();
         self.live_generation.store(0, Ordering::SeqCst);
         let Some(segment) = self.active_segment.take() else {
-            return Ok(false);
+            return Ok(None);
         };
         let native_sample_rate = segment.input.native_sample_rate();
         drop(segment.input);
+        let death_started_at = *segment.death_started_at.lock().unwrap();
         let native = std::mem::take(&mut *segment.native_samples.lock().unwrap());
+        if native.is_empty() {
+            if let Some(gap_before) = segment.gap_before {
+                self.set_pending_gap(gap_before);
+            }
+            return Ok(Some(ClosedSegment {
+                ended_at: close_started_at,
+                death_started_at,
+            }));
+        }
+
+        let (callback_at, first_buffer_frames) = segment
+            .first_data
+            .lock()
+            .unwrap()
+            .context("Captured microphone samples have no first callback timing")?;
+        let first_sample_at = callback_at
+            .saturating_sub(Self::duration_for_frames(
+                first_buffer_frames,
+                native_sample_rate,
+            )?)
+            .max(segment.attempt_started_at);
+        if let Some(gap_before) = segment.gap_before {
+            self.append_silence_fill_between(gap_before, first_sample_at)?;
+        }
         let canonical = resample_mono_f32(&native, native_sample_rate, self.target_sample_rate)
             .context("Failed to normalize meeting microphone Segment")?;
-        self.captured_audio |= !native.is_empty();
+        self.captured_audio |= !canonical.is_empty();
         debug!(
             "Closed meeting microphone Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
             native.len(),
@@ -251,7 +293,11 @@ impl MicAudioSource {
             self.target_sample_rate
         );
         self.canonical_samples.extend(canonical);
-        Ok(true)
+        Ok(Some(ClosedSegment {
+            ended_at: first_sample_at
+                .saturating_add(Self::duration_for_frames(native.len(), native_sample_rate)?),
+            death_started_at,
+        }))
     }
 
     async fn replace_capture(&mut self, death: Option<StreamDeath>) -> Result<CaptureRecovery> {
@@ -270,40 +316,41 @@ impl MicAudioSource {
             }
         }
 
-        if death.is_some() {
-            // The error callback records the exact death time before queuing
-            // the command; direct test injections fall back to handling time.
-            self.begin_gap();
-            self.close_current_segment()
-                .context("Failed to close dead meeting microphone Segment")?;
-        } else {
-            // A proactive switch may still deliver samples while the old
-            // stream is shutting down. Start Silence Fill only after it closes.
-            self.close_current_segment()
-                .context("Failed to close meeting microphone Segment for replacement")?;
-            self.begin_gap();
+        let closed = self
+            .close_current_segment()
+            .context("Failed to close meeting microphone Segment for replacement")?;
+        match (death, closed) {
+            (Some(_), Some(closed)) => self.set_pending_gap(
+                closed
+                    .death_started_at
+                    .unwrap_or_else(|| self.clock.now())
+                    .max(closed.ended_at),
+            ),
+            (None, Some(closed)) => self.set_pending_gap(closed.ended_at),
+            (_, None) if self.pending_gap_started_at.is_none() => self.begin_gap(),
+            _ => {}
         }
-        let replacement_gap_started_at = self
-            .gap_started_at
-            .lock()
-            .unwrap()
-            .take()
-            .expect("replacement always begins a capture gap");
 
         match start_capture_with_retries("replacement meeting Default Input", || {
-            *self.gap_started_at.lock().unwrap() = None;
             self.start_segment()
         })
         .await
         {
-            Ok(segment) => {
-                let segment_started_at = segment.started_at;
-                self.append_silence_fill_between(replacement_gap_started_at, segment_started_at)?;
+            Ok(mut segment) => {
+                segment.gap_before = self.pending_gap_started_at.take();
                 self.install_segment(segment);
                 if !self.has_live_stream() {
-                    self.close_current_segment().context(
+                    let closed = self.close_current_segment().context(
                         "Failed to close replacement Segment that died while being installed",
                     )?;
+                    if let Some(closed) = closed {
+                        self.set_pending_gap(
+                            closed
+                                .death_started_at
+                                .unwrap_or_else(|| self.clock.now())
+                                .max(closed.ended_at),
+                        );
+                    }
                     warn!("Meeting microphone remains in Degraded Capture");
                     return Ok(CaptureRecovery::Degraded);
                 }
@@ -311,11 +358,6 @@ impl MicAudioSource {
                 Ok(CaptureRecovery::Capturing)
             }
             Err(_) => {
-                let mut gap = self.gap_started_at.lock().unwrap();
-                *gap = Some(
-                    gap.map(|started_at| started_at.min(replacement_gap_started_at))
-                        .unwrap_or(replacement_gap_started_at),
-                );
                 warn!("Meeting microphone remains in Degraded Capture");
                 Ok(CaptureRecovery::Degraded)
             }
@@ -331,7 +373,7 @@ impl AudioSource for MicAudioSource {
 
         self.close_current_segment()?;
         self.canonical_samples.clear();
-        *self.gap_started_at.lock().unwrap() = None;
+        self.pending_gap_started_at = None;
         self.session_active = true;
         self.captured_audio = false;
 
@@ -350,8 +392,14 @@ impl AudioSource for MicAudioSource {
             return Err(anyhow!("Mic source not recording"));
         }
         self.session_active = false;
-        self.close_current_segment()
+        let closed = self
+            .close_current_segment()
             .context("Failed to close final meeting microphone Segment")?;
+        if let Some(closed) = closed {
+            if let Some(death_started_at) = closed.death_started_at {
+                self.set_pending_gap(death_started_at.max(closed.ended_at));
+            }
+        }
         self.append_silence_fill()?;
         let canonical = std::mem::take(&mut self.canonical_samples);
         info!(
@@ -379,7 +427,7 @@ impl AudioSource for MicAudioSource {
 impl MeetingMicSource for MicAudioSource {
     fn mark_meeting_started(&mut self) {
         if self.session_active && !self.has_live_stream() {
-            *self.gap_started_at.lock().unwrap() = Some(self.clock.now());
+            self.pending_gap_started_at = Some(self.clock.now());
         }
     }
 
@@ -554,6 +602,7 @@ mod tests {
             _on_error: InputErrorCallback,
         ) -> Result<ActiveInput> {
             if self.starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.clock.advance(Duration::from_millis(10));
                 on_data(&vec![0.25; 480], 1);
                 return Ok(ActiveInput::new(48_000, ()));
             }
@@ -608,7 +657,7 @@ mod tests {
                 PlannedInput {
                     sample_rate: 48_000,
                     samples: vec![0.25; 480],
-                    open_duration: Duration::ZERO,
+                    open_duration: Duration::from_millis(10),
                 },
                 PlannedInput {
                     sample_rate: 44_100,
@@ -683,6 +732,7 @@ mod tests {
         );
 
         mic.start().unwrap();
+        tokio::time::advance(Duration::from_millis(10)).await;
         errors.lock().unwrap()[0]();
         let death = events.lock().unwrap().pop().unwrap();
         assert_eq!(
@@ -817,6 +867,7 @@ mod tests {
         );
 
         mic.start().unwrap();
+        tokio::time::advance(Duration::from_millis(10)).await;
         errors.lock().unwrap()[0]();
         let death = events.lock().unwrap().pop().unwrap();
         assert_eq!(

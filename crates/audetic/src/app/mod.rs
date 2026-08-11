@@ -124,7 +124,7 @@ fn capture_stream_event_sink(tx: &mpsc::Sender<DaemonCommand>) -> StreamEventSin
                 CaptureSource::MeetingMicrophone => 1,
                 CaptureSource::SystemTap => 2,
             };
-            pending[slot].store(death.generation.0, Ordering::SeqCst);
+            pending[slot].fetch_max(death.generation.0, Ordering::SeqCst);
             notify.notify_one();
         }
     })
@@ -663,11 +663,15 @@ mod tests {
         let sink = capture_stream_event_sink(&tx);
         tx.try_send(DaemonCommand::DefaultInputSwitched).unwrap();
         let death = StreamDeath {
-            source: CaptureSource::Dictation,
-            generation: StreamGeneration(1),
+            source: CaptureSource::MeetingMicrophone,
+            generation: StreamGeneration(2),
         };
 
         sink(death);
+        sink(StreamDeath {
+            source: CaptureSource::MeetingMicrophone,
+            generation: StreamGeneration(1),
+        });
         assert!(matches!(
             rx.try_recv(),
             Ok(DaemonCommand::DefaultInputSwitched)

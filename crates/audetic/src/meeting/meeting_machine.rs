@@ -802,7 +802,7 @@ mod tests {
                     CapturePlan::Input(PlannedInput {
                         sample_rate: 48_000,
                         samples: vec![0.25; 480],
-                        open_duration: Duration::ZERO,
+                        open_duration: Duration::from_millis(10),
                     }),
                     CapturePlan::Input(PlannedInput {
                         sample_rate: 44_100,
