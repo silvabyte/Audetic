@@ -650,12 +650,12 @@ pub async fn retry_meeting_transcription(
 
 #[cfg(test)]
 mod tests {
+    use async_trait::async_trait;
+
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Mutex;
     use std::time::Duration;
-
-    use async_trait::async_trait;
 
     use crate::audio::input_device::{
         ActiveInput, CaptureBackend, InputDataCallback, InputErrorCallback,
