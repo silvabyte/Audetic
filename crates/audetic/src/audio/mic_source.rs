@@ -270,9 +270,19 @@ impl MicAudioSource {
             }
         }
 
-        self.begin_gap();
-        self.close_current_segment()
-            .context("Failed to close meeting microphone Segment for replacement")?;
+        if death.is_some() {
+            // The error callback records the exact death time before queuing
+            // the command; direct test injections fall back to handling time.
+            self.begin_gap();
+            self.close_current_segment()
+                .context("Failed to close dead meeting microphone Segment")?;
+        } else {
+            // A proactive switch may still deliver samples while the old
+            // stream is shutting down. Start Silence Fill only after it closes.
+            self.close_current_segment()
+                .context("Failed to close meeting microphone Segment for replacement")?;
+            self.begin_gap();
+        }
         let replacement_gap_started_at = self
             .gap_started_at
             .lock()
@@ -481,6 +491,45 @@ mod tests {
 
     struct ErrorDuringFailedStartBackend {
         starts: AtomicUsize,
+    }
+
+    struct SamplesOnDropStream {
+        on_data: Mutex<Option<InputDataCallback>>,
+        clock: Arc<FakeClock>,
+    }
+
+    impl Drop for SamplesOnDropStream {
+        fn drop(&mut self) {
+            self.clock.advance(Duration::from_millis(100));
+            if let Some(mut on_data) = self.on_data.lock().unwrap().take() {
+                on_data(&vec![0.25; 480], 1);
+            }
+        }
+    }
+
+    struct SamplesOnDropBackend {
+        starts: AtomicUsize,
+        clock: Arc<FakeClock>,
+    }
+
+    impl CaptureBackend for SamplesOnDropBackend {
+        fn start_default_input(
+            &self,
+            mut on_data: InputDataCallback,
+            _on_error: InputErrorCallback,
+        ) -> Result<ActiveInput> {
+            if self.starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Ok(ActiveInput::new(
+                    48_000,
+                    SamplesOnDropStream {
+                        on_data: Mutex::new(Some(on_data)),
+                        clock: self.clock.clone(),
+                    },
+                ));
+            }
+            on_data(&vec![-0.25; 441], 1);
+            Ok(ActiveInput::new(44_100, ()))
+        }
     }
 
     impl CaptureBackend for ErrorDuringFailedStartBackend {
@@ -912,5 +961,30 @@ mod tests {
         );
         assert!(mic.has_live_stream());
         assert_eq!(mic.stream_generation, StreamGeneration(2));
+    }
+
+    #[tokio::test]
+    async fn default_switch_gap_starts_after_old_stream_stops() {
+        let clock = Arc::new(FakeClock::default());
+        let mut mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(SamplesOnDropBackend {
+                starts: AtomicUsize::new(0),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+
+        mic.start().unwrap();
+        assert_eq!(
+            mic.default_input_switched().await.unwrap(),
+            CaptureRecovery::Capturing
+        );
+        let track = mic.stop().unwrap();
+
+        assert_eq!(track.len(), 320);
+        assert!(track[..160].iter().all(|sample| *sample > 0.0));
+        assert!(track[160..].iter().all(|sample| *sample < 0.0));
     }
 }
