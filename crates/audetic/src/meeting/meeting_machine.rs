@@ -153,6 +153,7 @@ impl MeetingMachine {
                 false
             }
         };
+        self.mic_source.mark_meeting_started();
 
         let mic_ok = mic_started && self.mic_source.has_live_stream();
         let system_ok = system_started && self.system_source.has_live_stream();
@@ -690,8 +691,16 @@ mod tests {
         open_duration: Duration,
     }
 
+    enum CapturePlan {
+        Input(PlannedInput),
+        Fail {
+            message: &'static str,
+            open_duration: Duration,
+        },
+    }
+
     struct PlannedCaptureBackend {
-        inputs: Mutex<VecDeque<PlannedInput>>,
+        plans: Mutex<VecDeque<CapturePlan>>,
         clock: Arc<FakeClock>,
     }
 
@@ -701,10 +710,20 @@ mod tests {
             mut on_data: InputDataCallback,
             _on_error: InputErrorCallback,
         ) -> Result<ActiveInput> {
-            let input = self.inputs.lock().unwrap().pop_front().unwrap();
-            self.clock.advance(input.open_duration);
-            on_data(&input.samples, 1);
-            Ok(ActiveInput::new(input.sample_rate, ()))
+            match self.plans.lock().unwrap().pop_front().unwrap() {
+                CapturePlan::Input(input) => {
+                    self.clock.advance(input.open_duration);
+                    on_data(&input.samples, 1);
+                    Ok(ActiveInput::new(input.sample_rate, ()))
+                }
+                CapturePlan::Fail {
+                    message,
+                    open_duration,
+                } => {
+                    self.clock.advance(open_duration);
+                    Err(anyhow::anyhow!(message))
+                }
+            }
         }
     }
 
@@ -778,17 +797,17 @@ mod tests {
         let mic = MicAudioSource::with_backend_and_clock(
             16_000,
             Box::new(PlannedCaptureBackend {
-                inputs: Mutex::new(VecDeque::from([
-                    PlannedInput {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
                         sample_rate: 48_000,
                         samples: vec![0.25; 480],
                         open_duration: Duration::ZERO,
-                    },
-                    PlannedInput {
+                    }),
+                    CapturePlan::Input(PlannedInput {
                         sample_rate: 44_100,
                         samples: vec![-0.25; 441],
                         open_duration: Duration::from_millis(250),
-                    },
+                    }),
                 ])),
                 clock: clock.clone(),
             }),
@@ -825,6 +844,60 @@ mod tests {
         let review = status.get().await;
         assert_eq!(review.phase, MeetingPhase::Review);
         assert!(!review.capture_degraded);
+    }
+
+    #[tokio::test]
+    async fn initial_mic_gap_starts_after_blocked_source_startup() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Fail {
+                        message: "Default Input permission unresolved",
+                        open_duration: Duration::from_secs(5),
+                    },
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::ZERO,
+                    }),
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let status = MeetingStatusHandle::default();
+        let meetings_dir = tempfile::tempdir().unwrap();
+        let mut machine = MeetingMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: vec![0.1; 4_960],
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Arc::new(PostProcessingService::new()),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            meetings_dir.path().to_path_buf(),
+        );
+
+        let started = machine.start(None).await.unwrap();
+        assert_eq!(started.capture_state, CaptureState::SystemOnly);
+        assert!(status.get().await.capture_degraded);
+
+        clock.advance(Duration::from_millis(300));
+        machine.default_input_switched().await.unwrap();
+        assert!(!status.get().await.capture_degraded);
+        machine.stop().await.unwrap();
+
+        let mixed = read_wav(&started.audio_path);
+        assert_eq!(mixed.len(), 4_960);
+        assert!(mixed[..4_800]
+            .iter()
+            .all(|sample| (*sample - 0.1).abs() < f32::EPSILON));
+        assert!(mixed[4_800..].iter().all(|sample| *sample > 0.1));
     }
 
     #[test]

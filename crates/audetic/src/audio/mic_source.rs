@@ -265,7 +265,6 @@ impl AudioSource for MicAudioSource {
         self.canonical_samples.clear();
         *self.gap_started_at.lock().unwrap() = None;
         self.session_active = true;
-        let session_started_at = self.clock.now();
 
         match self.start_segment() {
             Ok(segment) => {
@@ -273,10 +272,7 @@ impl AudioSource for MicAudioSource {
                 info!("Meeting microphone recording started");
                 Ok(())
             }
-            Err(error) => {
-                *self.gap_started_at.lock().unwrap() = Some(session_started_at);
-                Err(error).context("Failed to start meeting microphone")
-            }
+            Err(error) => Err(error).context("Failed to start meeting microphone"),
         }
     }
 
@@ -312,6 +308,12 @@ impl AudioSource for MicAudioSource {
 
 #[async_trait::async_trait(?Send)]
 impl MeetingMicSource for MicAudioSource {
+    fn mark_meeting_started(&mut self) {
+        if self.session_active && !self.has_live_stream() {
+            *self.gap_started_at.lock().unwrap() = Some(self.clock.now());
+        }
+    }
+
     async fn default_input_switched(&mut self) -> Result<CaptureRecovery> {
         self.replace_capture(None).await
     }
@@ -701,6 +703,7 @@ mod tests {
         assert!(mic.start().is_err());
         assert!(mic.is_active());
         assert!(!mic.has_live_stream());
+        mic.mark_meeting_started();
         clock.advance(Duration::from_millis(300));
         assert_eq!(
             mic.default_input_switched().await.unwrap(),

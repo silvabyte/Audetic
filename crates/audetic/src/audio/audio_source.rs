@@ -32,6 +32,10 @@ pub trait AudioSource {
 /// logical meeting session remains active.
 #[async_trait::async_trait(?Send)]
 pub trait MeetingMicSource: AudioSource {
+    /// Align an unavailable microphone's open gap with the point at which the
+    /// meeting's other capture source has finished starting.
+    fn mark_meeting_started(&mut self) {}
+
     async fn default_input_switched(&mut self) -> Result<CaptureRecovery> {
         Ok(CaptureRecovery::Ignored)
     }
