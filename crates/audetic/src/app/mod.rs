@@ -3,9 +3,10 @@
 mod command;
 
 use anyhow::{anyhow, Result};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{error, info, warn};
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -71,13 +72,61 @@ impl MeetingCaptureCommandTarget for MeetingMachine {
 
 fn capture_stream_event_sink(tx: &mpsc::Sender<DaemonCommand>) -> StreamEventSink {
     let tx = tx.downgrade();
+    let pending = Arc::new(std::array::from_fn::<_, 3, _>(|_| AtomicU64::new(0)));
+    let notify = Arc::new(Notify::new());
+    let bridge_tx = tx.clone();
+    let bridge_pending = pending.clone();
+    let bridge_notify = notify.clone();
+    tokio::spawn(async move {
+        loop {
+            bridge_notify.notified().await;
+            for (slot, source) in [
+                CaptureSource::Dictation,
+                CaptureSource::MeetingMicrophone,
+                CaptureSource::SystemTap,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let generation = bridge_pending[slot].swap(0, Ordering::SeqCst);
+                if generation == 0 {
+                    continue;
+                }
+                let Some(tx) = bridge_tx.upgrade() else {
+                    return;
+                };
+                if tx
+                    .send(DaemonCommand::CaptureStreamDied(StreamDeath {
+                        source,
+                        generation: generation.into(),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+
     Arc::new(move |death| {
         let Some(tx) = tx.upgrade() else {
             return;
         };
-        // Audio callbacks cannot wait for capacity. A full or closed command
-        // queue drops the report; later settled switches remain recovery triggers.
-        let _ = tx.try_send(DaemonCommand::CaptureStreamDied(death));
+        // Audio callbacks cannot wait for capacity. Coalesce overflow by source;
+        // the bridge forwards it when the bounded command queue has room.
+        if matches!(
+            tx.try_send(DaemonCommand::CaptureStreamDied(death)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ) {
+            let slot = match death.source {
+                CaptureSource::Dictation => 0,
+                CaptureSource::MeetingMicrophone => 1,
+                CaptureSource::SystemTap => 2,
+            };
+            pending[slot].store(death.generation.0, Ordering::SeqCst);
+            notify.notify_one();
+        }
     })
 }
 
@@ -605,8 +654,8 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
-    fn stream_death_sink_drops_reports_when_command_queue_is_full_or_closed() {
+    #[tokio::test]
+    async fn stream_death_sink_forwards_reports_after_a_full_queue_drains() {
         let (tx, mut rx) = mpsc::channel(1);
         let sink = capture_stream_event_sink(&tx);
         tx.try_send(DaemonCommand::DefaultInputSwitched).unwrap();
@@ -620,9 +669,14 @@ mod tests {
             rx.try_recv(),
             Ok(DaemonCommand::DefaultInputSwitched)
         ));
+
+        let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("overflow bridge timed out")
+            .expect("command queue closed");
         assert!(matches!(
-            rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
+            received,
+            DaemonCommand::CaptureStreamDied(received) if received == death
         ));
 
         drop(rx);
