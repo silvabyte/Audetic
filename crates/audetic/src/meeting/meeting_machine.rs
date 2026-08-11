@@ -807,7 +807,7 @@ mod tests {
                     CapturePlan::Input(PlannedInput {
                         sample_rate: 44_100,
                         samples: vec![-0.25; 441],
-                        open_duration: Duration::from_millis(250),
+                        open_duration: Duration::from_millis(260),
                     }),
                 ])),
                 clock: clock.clone(),

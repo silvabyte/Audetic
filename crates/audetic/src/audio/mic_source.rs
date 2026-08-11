@@ -119,16 +119,21 @@ impl MicAudioSource {
 
     fn start_segment(&mut self) -> Result<ActiveSegment> {
         let generation = self.stream_generation.next()?;
+        self.stream_generation = generation;
         let native_samples = Arc::new(Mutex::new(Vec::new()));
         let callback_samples = native_samples.clone();
         let segment_started_at = Arc::new(Mutex::new(None));
         let callback_started_at = segment_started_at.clone();
         let data_clock = self.clock.clone();
         let on_data: InputDataCallback = Box::new(move |data, channels| {
-            callback_started_at
-                .lock()
-                .unwrap()
-                .get_or_insert_with(|| data_clock.now());
+            callback_started_at.lock().unwrap().get_or_insert_with(|| {
+                let frames = if channels == 0 {
+                    0
+                } else {
+                    data.len() / channels
+                };
+                (data_clock.now(), frames)
+            });
             push_mono_f32(data, channels, &callback_samples);
         });
 
@@ -151,6 +156,7 @@ impl MicAudioSource {
         });
 
         self.live_generation.store(generation.0, Ordering::SeqCst);
+        let attempt_started_at = self.clock.now();
         let input = match self.backend.start_default_input(on_data, on_error) {
             Ok(input) => input,
             Err(error) => {
@@ -163,11 +169,18 @@ impl MicAudioSource {
                 return Err(error).context("Failed to start meeting microphone Segment");
             }
         };
-        self.stream_generation = generation;
-        let started_at = segment_started_at
-            .lock()
-            .unwrap()
-            .unwrap_or_else(|| self.clock.now());
+        let started_at = match *segment_started_at.lock().unwrap() {
+            Some((callback_at, frames)) => {
+                let buffered_nanos = frames as u128 * Duration::from_secs(1).as_nanos()
+                    / u128::from(input.native_sample_rate());
+                let buffered_nanos = u64::try_from(buffered_nanos)
+                    .context("First microphone callback duration overflowed")?;
+                callback_at
+                    .saturating_sub(Duration::from_nanos(buffered_nanos))
+                    .max(attempt_started_at)
+            }
+            None => self.clock.now(),
+        };
         if self.live_generation.load(Ordering::SeqCst) != generation.0 {
             drop(input);
             return Err(anyhow!(
@@ -466,6 +479,25 @@ mod tests {
         clock: Arc<FakeClock>,
     }
 
+    struct ErrorDuringFailedStartBackend {
+        starts: AtomicUsize,
+    }
+
+    impl CaptureBackend for ErrorDuringFailedStartBackend {
+        fn start_default_input(
+            &self,
+            mut on_data: InputDataCallback,
+            mut on_error: InputErrorCallback,
+        ) -> Result<ActiveInput> {
+            if self.starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                on_error();
+                return Err(anyhow!("stream failed while backend startup returned"));
+            }
+            on_data(&vec![0.25; 480], 1);
+            Ok(ActiveInput::new(48_000, ()))
+        }
+    }
+
     impl CaptureBackend for SamplesBeforeReturnBackend {
         fn start_default_input(
             &self,
@@ -532,7 +564,7 @@ mod tests {
                 PlannedInput {
                     sample_rate: 44_100,
                     samples: vec![-0.25; 441],
-                    open_duration: Duration::from_millis(250),
+                    open_duration: Duration::from_millis(260),
                 },
             ])),
             clock: clock.clone(),
@@ -842,11 +874,43 @@ mod tests {
         );
         let track = mic.stop().unwrap();
 
-        // Samples begin after 100ms even though backend startup returns after
-        // 250ms, so only 1,600 canonical Silence Fill samples are needed.
-        assert_eq!(track.len(), 1_920);
+        // The first 10ms callback buffer arrives after 100ms and backend startup
+        // returns after 250ms, so its first sample starts at 90ms.
+        assert_eq!(track.len(), 1_760);
         assert!(track[..160].iter().all(|sample| *sample > 0.0));
-        assert!(track[160..1_760].iter().all(|sample| *sample == 0.0));
-        assert!(track[1_760..].iter().all(|sample| *sample < 0.0));
+        assert!(track[160..1_600].iter().all(|sample| *sample == 0.0));
+        assert!(track[1_600..].iter().all(|sample| *sample < 0.0));
+    }
+
+    #[tokio::test]
+    async fn failed_start_death_cannot_match_the_next_stream_generation() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let mut mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(ErrorDuringFailedStartBackend {
+                starts: AtomicUsize::new(0),
+            }),
+            {
+                let events = events.clone();
+                Arc::new(move |event| events.lock().unwrap().push(event))
+            },
+            Arc::new(FakeClock::default()),
+        );
+
+        assert!(mic.start().is_err());
+        mic.mark_meeting_started();
+        let failed_start_death = events.lock().unwrap().pop().unwrap();
+        assert_eq!(failed_start_death.generation, StreamGeneration(1));
+
+        assert_eq!(
+            mic.default_input_switched().await.unwrap(),
+            CaptureRecovery::Capturing
+        );
+        assert_eq!(
+            mic.stream_died(failed_start_death).await.unwrap(),
+            CaptureRecovery::Ignored
+        );
+        assert!(mic.has_live_stream());
+        assert_eq!(mic.stream_generation, StreamGeneration(2));
     }
 }
