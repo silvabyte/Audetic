@@ -231,6 +231,15 @@ impl MeetingStatusHandle {
         }
         state.update_capture_degraded();
     }
+
+    pub(crate) async fn mark_microphone_degraded(&self) {
+        let mut state = self.inner.lock().await;
+        if state.phase != MeetingPhase::Recording {
+            return;
+        }
+        state.microphone_capturing = false;
+        state.update_capture_degraded();
+    }
 }
 
 #[cfg(test)]
@@ -462,6 +471,13 @@ mod tests {
         assert_eq!(degraded.phase, MeetingPhase::Recording);
         assert!(degraded.capture_degraded);
 
+        handle
+            .apply_microphone_recovery(CaptureRecovery::Capturing)
+            .await;
+        assert!(!handle.get().await.capture_degraded);
+
+        handle.mark_microphone_degraded().await;
+        assert!(handle.get().await.capture_degraded);
         handle
             .apply_microphone_recovery(CaptureRecovery::Capturing)
             .await;

@@ -189,6 +189,7 @@ impl AudioStreamManager {
             return Ok(CaptureRecovery::Ignored);
         }
 
+        let is_device_switch = matches!(&trigger, ReplacementTrigger::DefaultInputSwitched);
         if let ReplacementTrigger::StreamDied(death) = trigger {
             let current_generation = self
                 .active_segment
@@ -201,6 +202,12 @@ impl AudioStreamManager {
             {
                 return Ok(CaptureRecovery::Ignored);
             }
+        }
+
+        if is_device_switch {
+            // Let the meeting consumer enter recovery before Segment closing
+            // or native device lookup can block the command-loop thread.
+            tokio::task::yield_now().await;
         }
 
         self.close_current_segment()
@@ -223,7 +230,9 @@ impl AudioStreamManager {
     fn start_segment(&self) -> Result<ActiveSegment> {
         let generation = {
             let current = self.stream_generation.lock().unwrap();
-            current.next()?
+            current
+                .next()
+                .context("Failed to allocate dictation Stream Generation")?
         };
         let native_samples = Arc::new(Mutex::new(Vec::new()));
         let callback_samples = native_samples.clone();

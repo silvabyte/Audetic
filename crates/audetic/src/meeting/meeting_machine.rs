@@ -219,13 +219,25 @@ impl MeetingMachine {
     }
 
     pub(crate) async fn default_input_switched(&mut self) -> Result<()> {
-        let recovery = self.mic_source.default_input_switched().await?;
+        self.status.mark_microphone_degraded().await;
+        let recovery = self
+            .mic_source
+            .default_input_switched()
+            .await
+            .context("Failed to switch meeting microphone Default Input")?;
         self.status.apply_microphone_recovery(recovery).await;
         Ok(())
     }
 
     pub(crate) async fn microphone_stream_died(&mut self, death: StreamDeath) -> Result<()> {
-        let recovery = self.mic_source.stream_died(death).await?;
+        if !self.mic_source.has_live_stream() {
+            self.status.mark_microphone_degraded().await;
+        }
+        let recovery = self
+            .mic_source
+            .stream_died(death)
+            .await
+            .context("Failed to recover meeting microphone from stream death")?;
         self.status.apply_microphone_recovery(recovery).await;
         Ok(())
     }
@@ -899,6 +911,65 @@ mod tests {
             .iter()
             .all(|sample| (*sample - 0.1).abs() < f32::EPSILON));
         assert!(mixed[4_800..].iter().all(|sample| *sample > 0.1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn meeting_status_is_degraded_while_microphone_retries() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    }),
+                    CapturePlan::Fail {
+                        message: "replacement 1 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                    CapturePlan::Fail {
+                        message: "replacement 2 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                    CapturePlan::Fail {
+                        message: "replacement 3 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = MeetingStatusHandle::default();
+        let meetings_dir = tempfile::tempdir().unwrap();
+        let mut machine = MeetingMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: vec![0.1; 160],
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Arc::new(PostProcessingService::new()),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            meetings_dir.path().to_path_buf(),
+        );
+
+        machine.start(None).await.unwrap();
+        let replacement = machine.default_input_switched();
+        tokio::pin!(replacement);
+        tokio::select! {
+            biased;
+            result = &mut replacement => panic!("replacement completed before retrying: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        assert!(status.get().await.capture_degraded);
+        replacement.await.unwrap();
+        assert!(status.get().await.capture_degraded);
     }
 
     #[tokio::test]

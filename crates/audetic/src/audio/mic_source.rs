@@ -68,6 +68,7 @@ pub struct MicAudioSource {
     live_generation: Arc<AtomicU64>,
     stream_event_sink: StreamEventSink,
     clock: Arc<dyn MonotonicClock>,
+    meeting_started_at: Option<Duration>,
     pending_gap_started_at: Option<Duration>,
     session_active: bool,
     captured_audio: bool,
@@ -118,6 +119,7 @@ impl MicAudioSource {
             live_generation: Arc::new(AtomicU64::new(0)),
             stream_event_sink,
             clock,
+            meeting_started_at: None,
             pending_gap_started_at: None,
             session_active: false,
             captured_audio: false,
@@ -126,7 +128,10 @@ impl MicAudioSource {
     }
 
     fn start_segment(&mut self) -> Result<ActiveSegment> {
-        let generation = self.stream_generation.next()?;
+        let generation = self
+            .stream_generation
+            .next()
+            .context("Failed to allocate meeting microphone Stream Generation")?;
         self.stream_generation = generation;
         let native_samples = Arc::new(Mutex::new(Vec::new()));
         let callback_samples = native_samples.clone();
@@ -249,7 +254,6 @@ impl MicAudioSource {
     }
 
     fn close_current_segment(&mut self) -> Result<Option<ClosedSegment>> {
-        let close_started_at = self.clock.now();
         self.live_generation.store(0, Ordering::SeqCst);
         let Some(segment) = self.active_segment.take() else {
             return Ok(None);
@@ -259,11 +263,14 @@ impl MicAudioSource {
         let death_started_at = *segment.death_started_at.lock().unwrap();
         let native = std::mem::take(&mut *segment.native_samples.lock().unwrap());
         if native.is_empty() {
-            if let Some(gap_before) = segment.gap_before {
-                self.set_pending_gap(gap_before);
-            }
+            let ended_at = segment.gap_before.unwrap_or_else(|| {
+                self.meeting_started_at
+                    .map(|started_at| started_at.max(segment.attempt_started_at))
+                    .unwrap_or(segment.attempt_started_at)
+            });
+            self.set_pending_gap(ended_at);
             return Ok(Some(ClosedSegment {
-                ended_at: close_started_at,
+                ended_at,
                 death_started_at,
             }));
         }
@@ -274,13 +281,14 @@ impl MicAudioSource {
             .unwrap()
             .context("Captured microphone samples have no first callback timing")?;
         let first_sample_at = callback_at
-            .saturating_sub(Self::duration_for_frames(
-                first_buffer_frames,
-                native_sample_rate,
-            )?)
+            .saturating_sub(
+                Self::duration_for_frames(first_buffer_frames, native_sample_rate)
+                    .context("Failed to calculate first meeting microphone buffer duration")?,
+            )
             .max(segment.attempt_started_at);
         if let Some(gap_before) = segment.gap_before {
-            self.append_silence_fill_between(gap_before, first_sample_at)?;
+            self.append_silence_fill_between(gap_before, first_sample_at)
+                .context("Failed to align meeting microphone Segment")?;
         }
         let canonical = resample_mono_f32(&native, native_sample_rate, self.target_sample_rate)
             .context("Failed to normalize meeting microphone Segment")?;
@@ -294,8 +302,10 @@ impl MicAudioSource {
         );
         self.canonical_samples.extend(canonical);
         Ok(Some(ClosedSegment {
-            ended_at: first_sample_at
-                .saturating_add(Self::duration_for_frames(native.len(), native_sample_rate)?),
+            ended_at: first_sample_at.saturating_add(
+                Self::duration_for_frames(native.len(), native_sample_rate)
+                    .context("Failed to calculate meeting microphone Segment duration")?,
+            ),
             death_started_at,
         }))
     }
@@ -316,18 +326,18 @@ impl MicAudioSource {
             }
         }
 
+        if death.is_none() {
+            // Let the dictation consumer enter recovery before Segment closing
+            // or native device lookup can block the command-loop thread.
+            tokio::task::yield_now().await;
+        }
+
         let closed = self
             .close_current_segment()
             .context("Failed to close meeting microphone Segment for replacement")?;
-        match (death, closed) {
-            (Some(_), Some(closed)) => self.set_pending_gap(
-                closed
-                    .death_started_at
-                    .unwrap_or_else(|| self.clock.now())
-                    .max(closed.ended_at),
-            ),
-            (None, Some(closed)) => self.set_pending_gap(closed.ended_at),
-            (_, None) if self.pending_gap_started_at.is_none() => self.begin_gap(),
+        match closed {
+            Some(closed) => self.set_pending_gap(closed.ended_at),
+            None if self.pending_gap_started_at.is_none() => self.begin_gap(),
             _ => {}
         }
 
@@ -344,12 +354,7 @@ impl MicAudioSource {
                         "Failed to close replacement Segment that died while being installed",
                     )?;
                     if let Some(closed) = closed {
-                        self.set_pending_gap(
-                            closed
-                                .death_started_at
-                                .unwrap_or_else(|| self.clock.now())
-                                .max(closed.ended_at),
-                        );
+                        self.set_pending_gap(closed.ended_at);
                     }
                     warn!("Meeting microphone remains in Degraded Capture");
                     return Ok(CaptureRecovery::Degraded);
@@ -371,8 +376,10 @@ impl AudioSource for MicAudioSource {
             return Err(anyhow!("Mic source already recording"));
         }
 
-        self.close_current_segment()?;
+        self.close_current_segment()
+            .context("Failed to reset previous meeting microphone Segment")?;
         self.canonical_samples.clear();
+        self.meeting_started_at = None;
         self.pending_gap_started_at = None;
         self.session_active = true;
         self.captured_audio = false;
@@ -396,11 +403,12 @@ impl AudioSource for MicAudioSource {
             .close_current_segment()
             .context("Failed to close final meeting microphone Segment")?;
         if let Some(closed) = closed {
-            if let Some(death_started_at) = closed.death_started_at {
-                self.set_pending_gap(death_started_at.max(closed.ended_at));
+            if closed.death_started_at.is_some() {
+                self.set_pending_gap(closed.ended_at);
             }
         }
-        self.append_silence_fill()?;
+        self.append_silence_fill()
+            .context("Failed to close final meeting microphone Silence Fill")?;
         let canonical = std::mem::take(&mut self.canonical_samples);
         info!(
             "Meeting microphone stopped: {} canonical samples @ {} Hz",
@@ -426,8 +434,10 @@ impl AudioSource for MicAudioSource {
 #[async_trait::async_trait(?Send)]
 impl MeetingMicSource for MicAudioSource {
     fn mark_meeting_started(&mut self) {
+        let started_at = self.clock.now();
+        self.meeting_started_at = Some(started_at);
         if self.session_active && !self.has_live_stream() {
-            self.pending_gap_started_at = Some(self.clock.now());
+            self.pending_gap_started_at = Some(started_at);
         }
     }
 
@@ -759,6 +769,132 @@ mod tests {
         assert!(mic_track[160..40_160].iter().all(|sample| *sample == 0.0));
         assert!(mic_track[40_160..].iter().all(|sample| *sample < 0.0));
         assert_eq!(starts.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn delayed_stream_error_fills_from_the_last_captured_sample() {
+        let clock = Arc::new(FakeClock::default());
+        let mut mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                inputs: Mutex::new(VecDeque::from([
+                    PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    },
+                    PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![-0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    },
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+
+        // PlannedCaptureBackend does not retain its error callback, so install
+        // the current generation's death directly after 200ms without samples.
+        mic.start().unwrap();
+        clock.advance(Duration::from_millis(200));
+        let death = StreamDeath {
+            source: CaptureSource::MeetingMicrophone,
+            generation: mic.active_segment.as_ref().unwrap().generation,
+        };
+        *mic.active_segment
+            .as_ref()
+            .unwrap()
+            .death_started_at
+            .lock()
+            .unwrap() = Some(clock.now());
+        assert_eq!(
+            mic.stream_died(death).await.unwrap(),
+            CaptureRecovery::Capturing
+        );
+        let track = mic.stop().unwrap();
+
+        assert_eq!(track.len(), 3_520);
+        assert!(track[..160].iter().all(|sample| *sample > 0.0));
+        assert!(track[160..3_360].iter().all(|sample| *sample == 0.0));
+        assert!(track[3_360..].iter().all(|sample| *sample < 0.0));
+    }
+
+    #[tokio::test]
+    async fn empty_segments_preserve_the_original_capture_gap() {
+        let clock = Arc::new(FakeClock::default());
+        let mut mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                inputs: Mutex::new(VecDeque::from([
+                    PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    },
+                    PlannedInput {
+                        sample_rate: 48_000,
+                        samples: Vec::new(),
+                        open_duration: Duration::from_millis(100),
+                    },
+                    PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![-0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    },
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+
+        mic.start().unwrap();
+        mic.default_input_switched().await.unwrap();
+        clock.advance(Duration::from_millis(100));
+        mic.default_input_switched().await.unwrap();
+        let track = mic.stop().unwrap();
+
+        assert_eq!(track.len(), 3_520);
+        assert!(track[..160].iter().all(|sample| *sample > 0.0));
+        assert!(track[160..3_360].iter().all(|sample| *sample == 0.0));
+        assert!(track[3_360..].iter().all(|sample| *sample < 0.0));
+    }
+
+    #[tokio::test]
+    async fn empty_initial_segment_anchors_the_gap_at_meeting_start() {
+        let clock = Arc::new(FakeClock::default());
+        let mut mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                inputs: Mutex::new(VecDeque::from([
+                    PlannedInput {
+                        sample_rate: 48_000,
+                        samples: Vec::new(),
+                        open_duration: Duration::from_millis(100),
+                    },
+                    PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    },
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+
+        mic.start().unwrap();
+        mic.mark_meeting_started();
+        clock.advance(Duration::from_millis(300));
+        mic.default_input_switched().await.unwrap();
+        let track = mic.stop().unwrap();
+
+        assert_eq!(track.len(), 4_960);
+        assert!(track[..4_800].iter().all(|sample| *sample == 0.0));
+        assert!(track[4_800..].iter().all(|sample| *sample > 0.0));
     }
 
     #[tokio::test]
