@@ -36,6 +36,10 @@ pub trait MeetingMicSource: AudioSource {
     /// meeting's other capture source has finished starting.
     fn mark_meeting_started(&mut self) {}
 
+    /// Whether the current session captured any real microphone samples,
+    /// excluding synthetic Silence Fill.
+    fn has_captured_audio(&self) -> bool;
+
     async fn default_input_switched(&mut self) -> Result<CaptureRecovery> {
         Ok(CaptureRecovery::Ignored)
     }

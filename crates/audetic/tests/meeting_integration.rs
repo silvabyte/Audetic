@@ -66,7 +66,11 @@ impl AudioSource for MockAudioSource {
 }
 
 #[async_trait(?Send)]
-impl MeetingMicSource for MockAudioSource {}
+impl MeetingMicSource for MockAudioSource {
+    fn has_captured_audio(&self) -> bool {
+        !self.samples.is_empty()
+    }
+}
 
 // ---- mock transcription service ----
 

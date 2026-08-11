@@ -259,6 +259,7 @@ impl MeetingMachine {
                 Vec::new()
             }
         };
+        let mic_captured_audio = self.mic_source.has_captured_audio();
 
         let mic_rate = self.mic_source.sample_rate();
 
@@ -272,7 +273,7 @@ impl MeetingMachine {
 
         let system_rate = self.system_source.sample_rate();
 
-        if mic_samples.is_empty() && system_samples.is_empty() {
+        if !mic_captured_audio && system_samples.is_empty() {
             // Persist failure so the meeting row isn't left stuck in `recording`.
             if let Ok(conn) = db::init_db() {
                 let _ = MeetingRepository::fail(
@@ -898,6 +899,45 @@ mod tests {
             .iter()
             .all(|sample| (*sample - 0.1).abs() < f32::EPSILON));
         assert!(mixed[4_800..].iter().all(|sample| *sample > 0.1));
+    }
+
+    #[tokio::test]
+    async fn silence_fill_alone_does_not_count_as_captured_audio() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Fail {
+                    message: "Default Input unavailable",
+                    open_duration: Duration::ZERO,
+                }])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let status = MeetingStatusHandle::default();
+        let meetings_dir = tempfile::tempdir().unwrap();
+        let mut machine = MeetingMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: Vec::new(),
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Arc::new(PostProcessingService::new()),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            meetings_dir.path().to_path_buf(),
+        );
+
+        let started = machine.start(None).await.unwrap();
+        assert_eq!(started.capture_state, CaptureState::SystemOnly);
+        clock.advance(Duration::from_millis(300));
+
+        assert!(machine.stop().await.is_err());
+        assert_eq!(status.get().await.phase, MeetingPhase::Error);
+        assert!(!started.audio_path.exists());
     }
 
     #[test]

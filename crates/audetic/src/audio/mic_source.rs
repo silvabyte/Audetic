@@ -61,6 +61,7 @@ pub struct MicAudioSource {
     clock: Arc<dyn MonotonicClock>,
     gap_started_at: Arc<Mutex<Option<Duration>>>,
     session_active: bool,
+    captured_audio: bool,
     target_sample_rate: u32,
 }
 
@@ -110,6 +111,7 @@ impl MicAudioSource {
             clock,
             gap_started_at: Arc::new(Mutex::new(None)),
             session_active: false,
+            captured_audio: false,
             target_sample_rate: sample_rate,
         }
     }
@@ -203,6 +205,7 @@ impl MicAudioSource {
         let native_sample_rate = segment.input.native_sample_rate();
         drop(segment.input);
         let native = std::mem::take(&mut *segment.native_samples.lock().unwrap());
+        self.captured_audio |= !native.is_empty();
         let canonical = resample_mono_f32(&native, native_sample_rate, self.target_sample_rate)
             .context("Failed to normalize meeting microphone Segment")?;
         debug!(
@@ -265,6 +268,7 @@ impl AudioSource for MicAudioSource {
         self.canonical_samples.clear();
         *self.gap_started_at.lock().unwrap() = None;
         self.session_active = true;
+        self.captured_audio = false;
 
         match self.start_segment() {
             Ok(segment) => {
@@ -312,6 +316,10 @@ impl MeetingMicSource for MicAudioSource {
         if self.session_active && !self.has_live_stream() {
             *self.gap_started_at.lock().unwrap() = Some(self.clock.now());
         }
+    }
+
+    fn has_captured_audio(&self) -> bool {
+        self.captured_audio
     }
 
     async fn default_input_switched(&mut self) -> Result<CaptureRecovery> {
