@@ -16,6 +16,7 @@ use tracing::{error, info, warn};
 
 use crate::audio::audio_mixer::AudioMixer;
 use crate::audio::audio_source::{AudioSource, MeetingMicSource};
+use crate::audio::capture_recovery::CaptureRecovery;
 use crate::audio::stream_event::StreamDeath;
 use crate::db::{self, meetings::MeetingRepository};
 use crate::post_processing::PostProcessingService;
@@ -220,26 +221,46 @@ impl MeetingMachine {
 
     pub(crate) async fn default_input_switched(&mut self) -> Result<()> {
         self.status.mark_microphone_degraded().await;
-        let recovery = self
-            .mic_source
-            .default_input_switched()
-            .await
-            .context("Failed to switch meeting microphone Default Input")?;
-        self.status.apply_microphone_recovery(recovery).await;
-        Ok(())
+        let recovery = self.mic_source.default_input_switched().await;
+        self.finish_microphone_recovery(
+            recovery,
+            "Failed to switch meeting microphone Default Input",
+        )
+        .await
     }
 
     pub(crate) async fn microphone_stream_died(&mut self, death: StreamDeath) -> Result<()> {
         if !self.mic_source.has_live_stream() {
             self.status.mark_microphone_degraded().await;
         }
-        let recovery = self
-            .mic_source
-            .stream_died(death)
-            .await
-            .context("Failed to recover meeting microphone from stream death")?;
-        self.status.apply_microphone_recovery(recovery).await;
-        Ok(())
+        let recovery = self.mic_source.stream_died(death).await;
+        self.finish_microphone_recovery(
+            recovery,
+            "Failed to recover meeting microphone from stream death",
+        )
+        .await
+    }
+
+    async fn finish_microphone_recovery(
+        &self,
+        recovery: Result<CaptureRecovery>,
+        error_context: &'static str,
+    ) -> Result<()> {
+        match recovery {
+            Ok(recovery) => {
+                self.status.apply_microphone_recovery(recovery).await;
+                Ok(())
+            }
+            Err(error) => {
+                let actual = if self.mic_source.has_live_stream() {
+                    CaptureRecovery::Capturing
+                } else {
+                    CaptureRecovery::Degraded
+                };
+                self.status.apply_microphone_recovery(actual).await;
+                Err(error).context(error_context)
+            }
+        }
     }
 
     /// Stop the meeting recording.
@@ -1048,6 +1069,50 @@ mod tests {
         assert!(machine.stop().await.is_err());
         assert_eq!(status.get().await.phase, MeetingPhase::Error);
         assert!(!started.audio_path.exists());
+    }
+
+    #[tokio::test]
+    async fn replacement_normalization_error_reports_the_live_microphone() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            0,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    }),
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![-0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    }),
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = MeetingStatusHandle::default();
+        let meetings_dir = tempfile::tempdir().unwrap();
+        let mut machine = MeetingMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: vec![0.1; 160],
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Arc::new(PostProcessingService::new()),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            meetings_dir.path().to_path_buf(),
+        );
+
+        machine.start(None).await.unwrap();
+        assert!(machine.default_input_switched().await.is_err());
+
+        assert!(!status.get().await.capture_degraded);
     }
 
     #[test]

@@ -56,8 +56,12 @@ struct ActiveSegment {
 }
 
 struct ClosedSegment {
+    native_samples: Vec<f32>,
+    native_sample_rate: u32,
+    first_sample_at: Option<Duration>,
     ended_at: Duration,
     death_started_at: Option<Duration>,
+    gap_before: Option<Duration>,
 }
 
 pub struct MicAudioSource {
@@ -253,6 +257,36 @@ impl MicAudioSource {
         ))
     }
 
+    fn append_closed_segment(&mut self, segment: ClosedSegment) -> Result<()> {
+        if segment.native_samples.is_empty() {
+            return Ok(());
+        }
+
+        let first_sample_at = segment
+            .first_sample_at
+            .expect("non-empty Segment has first-sample timing");
+        if let Some(gap_before) = segment.gap_before {
+            self.append_silence_fill_between(gap_before, first_sample_at)
+                .context("Failed to align meeting microphone Segment")?;
+        }
+        let canonical = resample_mono_f32(
+            &segment.native_samples,
+            segment.native_sample_rate,
+            self.target_sample_rate,
+        )
+        .context("Failed to normalize meeting microphone Segment")?;
+        self.captured_audio |= !canonical.is_empty();
+        debug!(
+            "Closed meeting microphone Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
+            segment.native_samples.len(),
+            segment.native_sample_rate,
+            canonical.len(),
+            self.target_sample_rate
+        );
+        self.canonical_samples.extend(canonical);
+        Ok(())
+    }
+
     fn close_current_segment(&mut self) -> Result<Option<ClosedSegment>> {
         self.live_generation.store(0, Ordering::SeqCst);
         let Some(segment) = self.active_segment.take() else {
@@ -268,10 +302,13 @@ impl MicAudioSource {
                     .map(|started_at| started_at.max(segment.attempt_started_at))
                     .unwrap_or(segment.attempt_started_at)
             });
-            self.set_pending_gap(ended_at);
             return Ok(Some(ClosedSegment {
+                native_samples: native,
+                native_sample_rate,
+                first_sample_at: None,
                 ended_at,
                 death_started_at,
+                gap_before: segment.gap_before,
             }));
         }
 
@@ -286,27 +323,17 @@ impl MicAudioSource {
                     .context("Failed to calculate first meeting microphone buffer duration")?,
             )
             .max(segment.attempt_started_at);
-        if let Some(gap_before) = segment.gap_before {
-            self.append_silence_fill_between(gap_before, first_sample_at)
-                .context("Failed to align meeting microphone Segment")?;
-        }
-        let canonical = resample_mono_f32(&native, native_sample_rate, self.target_sample_rate)
-            .context("Failed to normalize meeting microphone Segment")?;
-        self.captured_audio |= !canonical.is_empty();
-        debug!(
-            "Closed meeting microphone Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
-            native.len(),
-            native_sample_rate,
-            canonical.len(),
-            self.target_sample_rate
-        );
-        self.canonical_samples.extend(canonical);
+        let native_len = native.len();
         Ok(Some(ClosedSegment {
+            native_samples: native,
+            native_sample_rate,
+            first_sample_at: Some(first_sample_at),
             ended_at: first_sample_at.saturating_add(
-                Self::duration_for_frames(native.len(), native_sample_rate)
+                Self::duration_for_frames(native_len, native_sample_rate)
                     .context("Failed to calculate meeting microphone Segment duration")?,
             ),
             death_started_at,
+            gap_before: segment.gap_before,
         }))
     }
 
@@ -332,16 +359,20 @@ impl MicAudioSource {
             tokio::task::yield_now().await;
         }
 
+        let mut closed_segments = Vec::new();
         let closed = self
             .close_current_segment()
             .context("Failed to close meeting microphone Segment for replacement")?;
         match closed {
-            Some(closed) => self.set_pending_gap(closed.ended_at),
+            Some(closed) => {
+                self.set_pending_gap(closed.ended_at);
+                closed_segments.push(closed);
+            }
             None if self.pending_gap_started_at.is_none() => self.begin_gap(),
             _ => {}
         }
 
-        match start_capture_with_retries("replacement meeting Default Input", || {
+        let recovery = match start_capture_with_retries("replacement meeting Default Input", || {
             self.start_segment()
         })
         .await
@@ -355,18 +386,26 @@ impl MicAudioSource {
                     )?;
                     if let Some(closed) = closed {
                         self.set_pending_gap(closed.ended_at);
+                        closed_segments.push(closed);
                     }
                     warn!("Meeting microphone remains in Degraded Capture");
-                    return Ok(CaptureRecovery::Degraded);
+                    CaptureRecovery::Degraded
+                } else {
+                    info!("Recovered meeting microphone on the current Default Input");
+                    CaptureRecovery::Capturing
                 }
-                info!("Recovered meeting microphone on the current Default Input");
-                Ok(CaptureRecovery::Capturing)
             }
             Err(_) => {
                 warn!("Meeting microphone remains in Degraded Capture");
-                Ok(CaptureRecovery::Degraded)
+                CaptureRecovery::Degraded
             }
+        };
+
+        for segment in closed_segments {
+            self.append_closed_segment(segment)
+                .context("Failed to preserve replaced meeting microphone Segment")?;
         }
+        Ok(recovery)
     }
 }
 
@@ -403,9 +442,17 @@ impl AudioSource for MicAudioSource {
             .close_current_segment()
             .context("Failed to close final meeting microphone Segment")?;
         if let Some(closed) = closed {
-            if closed.death_started_at.is_some() {
+            if closed.native_samples.is_empty() || closed.death_started_at.is_some() {
                 self.set_pending_gap(closed.ended_at);
             }
+            self.append_closed_segment(closed)
+                .context("Failed to preserve final meeting microphone Segment")?;
+        }
+        if !self.captured_audio {
+            self.pending_gap_started_at = None;
+            self.canonical_samples.clear();
+            info!("Meeting microphone stopped without captured audio");
+            return Ok(Vec::new());
         }
         self.append_silence_fill()
             .context("Failed to close final meeting microphone Silence Fill")?;
@@ -1017,6 +1064,63 @@ mod tests {
         assert!(track[..160].iter().all(|sample| *sample > 0.0));
         assert!(track[160..].iter().all(|sample| *sample == 0.0));
         assert_eq!(AudioMixer::mix(&[track, vec![0.1; 36_160]]).len(), 36_160);
+    }
+
+    #[test]
+    fn system_only_meeting_does_not_materialize_a_silence_track() {
+        let clock = Arc::new(FakeClock::default());
+        let mut mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(RecoveryBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Fail(
+                    "Default Input unavailable",
+                )])),
+                errors: Arc::new(Mutex::new(Vec::new())),
+                starts: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+
+        assert!(mic.start().is_err());
+        mic.mark_meeting_started();
+        clock.advance(Duration::from_secs(60 * 60));
+        let track = mic.stop().unwrap();
+
+        assert!(track.is_empty());
+        assert!(!mic.has_captured_audio());
+    }
+
+    #[tokio::test]
+    async fn replacement_opens_before_the_closed_segment_is_normalized() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let mut mic = MicAudioSource::with_backend_and_clock(
+            0,
+            Box::new(RecoveryBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::ZERO,
+                    }),
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![-0.25; 480],
+                        open_duration: Duration::ZERO,
+                    }),
+                ])),
+                errors: Arc::new(Mutex::new(Vec::new())),
+                starts: starts.clone(),
+            }),
+            Arc::new(|_| {}),
+            Arc::new(FakeClock::default()),
+        );
+
+        mic.start().unwrap();
+        assert!(mic.default_input_switched().await.is_err());
+
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert!(mic.has_live_stream());
     }
 
     #[tokio::test]
