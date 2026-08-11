@@ -121,7 +121,14 @@ impl MicAudioSource {
         let generation = self.stream_generation.next()?;
         let native_samples = Arc::new(Mutex::new(Vec::new()));
         let callback_samples = native_samples.clone();
+        let segment_started_at = Arc::new(Mutex::new(None));
+        let callback_started_at = segment_started_at.clone();
+        let data_clock = self.clock.clone();
         let on_data: InputDataCallback = Box::new(move |data, channels| {
+            callback_started_at
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| data_clock.now());
             push_mono_f32(data, channels, &callback_samples);
         });
 
@@ -157,7 +164,10 @@ impl MicAudioSource {
             }
         };
         self.stream_generation = generation;
-        let started_at = self.clock.now();
+        let started_at = segment_started_at
+            .lock()
+            .unwrap()
+            .unwrap_or_else(|| self.clock.now());
         if self.live_generation.load(Ordering::SeqCst) != generation.0 {
             drop(input);
             return Err(anyhow!(
@@ -449,6 +459,29 @@ mod tests {
 
     struct EarlyDeathBackend {
         starts: Arc<AtomicUsize>,
+    }
+
+    struct SamplesBeforeReturnBackend {
+        starts: AtomicUsize,
+        clock: Arc<FakeClock>,
+    }
+
+    impl CaptureBackend for SamplesBeforeReturnBackend {
+        fn start_default_input(
+            &self,
+            mut on_data: InputDataCallback,
+            _on_error: InputErrorCallback,
+        ) -> Result<ActiveInput> {
+            if self.starts.fetch_add(1, Ordering::SeqCst) == 0 {
+                on_data(&vec![0.25; 480], 1);
+                return Ok(ActiveInput::new(48_000, ()));
+            }
+
+            self.clock.advance(Duration::from_millis(100));
+            on_data(&vec![-0.25; 441], 1);
+            self.clock.advance(Duration::from_millis(150));
+            Ok(ActiveInput::new(44_100, ()))
+        }
     }
 
     impl CaptureBackend for EarlyDeathBackend {
@@ -787,5 +820,33 @@ mod tests {
         );
         assert!(mic.has_live_stream());
         assert_eq!(starts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn silence_fill_ends_when_replacement_samples_begin() {
+        let clock = Arc::new(FakeClock::default());
+        let mut mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(SamplesBeforeReturnBackend {
+                starts: AtomicUsize::new(0),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+
+        mic.start().unwrap();
+        assert_eq!(
+            mic.default_input_switched().await.unwrap(),
+            CaptureRecovery::Capturing
+        );
+        let track = mic.stop().unwrap();
+
+        // Samples begin after 100ms even though backend startup returns after
+        // 250ms, so only 1,600 canonical Silence Fill samples are needed.
+        assert_eq!(track.len(), 1_920);
+        assert!(track[..160].iter().all(|sample| *sample > 0.0));
+        assert!(track[160..1_760].iter().all(|sample| *sample == 0.0));
+        assert!(track[1_760..].iter().all(|sample| *sample < 0.0));
     }
 }

@@ -174,8 +174,11 @@ async fn handle_default_input_switched(
     dictation: &impl DictationCommandTarget,
     meeting: &mut impl MeetingCaptureCommandTarget,
 ) {
-    handle_dictation_command(dictation, DaemonCommand::DefaultInputSwitched).await;
-    if let Err(e) = meeting.default_input_switched().await {
+    let (_, meeting_result) = tokio::join!(
+        handle_dictation_command(dictation, DaemonCommand::DefaultInputSwitched),
+        meeting.default_input_switched(),
+    );
+    if let Err(e) = meeting_result {
         error!("Failed to switch meeting microphone to the current Default Input: {e}");
     }
 }
@@ -772,6 +775,41 @@ mod tests {
         deaths: usize,
     }
 
+    struct SlowDictationTarget;
+
+    #[async_trait::async_trait]
+    impl DictationCommandTarget for SlowDictationTarget {
+        async fn toggle(&self, _options: Option<crate::audio::JobOptions>) -> Result<ToggleResult> {
+            unreachable!("fan-out timing test does not toggle dictation")
+        }
+
+        async fn default_input_switched(&self) -> Result<()> {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(())
+        }
+
+        async fn stream_died(&self, _death: StreamDeath) -> Result<()> {
+            unreachable!("fan-out timing test does not inject stream death")
+        }
+    }
+
+    #[derive(Default)]
+    struct TimedMeetingTarget {
+        switched_at: Option<tokio::time::Instant>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl MeetingCaptureCommandTarget for TimedMeetingTarget {
+        async fn default_input_switched(&mut self) -> Result<()> {
+            self.switched_at = Some(tokio::time::Instant::now());
+            Ok(())
+        }
+
+        async fn microphone_stream_died(&mut self, _death: StreamDeath) -> Result<()> {
+            unreachable!("fan-out timing test does not inject stream death")
+        }
+    }
+
     #[async_trait::async_trait(?Send)]
     impl MeetingCaptureCommandTarget for RoutingMeetingTarget {
         async fn default_input_switched(&mut self) -> Result<()> {
@@ -814,5 +852,18 @@ mod tests {
         assert_eq!(meeting.switches, 1);
         assert_eq!(dictation.deaths.load(Ordering::SeqCst), 1);
         assert_eq!(meeting.deaths, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_dictation_recovery_does_not_delay_meeting_switch() {
+        let origin = tokio::time::Instant::now();
+        let mut meeting = TimedMeetingTarget::default();
+
+        handle_default_input_switched(&SlowDictationTarget, &mut meeting).await;
+
+        assert_eq!(
+            meeting.switched_at.unwrap().duration_since(origin),
+            Duration::ZERO
+        );
     }
 }
