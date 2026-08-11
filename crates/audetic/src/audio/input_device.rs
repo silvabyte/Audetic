@@ -15,10 +15,15 @@ use tracing::{error, info};
 
 /// Delivers native-rate, interleaved input samples and their channel count.
 pub(crate) type InputDataCallback = Box<dyn FnMut(&[f32], usize) + Send + 'static>;
+pub(crate) type InputErrorCallback = Box<dyn FnMut() + Send + 'static>;
 
 /// Starts capture from whichever device is the Default Input at call time.
 pub(crate) trait CaptureBackend: Send + Sync {
-    fn start_default_input(&self, on_data: InputDataCallback) -> Result<ActiveInput>;
+    fn start_default_input(
+        &self,
+        on_data: InputDataCallback,
+        on_error: InputErrorCallback,
+    ) -> Result<ActiveInput>;
 }
 
 trait CaptureStream: Send + Sync {}
@@ -57,7 +62,11 @@ impl CpalCaptureBackend {
 }
 
 impl CaptureBackend for CpalCaptureBackend {
-    fn start_default_input(&self, mut on_data: InputDataCallback) -> Result<ActiveInput> {
+    fn start_default_input(
+        &self,
+        mut on_data: InputDataCallback,
+        mut on_error: InputErrorCallback,
+    ) -> Result<ActiveInput> {
         let input = open_default_input(self.label)?;
         let channels = input.channels;
         let native_sample_rate = input.native_sample_rate;
@@ -69,7 +78,10 @@ impl CaptureBackend for CpalCaptureBackend {
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     on_data(data, channels);
                 },
-                move |err| error!("{label} audio stream error: {err}"),
+                move |err| {
+                    error!("{label} audio stream error: {err}");
+                    on_error();
+                },
                 None,
             )
             .context("Failed to build default input stream")?;

@@ -22,7 +22,7 @@ vulkan = ["transcribe-rs/whisper-vulkan"]
 audetic-core = { path = "../audetic-core", features = ["schema"] }
 
 # Async runtime
-tokio = { version = "1.35", features = ["full"] }
+tokio = { version = "1.35", features = ["full", "test-util"] }
 tokio-util = { version = "0.7", features = ["io"] }
 
 # Async trait support

@@ -5,6 +5,7 @@ pub mod input_device;
 pub mod mic_source;
 pub mod recording_machine;
 pub mod resample;
+pub mod stream_event;
 pub mod system_source;
 
 pub use audio_stream_manager::AudioStreamManager;

@@ -7,6 +7,8 @@ use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::audio::audio_stream_manager::CaptureRecovery;
+use crate::audio::stream_event::StreamDeath;
 use crate::audio::AudioStreamManager;
 use crate::db::{self, VoiceToTextData, Workflow, WorkflowData, WorkflowType};
 use crate::post_processing::{
@@ -52,6 +54,7 @@ pub struct CompletedJob {
 #[derive(Debug, Clone)]
 pub struct RecordingStatus {
     pub phase: RecordingPhase,
+    pub capture_degraded: bool,
     /// Current job ID (set when recording starts)
     pub current_job_id: Option<String>,
     /// Current job options (set when recording starts)
@@ -65,6 +68,7 @@ impl Default for RecordingStatus {
     fn default() -> Self {
         Self {
             phase: RecordingPhase::Idle,
+            capture_degraded: false,
             current_job_id: None,
             current_job_options: None,
             last_completed_job: None,
@@ -86,12 +90,31 @@ impl RecordingStatusHandle {
     pub async fn set_phase(&self, phase: RecordingPhase, last_error: Option<String>) {
         let mut status = self.inner.lock().await;
         status.phase = phase;
+        if phase != RecordingPhase::Recording {
+            status.capture_degraded = false;
+        }
         status.last_error = last_error;
+    }
+
+    pub async fn set_capture_degraded(&self, capture_degraded: bool) {
+        let mut status = self.inner.lock().await;
+        if status.phase == RecordingPhase::Recording {
+            status.capture_degraded = capture_degraded;
+        }
+    }
+
+    pub(crate) async fn apply_capture_recovery(&self, recovery: CaptureRecovery) {
+        match recovery {
+            CaptureRecovery::Ignored => {}
+            CaptureRecovery::Capturing => self.set_capture_degraded(false).await,
+            CaptureRecovery::Degraded => self.set_capture_degraded(true).await,
+        }
     }
 
     pub async fn start_job(&self, job_id: String, options: JobOptions) {
         let mut status = self.inner.lock().await;
         status.phase = RecordingPhase::Recording;
+        status.capture_degraded = false;
         status.current_job_id = Some(job_id);
         status.current_job_options = Some(options);
         status.last_error = None;
@@ -100,6 +123,7 @@ impl RecordingStatusHandle {
     pub async fn complete_job(&self, completed_job: CompletedJob) {
         let mut status = self.inner.lock().await;
         status.phase = RecordingPhase::Idle;
+        status.capture_degraded = false;
         status.current_job_id = None;
         status.current_job_options = None;
         status.last_completed_job = Some(completed_job);
@@ -109,6 +133,7 @@ impl RecordingStatusHandle {
     pub async fn fail_job(&self, error: String) {
         let mut status = self.inner.lock().await;
         status.phase = RecordingPhase::Error;
+        status.capture_degraded = false;
         status.current_job_id = None;
         status.current_job_options = None;
         status.last_error = Some(error);
@@ -117,6 +142,7 @@ impl RecordingStatusHandle {
     pub async fn set_processing(&self) {
         let mut status = self.inner.lock().await;
         status.phase = RecordingPhase::Processing;
+        status.capture_degraded = false;
         // Keep the current_job_id during processing
     }
 
@@ -313,8 +339,21 @@ impl RecordingMachine {
     }
 
     pub(crate) async fn default_input_switched(&self) -> Result<()> {
-        let recorder = self.audio.lock().await;
-        recorder.default_input_switched()
+        let recovery = {
+            let recorder = self.audio.lock().await;
+            recorder.default_input_switched().await?
+        };
+        self.status.apply_capture_recovery(recovery).await;
+        Ok(())
+    }
+
+    pub(crate) async fn stream_died(&self, death: StreamDeath) -> Result<()> {
+        let recovery = {
+            let recorder = self.audio.lock().await;
+            recorder.stream_died(death).await?
+        };
+        self.status.apply_capture_recovery(recovery).await;
+        Ok(())
     }
 
     async fn begin_processing(
@@ -536,6 +575,7 @@ mod tests {
     fn test_recording_status_default() {
         let status = RecordingStatus::default();
         assert_eq!(status.phase, RecordingPhase::Idle);
+        assert!(!status.capture_degraded);
         assert!(status.current_job_id.is_none());
         assert!(status.current_job_options.is_none());
         assert!(status.last_completed_job.is_none());
@@ -649,6 +689,7 @@ mod tests {
         // Full lifecycle: idle -> recording -> processing -> idle (with completed job)
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Idle);
+        assert!(!status.capture_degraded);
 
         // Start recording
         handle
@@ -656,12 +697,22 @@ mod tests {
             .await;
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Recording);
+        assert!(!status.capture_degraded);
         assert_eq!(status.current_job_id, Some("lifecycle-test".to_string()));
+
+        handle.set_capture_degraded(true).await;
+        assert!(handle.get().await.capture_degraded);
+
+        handle.set_capture_degraded(false).await;
+        assert!(!handle.get().await.capture_degraded);
+
+        handle.set_capture_degraded(true).await;
 
         // Start processing
         handle.set_processing().await;
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Processing);
+        assert!(!status.capture_degraded);
         assert_eq!(status.current_job_id, Some("lifecycle-test".to_string()));
 
         // Complete
@@ -675,9 +726,50 @@ mod tests {
 
         let status = handle.get().await;
         assert_eq!(status.phase, RecordingPhase::Idle);
+        assert!(!status.capture_degraded);
         assert!(status.current_job_id.is_none());
         assert!(status.last_completed_job.is_some());
         assert_eq!(status.last_completed_job.unwrap().history_id, 100);
+    }
+
+    #[tokio::test]
+    async fn capture_health_resets_on_error_and_new_recording() {
+        let handle = RecordingStatusHandle::default();
+        handle
+            .start_job("degraded-job".to_string(), JobOptions::default())
+            .await;
+        handle.set_capture_degraded(true).await;
+
+        handle.fail_job("pipeline failed".to_string()).await;
+        assert!(!handle.get().await.capture_degraded);
+
+        handle
+            .start_job("new-job".to_string(), JobOptions::default())
+            .await;
+        assert!(!handle.get().await.capture_degraded);
+    }
+
+    #[tokio::test]
+    async fn capture_health_follows_recovery_outcomes() {
+        let handle = RecordingStatusHandle::default();
+        handle
+            .start_job("recovery-job".to_string(), JobOptions::default())
+            .await;
+
+        handle
+            .apply_capture_recovery(CaptureRecovery::Degraded)
+            .await;
+        assert!(handle.get().await.capture_degraded);
+
+        handle
+            .apply_capture_recovery(CaptureRecovery::Ignored)
+            .await;
+        assert!(handle.get().await.capture_degraded);
+
+        handle
+            .apply_capture_recovery(CaptureRecovery::Capturing)
+            .await;
+        assert!(!handle.get().await.capture_degraded);
     }
 
     #[tokio::test]
