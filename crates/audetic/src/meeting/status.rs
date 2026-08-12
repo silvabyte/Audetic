@@ -240,6 +240,28 @@ impl MeetingStatusHandle {
         state.microphone_capturing = false;
         state.update_capture_degraded();
     }
+
+    pub(crate) async fn apply_system_recovery(&self, recovery: CaptureRecovery) {
+        let mut state = self.inner.lock().await;
+        if state.phase != MeetingPhase::Recording {
+            return;
+        }
+        match recovery {
+            CaptureRecovery::Ignored => return,
+            CaptureRecovery::Capturing => state.system_capturing = true,
+            CaptureRecovery::Degraded => state.system_capturing = false,
+        }
+        state.update_capture_degraded();
+    }
+
+    pub(crate) async fn mark_system_degraded(&self) {
+        let mut state = self.inner.lock().await;
+        if state.phase != MeetingPhase::Recording {
+            return;
+        }
+        state.system_capturing = false;
+        state.update_capture_degraded();
+    }
 }
 
 #[cfg(test)]
@@ -493,6 +515,13 @@ mod tests {
             handle.get().await.capture_degraded,
             "System Tap is still unavailable"
         );
+
+        handle
+            .apply_system_recovery(CaptureRecovery::Capturing)
+            .await;
+        assert!(!handle.get().await.capture_degraded);
+        handle.mark_system_degraded().await;
+        assert!(handle.get().await.capture_degraded);
 
         handle.enter_review(1).await;
         assert!(!handle.get().await.capture_degraded);

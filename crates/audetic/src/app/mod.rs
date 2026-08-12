@@ -56,7 +56,9 @@ impl DictationCommandTarget for RecordingMachine {
 #[async_trait::async_trait(?Send)]
 trait MeetingCaptureCommandTarget {
     async fn default_input_switched(&mut self) -> Result<()>;
+    async fn default_output_switched(&mut self) -> Result<()>;
     async fn microphone_stream_died(&mut self, death: StreamDeath) -> Result<()>;
+    async fn system_stream_died(&mut self, death: StreamDeath) -> Result<()>;
 }
 
 #[async_trait::async_trait(?Send)]
@@ -67,6 +69,14 @@ impl MeetingCaptureCommandTarget for MeetingMachine {
 
     async fn microphone_stream_died(&mut self, death: StreamDeath) -> Result<()> {
         MeetingMachine::microphone_stream_died(self, death).await
+    }
+
+    async fn default_output_switched(&mut self) -> Result<()> {
+        MeetingMachine::default_output_switched(self).await
+    }
+
+    async fn system_stream_died(&mut self, death: StreamDeath) -> Result<()> {
+        MeetingMachine::system_stream_died(self, death).await
     }
 }
 
@@ -198,8 +208,16 @@ async fn handle_capture_stream_died(
             }
         }
         CaptureSource::SystemTap => {
-            warn!("Ignoring System Tap stream death until Fizzy #111 adds tap recovery");
+            if let Err(e) = meeting.system_stream_died(death).await {
+                error!("Failed to recover System Tap from stream death: {e}");
+            }
         }
+    }
+}
+
+async fn handle_default_output_switched(meeting: &mut impl MeetingCaptureCommandTarget) {
+    if let Err(e) = meeting.default_output_switched().await {
+        error!("Failed to switch System Tap to the current Default Output: {e}");
     }
 }
 
@@ -329,6 +347,9 @@ pub async fn run_service() -> Result<()> {
             DaemonCommand::DefaultInputSwitched => {
                 handle_default_input_switched(&recording_machine, &mut meeting_machine).await;
             }
+            DaemonCommand::DefaultOutputSwitched => {
+                handle_default_output_switched(&mut meeting_machine).await;
+            }
             DaemonCommand::CaptureStreamDied(death) => {
                 handle_capture_stream_died(&recording_machine, &mut meeting_machine, death).await;
             }
@@ -453,10 +474,11 @@ fn build_meeting_machine(
     meetings_dir: std::path::PathBuf,
     stream_event_sink: StreamEventSink,
 ) -> MeetingMachine {
-    let mic_source: Box<dyn crate::audio::audio_source::MeetingMicSource> =
-        Box::new(MicAudioSource::with_event_sink(16000, stream_event_sink));
+    let mic_source: Box<dyn crate::audio::audio_source::MeetingMicSource> = Box::new(
+        MicAudioSource::with_event_sink(16000, stream_event_sink.clone()),
+    );
 
-    let system_source = Box::new(SystemAudioSource::new(16000));
+    let system_source = Box::new(SystemAudioSource::with_event_sink(16000, stream_event_sink));
 
     MeetingMachine::new(
         mic_source,
@@ -775,8 +797,10 @@ mod tests {
 
     #[derive(Default)]
     struct RoutingMeetingTarget {
-        switches: usize,
-        deaths: usize,
+        input_switches: usize,
+        output_switches: usize,
+        microphone_deaths: usize,
+        system_deaths: usize,
     }
 
     struct SlowDictationTarget;
@@ -812,17 +836,35 @@ mod tests {
         async fn microphone_stream_died(&mut self, _death: StreamDeath) -> Result<()> {
             unreachable!("fan-out timing test does not inject stream death")
         }
+
+        async fn default_output_switched(&mut self) -> Result<()> {
+            unreachable!("fan-out timing test does not inject output switch")
+        }
+
+        async fn system_stream_died(&mut self, _death: StreamDeath) -> Result<()> {
+            unreachable!("fan-out timing test does not inject System Tap death")
+        }
     }
 
     #[async_trait::async_trait(?Send)]
     impl MeetingCaptureCommandTarget for RoutingMeetingTarget {
         async fn default_input_switched(&mut self) -> Result<()> {
-            self.switches += 1;
+            self.input_switches += 1;
             Ok(())
         }
 
         async fn microphone_stream_died(&mut self, _death: StreamDeath) -> Result<()> {
-            self.deaths += 1;
+            self.microphone_deaths += 1;
+            Ok(())
+        }
+
+        async fn default_output_switched(&mut self) -> Result<()> {
+            self.output_switches += 1;
+            Ok(())
+        }
+
+        async fn system_stream_died(&mut self, _death: StreamDeath) -> Result<()> {
+            self.system_deaths += 1;
             Ok(())
         }
     }
@@ -836,6 +878,7 @@ mod tests {
         let mut meeting = RoutingMeetingTarget::default();
 
         handle_default_input_switched(&dictation, &mut meeting).await;
+        handle_default_output_switched(&mut meeting).await;
         for source in [
             CaptureSource::Dictation,
             CaptureSource::MeetingMicrophone,
@@ -853,9 +896,11 @@ mod tests {
         }
 
         assert_eq!(dictation.switches.load(Ordering::SeqCst), 1);
-        assert_eq!(meeting.switches, 1);
+        assert_eq!(meeting.input_switches, 1);
+        assert_eq!(meeting.output_switches, 1);
         assert_eq!(dictation.deaths.load(Ordering::SeqCst), 1);
-        assert_eq!(meeting.deaths, 1);
+        assert_eq!(meeting.microphone_deaths, 1);
+        assert_eq!(meeting.system_deaths, 1);
     }
 
     #[tokio::test(start_paused = true)]

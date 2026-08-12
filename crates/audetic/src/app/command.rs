@@ -4,6 +4,9 @@ pub enum DaemonCommand {
     // The platform watcher is a later slice; S1 injects this typed event in tests.
     #[allow(dead_code)]
     DefaultInputSwitched,
+    // The platform watcher is Fizzy #112; S4 injects this typed event in tests.
+    #[allow(dead_code)]
+    DefaultOutputSwitched,
     CaptureStreamDied(crate::audio::stream_event::StreamDeath),
     MeetingStart {
         options: Option<crate::meeting::MeetingStartOptions>,

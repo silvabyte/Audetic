@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 use which::which;
 
-use crate::audio::audio_source::AudioSource;
+use crate::audio::audio_source::{AudioSource, MeetingSystemSource};
+use crate::audio::stream_event::StreamEventSink;
 
 pub struct SystemAudioSource {
     child: Option<Child>,
@@ -18,6 +19,7 @@ pub struct SystemAudioSource {
     samples: Arc<Mutex<Vec<f32>>>,
     active: bool,
     target_sample_rate: u32,
+    captured_audio: bool,
 }
 
 impl SystemAudioSource {
@@ -28,7 +30,12 @@ impl SystemAudioSource {
             samples: Arc::new(Mutex::new(Vec::new())),
             active: false,
             target_sample_rate: sample_rate,
+            captured_audio: false,
         }
+    }
+
+    pub(crate) fn with_event_sink(sample_rate: u32, _stream_event_sink: StreamEventSink) -> Self {
+        Self::new(sample_rate)
     }
 
     /// Get the default PipeWire monitor source name via pactl.
@@ -60,6 +67,7 @@ impl AudioSource for SystemAudioSource {
         }
 
         // Clear previous samples
+        self.captured_audio = false;
         {
             let mut samples = self.samples.lock().unwrap();
             samples.clear();
@@ -175,6 +183,7 @@ impl AudioSource for SystemAudioSource {
             guard.shrink_to_fit();
             s
         };
+        self.captured_audio = !samples.is_empty();
 
         info!("System audio stopped, {} samples captured", samples.len());
         Ok(samples)
@@ -190,6 +199,13 @@ impl AudioSource for SystemAudioSource {
 
     fn sample_rate(&self) -> u32 {
         self.target_sample_rate
+    }
+}
+
+#[async_trait::async_trait(?Send)]
+impl MeetingSystemSource for SystemAudioSource {
+    fn has_captured_audio(&self) -> bool {
+        self.captured_audio
     }
 }
 
@@ -265,5 +281,23 @@ impl Drop for SystemAudioSource {
             debug!("Dropping active SystemAudioSource, cleaning up");
             let _ = self.stop();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::audio::audio_source::MeetingSystemSource;
+    use crate::audio::capture_recovery::CaptureRecovery;
+
+    use super::SystemAudioSource;
+
+    #[tokio::test]
+    async fn output_switch_recovery_remains_a_noop_until_pipewire_support_lands() {
+        let mut source = SystemAudioSource::new(16_000);
+
+        assert_eq!(
+            source.default_output_switched().await.unwrap(),
+            CaptureRecovery::Ignored
+        );
     }
 }

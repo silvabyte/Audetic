@@ -48,3 +48,30 @@ pub trait MeetingMicSource: AudioSource {
         Ok(CaptureRecovery::Ignored)
     }
 }
+
+/// Meeting System Tap capture, including live-stream replacement while the
+/// logical meeting session remains active.
+#[async_trait::async_trait(?Send)]
+pub trait MeetingSystemSource: AudioSource {
+    /// Whether this adapter replaces a live System Tap in response to daemon
+    /// recovery commands. Linux adopts this in Fizzy #97.
+    fn supports_hot_swap(&self) -> bool {
+        false
+    }
+
+    /// Align an unavailable System Tap's open gap with the point at which the
+    /// meeting's other capture source has finished starting.
+    fn mark_meeting_started(&mut self) {}
+
+    /// Whether the current session captured real System Tap samples,
+    /// excluding synthetic Silence Fill.
+    fn has_captured_audio(&self) -> bool;
+
+    async fn default_output_switched(&mut self) -> Result<CaptureRecovery> {
+        Ok(CaptureRecovery::Ignored)
+    }
+
+    async fn stream_died(&mut self, _death: StreamDeath) -> Result<CaptureRecovery> {
+        Ok(CaptureRecovery::Ignored)
+    }
+}

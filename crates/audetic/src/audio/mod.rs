@@ -8,6 +8,8 @@ pub mod recording_machine;
 pub mod resample;
 pub mod stream_event;
 pub mod system_source;
+#[cfg(any(target_os = "macos", test))]
+pub(crate) mod system_tap;
 
 pub use audio_stream_manager::AudioStreamManager;
 pub use recording_machine::{

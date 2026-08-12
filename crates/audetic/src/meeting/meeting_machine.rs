@@ -15,7 +15,7 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 
 use crate::audio::audio_mixer::AudioMixer;
-use crate::audio::audio_source::{AudioSource, MeetingMicSource};
+use crate::audio::audio_source::{MeetingMicSource, MeetingSystemSource};
 use crate::audio::capture_recovery::CaptureRecovery;
 use crate::audio::stream_event::StreamDeath;
 use crate::db::{self, meetings::MeetingRepository};
@@ -77,7 +77,7 @@ pub struct MeetingStartResult {
 
 pub struct MeetingMachine {
     mic_source: Box<dyn MeetingMicSource>,
-    system_source: Box<dyn AudioSource>,
+    system_source: Box<dyn MeetingSystemSource>,
     transcription: Arc<dyn TranscriptionJobService>,
     post_processing: Arc<PostProcessingService>,
     indicator: Indicator,
@@ -88,7 +88,7 @@ pub struct MeetingMachine {
 impl MeetingMachine {
     pub fn new(
         mic_source: Box<dyn MeetingMicSource>,
-        system_source: Box<dyn AudioSource>,
+        system_source: Box<dyn MeetingSystemSource>,
         transcription: Arc<dyn TranscriptionJobService>,
         post_processing: Arc<PostProcessingService>,
         indicator: Indicator,
@@ -155,6 +155,7 @@ impl MeetingMachine {
             }
         };
         self.mic_source.mark_meeting_started();
+        self.system_source.mark_meeting_started();
 
         let mic_ok = mic_started && self.mic_source.has_live_stream();
         let system_ok = system_started && self.system_source.has_live_stream();
@@ -241,6 +242,25 @@ impl MeetingMachine {
         .await
     }
 
+    pub(crate) async fn default_output_switched(&mut self) -> Result<()> {
+        if !self.system_source.supports_hot_swap() {
+            return Ok(());
+        }
+        self.status.mark_system_degraded().await;
+        let recovery = self.system_source.default_output_switched().await;
+        self.finish_system_recovery(recovery, "Failed to switch System Tap Default Output")
+            .await
+    }
+
+    pub(crate) async fn system_stream_died(&mut self, death: StreamDeath) -> Result<()> {
+        if !self.system_source.has_live_stream() {
+            self.status.mark_system_degraded().await;
+        }
+        let recovery = self.system_source.stream_died(death).await;
+        self.finish_system_recovery(recovery, "Failed to recover System Tap from stream death")
+            .await
+    }
+
     async fn finish_microphone_recovery(
         &self,
         recovery: Result<CaptureRecovery>,
@@ -258,6 +278,28 @@ impl MeetingMachine {
                     CaptureRecovery::Degraded
                 };
                 self.status.apply_microphone_recovery(actual).await;
+                Err(error).context(error_context)
+            }
+        }
+    }
+
+    async fn finish_system_recovery(
+        &self,
+        recovery: Result<CaptureRecovery>,
+        error_context: &'static str,
+    ) -> Result<()> {
+        match recovery {
+            Ok(recovery) => {
+                self.status.apply_system_recovery(recovery).await;
+                Ok(())
+            }
+            Err(error) => {
+                let actual = if self.system_source.has_live_stream() {
+                    CaptureRecovery::Capturing
+                } else {
+                    CaptureRecovery::Degraded
+                };
+                self.status.apply_system_recovery(actual).await;
                 Err(error).context(error_context)
             }
         }
@@ -296,17 +338,19 @@ impl MeetingMachine {
 
         let mic_rate = self.mic_source.sample_rate();
 
-        let system_samples = match self.system_source.stop() {
-            Ok(s) => s,
+        let (system_samples, system_stop_succeeded) = match self.system_source.stop() {
+            Ok(samples) => (samples, true),
             Err(e) => {
                 warn!("Failed to stop system audio: {}", e);
-                Vec::new()
+                (Vec::new(), false)
             }
         };
+        let system_captured_audio =
+            system_stop_succeeded && self.system_source.has_captured_audio();
 
         let system_rate = self.system_source.sample_rate();
 
-        if !mic_captured_audio && system_samples.is_empty() {
+        if !mic_captured_audio && !system_captured_audio {
             // Persist failure so the meeting row isn't left stuck in `recording`.
             if let Ok(conn) = db::init_db() {
                 let _ = MeetingRepository::fail(
@@ -692,10 +736,15 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
+    use crate::audio::audio_source::AudioSource;
     use crate::audio::input_device::{
         ActiveInput, CaptureBackend, InputDataCallback, InputErrorCallback,
     };
     use crate::audio::mic_source::{MicAudioSource, MonotonicClock};
+    use crate::audio::system_tap::{
+        ActiveSystemTap, SystemTapAudioSource, SystemTapBackend, SystemTapDataCallback,
+        SystemTapErrorCallback,
+    };
     use crate::post_processing::PostProcessingService;
     use crate::transcription::job_service::{TranscriptionJobResult, TranscriptionJobService};
 
@@ -761,6 +810,34 @@ mod tests {
         }
     }
 
+    struct PlannedSystemBackend {
+        plans: Mutex<VecDeque<CapturePlan>>,
+        clock: Arc<FakeClock>,
+    }
+
+    impl SystemTapBackend for PlannedSystemBackend {
+        fn start_default_output(
+            &self,
+            mut on_data: SystemTapDataCallback,
+            _on_error: SystemTapErrorCallback,
+        ) -> Result<ActiveSystemTap> {
+            match self.plans.lock().unwrap().pop_front().unwrap() {
+                CapturePlan::Input(input) => {
+                    self.clock.advance(input.open_duration);
+                    on_data(&input.samples, 1);
+                    Ok(ActiveSystemTap::new(input.sample_rate, ()))
+                }
+                CapturePlan::Fail {
+                    message,
+                    open_duration,
+                } => {
+                    self.clock.advance(open_duration);
+                    Err(anyhow::anyhow!(message))
+                }
+            }
+        }
+    }
+
     struct ContinuousSystemSource {
         samples: Vec<f32>,
         active: bool,
@@ -783,6 +860,13 @@ mod tests {
 
         fn sample_rate(&self) -> u32 {
             16_000
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl MeetingSystemSource for ContinuousSystemSource {
+        fn has_captured_audio(&self) -> bool {
+            !self.samples.is_empty()
         }
     }
 
@@ -878,6 +962,202 @@ mod tests {
         let review = status.get().await;
         assert_eq!(review.phase, MeetingPhase::Review);
         assert!(!review.capture_degraded);
+    }
+
+    #[tokio::test]
+    async fn system_tap_hot_swap_keeps_continuous_mic_track_aligned() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Input(PlannedInput {
+                    sample_rate: 16_000,
+                    samples: vec![0.1; 4_320],
+                    open_duration: Duration::ZERO,
+                })])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let system = SystemTapAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedSystemBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    }),
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 44_100,
+                        samples: vec![-0.25; 441],
+                        open_duration: Duration::from_millis(260),
+                    }),
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = MeetingStatusHandle::default();
+        let meetings_dir = tempfile::tempdir().unwrap();
+        let mut machine = MeetingMachine::new(
+            Box::new(mic),
+            Box::new(system),
+            Arc::new(UnusedTranscription),
+            Arc::new(PostProcessingService::new()),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            meetings_dir.path().to_path_buf(),
+        );
+
+        let started = machine.start(None).await.unwrap();
+        assert!(!status.get().await.capture_degraded);
+        machine.default_output_switched().await.unwrap();
+        assert!(!status.get().await.capture_degraded);
+        machine.stop().await.unwrap();
+
+        let mixed = read_wav(&started.audio_path);
+        assert_eq!(mixed.len(), 4_320);
+        assert!(mixed[..160].iter().all(|sample| *sample > 0.1));
+        assert!(mixed[160..4_160]
+            .iter()
+            .all(|sample| (*sample - 0.1).abs() < f32::EPSILON));
+        assert!(mixed[4_160..].iter().all(|sample| *sample < 0.1));
+        assert_eq!(status.get().await.phase, MeetingPhase::Review);
+    }
+
+    #[tokio::test]
+    async fn initial_system_tap_failure_recovers_with_prefix_silence() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Input(PlannedInput {
+                    sample_rate: 16_000,
+                    samples: vec![0.1; 4_960],
+                    open_duration: Duration::ZERO,
+                })])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let system = SystemTapAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedSystemBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Fail {
+                        message: "Default Output unavailable",
+                        open_duration: Duration::from_secs(5),
+                    },
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::ZERO,
+                    }),
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let status = MeetingStatusHandle::default();
+        let meetings_dir = tempfile::tempdir().unwrap();
+        let mut machine = MeetingMachine::new(
+            Box::new(mic),
+            Box::new(system),
+            Arc::new(UnusedTranscription),
+            Arc::new(PostProcessingService::new()),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            meetings_dir.path().to_path_buf(),
+        );
+
+        let started = machine.start(None).await.unwrap();
+        assert_eq!(started.capture_state, CaptureState::MicOnly);
+        assert!(status.get().await.capture_degraded);
+        clock.advance(Duration::from_millis(300));
+        machine.default_output_switched().await.unwrap();
+        assert!(!status.get().await.capture_degraded);
+        machine.stop().await.unwrap();
+
+        let mixed = read_wav(&started.audio_path);
+        assert_eq!(mixed.len(), 4_960);
+        assert!(mixed[..4_800]
+            .iter()
+            .all(|sample| (*sample - 0.1).abs() < f32::EPSILON));
+        assert!(mixed[4_800..].iter().all(|sample| *sample > 0.1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn meeting_status_is_degraded_while_system_tap_retries() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Input(PlannedInput {
+                    sample_rate: 16_000,
+                    samples: vec![0.1; 160],
+                    open_duration: Duration::ZERO,
+                })])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let system = SystemTapAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedSystemBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 16_000,
+                        samples: vec![0.25; 160],
+                        open_duration: Duration::ZERO,
+                    }),
+                    CapturePlan::Fail {
+                        message: "replacement 1 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                    CapturePlan::Fail {
+                        message: "replacement 2 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                    CapturePlan::Fail {
+                        message: "replacement 3 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = MeetingStatusHandle::default();
+        let meetings_dir = tempfile::tempdir().unwrap();
+        let mut machine = MeetingMachine::new(
+            Box::new(mic),
+            Box::new(system),
+            Arc::new(UnusedTranscription),
+            Arc::new(PostProcessingService::new()),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            meetings_dir.path().to_path_buf(),
+        );
+
+        machine.start(None).await.unwrap();
+        let replacement = machine.default_output_switched();
+        tokio::pin!(replacement);
+        tokio::select! {
+            biased;
+            result = &mut replacement => panic!("replacement completed before retrying: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        assert!(status.get().await.capture_degraded);
+        replacement.await.unwrap();
+        assert!(status.get().await.capture_degraded);
     }
 
     #[tokio::test]
