@@ -27,7 +27,7 @@ pub(crate) trait MonotonicClock: Send + Sync {
     fn now(&self) -> Duration;
 }
 
-struct SystemMonotonicClock {
+pub(crate) struct SystemMonotonicClock {
     origin: Instant,
 }
 

@@ -1183,6 +1183,18 @@ mod tests {
         let recording = default_meeting_status_json(&status.get().await);
         assert_eq!(recording["capture_degraded"], true);
 
+        status
+            .apply_microphone_recovery(crate::audio::capture_recovery::CaptureRecovery::Capturing)
+            .await;
+        status.mark_system_degraded().await;
+        let system_degraded = default_meeting_status_json(&status.get().await);
+        assert_eq!(system_degraded["capture_degraded"], true);
+        status
+            .apply_system_recovery(crate::audio::capture_recovery::CaptureRecovery::Capturing)
+            .await;
+        let recovered = default_meeting_status_json(&status.get().await);
+        assert_eq!(recovered["capture_degraded"], false);
+
         status.enter_review(1).await;
         let review = default_meeting_status_json(&status.get().await);
         assert_eq!(review["capture_degraded"], false);

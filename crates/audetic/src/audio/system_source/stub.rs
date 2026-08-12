@@ -6,11 +6,19 @@
 use anyhow::Result;
 use tracing::warn;
 
-use crate::audio::audio_source::AudioSource;
+use crate::audio::audio_source::{AudioSource, MeetingSystemSource};
+use crate::audio::stream_event::StreamEventSink;
 
 pub struct SystemAudioSource {
     active: bool,
     target_sample_rate: u32,
+}
+
+#[async_trait::async_trait(?Send)]
+impl MeetingSystemSource for SystemAudioSource {
+    fn has_captured_audio(&self) -> bool {
+        false
+    }
 }
 
 impl SystemAudioSource {
@@ -19,6 +27,10 @@ impl SystemAudioSource {
             active: false,
             target_sample_rate: sample_rate,
         }
+    }
+
+    pub(crate) fn with_event_sink(sample_rate: u32, _stream_event_sink: StreamEventSink) -> Self {
+        Self::new(sample_rate)
     }
 }
 
