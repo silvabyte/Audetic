@@ -137,3 +137,4 @@ objc2-av-foundation = { version = "0.3", features = [
     "AVMediaFormat",
     "block2",
 ] }
+objc2-core-audio = { version = "0.3", features = ["AudioHardware"] }

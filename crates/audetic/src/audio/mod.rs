@@ -2,6 +2,7 @@ pub mod audio_mixer;
 pub mod audio_source;
 pub mod audio_stream_manager;
 pub mod capture_recovery;
+pub(crate) mod device_watcher;
 pub mod input_device;
 pub mod mic_source;
 pub mod recording_machine;
@@ -12,6 +13,7 @@ pub mod system_source;
 pub(crate) mod system_tap;
 
 pub use audio_stream_manager::AudioStreamManager;
+pub use device_watcher::SettledSwitch;
 pub use recording_machine::{
     BehaviorOptions, CompletedJob, JobOptions, RecordingMachine, RecordingPhase, RecordingStatus,
     RecordingStatusHandle, ToggleResult,
