@@ -6,8 +6,8 @@ use tracing::{debug, info, warn};
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
+use super::capture_recovery::{start_capture_with_retries, CaptureRecovery};
 use super::input_device::{
     ActiveInput, CaptureBackend, CpalCaptureBackend, InputDataCallback, InputErrorCallback,
 };
@@ -17,8 +17,6 @@ use super::stream_event::{CaptureSource, StreamDeath, StreamEventSink, StreamGen
 /// Target sample rate the VTT pipeline (Whisper) expects. The device may
 /// capture at a higher native rate; the WAV written on stop is at this rate.
 const TARGET_SAMPLE_RATE: u32 = 16000; // Whisper optimal
-const REPLACEMENT_ATTEMPTS: usize = 3;
-const REPLACEMENT_RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// State of the audio recording session
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -26,13 +24,6 @@ pub enum RecordingState {
     Idle,
     Recording,
     Stopping,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CaptureRecovery {
-    Ignored,
-    Capturing,
-    Degraded,
 }
 
 enum ReplacementTrigger {
@@ -198,6 +189,7 @@ impl AudioStreamManager {
             return Ok(CaptureRecovery::Ignored);
         }
 
+        let is_device_switch = matches!(&trigger, ReplacementTrigger::DefaultInputSwitched);
         if let ReplacementTrigger::StreamDied(death) = trigger {
             let current_generation = self
                 .active_segment
@@ -212,40 +204,35 @@ impl AudioStreamManager {
             }
         }
 
+        if is_device_switch {
+            // Let the meeting consumer enter recovery before Segment closing
+            // or native device lookup can block the command-loop thread.
+            tokio::task::yield_now().await;
+        }
+
         self.close_current_segment()
             .context("Failed to close Segment for capture replacement")?;
 
-        for attempt in 1..=REPLACEMENT_ATTEMPTS {
-            match self.start_segment() {
-                Ok(segment) => {
-                    *self.active_segment.lock().unwrap() = Some(segment);
-                    info!("Recovered active dictation on the current Default Input");
-                    return Ok(CaptureRecovery::Capturing);
-                }
-                Err(error) => {
-                    warn!(
-                        "Failed to open replacement Default Input (attempt {attempt}/{REPLACEMENT_ATTEMPTS}): {error:#}"
-                    );
-                    if attempt < REPLACEMENT_ATTEMPTS {
-                        tokio::time::sleep(REPLACEMENT_RETRY_DELAY).await;
-                    }
-                }
+        match start_capture_with_retries("replacement Default Input", || self.start_segment()).await
+        {
+            Ok(segment) => {
+                *self.active_segment.lock().unwrap() = Some(segment);
+                info!("Recovered active dictation on the current Default Input");
+                Ok(CaptureRecovery::Capturing)
+            }
+            Err(_) => {
+                warn!("Dictation remains active in Degraded Capture");
+                Ok(CaptureRecovery::Degraded)
             }
         }
-
-        warn!("Dictation remains active in Degraded Capture");
-        Ok(CaptureRecovery::Degraded)
     }
 
     fn start_segment(&self) -> Result<ActiveSegment> {
         let generation = {
             let current = self.stream_generation.lock().unwrap();
-            StreamGeneration(
-                current
-                    .0
-                    .checked_add(1)
-                    .context("Stream Generation overflowed")?,
-            )
+            current
+                .next()
+                .context("Failed to allocate dictation Stream Generation")?
         };
         let native_samples = Arc::new(Mutex::new(Vec::new()));
         let callback_samples = native_samples.clone();

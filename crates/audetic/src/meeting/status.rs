@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use crate::audio::capture_recovery::CaptureRecovery;
+
 /// Phase of a meeting recording lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -65,6 +67,7 @@ pub struct MeetingStartOptions {
 #[derive(Debug, Clone)]
 pub struct MeetingState {
     pub phase: MeetingPhase,
+    pub capture_degraded: bool,
     pub meeting_id: Option<i64>,
     pub started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub title: Option<String>,
@@ -74,18 +77,23 @@ pub struct MeetingState {
     /// duration reported to clients so the timer stops climbing and the trim
     /// UI has an accurate end bound.
     pub recorded_duration_seconds: Option<u64>,
+    microphone_capturing: bool,
+    system_capturing: bool,
 }
 
 impl Default for MeetingState {
     fn default() -> Self {
         Self {
             phase: MeetingPhase::Idle,
+            capture_degraded: false,
             meeting_id: None,
             started_at: None,
             title: None,
             audio_path: None,
             last_error: None,
             recorded_duration_seconds: None,
+            microphone_capturing: false,
+            system_capturing: false,
         }
     }
 }
@@ -102,6 +110,17 @@ impl MeetingState {
             let elapsed = chrono::Utc::now() - started;
             elapsed.num_seconds().max(0) as u64
         })
+    }
+
+    fn update_capture_degraded(&mut self) {
+        self.capture_degraded = self.phase == MeetingPhase::Recording
+            && (!self.microphone_capturing || !self.system_capturing);
+    }
+
+    fn clear_capture_health(&mut self) {
+        self.capture_degraded = false;
+        self.microphone_capturing = false;
+        self.system_capturing = false;
     }
 }
 
@@ -121,6 +140,8 @@ impl MeetingStatusHandle {
         meeting_id: i64,
         title: Option<String>,
         audio_path: PathBuf,
+        microphone_capturing: bool,
+        system_capturing: bool,
     ) {
         let mut state = self.inner.lock().await;
         state.phase = MeetingPhase::Recording;
@@ -133,11 +154,17 @@ impl MeetingStatusHandle {
         // otherwise the new recording inherits the old meeting's length (the
         // live timer freezes and the trim UI gets a bogus end bound).
         state.recorded_duration_seconds = None;
+        state.microphone_capturing = microphone_capturing;
+        state.system_capturing = system_capturing;
+        state.update_capture_degraded();
     }
 
     pub async fn set_phase(&self, phase: MeetingPhase) {
         let mut state = self.inner.lock().await;
         state.phase = phase;
+        if phase != MeetingPhase::Recording {
+            state.clear_capture_health();
+        }
     }
 
     /// Transition into the Review phase, freezing the recorded duration so the
@@ -147,12 +174,14 @@ impl MeetingStatusHandle {
         state.phase = MeetingPhase::Review;
         state.recorded_duration_seconds = Some(duration_seconds);
         state.last_error = None;
+        state.clear_capture_health();
     }
 
     pub async fn set_error(&self, error: String) {
         let mut state = self.inner.lock().await;
         state.phase = MeetingPhase::Error;
         state.last_error = Some(error);
+        state.clear_capture_health();
     }
 
     pub async fn reset(&self) {
@@ -181,11 +210,35 @@ impl MeetingStatusHandle {
     pub async fn complete(&self) {
         let mut state = self.inner.lock().await;
         state.phase = MeetingPhase::Completed;
+        state.clear_capture_health();
     }
 
     pub async fn cancelled(&self) {
         let mut state = self.inner.lock().await;
         state.phase = MeetingPhase::Cancelled;
+        state.clear_capture_health();
+    }
+
+    pub(crate) async fn apply_microphone_recovery(&self, recovery: CaptureRecovery) {
+        let mut state = self.inner.lock().await;
+        if state.phase != MeetingPhase::Recording {
+            return;
+        }
+        match recovery {
+            CaptureRecovery::Ignored => return,
+            CaptureRecovery::Capturing => state.microphone_capturing = true,
+            CaptureRecovery::Degraded => state.microphone_capturing = false,
+        }
+        state.update_capture_degraded();
+    }
+
+    pub(crate) async fn mark_microphone_degraded(&self) {
+        let mut state = self.inner.lock().await;
+        if state.phase != MeetingPhase::Recording {
+            return;
+        }
+        state.microphone_capturing = false;
+        state.update_capture_degraded();
     }
 }
 
@@ -263,6 +316,8 @@ mod tests {
                 1,
                 Some("Standup".to_string()),
                 PathBuf::from("/tmp/test.wav"),
+                true,
+                true,
             )
             .await;
 
@@ -280,7 +335,7 @@ mod tests {
         // Meeting 1 stops and freezes its duration in Review, then errors —
         // neither `enter_review` nor `set_error` clears the frozen value.
         handle
-            .start_recording(1, None, PathBuf::from("/tmp/one.wav"))
+            .start_recording(1, None, PathBuf::from("/tmp/one.wav"), true, true)
             .await;
         handle.enter_review(654).await;
         handle.set_error("boom".to_string()).await;
@@ -288,7 +343,7 @@ mod tests {
         // Meeting 2 starts without an intervening reset(). Its duration must
         // be the live elapsed time, not meeting 1's frozen 654s.
         handle
-            .start_recording(2, None, PathBuf::from("/tmp/two.wav"))
+            .start_recording(2, None, PathBuf::from("/tmp/two.wav"), true, true)
             .await;
         let state = handle.get().await;
         assert_eq!(state.recorded_duration_seconds, None);
@@ -316,7 +371,13 @@ mod tests {
     async fn test_status_handle_reset() {
         let handle = MeetingStatusHandle::default();
         handle
-            .start_recording(1, Some("Test".to_string()), PathBuf::from("/tmp/test.wav"))
+            .start_recording(
+                1,
+                Some("Test".to_string()),
+                PathBuf::from("/tmp/test.wav"),
+                true,
+                true,
+            )
             .await;
         handle.reset().await;
 
@@ -329,7 +390,13 @@ mod tests {
     async fn test_clear_if_current_resets_matching_meeting() {
         let handle = MeetingStatusHandle::default();
         handle
-            .start_recording(7, Some("Test".to_string()), PathBuf::from("/tmp/test.wav"))
+            .start_recording(
+                7,
+                Some("Test".to_string()),
+                PathBuf::from("/tmp/test.wav"),
+                true,
+                true,
+            )
             .await;
         handle.complete().await;
 
@@ -346,7 +413,13 @@ mod tests {
     async fn test_clear_if_current_ignores_other_meeting() {
         let handle = MeetingStatusHandle::default();
         handle
-            .start_recording(8, Some("Live".to_string()), PathBuf::from("/tmp/live.wav"))
+            .start_recording(
+                8,
+                Some("Live".to_string()),
+                PathBuf::from("/tmp/live.wav"),
+                true,
+                true,
+            )
             .await;
 
         // Deleting an older meeting must not disturb the current one.
@@ -369,7 +442,7 @@ mod tests {
 
         // Start
         handle
-            .start_recording(1, None, PathBuf::from("/tmp/meeting.wav"))
+            .start_recording(1, None, PathBuf::from("/tmp/meeting.wav"), true, true)
             .await;
         assert_eq!(handle.get().await.phase, MeetingPhase::Recording);
 
@@ -384,5 +457,77 @@ mod tests {
         // Complete
         handle.complete().await;
         assert_eq!(handle.get().await.phase, MeetingPhase::Completed);
+    }
+
+    #[tokio::test]
+    async fn capture_health_tracks_each_expected_meeting_leg() {
+        use crate::audio::capture_recovery::CaptureRecovery;
+
+        let handle = MeetingStatusHandle::default();
+        handle
+            .start_recording(1, None, PathBuf::from("/tmp/meeting.wav"), false, true)
+            .await;
+        let degraded = handle.get().await;
+        assert_eq!(degraded.phase, MeetingPhase::Recording);
+        assert!(degraded.capture_degraded);
+
+        handle
+            .apply_microphone_recovery(CaptureRecovery::Capturing)
+            .await;
+        assert!(!handle.get().await.capture_degraded);
+
+        handle.mark_microphone_degraded().await;
+        assert!(handle.get().await.capture_degraded);
+        handle
+            .apply_microphone_recovery(CaptureRecovery::Capturing)
+            .await;
+        assert!(!handle.get().await.capture_degraded);
+
+        handle
+            .start_recording(2, None, PathBuf::from("/tmp/meeting-2.wav"), true, false)
+            .await;
+        handle
+            .apply_microphone_recovery(CaptureRecovery::Capturing)
+            .await;
+        assert!(
+            handle.get().await.capture_degraded,
+            "System Tap is still unavailable"
+        );
+
+        handle.enter_review(1).await;
+        assert!(!handle.get().await.capture_degraded);
+    }
+
+    #[tokio::test]
+    async fn capture_health_resets_on_every_session_end() {
+        let handle = MeetingStatusHandle::default();
+        let path = PathBuf::from("/tmp/meeting.wav");
+
+        handle
+            .start_recording(1, None, path.clone(), false, true)
+            .await;
+        handle.set_error("capture failed".to_string()).await;
+        assert!(!handle.get().await.capture_degraded);
+
+        handle
+            .start_recording(2, None, path.clone(), false, true)
+            .await;
+        handle.complete().await;
+        assert!(!handle.get().await.capture_degraded);
+
+        handle
+            .start_recording(3, None, path.clone(), false, true)
+            .await;
+        handle.cancelled().await;
+        assert!(!handle.get().await.capture_degraded);
+
+        handle
+            .start_recording(4, None, path.clone(), false, true)
+            .await;
+        handle.reset().await;
+        assert!(!handle.get().await.capture_degraded);
+
+        handle.start_recording(5, None, path, true, true).await;
+        assert!(!handle.get().await.capture_degraded);
     }
 }

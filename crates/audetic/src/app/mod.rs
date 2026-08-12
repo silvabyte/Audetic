@@ -3,14 +3,15 @@
 mod command;
 
 use anyhow::{anyhow, Result};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{error, info, warn};
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::ApiServer;
-use crate::audio::stream_event::{StreamDeath, StreamEventSink};
+use crate::audio::stream_event::{CaptureSource, StreamDeath, StreamEventSink};
 use crate::audio::{
     mic_source::MicAudioSource, system_source::SystemAudioSource, AudioStreamManager,
     BehaviorOptions, RecordingMachine, RecordingPhase, RecordingStatusHandle, ToggleResult,
@@ -52,15 +53,80 @@ impl DictationCommandTarget for RecordingMachine {
     }
 }
 
-fn dictation_stream_event_sink(tx: &mpsc::Sender<DaemonCommand>) -> StreamEventSink {
+#[async_trait::async_trait(?Send)]
+trait MeetingCaptureCommandTarget {
+    async fn default_input_switched(&mut self) -> Result<()>;
+    async fn microphone_stream_died(&mut self, death: StreamDeath) -> Result<()>;
+}
+
+#[async_trait::async_trait(?Send)]
+impl MeetingCaptureCommandTarget for MeetingMachine {
+    async fn default_input_switched(&mut self) -> Result<()> {
+        MeetingMachine::default_input_switched(self).await
+    }
+
+    async fn microphone_stream_died(&mut self, death: StreamDeath) -> Result<()> {
+        MeetingMachine::microphone_stream_died(self, death).await
+    }
+}
+
+fn capture_stream_event_sink(tx: &mpsc::Sender<DaemonCommand>) -> StreamEventSink {
     let tx = tx.downgrade();
+    let pending = Arc::new(std::array::from_fn::<_, 3, _>(|_| AtomicU64::new(0)));
+    let notify = Arc::new(Notify::new());
+    let bridge_tx = tx.clone();
+    let bridge_pending = pending.clone();
+    let bridge_notify = notify.clone();
+    tokio::spawn(async move {
+        loop {
+            bridge_notify.notified().await;
+            for (slot, source) in [
+                CaptureSource::Dictation,
+                CaptureSource::MeetingMicrophone,
+                CaptureSource::SystemTap,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let generation = bridge_pending[slot].swap(0, Ordering::SeqCst);
+                if generation == 0 {
+                    continue;
+                }
+                let Some(tx) = bridge_tx.upgrade() else {
+                    return;
+                };
+                if tx
+                    .send(DaemonCommand::CaptureStreamDied(StreamDeath {
+                        source,
+                        generation: generation.into(),
+                    }))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        }
+    });
+
     Arc::new(move |death| {
         let Some(tx) = tx.upgrade() else {
             return;
         };
-        // Audio callbacks cannot wait for capacity. A full or closed command
-        // queue drops the report; later settled switches remain recovery triggers.
-        let _ = tx.try_send(DaemonCommand::CaptureStreamDied(death));
+        // Audio callbacks cannot wait for capacity. Coalesce overflow by source;
+        // the bridge forwards it when the bounded command queue has room.
+        if matches!(
+            tx.try_send(DaemonCommand::CaptureStreamDied(death)),
+            Err(mpsc::error::TrySendError::Full(_))
+        ) {
+            let slot = match death.source {
+                CaptureSource::Dictation => 0,
+                CaptureSource::MeetingMicrophone => 1,
+                CaptureSource::SystemTap => 2,
+            };
+            pending[slot].fetch_max(death.generation.0, Ordering::SeqCst);
+            notify.notify_one();
+        }
     })
 }
 
@@ -104,6 +170,39 @@ async fn handle_dictation_command(target: &impl DictationCommandTarget, command:
     }
 }
 
+async fn handle_default_input_switched(
+    dictation: &impl DictationCommandTarget,
+    meeting: &mut impl MeetingCaptureCommandTarget,
+) {
+    let (_, meeting_result) = tokio::join!(
+        handle_dictation_command(dictation, DaemonCommand::DefaultInputSwitched),
+        meeting.default_input_switched(),
+    );
+    if let Err(e) = meeting_result {
+        error!("Failed to switch meeting microphone to the current Default Input: {e}");
+    }
+}
+
+async fn handle_capture_stream_died(
+    dictation: &impl DictationCommandTarget,
+    meeting: &mut impl MeetingCaptureCommandTarget,
+    death: StreamDeath,
+) {
+    match death.source {
+        CaptureSource::Dictation => {
+            handle_dictation_command(dictation, DaemonCommand::CaptureStreamDied(death)).await;
+        }
+        CaptureSource::MeetingMicrophone => {
+            if let Err(e) = meeting.microphone_stream_died(death).await {
+                error!("Failed to recover meeting microphone from stream death: {e}");
+            }
+        }
+        CaptureSource::SystemTap => {
+            warn!("Ignoring System Tap stream death until Fizzy #111 adds tap recovery");
+        }
+    }
+}
+
 pub async fn run_service() -> Result<()> {
     info!("Starting Audetic service");
 
@@ -122,8 +221,9 @@ pub async fn run_service() -> Result<()> {
     let config = Config::load()?;
 
     let (tx, mut rx) = mpsc::channel::<DaemonCommand>(10);
+    let stream_event_sink = capture_stream_event_sink(&tx);
     let audio_recorder = Arc::new(Mutex::new(AudioStreamManager::with_event_sink(
-        dictation_stream_event_sink(&tx),
+        stream_event_sink.clone(),
     )?));
 
     let whisper = build_transcriber(&config)?;
@@ -190,6 +290,7 @@ pub async fn run_service() -> Result<()> {
         meeting_transcription.clone(),
         Arc::clone(&post_processing),
         meetings_dir.clone(),
+        stream_event_sink,
     );
 
     let api_server = ApiServer::new(
@@ -222,10 +323,14 @@ pub async fn run_service() -> Result<()> {
 
     while let Some(command) = rx.recv().await {
         match command {
-            command @ (DaemonCommand::ToggleRecording(_)
-            | DaemonCommand::DefaultInputSwitched
-            | DaemonCommand::CaptureStreamDied(_)) => {
+            command @ DaemonCommand::ToggleRecording(_) => {
                 handle_dictation_command(&recording_machine, command).await;
+            }
+            DaemonCommand::DefaultInputSwitched => {
+                handle_default_input_switched(&recording_machine, &mut meeting_machine).await;
+            }
+            DaemonCommand::CaptureStreamDied(death) => {
+                handle_capture_stream_died(&recording_machine, &mut meeting_machine, death).await;
             }
             DaemonCommand::MeetingStart { options, reply } => {
                 let result = meeting_machine.start(options).await;
@@ -346,16 +451,10 @@ fn build_meeting_machine(
     transcription: Arc<dyn crate::transcription::job_service::TranscriptionJobService>,
     post_processing: Arc<PostProcessingService>,
     meetings_dir: std::path::PathBuf,
+    stream_event_sink: StreamEventSink,
 ) -> MeetingMachine {
-    let mic_source = MicAudioSource::new(16000)
-        .map(|s| Box::new(s) as Box<dyn crate::audio::audio_source::AudioSource>)
-        .unwrap_or_else(|e| {
-            warn!(
-                "Failed to create meeting mic source: {}. Using fallback.",
-                e
-            );
-            Box::new(NullAudioSource)
-        });
+    let mic_source: Box<dyn crate::audio::audio_source::MeetingMicSource> =
+        Box::new(MicAudioSource::with_event_sink(16000, stream_event_sink));
 
     let system_source = Box::new(SystemAudioSource::new(16000));
 
@@ -378,24 +477,6 @@ fn resolve_meetings_dir() -> std::path::PathBuf {
     crate::global::data_dir()
         .map(|d| d.join("meetings"))
         .unwrap_or_else(|_| std::path::PathBuf::from("/tmp/audetic/meetings"))
-}
-
-/// Fallback audio source that produces no samples (for when mic init fails).
-struct NullAudioSource;
-
-impl crate::audio::audio_source::AudioSource for NullAudioSource {
-    fn start(&mut self) -> anyhow::Result<()> {
-        Ok(())
-    }
-    fn stop(&mut self) -> anyhow::Result<Vec<f32>> {
-        Ok(Vec::new())
-    }
-    fn is_active(&self) -> bool {
-        false
-    }
-    fn sample_rate(&self) -> u32 {
-        16000
-    }
 }
 
 fn build_transcriber(config: &Config) -> Result<Transcriber> {
@@ -576,24 +657,33 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
-    #[test]
-    fn stream_death_sink_drops_reports_when_command_queue_is_full_or_closed() {
+    #[tokio::test]
+    async fn stream_death_sink_forwards_reports_after_a_full_queue_drains() {
         let (tx, mut rx) = mpsc::channel(1);
-        let sink = dictation_stream_event_sink(&tx);
+        let sink = capture_stream_event_sink(&tx);
         tx.try_send(DaemonCommand::DefaultInputSwitched).unwrap();
         let death = StreamDeath {
-            source: CaptureSource::Dictation,
-            generation: StreamGeneration(1),
+            source: CaptureSource::MeetingMicrophone,
+            generation: StreamGeneration(2),
         };
 
         sink(death);
+        sink(StreamDeath {
+            source: CaptureSource::MeetingMicrophone,
+            generation: StreamGeneration(1),
+        });
         assert!(matches!(
             rx.try_recv(),
             Ok(DaemonCommand::DefaultInputSwitched)
         ));
+
+        let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("overflow bridge timed out")
+            .expect("command queue closed");
         assert!(matches!(
-            rx.try_recv(),
-            Err(mpsc::error::TryRecvError::Empty)
+            received,
+            DaemonCommand::CaptureStreamDied(received) if received == death
         ));
 
         drop(rx);
@@ -621,7 +711,7 @@ mod tests {
         let target = TestDictationTarget {
             audio: AudioStreamManager::with_backend(
                 Box::new(backend),
-                dictation_stream_event_sink(&tx),
+                capture_stream_event_sink(&tx),
             ),
             recording: StdMutex::new(false),
             status: status.clone(),
@@ -659,5 +749,125 @@ mod tests {
         assert!(samples.iter().all(|sample| *sample > 0.0));
         assert_eq!(starts.load(Ordering::SeqCst), 4);
         assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    struct RoutingDictationTarget {
+        switches: AtomicUsize,
+        deaths: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl DictationCommandTarget for RoutingDictationTarget {
+        async fn toggle(&self, _options: Option<crate::audio::JobOptions>) -> Result<ToggleResult> {
+            unreachable!("routing test does not toggle dictation")
+        }
+
+        async fn default_input_switched(&self) -> Result<()> {
+            self.switches.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn stream_died(&self, _death: StreamDeath) -> Result<()> {
+            self.deaths.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct RoutingMeetingTarget {
+        switches: usize,
+        deaths: usize,
+    }
+
+    struct SlowDictationTarget;
+
+    #[async_trait::async_trait]
+    impl DictationCommandTarget for SlowDictationTarget {
+        async fn toggle(&self, _options: Option<crate::audio::JobOptions>) -> Result<ToggleResult> {
+            unreachable!("fan-out timing test does not toggle dictation")
+        }
+
+        async fn default_input_switched(&self) -> Result<()> {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(())
+        }
+
+        async fn stream_died(&self, _death: StreamDeath) -> Result<()> {
+            unreachable!("fan-out timing test does not inject stream death")
+        }
+    }
+
+    #[derive(Default)]
+    struct TimedMeetingTarget {
+        switched_at: Option<tokio::time::Instant>,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl MeetingCaptureCommandTarget for TimedMeetingTarget {
+        async fn default_input_switched(&mut self) -> Result<()> {
+            self.switched_at = Some(tokio::time::Instant::now());
+            Ok(())
+        }
+
+        async fn microphone_stream_died(&mut self, _death: StreamDeath) -> Result<()> {
+            unreachable!("fan-out timing test does not inject stream death")
+        }
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl MeetingCaptureCommandTarget for RoutingMeetingTarget {
+        async fn default_input_switched(&mut self) -> Result<()> {
+            self.switches += 1;
+            Ok(())
+        }
+
+        async fn microphone_stream_died(&mut self, _death: StreamDeath) -> Result<()> {
+            self.deaths += 1;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn input_switch_fans_out_and_stream_deaths_route_by_source() {
+        let dictation = RoutingDictationTarget {
+            switches: AtomicUsize::new(0),
+            deaths: AtomicUsize::new(0),
+        };
+        let mut meeting = RoutingMeetingTarget::default();
+
+        handle_default_input_switched(&dictation, &mut meeting).await;
+        for source in [
+            CaptureSource::Dictation,
+            CaptureSource::MeetingMicrophone,
+            CaptureSource::SystemTap,
+        ] {
+            handle_capture_stream_died(
+                &dictation,
+                &mut meeting,
+                StreamDeath {
+                    source,
+                    generation: StreamGeneration(1),
+                },
+            )
+            .await;
+        }
+
+        assert_eq!(dictation.switches.load(Ordering::SeqCst), 1);
+        assert_eq!(meeting.switches, 1);
+        assert_eq!(dictation.deaths.load(Ordering::SeqCst), 1);
+        assert_eq!(meeting.deaths, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_dictation_recovery_does_not_delay_meeting_switch() {
+        let origin = tokio::time::Instant::now();
+        let mut meeting = TimedMeetingTarget::default();
+
+        handle_default_input_switched(&SlowDictationTarget, &mut meeting).await;
+
+        assert_eq!(
+            meeting.switched_at.unwrap().duration_since(origin),
+            Duration::ZERO
+        );
     }
 }

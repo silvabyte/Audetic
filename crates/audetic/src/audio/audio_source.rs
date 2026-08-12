@@ -2,6 +2,9 @@
 
 use anyhow::Result;
 
+use super::capture_recovery::CaptureRecovery;
+use super::stream_event::StreamDeath;
+
 /// Trait for audio capture sources (microphone, system audio, etc.).
 ///
 /// Each source captures audio independently and returns samples when stopped.
@@ -16,6 +19,32 @@ pub trait AudioSource {
     /// Whether this source is currently capturing.
     fn is_active(&self) -> bool;
 
+    /// Whether the logical source currently has a live capture stream.
+    fn has_live_stream(&self) -> bool {
+        self.is_active()
+    }
+
     /// The sample rate of captured audio.
     fn sample_rate(&self) -> u32;
+}
+
+/// Meeting microphone capture, including live-stream replacement while the
+/// logical meeting session remains active.
+#[async_trait::async_trait(?Send)]
+pub trait MeetingMicSource: AudioSource {
+    /// Align an unavailable microphone's open gap with the point at which the
+    /// meeting's other capture source has finished starting.
+    fn mark_meeting_started(&mut self) {}
+
+    /// Whether the current session captured any real microphone samples,
+    /// excluding synthetic Silence Fill.
+    fn has_captured_audio(&self) -> bool;
+
+    async fn default_input_switched(&mut self) -> Result<CaptureRecovery> {
+        Ok(CaptureRecovery::Ignored)
+    }
+
+    async fn stream_died(&mut self, _death: StreamDeath) -> Result<CaptureRecovery> {
+        Ok(CaptureRecovery::Ignored)
+    }
 }

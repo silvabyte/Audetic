@@ -19,6 +19,14 @@ impl From<u64> for StreamGeneration {
     }
 }
 
+impl StreamGeneration {
+    pub(crate) fn next(self) -> anyhow::Result<Self> {
+        Ok(Self(self.0.checked_add(1).ok_or_else(|| {
+            anyhow::anyhow!("Stream Generation overflowed")
+        })?))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StreamDeath {
     pub source: CaptureSource,
