@@ -2,7 +2,7 @@
 
 mod command;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{error, info, warn};
 
@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::api::ApiServer;
+use crate::audio::device_watcher::{DeviceWatcher, SettledSwitch};
 use crate::audio::stream_event::{CaptureSource, StreamDeath, StreamEventSink};
 use crate::audio::{
     mic_source::MicAudioSource, system_source::SystemAudioSource, AudioStreamManager,
@@ -166,11 +167,6 @@ async fn handle_dictation_command(target: &impl DictationCommandTarget, command:
             }
             Err(e) => error!("Failed to toggle recording: {}", e),
         },
-        DaemonCommand::DefaultInputSwitched => {
-            if let Err(e) = target.default_input_switched().await {
-                error!("Failed to switch dictation to the current Default Input: {e}");
-            }
-        }
         DaemonCommand::CaptureStreamDied(death) => {
             if let Err(e) = target.stream_died(death).await {
                 error!("Failed to recover dictation from stream death: {e}");
@@ -185,7 +181,11 @@ async fn handle_default_input_switched(
     meeting: &mut impl MeetingCaptureCommandTarget,
 ) {
     let (_, meeting_result) = tokio::join!(
-        handle_dictation_command(dictation, DaemonCommand::DefaultInputSwitched),
+        async {
+            if let Err(e) = dictation.default_input_switched().await {
+                error!("Failed to switch dictation to the current Default Input: {e}");
+            }
+        },
         meeting.default_input_switched(),
     );
     if let Err(e) = meeting_result {
@@ -221,6 +221,19 @@ async fn handle_default_output_switched(meeting: &mut impl MeetingCaptureCommand
     }
 }
 
+async fn handle_settled_switch(
+    dictation: &impl DictationCommandTarget,
+    meeting: &mut impl MeetingCaptureCommandTarget,
+    settled: SettledSwitch,
+) {
+    if settled.input_changed {
+        handle_default_input_switched(dictation, meeting).await;
+    }
+    if settled.output_changed {
+        handle_default_output_switched(meeting).await;
+    }
+}
+
 pub async fn run_service() -> Result<()> {
     info!("Starting Audetic service");
 
@@ -239,6 +252,17 @@ pub async fn run_service() -> Result<()> {
     let config = Config::load()?;
 
     let (tx, mut rx) = mpsc::channel::<DaemonCommand>(10);
+    let watcher_tx = tx.downgrade();
+    let _device_watcher = DeviceWatcher::start(move |settled| {
+        let watcher_tx = watcher_tx.clone();
+        async move {
+            let Some(tx) = watcher_tx.upgrade() else {
+                return;
+            };
+            let _ = tx.send(DaemonCommand::SettledDeviceSwitch(settled)).await;
+        }
+    })
+    .context("failed to start Device Watcher")?;
     let stream_event_sink = capture_stream_event_sink(&tx);
     let audio_recorder = Arc::new(Mutex::new(AudioStreamManager::with_event_sink(
         stream_event_sink.clone(),
@@ -344,11 +368,8 @@ pub async fn run_service() -> Result<()> {
             command @ DaemonCommand::ToggleRecording(_) => {
                 handle_dictation_command(&recording_machine, command).await;
             }
-            DaemonCommand::DefaultInputSwitched => {
-                handle_default_input_switched(&recording_machine, &mut meeting_machine).await;
-            }
-            DaemonCommand::DefaultOutputSwitched => {
-                handle_default_output_switched(&mut meeting_machine).await;
+            DaemonCommand::SettledDeviceSwitch(settled) => {
+                handle_settled_switch(&recording_machine, &mut meeting_machine, settled).await;
             }
             DaemonCommand::CaptureStreamDied(death) => {
                 handle_capture_stream_died(&recording_machine, &mut meeting_machine, death).await;
@@ -527,6 +548,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};
 
+    use crate::audio::device_watcher::{
+        ActiveDeviceWatcher, DeviceWatcherBackend, RawDeviceSwitch, RawSwitchSink,
+    };
     use crate::audio::input_device::{
         ActiveInput, CaptureBackend, InputDataCallback, InputErrorCallback,
     };
@@ -548,6 +572,30 @@ mod tests {
 
     struct FakeStream {
         drops: Arc<AtomicUsize>,
+    }
+
+    #[derive(Clone, Default)]
+    struct FakeWatcherHandle {
+        sink: Arc<StdMutex<Option<RawSwitchSink>>>,
+    }
+
+    impl FakeWatcherHandle {
+        fn emit(&self, event: RawDeviceSwitch) {
+            self.sink.lock().unwrap().as_ref().unwrap()(event);
+        }
+    }
+
+    struct FakeWatcherBackend(FakeWatcherHandle);
+
+    struct FakeActiveWatcher;
+
+    impl ActiveDeviceWatcher for FakeActiveWatcher {}
+
+    impl DeviceWatcherBackend for FakeWatcherBackend {
+        fn start(self: Box<Self>, sink: RawSwitchSink) -> Result<Box<dyn ActiveDeviceWatcher>> {
+            *self.0.sink.lock().unwrap() = Some(sink);
+            Ok(Box::new(FakeActiveWatcher))
+        }
     }
 
     impl Drop for FakeStream {
@@ -655,16 +703,29 @@ mod tests {
 
         for command in [
             DaemonCommand::ToggleRecording(None),
-            DaemonCommand::DefaultInputSwitched,
+            DaemonCommand::SettledDeviceSwitch(SettledSwitch {
+                input_changed: true,
+                output_changed: false,
+            }),
             DaemonCommand::ToggleRecording(None),
-            DaemonCommand::DefaultInputSwitched,
+            DaemonCommand::SettledDeviceSwitch(SettledSwitch {
+                input_changed: true,
+                output_changed: false,
+            }),
         ] {
             tx.send(command).await.unwrap();
         }
         drop(tx);
 
         while let Some(command) = rx.recv().await {
-            handle_dictation_command(&target, command).await;
+            match command {
+                DaemonCommand::SettledDeviceSwitch(settled) => {
+                    if settled.input_changed {
+                        target.default_input_switched().await.unwrap();
+                    }
+                }
+                command => handle_dictation_command(&target, command).await,
+            }
         }
 
         let samples = hound::WavReader::open(output_path)
@@ -679,11 +740,93 @@ mod tests {
         assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn watcher_burst_replaces_active_capture_once_and_leaves_idle_capture_closed() {
+        let starts = Arc::new(AtomicUsize::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let backend = FakeCaptureBackend {
+            defaults: StdMutex::new(VecDeque::from([
+                FakeDefaultInput {
+                    sample_rate: 48_000,
+                    samples: vec![0.25; 480],
+                },
+                FakeDefaultInput {
+                    sample_rate: 44_100,
+                    samples: vec![-0.5; 441],
+                },
+            ])),
+            starts: starts.clone(),
+            drops: drops.clone(),
+            errors: Arc::new(StdMutex::new(Vec::new())),
+        };
+        let output_dir = tempfile::tempdir().unwrap();
+        let target = TestDictationTarget {
+            audio: AudioStreamManager::with_backend(Box::new(backend), Arc::new(|_| {})),
+            recording: StdMutex::new(false),
+            status: RecordingStatusHandle::default(),
+            output_path: output_dir.path().join("watcher-switched-default.wav"),
+        };
+        let watcher_backend = FakeWatcherHandle::default();
+        let (tx, mut rx) = mpsc::channel(10);
+        let settled_tx = tx.clone();
+        let _watcher = DeviceWatcher::with_backend(
+            Box::new(FakeWatcherBackend(watcher_backend.clone())),
+            move |settled| {
+                let settled_tx = settled_tx.clone();
+                async move {
+                    let _ = settled_tx
+                        .send(DaemonCommand::SettledDeviceSwitch(settled))
+                        .await;
+                }
+            },
+        )
+        .unwrap();
+        let mut meeting = RoutingMeetingTarget::default();
+
+        assert_eq!(starts.load(Ordering::SeqCst), 0);
+        tx.send(DaemonCommand::ToggleRecording(None)).await.unwrap();
+        handle_dictation_command(&target, rx.recv().await.unwrap()).await;
+
+        watcher_backend.emit(RawDeviceSwitch::Input);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(400)).await;
+        watcher_backend.emit(RawDeviceSwitch::Input);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        let settled = match rx.recv().await.unwrap() {
+            DaemonCommand::SettledDeviceSwitch(settled) => settled,
+            _ => unreachable!("expected settled switch"),
+        };
+        handle_settled_switch(&target, &mut meeting, settled).await;
+        assert!(rx.try_recv().is_err());
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+
+        tx.send(DaemonCommand::ToggleRecording(None)).await.unwrap();
+        handle_dictation_command(&target, rx.recv().await.unwrap()).await;
+        watcher_backend.emit(RawDeviceSwitch::Input);
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        let settled = match rx.recv().await.unwrap() {
+            DaemonCommand::SettledDeviceSwitch(settled) => settled,
+            _ => unreachable!("expected settled switch"),
+        };
+        handle_settled_switch(&target, &mut meeting, settled).await;
+
+        assert_eq!(starts.load(Ordering::SeqCst), 2);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn stream_death_sink_forwards_reports_after_a_full_queue_drains() {
         let (tx, mut rx) = mpsc::channel(1);
         let sink = capture_stream_event_sink(&tx);
-        tx.try_send(DaemonCommand::DefaultInputSwitched).unwrap();
+        tx.try_send(DaemonCommand::SettledDeviceSwitch(SettledSwitch {
+            input_changed: true,
+            output_changed: false,
+        }))
+        .unwrap();
         let death = StreamDeath {
             source: CaptureSource::MeetingMicrophone,
             generation: StreamGeneration(2),
@@ -696,7 +839,10 @@ mod tests {
         });
         assert!(matches!(
             rx.try_recv(),
-            Ok(DaemonCommand::DefaultInputSwitched)
+            Ok(DaemonCommand::SettledDeviceSwitch(SettledSwitch {
+                input_changed: true,
+                output_changed: false,
+            }))
         ));
 
         let received = tokio::time::timeout(Duration::from_secs(1), rx.recv())
@@ -745,7 +891,12 @@ mod tests {
         errors.lock().unwrap()[0]();
         errors.lock().unwrap()[0]();
         tx.send(DaemonCommand::ToggleRecording(None)).await.unwrap();
-        tx.send(DaemonCommand::DefaultInputSwitched).await.unwrap();
+        tx.send(DaemonCommand::SettledDeviceSwitch(SettledSwitch {
+            input_changed: true,
+            output_changed: false,
+        }))
+        .await
+        .unwrap();
         drop(tx);
 
         handle_dictation_command(&target, rx.recv().await.unwrap()).await;
@@ -759,7 +910,13 @@ mod tests {
         assert_eq!(status.get().await.phase, RecordingPhase::Processing);
         assert!(!status.get().await.capture_degraded);
 
-        handle_dictation_command(&target, rx.recv().await.unwrap()).await;
+        let settled = match rx.recv().await.unwrap() {
+            DaemonCommand::SettledDeviceSwitch(settled) => settled,
+            _ => unreachable!("expected settled switch"),
+        };
+        if settled.input_changed {
+            target.default_input_switched().await.unwrap();
+        }
         assert!(rx.recv().await.is_none());
 
         let samples = hound::WavReader::open(output_path)
@@ -870,15 +1027,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn input_switch_fans_out_and_stream_deaths_route_by_source() {
+    async fn settled_switch_routes_directions_and_stream_deaths_by_source() {
         let dictation = RoutingDictationTarget {
             switches: AtomicUsize::new(0),
             deaths: AtomicUsize::new(0),
         };
         let mut meeting = RoutingMeetingTarget::default();
 
-        handle_default_input_switched(&dictation, &mut meeting).await;
-        handle_default_output_switched(&mut meeting).await;
+        handle_settled_switch(
+            &dictation,
+            &mut meeting,
+            SettledSwitch {
+                input_changed: true,
+                output_changed: false,
+            },
+        )
+        .await;
+        assert_eq!(dictation.switches.load(Ordering::SeqCst), 1);
+        assert_eq!(meeting.input_switches, 1);
+        assert_eq!(meeting.output_switches, 0);
+
+        handle_settled_switch(
+            &dictation,
+            &mut meeting,
+            SettledSwitch {
+                input_changed: false,
+                output_changed: true,
+            },
+        )
+        .await;
+        assert_eq!(dictation.switches.load(Ordering::SeqCst), 1);
+        assert_eq!(meeting.input_switches, 1);
+        assert_eq!(meeting.output_switches, 1);
+
+        handle_settled_switch(
+            &dictation,
+            &mut meeting,
+            SettledSwitch {
+                input_changed: true,
+                output_changed: true,
+            },
+        )
+        .await;
         for source in [
             CaptureSource::Dictation,
             CaptureSource::MeetingMicrophone,
@@ -895,9 +1085,9 @@ mod tests {
             .await;
         }
 
-        assert_eq!(dictation.switches.load(Ordering::SeqCst), 1);
-        assert_eq!(meeting.input_switches, 1);
-        assert_eq!(meeting.output_switches, 1);
+        assert_eq!(dictation.switches.load(Ordering::SeqCst), 2);
+        assert_eq!(meeting.input_switches, 2);
+        assert_eq!(meeting.output_switches, 2);
         assert_eq!(dictation.deaths.load(Ordering::SeqCst), 1);
         assert_eq!(meeting.microphone_deaths, 1);
         assert_eq!(meeting.system_deaths, 1);

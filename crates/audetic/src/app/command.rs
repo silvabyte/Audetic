@@ -1,12 +1,7 @@
 /// Commands serialized by the daemon's single owner loop.
 pub enum DaemonCommand {
     ToggleRecording(Option<crate::audio::JobOptions>),
-    // The platform watcher is a later slice; S1 injects this typed event in tests.
-    #[allow(dead_code)]
-    DefaultInputSwitched,
-    // The platform watcher is Fizzy #112; S4 injects this typed event in tests.
-    #[allow(dead_code)]
-    DefaultOutputSwitched,
+    SettledDeviceSwitch(crate::audio::SettledSwitch),
     CaptureStreamDied(crate::audio::stream_event::StreamDeath),
     MeetingStart {
         options: Option<crate::meeting::MeetingStartOptions>,
