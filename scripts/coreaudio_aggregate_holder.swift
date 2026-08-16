@@ -294,20 +294,42 @@ private final class AggregateHolder {
     }
 
     private func restoreUnlocked(scope: String?) throws {
+        var failures: [String] = []
+        func restoreDefault(_ label: String,
+                            selector: AudioObjectPropertySelector,
+                            uid: String)
+        {
+            do {
+                try setSystemDefaultAndWait(
+                    selector, deviceID: findDevice(uid: uid)
+                )
+            } catch {
+                failures.append("\(label): \(error)")
+            }
+        }
+
         if scope == nil || scope == "input" {
-            try setSystemDefaultAndWait(
-                kAudioHardwarePropertyDefaultInputDevice,
-                deviceID: findDevice(uid: originalInputUID)
+            restoreDefault(
+                "Default Input",
+                selector: kAudioHardwarePropertyDefaultInputDevice,
+                uid: originalInputUID
             )
         }
         if scope == nil || scope == "output" {
-            try setSystemDefaultAndWait(
-                kAudioHardwarePropertyDefaultOutputDevice,
-                deviceID: findDevice(uid: originalOutputUID)
+            restoreDefault(
+                "Default Output",
+                selector: kAudioHardwarePropertyDefaultOutputDevice,
+                uid: originalOutputUID
             )
-            try setSystemDefaultAndWait(
-                kAudioHardwarePropertyDefaultSystemOutputDevice,
-                deviceID: findDevice(uid: originalSystemOutputUID)
+            restoreDefault(
+                "Default System Output",
+                selector: kAudioHardwarePropertyDefaultSystemOutputDevice,
+                uid: originalSystemOutputUID
+            )
+        }
+        if !failures.isEmpty {
+            throw HolderError(
+                description: "Failed to restore CoreAudio defaults: \(failures.joined(separator: "; "))"
             )
         }
     }
