@@ -56,6 +56,7 @@ struct ActiveSegment {
 }
 
 struct ClosedSegment {
+    generation: StreamGeneration,
     native_samples: Vec<f32>,
     native_sample_rate: u32,
     first_sample_at: Option<Duration>,
@@ -192,6 +193,14 @@ impl MicAudioSource {
                 "Meeting microphone stream died while its Segment was starting"
             ));
         }
+        info!(
+            event = "audio_segment_started",
+            source = "meeting_microphone",
+            generation = generation.0,
+            native_rate_hz = input.native_sample_rate(),
+            target_rate_hz = self.target_sample_rate,
+            "Started audio Segment"
+        );
         Ok(ActiveSegment {
             input,
             native_samples,
@@ -240,9 +249,13 @@ impl MicAudioSource {
         let fill_samples = usize::try_from(fill_samples).context("Silence Fill is too long")?;
         self.canonical_samples
             .resize(self.canonical_samples.len() + fill_samples, 0.0);
-        debug!(
-            "Inserted {} samples of meeting microphone Silence Fill for {:?}",
-            fill_samples, elapsed
+        info!(
+            event = "audio_silence_fill",
+            source = "meeting_microphone",
+            fill_frames = fill_samples,
+            elapsed_ms = elapsed.as_millis(),
+            target_rate_hz = self.target_sample_rate,
+            "Inserted meeting microphone Silence Fill"
         );
         Ok(())
     }
@@ -259,6 +272,16 @@ impl MicAudioSource {
 
     fn append_closed_segment(&mut self, segment: ClosedSegment) -> Result<()> {
         if segment.native_samples.is_empty() {
+            info!(
+                event = "audio_segment_closed",
+                source = "meeting_microphone",
+                generation = segment.generation.0,
+                native_frames = 0,
+                native_rate_hz = segment.native_sample_rate,
+                canonical_frames = 0,
+                target_rate_hz = self.target_sample_rate,
+                "Closed empty audio Segment"
+            );
             return Ok(());
         }
 
@@ -276,12 +299,15 @@ impl MicAudioSource {
         )
         .context("Failed to normalize meeting microphone Segment")?;
         self.captured_audio |= !canonical.is_empty();
-        debug!(
-            "Closed meeting microphone Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
-            segment.native_samples.len(),
-            segment.native_sample_rate,
-            canonical.len(),
-            self.target_sample_rate
+        info!(
+            event = "audio_segment_closed",
+            source = "meeting_microphone",
+            generation = segment.generation.0,
+            native_frames = segment.native_samples.len(),
+            native_rate_hz = segment.native_sample_rate,
+            canonical_frames = canonical.len(),
+            target_rate_hz = self.target_sample_rate,
+            "Closed audio Segment"
         );
         self.canonical_samples.extend(canonical);
         Ok(())
@@ -303,6 +329,7 @@ impl MicAudioSource {
                     .unwrap_or(segment.attempt_started_at)
             });
             return Ok(Some(ClosedSegment {
+                generation: segment.generation,
                 native_samples: native,
                 native_sample_rate,
                 first_sample_at: None,
@@ -325,6 +352,7 @@ impl MicAudioSource {
             .max(segment.attempt_started_at);
         let native_len = native.len();
         Ok(Some(ClosedSegment {
+            generation: segment.generation,
             native_samples: native,
             native_sample_rate,
             first_sample_at: Some(first_sample_at),
@@ -388,15 +416,30 @@ impl MicAudioSource {
                         self.set_pending_gap(closed.ended_at);
                         closed_segments.push(closed);
                     }
-                    warn!("Meeting microphone remains in Degraded Capture");
+                    warn!(
+                        event = "audio_capture_recovery",
+                        source = "meeting_microphone",
+                        state = "degraded",
+                        "Meeting microphone remains in Degraded Capture"
+                    );
                     CaptureRecovery::Degraded
                 } else {
-                    info!("Recovered meeting microphone on the current Default Input");
+                    info!(
+                        event = "audio_capture_recovery",
+                        source = "meeting_microphone",
+                        state = "capturing",
+                        "Recovered meeting microphone on the current Default Input"
+                    );
                     CaptureRecovery::Capturing
                 }
             }
             Err(_) => {
-                warn!("Meeting microphone remains in Degraded Capture");
+                warn!(
+                    event = "audio_capture_recovery",
+                    source = "meeting_microphone",
+                    state = "degraded",
+                    "Meeting microphone remains in Degraded Capture"
+                );
                 CaptureRecovery::Degraded
             }
         };

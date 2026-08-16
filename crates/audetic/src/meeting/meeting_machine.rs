@@ -380,6 +380,17 @@ impl MeetingMachine {
         let mic_resampled = AudioMixer::resample(&mic_samples, mic_rate, target_rate);
         let system_resampled = AudioMixer::resample(&system_samples, system_rate, target_rate);
         let mixed = AudioMixer::mix(&[mic_resampled, system_resampled]);
+        info!(
+            event = "meeting_audio_output",
+            meeting_id,
+            mic_frames = mic_samples.len(),
+            mic_rate_hz = mic_rate,
+            system_frames = system_samples.len(),
+            system_rate_hz = system_rate,
+            mixed_frames = mixed.len(),
+            output_rate_hz = target_rate,
+            "Prepared mixed meeting audio"
+        );
 
         // Write WAV file
         self.write_wav(&audio_path, &mixed, target_rate)?;

@@ -217,11 +217,21 @@ impl AudioStreamManager {
         {
             Ok(segment) => {
                 *self.active_segment.lock().unwrap() = Some(segment);
-                info!("Recovered active dictation on the current Default Input");
+                info!(
+                    event = "audio_capture_recovery",
+                    source = "dictation",
+                    state = "capturing",
+                    "Recovered active dictation on the current Default Input"
+                );
                 Ok(CaptureRecovery::Capturing)
             }
             Err(_) => {
-                warn!("Dictation remains active in Degraded Capture");
+                warn!(
+                    event = "audio_capture_recovery",
+                    source = "dictation",
+                    state = "degraded",
+                    "Dictation remains active in Degraded Capture"
+                );
                 Ok(CaptureRecovery::Degraded)
             }
         }
@@ -253,6 +263,14 @@ impl AudioStreamManager {
             .backend
             .start_default_input(on_data, on_error)
             .context("Failed to start Segment from current Default Input")?;
+        info!(
+            event = "audio_segment_started",
+            source = "dictation",
+            generation = generation.0,
+            native_rate_hz = input.native_sample_rate(),
+            target_rate_hz = TARGET_SAMPLE_RATE,
+            "Started audio Segment"
+        );
         *self.stream_generation.lock().unwrap() = generation;
         Ok(ActiveSegment {
             input,
@@ -272,12 +290,15 @@ impl AudioStreamManager {
         let canonical = resample_mono_f32(&native, native_sample_rate, TARGET_SAMPLE_RATE)
             .context("Failed to normalize audio Segment")?;
 
-        debug!(
-            "Closed Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
-            native.len(),
-            native_sample_rate,
-            canonical.len(),
-            TARGET_SAMPLE_RATE
+        info!(
+            event = "audio_segment_closed",
+            source = "dictation",
+            generation = segment.generation.0,
+            native_frames = native.len(),
+            native_rate_hz = native_sample_rate,
+            canonical_frames = canonical.len(),
+            target_rate_hz = TARGET_SAMPLE_RATE,
+            "Closed audio Segment"
         );
         self.canonical_samples.lock().unwrap().extend(canonical);
         Ok(true)

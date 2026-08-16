@@ -63,6 +63,7 @@ struct ActiveSegment {
 }
 
 struct ClosedSegment {
+    generation: StreamGeneration,
     native_samples: Vec<f32>,
     native_sample_rate: u32,
     first_sample_at: Option<Duration>,
@@ -171,6 +172,15 @@ impl SystemTapAudioSource {
             return Err(anyhow!("System Tap died while its Segment was starting"));
         }
 
+        info!(
+            event = "audio_segment_started",
+            source = "system_tap",
+            generation = generation.0,
+            native_rate_hz = tap.native_sample_rate(),
+            target_rate_hz = self.target_sample_rate,
+            "Started audio Segment"
+        );
+
         Ok(ActiveSegment {
             tap,
             native_samples,
@@ -217,9 +227,13 @@ impl SystemTapAudioSource {
         let fill_samples = usize::try_from(fill_samples).context("Silence Fill is too long")?;
         self.canonical_samples
             .resize(self.canonical_samples.len() + fill_samples, 0.0);
-        debug!(
-            "Inserted {} samples of System Tap Silence Fill for {:?}",
-            fill_samples, elapsed
+        info!(
+            event = "audio_silence_fill",
+            source = "system_tap",
+            fill_frames = fill_samples,
+            elapsed_ms = elapsed.as_millis(),
+            target_rate_hz = self.target_sample_rate,
+            "Inserted System Tap Silence Fill"
         );
         Ok(())
     }
@@ -236,6 +250,16 @@ impl SystemTapAudioSource {
 
     fn append_closed_segment(&mut self, segment: ClosedSegment) -> Result<()> {
         if segment.native_samples.is_empty() {
+            info!(
+                event = "audio_segment_closed",
+                source = "system_tap",
+                generation = segment.generation.0,
+                native_frames = 0,
+                native_rate_hz = segment.native_sample_rate,
+                canonical_frames = 0,
+                target_rate_hz = self.target_sample_rate,
+                "Closed empty audio Segment"
+            );
             return Ok(());
         }
 
@@ -255,12 +279,15 @@ impl SystemTapAudioSource {
         .context("Failed to normalize System Tap Segment")?;
         self.captured_audio |= !canonical.is_empty();
         self.captured_nonzero_audio |= contains_nonzero && !canonical.is_empty();
-        debug!(
-            "Closed System Tap Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
-            segment.native_samples.len(),
-            segment.native_sample_rate,
-            canonical.len(),
-            self.target_sample_rate
+        info!(
+            event = "audio_segment_closed",
+            source = "system_tap",
+            generation = segment.generation.0,
+            native_frames = segment.native_samples.len(),
+            native_rate_hz = segment.native_sample_rate,
+            canonical_frames = canonical.len(),
+            target_rate_hz = self.target_sample_rate,
+            "Closed audio Segment"
         );
         self.canonical_samples.extend(canonical);
         Ok(())
@@ -284,6 +311,7 @@ impl SystemTapAudioSource {
                     .unwrap_or(segment.attempt_started_at)
             });
             return Ok(Some(ClosedSegment {
+                generation: segment.generation,
                 native_samples: native,
                 native_sample_rate,
                 first_sample_at: None,
@@ -306,6 +334,7 @@ impl SystemTapAudioSource {
             .max(segment.attempt_started_at);
         let native_len = native.len();
         Ok(Some(ClosedSegment {
+            generation: segment.generation,
             native_samples: native,
             native_sample_rate,
             first_sample_at: Some(first_sample_at),
@@ -376,15 +405,30 @@ impl SystemTapAudioSource {
                         self.set_pending_gap(closed.ended_at);
                         closed_segments.push(closed);
                     }
-                    warn!("System Tap remains in Degraded Capture");
+                    warn!(
+                        event = "audio_capture_recovery",
+                        source = "system_tap",
+                        state = "degraded",
+                        "System Tap remains in Degraded Capture"
+                    );
                     CaptureRecovery::Degraded
                 } else {
-                    info!("Recovered System Tap on the current Default Output");
+                    info!(
+                        event = "audio_capture_recovery",
+                        source = "system_tap",
+                        state = "capturing",
+                        "Recovered System Tap on the current Default Output"
+                    );
                     CaptureRecovery::Capturing
                 }
             }
             Err(_) => {
-                warn!("System Tap remains in Degraded Capture");
+                warn!(
+                    event = "audio_capture_recovery",
+                    source = "system_tap",
+                    state = "degraded",
+                    "System Tap remains in Degraded Capture"
+                );
                 CaptureRecovery::Degraded
             }
         };
