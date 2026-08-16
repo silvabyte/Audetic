@@ -317,7 +317,6 @@ mod macos {
         stdin: ChildStdin,
         stdout: BufReader<ChildStdout>,
         ready: HolderReady,
-        restored: bool,
         destroyed: bool,
     }
 
@@ -381,7 +380,6 @@ mod macos {
                 stdin,
                 stdout,
                 ready,
-                restored: false,
                 destroyed: false,
             })
         }
@@ -428,7 +426,6 @@ mod macos {
                     && response["device_id"].as_u64() == Some(u64::from(device_id)),
                 "holder confirmed the wrong default-device request: {response}"
             );
-            self.restored = false;
             Ok(())
         }
 
@@ -438,9 +435,6 @@ mod macos {
                 command["scope"] = Value::String(scope.to_string());
             }
             self.command(command)?;
-            if scope.is_none() {
-                self.restored = true;
-            }
             Ok(())
         }
 
@@ -478,13 +472,12 @@ mod macos {
             if self.destroyed {
                 return;
             }
-            if !self.restored {
-                let _ = self.restore(None);
-            }
             let _ = serde_json::to_writer(&mut self.stdin, &json!({ "command": "destroy" }));
             let _ = self.stdin.write_all(b"\n");
             let _ = self.stdin.flush();
-            for _ in 0..20 {
+            // The holder may spend up to five seconds restoring each of three
+            // defaults, then five seconds confirming aggregate disappearance.
+            for _ in 0..250 {
                 if self.child.try_wait().ok().flatten().is_some() {
                     return;
                 }
