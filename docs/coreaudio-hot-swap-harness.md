@@ -44,10 +44,12 @@ and canonical frame counts, rates, and Silence Fill lengths.
 `ready` record, accepts JSON commands on stdin, and owns the aggregate for its
 lifetime. It restores the original input, output, and system-output defaults
 before destroying the aggregate on a normal command, stdin EOF, SIGINT,
-SIGTERM, or SIGHUP. Readiness is emitted only after the UUID is visible in the
-CoreAudio device list with input and output streams. Default-change commands
-poll CoreAudio readback before replying, and command-driven teardown reports
-`destroyed` only after the UUID disappears from the device list.
+SIGTERM, or SIGHUP. Restoration resolves the original device UIDs again because
+CoreAudio numeric IDs can change after a USB device reconnects. Readiness is
+emitted only after the UUID is visible in the CoreAudio device list with input
+and output streams. Default-change commands poll CoreAudio readback before
+replying, and command-driven teardown reports `destroyed` only after the UUID
+disappears from the device list.
 
 If the Rust driver crashes, its pipe closes and the holder tears down on EOF.
 SIGKILL cannot run cleanup in either process, but every invocation uses a new

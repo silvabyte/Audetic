@@ -176,6 +176,9 @@ private final class AggregateHolder {
     let originalInput: AudioDeviceID
     let originalOutput: AudioDeviceID
     let originalSystemOutput: AudioDeviceID
+    let originalInputUID: String
+    let originalOutputUID: String
+    let originalSystemOutputUID: String
 
     init(name: String, uid: String, inputUID: String?, outputUID: String?) throws {
         self.uid = uid
@@ -188,13 +191,14 @@ private final class AggregateHolder {
         else {
             throw HolderError(description: "CoreAudio defaults are unavailable; refusing a run that cannot restore them")
         }
+        originalInputUID = try readString(originalInput, kAudioDevicePropertyDeviceUID)
+        originalOutputUID = try readString(originalOutput, kAudioDevicePropertyDeviceUID)
+        originalSystemOutputUID = try readString(
+            originalSystemOutput, kAudioDevicePropertyDeviceUID
+        )
 
-        let resolvedInputUID = try inputUID ?? readString(
-            originalInput, kAudioDevicePropertyDeviceUID
-        )
-        let resolvedOutputUID = try outputUID ?? readString(
-            originalOutput, kAudioDevicePropertyDeviceUID
-        )
+        let resolvedInputUID = inputUID ?? originalInputUID
+        let resolvedOutputUID = outputUID ?? originalOutputUID
         guard try deviceID(uid: uid) == nil else {
             throw HolderError(description: "Aggregate UID already exists: \(uid)")
         }
@@ -252,6 +256,9 @@ private final class AggregateHolder {
             "original_default_input_id": originalInput,
             "original_default_output_id": originalOutput,
             "original_system_output_id": originalSystemOutput,
+            "original_default_input_uid": originalInputUID,
+            "original_default_output_uid": originalOutputUID,
+            "original_system_output_uid": originalSystemOutputUID,
             "input": inputSummary,
             "output": outputSummary,
         ])
@@ -289,16 +296,18 @@ private final class AggregateHolder {
     private func restoreUnlocked(scope: String?) throws {
         if scope == nil || scope == "input" {
             try setSystemDefaultAndWait(
-                kAudioHardwarePropertyDefaultInputDevice, deviceID: originalInput
+                kAudioHardwarePropertyDefaultInputDevice,
+                deviceID: findDevice(uid: originalInputUID)
             )
         }
         if scope == nil || scope == "output" {
             try setSystemDefaultAndWait(
-                kAudioHardwarePropertyDefaultOutputDevice, deviceID: originalOutput
+                kAudioHardwarePropertyDefaultOutputDevice,
+                deviceID: findDevice(uid: originalOutputUID)
             )
             try setSystemDefaultAndWait(
                 kAudioHardwarePropertyDefaultSystemOutputDevice,
-                deviceID: originalSystemOutput
+                deviceID: findDevice(uid: originalSystemOutputUID)
             )
         }
     }

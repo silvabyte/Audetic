@@ -308,6 +308,9 @@ mod macos {
         original_default_input_id: u32,
         original_default_output_id: u32,
         original_system_output_id: u32,
+        original_default_input_uid: String,
+        original_default_output_uid: String,
+        original_system_output_uid: String,
         input: DeviceSummary,
         output: DeviceSummary,
     }
