@@ -55,6 +55,9 @@ jobs:
         run: cd apps/web-ui && bun run lint
       - name: Test web-ui (lint rules)
         run: cd apps/web-ui && bun run test
+      - name: Typecheck CoreAudio aggregate holder
+        if: matrix.platform == 'macos'
+        run: xcrun swiftc -typecheck scripts/coreaudio_aggregate_holder.swift
       - name: Build
         # `bun` is on PATH, so crates/audetic/build.rs runs `bun run build`
         # in apps/web-ui and the real dist/ is embedded via include_dir!.

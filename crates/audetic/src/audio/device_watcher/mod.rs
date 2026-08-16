@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 const SETTLE_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 pub(crate) enum RawDeviceSwitch {
     Input,
     Output,
