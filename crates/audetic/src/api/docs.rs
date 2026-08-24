@@ -218,6 +218,11 @@ mod tests {
         for known in [
             paths::VERSION,
             paths::TOGGLE,
+            paths::RECORDING_STATUS,
+            paths::MEETINGS_START,
+            paths::MEETINGS_STOP,
+            paths::MEETINGS_CANCEL,
+            paths::MEETINGS_STATUS,
             paths::MEETINGS_TOGGLE,
             paths::MEETINGS_IMPORT,
             paths::AGENT_PROFILES,

@@ -14,7 +14,7 @@ use std::time::Duration;
 use super::audio_source::{AudioSource, MeetingSystemSource};
 use super::capture_recovery::{start_capture_with_retries, CaptureRecovery};
 use super::mic_source::MonotonicClock;
-use super::resample::{push_mono_f32, resample_mono_f32};
+use super::resample::{push_mono_f32, resample_mono_f32, sample_levels};
 use super::stream_event::{CaptureSource, StreamDeath, StreamEventSink, StreamGeneration};
 
 pub(crate) type SystemTapDataCallback = Box<dyn FnMut(&[f32], usize) + Send + 'static>;
@@ -65,6 +65,7 @@ struct ActiveSegment {
 struct ClosedSegment {
     native_samples: Vec<f32>,
     native_sample_rate: u32,
+    generation: StreamGeneration,
     first_sample_at: Option<Duration>,
     ended_at: Duration,
     death_started_at: Option<Duration>,
@@ -171,6 +172,14 @@ impl SystemTapAudioSource {
             return Err(anyhow!("System Tap died while its Segment was starting"));
         }
 
+        info!(
+            event = "capture_segment_opened",
+            source = "system_tap",
+            stream_generation = generation.0,
+            native_sample_rate_hz = tap.native_sample_rate(),
+            "Capture Segment opened"
+        );
+
         Ok(ActiveSegment {
             tap,
             native_samples,
@@ -217,9 +226,12 @@ impl SystemTapAudioSource {
         let fill_samples = usize::try_from(fill_samples).context("Silence Fill is too long")?;
         self.canonical_samples
             .resize(self.canonical_samples.len() + fill_samples, 0.0);
-        debug!(
-            "Inserted {} samples of System Tap Silence Fill for {:?}",
-            fill_samples, elapsed
+        info!(
+            event = "capture_silence_fill",
+            source = "system_tap",
+            canonical_samples = fill_samples,
+            gap_milliseconds = elapsed.as_millis(),
+            "Capture Silence Fill inserted"
         );
         Ok(())
     }
@@ -247,6 +259,7 @@ impl SystemTapAudioSource {
                 .context("Failed to align System Tap Segment")?;
         }
         let contains_nonzero = segment.native_samples.iter().any(|sample| *sample != 0.0);
+        let (native_rms, native_peak) = sample_levels(&segment.native_samples);
         let canonical = resample_mono_f32(
             &segment.native_samples,
             segment.native_sample_rate,
@@ -255,12 +268,17 @@ impl SystemTapAudioSource {
         .context("Failed to normalize System Tap Segment")?;
         self.captured_audio |= !canonical.is_empty();
         self.captured_nonzero_audio |= contains_nonzero && !canonical.is_empty();
-        debug!(
-            "Closed System Tap Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
-            segment.native_samples.len(),
-            segment.native_sample_rate,
-            canonical.len(),
-            self.target_sample_rate
+        info!(
+            event = "capture_segment_closed",
+            source = "system_tap",
+            stream_generation = segment.generation.0,
+            native_samples = segment.native_samples.len(),
+            native_rms,
+            native_peak,
+            native_sample_rate_hz = segment.native_sample_rate,
+            canonical_samples = canonical.len(),
+            canonical_sample_rate_hz = self.target_sample_rate,
+            "Capture Segment closed"
         );
         self.canonical_samples.extend(canonical);
         Ok(())
@@ -286,6 +304,7 @@ impl SystemTapAudioSource {
             return Ok(Some(ClosedSegment {
                 native_samples: native,
                 native_sample_rate,
+                generation: segment.generation,
                 first_sample_at: None,
                 ended_at,
                 death_started_at,
@@ -308,6 +327,7 @@ impl SystemTapAudioSource {
         Ok(Some(ClosedSegment {
             native_samples: native,
             native_sample_rate,
+            generation: segment.generation,
             first_sample_at: Some(first_sample_at),
             ended_at: first_sample_at.saturating_add(
                 Self::duration_for_frames(native_len, native_sample_rate)

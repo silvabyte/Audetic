@@ -198,6 +198,12 @@ async fn handle_capture_stream_died(
     meeting: &mut impl MeetingCaptureCommandTarget,
     death: StreamDeath,
 ) {
+    info!(
+        event = "capture_stream_died",
+        source = ?death.source,
+        stream_generation = death.generation.0,
+        "Handling capture stream death"
+    );
     match death.source {
         CaptureSource::Dictation => {
             handle_dictation_command(dictation, DaemonCommand::CaptureStreamDied(death)).await;
@@ -226,6 +232,12 @@ async fn handle_settled_switch(
     meeting: &mut impl MeetingCaptureCommandTarget,
     settled: SettledSwitch,
 ) {
+    info!(
+        event = "settled_device_switch",
+        input_changed = settled.input_changed,
+        output_changed = settled.output_changed,
+        "Handling Settled Switch"
+    );
     if settled.input_changed {
         handle_default_input_switched(dictation, meeting).await;
     }

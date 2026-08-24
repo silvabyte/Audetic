@@ -13,7 +13,8 @@ LAUNCH_LABEL  ?= ai.audetic.daemon
         install install-linux install-macos uninstall \
         logs start restart stop status \
         ui-install ui-dev ui-build ui-preview ui-typecheck ui-lint codegen \
-        macos-sign macos-sign-release macos-app macos-app-debug macos-menubar
+        macos-sign macos-sign-release macos-app macos-app-debug macos-menubar \
+        macos-audiodev macos-device-switch-repro
 
 # Default target
 help:
@@ -52,6 +53,7 @@ help:
 	@echo "  macOS bundle:"
 	@echo "  make macos-app         - Build + ad-hoc sign target/release/Audetic.app"
 	@echo "  make macos-menubar     - Build the SwiftUI menu-bar agent"
+	@echo "  make macos-device-switch-repro - Build the manual CoreAudio churn proof tools"
 
 # Build commands
 build:
@@ -237,6 +239,27 @@ macos-sign:
 
 macos-sign-release: MACOS_BINARY=target/release/audeticd
 macos-sign-release: macos-sign
+
+# Manual CoreAudio churn proof tooling. The Rust example only drives the signed
+# daemon over HTTP; audiodev owns disposable aggregate devices and therefore
+# stays alive for the entire run. Neither executable captures audio itself.
+MACOS_AUDIODEV ?= target/tools/audiodev
+MACOS_SWIFT_TARGET ?= $(shell uname -m)-apple-macos14.6
+
+macos-audiodev:
+	@command -v swiftc >/dev/null 2>&1 || { echo "✗ swift toolchain not found (install Xcode CLT)"; exit 1; }
+	@mkdir -p $(dir $(MACOS_AUDIODEV))
+	swiftc -warnings-as-errors -target $(MACOS_SWIFT_TARGET) \
+		scripts/macos/audiodev.swift -o $(MACOS_AUDIODEV)
+	codesign --force --sign "$(SIGN_IDENTITY)" \
+		--options runtime \
+		--timestamp=none \
+		$(MACOS_AUDIODEV)
+
+macos-device-switch-repro: macos-audiodev
+	cargo build -p audetic --example device_switch_repro --release
+	@echo "Run: cargo run -p audetic --example device_switch_repro --release -- all"
+	@echo "Guide: docs/coreaudio-device-churn-proof.md"
 
 # macOS app bundle. Produces target/<profile>/Audetic.app containing the
 # daemon binary, Info.plist, and PkgInfo. Signed in place.

@@ -45,6 +45,19 @@ pub fn push_mono_f32(data: &[f32], channels: usize, dst: &Arc<Mutex<Vec<f32>>>) 
     }
 }
 
+pub(crate) fn sample_levels(samples: &[f32]) -> (f32, f32) {
+    if samples.is_empty() {
+        return (0.0, 0.0);
+    }
+    let sum_squares = samples.iter().map(|sample| sample * sample).sum::<f32>();
+    let rms = (sum_squares / samples.len() as f32).sqrt();
+    let peak = samples
+        .iter()
+        .map(|sample| sample.abs())
+        .fold(0.0_f32, f32::max);
+    (rms, peak)
+}
+
 /// Resample a mono buffer from `from_rate` Hz to `to_rate` Hz using rubato's
 /// FFT-based fixed-input resampler. Internal delay and final-chunk padding are
 /// trimmed so the returned clip has `input.len() * to_rate / from_rate` frames,
@@ -109,7 +122,15 @@ pub fn resample_mono_f32(input: &[f32], from_rate: u32, to_rate: u32) -> Result<
 
 #[cfg(test)]
 mod tests {
-    use super::resample_mono_f32;
+    use super::{resample_mono_f32, sample_levels};
+
+    #[test]
+    fn reports_rms_and_peak_for_segment_diagnostics() {
+        let (rms, peak) = sample_levels(&[0.5, -0.5, 0.5, -0.5]);
+        assert_eq!(rms, 0.5);
+        assert_eq!(peak, 0.5);
+        assert_eq!(sample_levels(&[]), (0.0, 0.0));
+    }
 
     #[test]
     fn normalizes_segments_to_the_exact_target_duration() {
