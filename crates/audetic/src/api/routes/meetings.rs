@@ -20,6 +20,7 @@ use tower_http::services::ServeFile;
 use tracing::{error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
+use crate::api::error::{ApiError, ApiResult};
 use crate::app::DaemonCommand as ApiCommand;
 use crate::meeting::{
     import_meeting_file, ImportArgs, MediaInspector, MeetingPhase, MeetingStartOptions,
@@ -114,6 +115,8 @@ pub struct MeetingStatusResponse {
 pub struct MeetingSummary {
     pub id: i64,
     pub title: Option<String>,
+    pub title_source: Option<MeetingTitleSource>,
+    pub source_filename: Option<String>,
     pub status: String,
     pub duration_seconds: Option<i64>,
     pub started_at: String,
@@ -132,6 +135,8 @@ pub struct MeetingsListResponse {
 pub struct MeetingDetailResponse {
     pub id: i64,
     pub title: Option<String>,
+    pub title_source: Option<MeetingTitleSource>,
+    pub source_filename: Option<String>,
     pub status: String,
     pub audio_path: String,
     pub transcript_path: Option<String>,
@@ -163,6 +168,54 @@ pub struct MeetingImportResponse {
     pub message: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum MeetingTitleSource {
+    Manual,
+    Generated,
+}
+
+impl MeetingTitleSource {
+    fn from_stored(source: Option<&str>) -> Option<Self> {
+        match source {
+            Some("manual") => Some(Self::Manual),
+            Some("generated") => Some(Self::Generated),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct RecentMeetingTitlesQuery {
+    /// Maximum distinct Manual Titles to return (default 10, maximum 50).
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RecentMeetingTitlesResponse {
+    pub titles: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MeetingTitleUpdateRequest {
+    /// New non-empty Manual Title.
+    pub title: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeetingTitleResponse {
+    pub meeting_id: i64,
+    pub title: Option<String>,
+    pub title_source: Option<MeetingTitleSource>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct MeetingTitleRegenerationResponse {
+    pub success: bool,
+    pub meeting_id: i64,
+    pub message: String,
+}
+
 pub fn router(state: MeetingState) -> Router {
     Router::new()
         .route("/meetings/start", post(start_meeting))
@@ -171,6 +224,7 @@ pub fn router(state: MeetingState) -> Router {
         .route("/meetings/cancel", post(cancel_meeting))
         .route("/meetings/toggle", post(toggle_meeting))
         .route("/meetings/status", get(meeting_status))
+        .route("/meetings/recent-titles", get(recent_meeting_titles))
         .route("/meetings", get(list_meetings))
         .route(
             "/meetings/import",
@@ -181,6 +235,14 @@ pub fn router(state: MeetingState) -> Router {
             post(import_meeting).layer(DefaultBodyLimit::disable()),
         )
         .route("/meetings/:id", get(get_meeting).delete(delete_meeting))
+        .route(
+            "/meetings/:id/title",
+            axum::routing::patch(update_meeting_title),
+        )
+        .route(
+            "/meetings/:id/regenerate-title",
+            post(regenerate_meeting_title),
+        )
         .route("/meetings/:id/audio", get(meeting_audio))
         .route("/meetings/:id/retry", post(retry_meeting))
         .with_state(state)
@@ -543,6 +605,8 @@ pub async fn list_meetings(
         .map(|m| MeetingSummary {
             id: m.id,
             title: m.title,
+            title_source: MeetingTitleSource::from_stored(m.title_source.as_deref()),
+            source_filename: m.source_filename,
             status: m.status,
             duration_seconds: m.duration_seconds,
             started_at: m.started_at,
@@ -552,6 +616,112 @@ pub async fn list_meetings(
         .collect();
 
     Ok(Json(MeetingsListResponse { meetings: entries }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/meetings/recent-titles",
+    tag = "meetings",
+    params(RecentMeetingTitlesQuery),
+    responses(
+        (status = 200, description = "Distinct recent Manual Titles ordered by latest use", body = RecentMeetingTitlesResponse),
+    ),
+)]
+pub async fn recent_meeting_titles(
+    Query(params): Query<RecentMeetingTitlesQuery>,
+    State(_state): State<MeetingState>,
+) -> ApiResult<Json<RecentMeetingTitlesResponse>> {
+    let limit = params.limit.unwrap_or(10).min(50);
+    let titles = tokio::task::spawn_blocking(move || {
+        let conn = crate::db::init_db()?;
+        crate::db::meetings::MeetingRepository::recent_manual_titles(&conn, limit)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
+    .map_err(ApiError::from)?;
+    Ok(Json(RecentMeetingTitlesResponse { titles }))
+}
+
+#[utoipa::path(
+    patch,
+    path = "/meetings/{id}/title",
+    tag = "meetings",
+    params(("id" = i64, Path, description = "Meeting id")),
+    request_body = MeetingTitleUpdateRequest,
+    responses(
+        (status = 200, description = "Meeting Title updated with manual ownership", body = MeetingTitleResponse),
+        (status = 400, description = "Meeting Title is blank"),
+        (status = 404, description = "Meeting not found"),
+    ),
+)]
+pub async fn update_meeting_title(
+    Path(id): Path<i64>,
+    State(state): State<MeetingState>,
+    Json(request): Json<MeetingTitleUpdateRequest>,
+) -> ApiResult<Json<MeetingTitleResponse>> {
+    let title = request.title.trim().to_string();
+    if title.is_empty() {
+        return Err(ApiError::bad_request("Meeting Title cannot be blank"));
+    }
+    let meeting = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = crate::db::init_db()?;
+        if !crate::db::meetings::MeetingRepository::set_manual_title(&conn, id, &title)? {
+            return Ok(None);
+        }
+        crate::db::meetings::MeetingRepository::get(&conn, id)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::not_found(format!("Meeting {id} not found")))?;
+
+    state
+        .status
+        .set_title_if_current(id, meeting.title.clone())
+        .await;
+    Ok(Json(MeetingTitleResponse {
+        meeting_id: id,
+        title: meeting.title,
+        title_source: MeetingTitleSource::from_stored(meeting.title_source.as_deref()),
+    }))
+}
+
+#[utoipa::path(
+    post,
+    path = "/meetings/{id}/regenerate-title",
+    tag = "meetings",
+    params(("id" = i64, Path, description = "Meeting id")),
+    responses(
+        (status = 202, description = "Title ownership released and regeneration started", body = MeetingTitleRegenerationResponse),
+        (status = 404, description = "Meeting not found"),
+        (status = 409, description = "Meeting is not completed or has no transcript"),
+    ),
+)]
+pub async fn regenerate_meeting_title(
+    Path(id): Path<i64>,
+    State(state): State<MeetingState>,
+) -> ApiResult<(StatusCode, Json<MeetingTitleRegenerationResponse>)> {
+    tokio::task::spawn_blocking(move || crate::meeting::title::prepare_title_regeneration(id))
+        .await
+        .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("not found") {
+                ApiError::not_found(message)
+            } else {
+                ApiError::new(StatusCode::CONFLICT, message)
+            }
+        })?;
+    state.status.set_title_if_current(id, None).await;
+    crate::meeting::title::spawn_title_generation(id);
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(MeetingTitleRegenerationResponse {
+            success: true,
+            meeting_id: id,
+            message: "Title regeneration started".to_string(),
+        }),
+    ))
 }
 
 #[utoipa::path(
@@ -595,6 +765,8 @@ pub async fn get_meeting(
         Some(m) => Ok(Json(MeetingDetailResponse {
             id: m.id,
             title: m.title,
+            title_source: MeetingTitleSource::from_stored(m.title_source.as_deref()),
+            source_filename: m.source_filename,
             status: m.status,
             audio_path: m.audio_path,
             transcript_path: m.transcript_path,
@@ -985,8 +1157,8 @@ pub async fn delete_meeting(Path(id): Path<i64>, State(state): State<MeetingStat
 ///
 /// Accepts a `multipart/form-data` body with:
 /// - `file`: the audio or video bytes (required)
-/// - `title`: optional human-readable title; defaults to the filename
-///   stem if absent
+/// - `title`: optional Manual Title; absent or blank imports remain untitled
+///   until transcript-derived generation succeeds
 ///
 /// The file is streamed chunk-by-chunk into a temp file under the meetings
 /// directory, then handed to `meeting::import_meeting_file`, which moves

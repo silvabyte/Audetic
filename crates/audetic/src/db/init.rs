@@ -48,8 +48,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         "CREATE TABLE IF NOT EXISTS meetings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
+            title_source TEXT,
+            title_updated_at TIMESTAMP,
+            title_version INTEGER NOT NULL DEFAULT 0,
             status TEXT NOT NULL DEFAULT 'recording',
             audio_path TEXT NOT NULL,
+            source_filename TEXT,
             transcript_path TEXT,
             transcript_text TEXT,
             transcript_segments TEXT,
@@ -73,6 +77,32 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // transcript lines. Backfilled for meetings created before this column —
     // older rows just have NULL and the UI falls back to plain text.
     add_column_if_missing(conn, "meetings", "transcript_segments", "TEXT")?;
+
+    // Meeting Titles gained persisted provenance after the initial meetings
+    // schema shipped. Existing non-empty titles are user-owned Manual Titles;
+    // whitespace-only legacy values are absence, not titles.
+    add_column_if_missing(conn, "meetings", "title_source", "TEXT")?;
+    add_column_if_missing(conn, "meetings", "title_updated_at", "TIMESTAMP")?;
+    add_column_if_missing(
+        conn,
+        "meetings",
+        "title_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "meetings", "source_filename", "TEXT")?;
+    conn.execute(
+        "UPDATE meetings SET title = NULL, title_source = NULL \
+         WHERE (title IS NOT NULL AND trim(title) = '') \
+            OR (title IS NULL AND title_source IS NOT NULL)",
+        [],
+    )
+    .context("Failed to normalize absent meeting titles")?;
+    conn.execute(
+        "UPDATE meetings SET title = trim(title), title_source = 'manual' \
+         WHERE title IS NOT NULL AND title_source IS NULL",
+        [],
+    )
+    .context("Failed to migrate legacy meeting titles to manual provenance")?;
 
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at DESC)",
@@ -231,4 +261,45 @@ fn is_duplicate_column(err: &rusqlite::Error) -> bool {
         err,
         rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("duplicate column name")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_marks_legacy_non_empty_titles_manual_and_clears_blank_titles() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE meetings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT,
+                status TEXT NOT NULL DEFAULT 'recording',
+                audio_path TEXT NOT NULL,
+                transcript_path TEXT,
+                transcript_text TEXT,
+                duration_seconds INTEGER,
+                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP,
+                error TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO meetings (title, audio_path) VALUES ('  Legacy Planning  ', '/tmp/one.wav');
+            INSERT INTO meetings (title, audio_path) VALUES ('   ', '/tmp/two.wav');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let legacy = crate::db::meetings::MeetingRepository::get(&conn, 1)
+            .unwrap()
+            .unwrap();
+        assert_eq!(legacy.title.as_deref(), Some("Legacy Planning"));
+        assert_eq!(legacy.title_source.as_deref(), Some("manual"));
+        let blank = crate::db::meetings::MeetingRepository::get(&conn, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(blank.title, None);
+        assert_eq!(blank.title_source, None);
+    }
 }

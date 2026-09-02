@@ -13,6 +13,7 @@ pub mod meeting_machine;
 pub mod processing;
 pub mod progress;
 pub mod status;
+pub mod title;
 
 pub use import::{import_meeting_file, ImportArgs, ImportResult};
 pub use media_inspector::{FfprobeMediaInspector, MediaInspector};

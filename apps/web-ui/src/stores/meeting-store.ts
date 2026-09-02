@@ -6,6 +6,7 @@ import type { components } from "@/api/schema";
 export type MeetingStatus = components["schemas"]["MeetingStatusResponse"];
 export type MeetingSummary = components["schemas"]["MeetingSummary"];
 export type MeetingDetail = components["schemas"]["MeetingDetailResponse"];
+export type TitleMutationStatus = "idle" | "saving" | "generating" | "error";
 
 /**
  * Phases mirror crates/audetic/src/meeting/meeting_machine.rs.
@@ -52,6 +53,7 @@ export class MeetingStore {
   durationSeconds: number | null = null;
   captureState: CaptureState | null = null;
   audioPath: string | null = null;
+  meetingStartedAt: string | null = null;
   lastError: string | null = null;
 
   // List
@@ -63,17 +65,31 @@ export class MeetingStore {
   detailCache: Record<number, MeetingDetail> = {};
   detailStatus: Record<number, ListStatus> = {};
 
+  // Shared title picker + per-detail mutation feedback.
+  recentTitles: string[] = [];
+  recentTitlesStatus: ListStatus = "idle";
+  recentTitlesError: string | null = null;
+  titleMutationStatus: Record<number, TitleMutationStatus> = {};
+  titleMutationError: Record<number, string | null> = {};
+
   /** ID the store wants the UI to auto-navigate to on Completed. */
   pendingNavigationId: number | null = null;
 
   private pollTimer: ReturnType<typeof setTimeout> | null = null;
+  private silentTitlePolls = new Set<number>();
+  private titleMutationEpoch = new Map<number, number>();
   private root: RootStore;
 
   constructor(root: RootStore) {
     this.root = root;
-    makeAutoObservable<this, "root" | "pollTimer">(this, {
+    makeAutoObservable<
+      this,
+      "root" | "pollTimer" | "silentTitlePolls" | "titleMutationEpoch"
+    >(this, {
       root: false,
       pollTimer: false,
+      silentTitlePolls: false,
+      titleMutationEpoch: false,
     });
   }
 
@@ -104,6 +120,8 @@ export class MeetingStore {
       if (data) {
         runInAction(() => {
           this.captureState = normalizeCaptureState(data.capture_state);
+          this.meetingStartedAt = new Date().toISOString();
+          if (title) this.rememberRecentTitle(title);
         });
       }
     } catch (e) {
@@ -210,6 +228,7 @@ export class MeetingStore {
       }
       // Best-effort list refresh so the row appears immediately.
       void this.loadList();
+      this.watchForGeneratedTitle(data.meeting_id);
       return { meetingId: data.meeting_id };
     } catch (e) {
       runInAction(() => {
@@ -230,6 +249,7 @@ export class MeetingStore {
         params: { path: { id } },
       });
       if (error) throw new Error(formatError(error));
+      this.bumpTitleMutationEpoch(id);
       runInAction(() => {
         const cached = this.detailCache[id];
         if (cached) {
@@ -267,10 +287,13 @@ export class MeetingStore {
         params: { path: { id } },
       });
       if (error) throw new Error(formatError(error));
+      this.bumpTitleMutationEpoch(id);
       runInAction(() => {
         this.list = this.list.filter((m) => m.id !== id);
         delete this.detailCache[id];
         delete this.detailStatus[id];
+        delete this.titleMutationStatus[id];
+        delete this.titleMutationError[id];
       });
       return true;
     } catch (e) {
@@ -284,6 +307,106 @@ export class MeetingStore {
   // ---------------------------------------------------------------
   // List + detail fetches
   // ---------------------------------------------------------------
+
+  async loadRecentTitles(limit = 10): Promise<void> {
+    if (this.recentTitlesStatus === "loading") return;
+    runInAction(() => {
+      this.recentTitlesStatus = "loading";
+      this.recentTitlesError = null;
+    });
+    try {
+      const { data, error } = await daemon.GET("/meetings/recent-titles", {
+        params: { query: { limit } },
+      });
+      if (error || !data) throw new Error(formatError(error ?? "empty response"));
+      runInAction(() => {
+        this.recentTitles = data.titles;
+        this.recentTitlesStatus = "loaded";
+      });
+    } catch (e) {
+      runInAction(() => {
+        this.recentTitlesError = e instanceof Error ? e.message : String(e);
+        this.recentTitlesStatus = "error";
+      });
+    }
+  }
+
+  async updateTitle(id: number, title: string): Promise<boolean> {
+    const trimmed = title.trim();
+    if (!trimmed) {
+      runInAction(() => {
+        this.titleMutationStatus[id] = "error";
+        this.titleMutationError[id] = "Title cannot be blank.";
+      });
+      return false;
+    }
+
+    this.bumpTitleMutationEpoch(id);
+    runInAction(() => {
+      this.titleMutationStatus[id] = "saving";
+      this.titleMutationError[id] = null;
+    });
+    try {
+      const { data, error } = await daemon.PATCH("/meetings/{id}/title", {
+        params: { path: { id } },
+        body: { title: trimmed },
+      });
+      if (error || !data) throw new Error(formatError(error ?? "empty response"));
+      runInAction(() => {
+        this.applyTitle(id, data.title ?? trimmed, data.title_source ?? "manual");
+        this.rememberRecentTitle(data.title ?? trimmed);
+        this.titleMutationStatus[id] = "idle";
+      });
+      return true;
+    } catch (e) {
+      runInAction(() => {
+        this.titleMutationStatus[id] = "error";
+        this.titleMutationError[id] = e instanceof Error ? e.message : String(e);
+      });
+      return false;
+    }
+  }
+
+  async regenerateTitle(id: number): Promise<boolean> {
+    const mutationEpoch = this.bumpTitleMutationEpoch(id);
+    runInAction(() => {
+      this.titleMutationStatus[id] = "generating";
+      this.titleMutationError[id] = null;
+    });
+    try {
+      const { error } = await daemon.POST("/meetings/{id}/regenerate-title", {
+        params: { path: { id } },
+      });
+      if (error) throw new Error(formatError(error));
+      runInAction(() => {
+        this.applyTitle(id, null, null);
+      });
+      void this.pollForGeneratedTitle(id, true, mutationEpoch);
+      return true;
+    } catch (e) {
+      runInAction(() => {
+        this.titleMutationStatus[id] = "error";
+        this.titleMutationError[id] = e instanceof Error ? e.message : String(e);
+      });
+      return false;
+    }
+  }
+
+  clearTitleMutationFeedback(id: number): void {
+    if (this.titleMutationStatus[id] === "error") {
+      this.titleMutationStatus[id] = "idle";
+      this.titleMutationError[id] = null;
+    }
+  }
+
+  watchForGeneratedTitle(id: number): void {
+    if (this.silentTitlePolls.has(id)) return;
+    this.silentTitlePolls.add(id);
+    const mutationEpoch = this.currentTitleMutationEpoch(id);
+    void this.pollForGeneratedTitle(id, false, mutationEpoch).finally(() => {
+      this.silentTitlePolls.delete(id);
+    });
+  }
 
   async loadList(limit = 50): Promise<void> {
     if (this.listStatus === "loading") return;
@@ -341,6 +464,7 @@ export class MeetingStore {
 
       const prevPhase = this.phase;
       const nextPhase = normalizePhase(s.phase);
+      const previousMeetingId = this.meetingId;
 
       runInAction(() => {
         this.active = s.active;
@@ -350,6 +474,9 @@ export class MeetingStore {
         this.durationSeconds = s.duration_seconds ?? null;
         this.audioPath = s.audio_path ?? null;
         this.lastError = s.last_error ?? null;
+        if (s.meeting_id != null && s.meeting_id !== previousMeetingId) {
+          this.meetingStartedAt = new Date().toISOString();
+        }
       });
 
       // Transition into completed → tell the UI to jump to detail and
@@ -393,6 +520,109 @@ export class MeetingStore {
       void this.pollStatus();
     }, Math.max(0, delayMs));
   }
+
+  private async pollForGeneratedTitle(
+    id: number,
+    reportTimeout: boolean,
+    mutationEpoch: number,
+  ): Promise<void> {
+    // Explicit regeneration starts from a completed meeting and gets a short,
+    // visible timeout. Silent import polling waits through transcription, then
+    // allows the same generation window once the meeting reaches completion.
+    const maxAttempts = reportTimeout ? 75 : 900;
+    let completedAttempts = 0;
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      await delay(2000);
+      if (mutationEpoch !== this.currentTitleMutationEpoch(id)) return;
+      if (reportTimeout && this.titleMutationStatus[id] !== "generating") {
+        return;
+      }
+
+      try {
+        const { data, error } = await daemon.GET("/meetings/{id}", {
+          params: { path: { id } },
+        });
+        if (error || !data) continue;
+        if (mutationEpoch !== this.currentTitleMutationEpoch(id)) return;
+        if (data.title?.trim()) {
+          runInAction(() => {
+            this.detailCache[id] = data;
+            this.detailStatus[id] = "loaded";
+            this.applyTitle(id, data.title ?? null, data.title_source ?? null);
+            if (this.titleMutationStatus[id] === "generating") {
+              this.titleMutationStatus[id] = "idle";
+            }
+          });
+          return;
+        }
+        if (data.status === "error" || data.status === "cancelled") return;
+        if (data.status === "completed") {
+          completedAttempts += 1;
+          if (completedAttempts >= 75) break;
+        }
+        runInAction(() => {
+          this.detailCache[id] = data;
+          this.detailStatus[id] = "loaded";
+        });
+      } catch {
+        // A transient detail failure should not stop the generation poll.
+      }
+    }
+
+    if (mutationEpoch !== this.currentTitleMutationEpoch(id)) return;
+    if (reportTimeout) {
+      runInAction(() => {
+        this.titleMutationStatus[id] = "error";
+        this.titleMutationError[id] =
+          "Title generation is still pending. Refresh to check again.";
+      });
+    }
+  }
+
+  private applyTitle(
+    id: number,
+    title: string | null,
+    titleSource: components["schemas"]["MeetingTitleSource"] | null,
+  ): void {
+    const detail = this.detailCache[id];
+    if (detail) {
+      this.detailCache[id] = {
+        ...detail,
+        title,
+        title_source: titleSource,
+      };
+    }
+    this.list = this.list.map((meeting) =>
+      meeting.id === id
+        ? { ...meeting, title, title_source: titleSource }
+        : meeting,
+    );
+    if (this.meetingId === id) this.title = title;
+  }
+
+  private rememberRecentTitle(title: string): void {
+    const trimmed = title.trim();
+    if (!trimmed) return;
+    this.recentTitles = [
+      trimmed,
+      ...this.recentTitles.filter((recent) => recent !== trimmed),
+    ].slice(0, 10);
+    this.recentTitlesStatus = "loaded";
+  }
+
+  private bumpTitleMutationEpoch(id: number): number {
+    const next = this.currentTitleMutationEpoch(id) + 1;
+    this.titleMutationEpoch.set(id, next);
+    return next;
+  }
+
+  private currentTitleMutationEpoch(id: number): number {
+    return this.titleMutationEpoch.get(id) ?? 0;
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 }
 
 function nextPollDelay(phase: MeetingPhase, active: boolean): number {

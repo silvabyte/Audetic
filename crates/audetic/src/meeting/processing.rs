@@ -1,8 +1,8 @@
 //! Post-recording meeting pipeline.
 //!
 //! Drives a meeting from a freshly-staged audio file to a completed,
-//! transcribed record: compress → transcribe → write transcript →
-//! dispatch the `meeting.completed` event → mark completed. Updates the DB
+//! transcribed record: compress → transcribe → write transcript → mark
+//! completed → dispatch the `meeting.completed` event. Updates the DB
 //! row at every transition. Side effects that depend on the *caller*
 //! (live indicator, status handle) are delegated to a
 //! `MeetingProgressObserver` so this module stays oblivious to whether
@@ -39,7 +39,6 @@ pub struct ProcessingServices {
 pub struct ProcessingArgs {
     pub meeting_id: i64,
     pub audio_path: PathBuf,
-    pub title: Option<String>,
     pub duration_seconds: u64,
     pub services: ProcessingServices,
     pub observer: Arc<dyn MeetingProgressObserver>,
@@ -55,7 +54,6 @@ pub async fn process_meeting(args: ProcessingArgs) {
     let ProcessingArgs {
         meeting_id,
         audio_path,
-        title,
         duration_seconds,
         services,
         observer,
@@ -137,7 +135,7 @@ pub async fn process_meeting(args: ProcessingArgs) {
                 error!("Failed to write transcript file: {}", e);
             }
 
-            if let Ok(conn) = db::init_db() {
+            let canonical_title = if let Ok(conn) = db::init_db() {
                 let _ = MeetingRepository::complete(
                     &conn,
                     meeting_id,
@@ -146,7 +144,13 @@ pub async fn process_meeting(args: ProcessingArgs) {
                     result.segments.as_deref(),
                     duration_seconds as i64,
                 );
-            }
+                MeetingRepository::get(&conn, meeting_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|meeting| meeting.title)
+            } else {
+                None
+            };
 
             info!(
                 "Meeting {} transcription complete: {} chars",
@@ -163,7 +167,7 @@ pub async fn process_meeting(args: ProcessingArgs) {
                 .dispatch(PostProcessingEvent::MeetingCompleted(
                     MeetingCompletedPayload {
                         meeting_id,
-                        title,
+                        title: canonical_title,
                         audio_path: durable_audio,
                         transcript_path,
                         transcript_text: result.text.clone(),
@@ -172,6 +176,7 @@ pub async fn process_meeting(args: ProcessingArgs) {
                 ));
 
             observer.on_complete(&result.text).await;
+            super::title::spawn_title_generation(meeting_id);
         }
         Err(e) => {
             error!("Meeting {} transcription failed: {}", meeting_id, e);

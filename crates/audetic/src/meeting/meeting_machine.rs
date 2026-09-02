@@ -431,7 +431,6 @@ impl MeetingMachine {
 
         let meeting_id = state.meeting_id.unwrap_or(0);
         let audio_path = state.audio_path.clone().unwrap_or_default();
-        let title = state.title.clone();
         let mut duration_seconds = state.duration_seconds().unwrap_or(0);
 
         // Apply the trim if either boundary was provided.
@@ -445,7 +444,7 @@ impl MeetingMachine {
             );
         }
 
-        self.spawn_processing(meeting_id, audio_path, title, duration_seconds)
+        self.spawn_processing(meeting_id, audio_path, duration_seconds)
             .await;
 
         Ok(MeetingStopResult {
@@ -460,13 +459,7 @@ impl MeetingMachine {
     /// coherent the moment this returns; the pipeline itself runs detached.
     /// `LiveProgressObserver` forwards later phase transitions to the
     /// singleton status handle and the indicator.
-    async fn spawn_processing(
-        &self,
-        meeting_id: i64,
-        audio_path: PathBuf,
-        title: Option<String>,
-        duration_seconds: u64,
-    ) {
+    async fn spawn_processing(&self, meeting_id: i64, audio_path: PathBuf, duration_seconds: u64) {
         self.status.set_phase(MeetingPhase::Compressing).await;
         if let Err(e) = self.indicator.show_processing().await {
             warn!("Failed to show processing indicator: {}", e);
@@ -479,7 +472,6 @@ impl MeetingMachine {
         let args = ProcessingArgs {
             meeting_id,
             audio_path,
-            title,
             duration_seconds,
             services: ProcessingServices {
                 transcription: Arc::clone(&self.transcription),
@@ -710,6 +702,8 @@ pub async fn retry_meeting_transcription(
                     error!("Failed to mark meeting {} completed: {}", meeting_id, e);
                 }
             }
+
+            super::title::spawn_title_generation(meeting_id);
 
             info!(
                 "Meeting {} retry transcription complete: {} chars",
