@@ -83,6 +83,34 @@ impl AgentProfileRepository {
             )
             .context("Failed to insert built-in agent profile")?;
         }
+
+        // Older persisted OpenCode built-ins hard-coded artifact output in
+        // argv. Upgrade only that exact built-in value so user-edited profiles
+        // remain untouched and every task can define its own output contract.
+        let legacy_opencode_args = vec![
+            "run".to_string(),
+            "--dir".to_string(),
+            "{run_dir}".to_string(),
+            "--file".to_string(),
+            "{prompt_path}".to_string(),
+            "Follow the attached prompt exactly. Return only the requested Markdown artifact."
+                .to_string(),
+        ];
+        let current_opencode_args = builtin_profiles()
+            .into_iter()
+            .find(|profile| profile.kind == "opencode")
+            .expect("OpenCode built-in profile")
+            .args;
+        let current_opencode_args = serde_json::to_string(&current_opencode_args)
+            .context("Failed to serialize current OpenCode profile arguments")?;
+        let legacy_opencode_args = serde_json::to_string(&legacy_opencode_args)
+            .context("Failed to serialize legacy OpenCode profile arguments")?;
+        conn.execute(
+            "UPDATE agent_profiles SET args_json = ?1, updated_at = CURRENT_TIMESTAMP \
+             WHERE kind = 'opencode' AND executable = 'opencode' AND args_json = ?2",
+            params![current_opencode_args, legacy_opencode_args],
+        )
+        .context("Failed to upgrade built-in OpenCode profile")?;
         Ok(())
     }
 
@@ -129,6 +157,29 @@ impl AgentProfileRepository {
         .optional()
         .context("Failed to query default agent profile")?
         .transpose()
+    }
+
+    /// Resolve the default enabled profile when installed, otherwise the first
+    /// enabled profile whose executable is available on this machine.
+    pub fn first_available(conn: &Connection) -> Result<Option<AgentProfile>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, name, kind, executable, args_json, prompt_mode, \
+                 default_profile, enabled, created_at, updated_at \
+                 FROM agent_profiles WHERE enabled = 1 \
+                 ORDER BY default_profile DESC, id ASC",
+            )
+            .context("Failed to prepare available agent profile query")?;
+        let rows = stmt
+            .query_map([], row_to_profile)
+            .context("Failed to query available agent profiles")?;
+        for row in rows {
+            let profile = row??;
+            if profile.available {
+                return Ok(Some(profile));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -196,8 +247,7 @@ fn builtin_profiles() -> Vec<NewAgentProfile> {
                 "{run_dir}".into(),
                 "--file".into(),
                 "{prompt_path}".into(),
-                "Follow the attached prompt exactly. Return only the requested Markdown artifact."
-                    .into(),
+                "Follow the attached prompt exactly. Return only the requested output.".into(),
             ],
             prompt_mode: PromptMode::FileArg,
             default_profile: false,
@@ -234,4 +284,49 @@ fn builtin_profiles() -> Vec<NewAgentProfile> {
             enabled: true,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::db::migrate;
+
+    use super::*;
+
+    #[test]
+    fn first_available_skips_an_unavailable_default_profile() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO agent_profiles \
+             (name, kind, executable, args_json, prompt_mode, default_profile, enabled) \
+             VALUES ('Missing Default', 'missing', '/not/a/real/agent', '[]', 'stdin', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        conn.execute(
+            "INSERT INTO agent_profiles \
+             (name, kind, executable, args_json, prompt_mode, default_profile, enabled) \
+             VALUES ('Available Agent', 'available', ?1, '[]', 'stdin', 0, 1)",
+            params![executable.to_string_lossy()],
+        )
+        .unwrap();
+
+        let profile = AgentProfileRepository::first_available(&conn)
+            .unwrap()
+            .expect("available fallback profile");
+        assert_eq!(profile.name, "Available Agent");
+        assert!(profile.available);
+    }
+
+    #[test]
+    fn builtin_profiles_are_not_coupled_to_artifact_output() {
+        for profile in builtin_profiles() {
+            assert!(
+                profile.args.iter().all(|arg| !arg.contains("artifact")),
+                "{} argv should defer output format to the task prompt",
+                profile.name
+            );
+        }
+    }
 }

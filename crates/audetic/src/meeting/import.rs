@@ -29,10 +29,11 @@ pub struct ImportArgs {
     /// **moved** into the meetings directory; on success, `source_path` no
     /// longer exists.
     pub source_path: PathBuf,
-    /// Original filename, used to derive an extension and a title fallback.
+    /// Original filename, used to derive an extension and retained as a
+    /// presentation fallback until a canonical Meeting Title exists.
     /// Take this from the multipart filename or `path.file_name()`.
     pub original_filename: Option<String>,
-    /// Optional user-supplied title. Falls back to the filename stem.
+    /// Optional user-supplied Manual Title.
     pub title: Option<String>,
     /// Shared pipeline dependencies (transcription + post-processing dispatch).
     pub services: ProcessingServices,
@@ -85,36 +86,35 @@ pub async fn import_meeting_file(args: ImportArgs) -> Result<ImportResult> {
     move_file(&source_path, &destination)
         .with_context(|| format!("Failed to move imported file into {:?}", destination))?;
 
-    let resolved_title = title.or_else(|| {
-        original_filename
-            .as_deref()
-            .or_else(|| source_path.file_name().and_then(|n| n.to_str()))
-            .and_then(|name| Path::new(name).file_stem().and_then(|s| s.to_str()))
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty())
-    });
+    let resolved_title = title
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty());
+    let source_filename = original_filename
+        .as_deref()
+        .or_else(|| source_path.file_name().and_then(|name| name.to_str()));
 
     let duration_seconds = inspector
         .probe_duration_seconds(&destination)
         .await
         .unwrap_or(0);
 
-    let meeting_id = match insert_meeting_row(&destination, resolved_title.as_deref()) {
-        Ok(id) => id,
-        Err(e) => {
-            // The DB row is the only thing tying this file to the meeting
-            // surface — if insert failed, the file is orphaned. Remove it
-            // so we don't leak storage on every failed import.
-            if let Err(cleanup_err) = std::fs::remove_file(&destination) {
-                tracing::warn!(
-                    "Failed to clean up orphaned import at {:?}: {}",
-                    destination,
-                    cleanup_err
-                );
+    let meeting_id =
+        match insert_meeting_row(&destination, resolved_title.as_deref(), source_filename) {
+            Ok(id) => id,
+            Err(e) => {
+                // The DB row is the only thing tying this file to the meeting
+                // surface — if insert failed, the file is orphaned. Remove it
+                // so we don't leak storage on every failed import.
+                if let Err(cleanup_err) = std::fs::remove_file(&destination) {
+                    tracing::warn!(
+                        "Failed to clean up orphaned import at {:?}: {}",
+                        destination,
+                        cleanup_err
+                    );
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
-    };
+        };
 
     info!(
         "Imported meeting {} from file: {:?} ({}s)",
@@ -124,7 +124,6 @@ pub async fn import_meeting_file(args: ImportArgs) -> Result<ImportResult> {
     let pipeline_args = ProcessingArgs {
         meeting_id,
         audio_path: destination.clone(),
-        title: resolved_title,
         duration_seconds,
         services,
         observer: Arc::new(NoopProgressObserver),
@@ -179,9 +178,18 @@ fn move_file(source: &Path, destination: &Path) -> std::io::Result<()> {
 
 /// Insert the meeting row with `status = compressing` so the list UI shows
 /// it as in-flight rather than recording.
-fn insert_meeting_row(audio_path: &Path, title: Option<&str>) -> Result<i64> {
+fn insert_meeting_row(
+    audio_path: &Path,
+    title: Option<&str>,
+    source_filename: Option<&str>,
+) -> Result<i64> {
     let conn = db::init_db().context("Failed to open audetic database")?;
-    let id = MeetingRepository::insert(&conn, title, &audio_path.to_string_lossy())?;
+    let id = MeetingRepository::insert_import(
+        &conn,
+        title,
+        &audio_path.to_string_lossy(),
+        source_filename,
+    )?;
     MeetingRepository::update_status(&conn, id, MeetingPhase::Compressing)?;
     Ok(id)
 }

@@ -2,6 +2,7 @@ import { Observer } from "mobx-react-lite";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useStore } from "@/stores/root-store";
 import { cn } from "@/lib/utils";
+import { meetingDisplayTitle } from "@/lib/meeting-title";
 
 type OrbState =
   | "offline"
@@ -129,16 +130,25 @@ function describe(state: OrbState, store: ReturnType<typeof useStore>): string {
     case "error":
       return store.status.lastError ?? "Last pipeline run failed. Check daemon logs.";
     case "meeting-active": {
-      const title = store.meetings.title ?? "Untitled meeting";
+      const title = meetingDisplayTitle({
+        title: store.meetings.title,
+        startedAt: store.meetings.meetingStartedAt,
+      });
       const dur = store.meetings.durationSeconds;
       return typeof dur === "number"
         ? `${title} · ${formatDuration(dur)}`
         : title;
     }
     case "meeting-review":
-      return "Recording stopped — review and trim before transcribing.";
+      return `${meetingDisplayTitle({
+        title: store.meetings.title,
+        startedAt: store.meetings.meetingStartedAt,
+      })} · review and trim before transcribing.`;
     case "meeting-pipeline":
-      return `Meeting: ${meetingPhaseLabel(store.meetings.phase).toLowerCase()}…`;
+      return `${meetingDisplayTitle({
+        title: store.meetings.title,
+        startedAt: store.meetings.meetingStartedAt,
+      })} · ${meetingPhaseLabel(store.meetings.phase).toLowerCase()}…`;
     case "dictation-rec":
       return "Dictation recording. Press Super+R or the stop button to finish.";
     case "dictation-proc":

@@ -7,6 +7,7 @@ import type { CaptureState, MeetingPhase } from "@/stores/meeting-store";
 import { MEETING_INTENTS } from "@/routes/meetings";
 import { MeetingReviewPanel } from "@/components/meeting-review-panel";
 import { cn } from "@/lib/utils";
+import { meetingDisplayTitle } from "@/lib/meeting-title";
 
 const PHASE_ORDER: MeetingPhase[] = [
   "recording",
@@ -50,6 +51,7 @@ export function ActiveMeetingBanner() {
               meetingId={meetings.meetingId}
               durationSeconds={meetings.durationSeconds ?? 0}
               title={meetings.title}
+              startedAt={meetings.meetingStartedAt}
             />
           );
         }
@@ -81,7 +83,10 @@ export function ActiveMeetingBanner() {
                 </span>
                 <div className="text-sm">
                   <div className="font-medium">
-                    {meetings.title ?? "Untitled meeting"}
+                    {meetingDisplayTitle({
+                      title: meetings.title,
+                      startedAt: meetings.meetingStartedAt,
+                    })}
                   </div>
                   <div className="text-xs text-muted-foreground">
                     {PHASE_LABEL[meetings.phase]}

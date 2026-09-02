@@ -167,6 +167,15 @@ impl MeetingStatusHandle {
         }
     }
 
+    /// Keep the live status snapshot aligned when the current meeting is
+    /// renamed through the repository-backed HTTP endpoint.
+    pub async fn set_title_if_current(&self, meeting_id: i64, title: Option<String>) {
+        let mut state = self.inner.lock().await;
+        if state.meeting_id == Some(meeting_id) {
+            state.title = title;
+        }
+    }
+
     /// Transition into the Review phase, freezing the recorded duration so the
     /// reported timer stops climbing and the trim UI knows the end bound.
     pub async fn enter_review(&self, duration_seconds: u64) {
@@ -317,6 +326,26 @@ mod tests {
 
         let parsed: MeetingPhase = serde_json::from_str("\"transcribing\"").unwrap();
         assert_eq!(parsed, MeetingPhase::Transcribing);
+    }
+
+    #[tokio::test]
+    async fn title_updates_only_change_the_matching_live_meeting() {
+        let status = MeetingStatusHandle::default();
+        status
+            .start_recording(7, None, PathBuf::from("/tmp/seven.wav"), true, true)
+            .await;
+
+        status
+            .set_title_if_current(8, Some("Wrong Meeting".to_string()))
+            .await;
+        assert_eq!(status.get().await.title, None);
+        status
+            .set_title_if_current(7, Some("Canonical Meeting Title".to_string()))
+            .await;
+        assert_eq!(
+            status.get().await.title.as_deref(),
+            Some("Canonical Meeting Title")
+        );
     }
 
     #[test]

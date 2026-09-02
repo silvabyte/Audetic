@@ -27,8 +27,11 @@ pub enum SoftDeleteOutcome {
 pub struct MeetingRecord {
     pub id: i64,
     pub title: Option<String>,
+    pub title_source: Option<String>,
+    pub title_version: i64,
     pub status: String,
     pub audio_path: String,
+    pub source_filename: Option<String>,
     pub transcript_path: Option<String>,
     pub transcript_text: Option<String>,
     /// Per-segment `{start,end,text}` timestamps, or `None` for meetings
@@ -54,9 +57,42 @@ impl MeetingRepository {
     /// Insert a new meeting record (status = recording).
     /// Returns the new meeting ID.
     pub fn insert(conn: &Connection, title: Option<&str>, audio_path: &str) -> Result<i64> {
+        Self::insert_with_source(conn, title, audio_path, None)
+    }
+
+    /// Insert an imported meeting while retaining its original filename for
+    /// presentation before a canonical Meeting Title exists.
+    pub fn insert_import(
+        conn: &Connection,
+        title: Option<&str>,
+        audio_path: &str,
+        source_filename: Option<&str>,
+    ) -> Result<i64> {
+        Self::insert_with_source(conn, title, audio_path, source_filename)
+    }
+
+    fn insert_with_source(
+        conn: &Connection,
+        title: Option<&str>,
+        audio_path: &str,
+        source_filename: Option<&str>,
+    ) -> Result<i64> {
+        let title = title.map(str::trim).filter(|title| !title.is_empty());
+        let source_filename = source_filename
+            .map(str::trim)
+            .filter(|filename| !filename.is_empty());
         conn.execute(
-            "INSERT INTO meetings (title, status, audio_path) VALUES (?1, ?2, ?3)",
-            params![title, MeetingPhase::Recording.as_str(), audio_path],
+            "INSERT INTO meetings \
+             (title, title_source, title_updated_at, status, audio_path, source_filename) \
+             VALUES (?1, CASE WHEN ?1 IS NULL THEN NULL ELSE 'manual' END, \
+                     CASE WHEN ?1 IS NULL THEN NULL \
+                          ELSE strftime('%Y-%m-%d %H:%M:%f', 'now') END, ?2, ?3, ?4)",
+            params![
+                title,
+                MeetingPhase::Recording.as_str(),
+                audio_path,
+                source_filename
+            ],
         )
         .context("Failed to insert meeting")?;
 
@@ -96,6 +132,89 @@ impl MeetingRepository {
         )
         .context("Failed to update meeting audio_path")?;
         Ok(())
+    }
+
+    /// Assign a non-empty Manual Title to one live meeting.
+    pub fn set_manual_title(conn: &Connection, id: i64, title: &str) -> Result<bool> {
+        let title = title.trim();
+        if title.is_empty() {
+            anyhow::bail!("Meeting Title cannot be blank");
+        }
+        let affected = conn
+            .execute(
+                "UPDATE meetings SET \
+                 title = ?1, \
+                 title_source = 'manual', \
+                 title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
+                 title_version = title_version + 1 \
+                 WHERE id = ?2 AND deleted_at IS NULL",
+                params![title, id],
+            )
+            .context("Failed to update meeting Manual Title")?;
+        Ok(affected > 0)
+    }
+
+    /// Claim an unowned meeting title for generation. The guarded update is
+    /// the Manual Title precedence rule: a person can edit while generation is
+    /// running and the late agent result will then be discarded.
+    pub fn set_generated_title_if_unowned(
+        conn: &Connection,
+        id: i64,
+        title: &str,
+        title_version: i64,
+    ) -> Result<bool> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(false);
+        }
+        let affected = conn
+            .execute(
+                "UPDATE meetings SET title = ?1, title_source = 'generated', \
+                 title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+                 WHERE id = ?2 AND deleted_at IS NULL \
+                 AND title IS NULL AND title_source IS NULL AND title_version = ?3",
+                params![title, id, title_version],
+            )
+            .context("Failed to set Generated Title")?;
+        Ok(affected > 0)
+    }
+
+    /// Intentionally return title ownership to generation. Only completed
+    /// meetings with transcript text are eligible.
+    pub fn release_title_for_regeneration(conn: &Connection, id: i64) -> Result<bool> {
+        let affected = conn
+            .execute(
+                "UPDATE meetings SET title = NULL, title_source = NULL, \
+                 title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
+                 title_version = title_version + 1 \
+                 WHERE id = ?1 AND deleted_at IS NULL AND status = ?2 \
+                 AND transcript_text IS NOT NULL AND trim(transcript_text) <> ''",
+                params![id, MeetingPhase::Completed.as_str()],
+            )
+            .context("Failed to release Meeting Title for regeneration")?;
+        Ok(affected > 0)
+    }
+
+    /// Distinct Manual Titles ordered by the latest meeting where each title
+    /// was assigned or reused.
+    pub fn recent_manual_titles(conn: &Connection, limit: usize) -> Result<Vec<String>> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT title FROM meetings \
+                 WHERE deleted_at IS NULL AND title_source = 'manual' AND title IS NOT NULL \
+                 GROUP BY title \
+                 ORDER BY MAX(COALESCE(title_updated_at, started_at)) DESC, MAX(id) DESC \
+                 LIMIT ?1",
+            )
+            .context("Failed to prepare recent Manual Titles query")?;
+        let rows = stmt
+            .query_map(params![limit as i64], |row| row.get(0))
+            .context("Failed to query recent Manual Titles")?;
+        let mut titles = Vec::new();
+        for row in rows {
+            titles.push(row?);
+        }
+        Ok(titles)
     }
 
     /// Mark meeting as completed with transcript and duration. Clears any
@@ -284,9 +403,9 @@ impl MeetingRepository {
     pub fn get(conn: &Connection, id: i64) -> Result<Option<MeetingRecord>> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at, deleted_at, \
-                 transcript_segments \
+                "SELECT id, title, title_source, title_version, status, audio_path, source_filename, \
+                 transcript_path, transcript_text, duration_seconds, started_at, completed_at, \
+                 error, created_at, deleted_at, transcript_segments \
                  FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
             )
             .context("Failed to prepare meeting query")?;
@@ -296,20 +415,23 @@ impl MeetingRepository {
                 Ok(MeetingRecord {
                     id: row.get(0)?,
                     title: row.get(1)?,
-                    status: row.get(2)?,
-                    audio_path: row.get(3)?,
-                    transcript_path: row.get(4)?,
-                    transcript_text: row.get(5)?,
-                    duration_seconds: row.get(6)?,
-                    started_at: row.get(7)?,
-                    completed_at: row.get(8)?,
-                    error: row.get(9)?,
-                    created_at: row.get(10)?,
-                    deleted_at: row.get(11)?,
+                    title_source: row.get(2)?,
+                    title_version: row.get(3)?,
+                    status: row.get(4)?,
+                    audio_path: row.get(5)?,
+                    source_filename: row.get(6)?,
+                    transcript_path: row.get(7)?,
+                    transcript_text: row.get(8)?,
+                    duration_seconds: row.get(9)?,
+                    started_at: row.get(10)?,
+                    completed_at: row.get(11)?,
+                    error: row.get(12)?,
+                    created_at: row.get(13)?,
+                    deleted_at: row.get(14)?,
                     // Tolerate malformed/legacy JSON by decoding to None, so a
                     // bad value just drops back to the plain-text transcript.
                     transcript_segments: row
-                        .get::<_, Option<String>>(12)?
+                        .get::<_, Option<String>>(15)?
                         .as_deref()
                         .and_then(|json| serde_json::from_str(json).ok()),
                 })
@@ -327,9 +449,9 @@ impl MeetingRepository {
     pub fn list(conn: &Connection, limit: usize) -> Result<Vec<MeetingRecord>> {
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, status, audio_path, transcript_path, transcript_text, \
-                 duration_seconds, started_at, completed_at, error, created_at, deleted_at, \
-                 transcript_segments \
+                "SELECT id, title, title_source, title_version, status, audio_path, source_filename, \
+                 transcript_path, transcript_text, duration_seconds, started_at, completed_at, \
+                 error, created_at, deleted_at, transcript_segments \
                  FROM meetings WHERE deleted_at IS NULL \
                  ORDER BY started_at DESC, id DESC LIMIT ?1",
             )
@@ -340,20 +462,23 @@ impl MeetingRepository {
                 Ok(MeetingRecord {
                     id: row.get(0)?,
                     title: row.get(1)?,
-                    status: row.get(2)?,
-                    audio_path: row.get(3)?,
-                    transcript_path: row.get(4)?,
-                    transcript_text: row.get(5)?,
-                    duration_seconds: row.get(6)?,
-                    started_at: row.get(7)?,
-                    completed_at: row.get(8)?,
-                    error: row.get(9)?,
-                    created_at: row.get(10)?,
-                    deleted_at: row.get(11)?,
+                    title_source: row.get(2)?,
+                    title_version: row.get(3)?,
+                    status: row.get(4)?,
+                    audio_path: row.get(5)?,
+                    source_filename: row.get(6)?,
+                    transcript_path: row.get(7)?,
+                    transcript_text: row.get(8)?,
+                    duration_seconds: row.get(9)?,
+                    started_at: row.get(10)?,
+                    completed_at: row.get(11)?,
+                    error: row.get(12)?,
+                    created_at: row.get(13)?,
+                    deleted_at: row.get(14)?,
                     // Tolerate malformed/legacy JSON by decoding to None, so a
                     // bad value just drops back to the plain-text transcript.
                     transcript_segments: row
-                        .get::<_, Option<String>>(12)?
+                        .get::<_, Option<String>>(15)?
                         .as_deref()
                         .and_then(|json| serde_json::from_str(json).ok()),
                 })
@@ -383,8 +508,42 @@ mod tests {
     #[test]
     fn test_insert_meeting() {
         let conn = setup_db();
-        let id = MeetingRepository::insert(&conn, Some("Standup"), "/tmp/meeting.wav").unwrap();
+        let id = MeetingRepository::insert(&conn, Some("  Standup  "), "/tmp/meeting.wav").unwrap();
         assert!(id > 0);
+
+        let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        assert_eq!(meeting.title.as_deref(), Some("Standup"));
+        assert_eq!(meeting.title_source.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn test_insert_blank_title_as_absent() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, Some("  \t  "), "/tmp/meeting.wav").unwrap();
+
+        let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        assert_eq!(meeting.title, None);
+        assert_eq!(meeting.title_source, None);
+    }
+
+    #[test]
+    fn imported_filename_is_presentation_metadata_not_a_meeting_title() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert_import(
+            &conn,
+            None,
+            "/tmp/imported.mp3",
+            Some("Quarterly Planning Recording.mp3"),
+        )
+        .unwrap();
+
+        let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        assert_eq!(meeting.title, None);
+        assert_eq!(meeting.title_source, None);
+        assert_eq!(
+            meeting.source_filename.as_deref(),
+            Some("Quarterly Planning Recording.mp3")
+        );
     }
 
     #[test]
@@ -612,6 +771,158 @@ mod tests {
         let conn = setup_db();
         let meetings = MeetingRepository::list(&conn, 10).unwrap();
         assert!(meetings.is_empty());
+    }
+
+    #[test]
+    fn manual_title_edit_affects_one_meeting_and_rejects_blank_input() {
+        let conn = setup_db();
+        let first = MeetingRepository::insert(&conn, None, "/tmp/first.wav").unwrap();
+        let second = MeetingRepository::insert(&conn, None, "/tmp/second.wav").unwrap();
+
+        assert!(MeetingRepository::set_manual_title(&conn, first, "  Planning Review  ").unwrap());
+        let first_record = MeetingRepository::get(&conn, first).unwrap().unwrap();
+        assert_eq!(first_record.title.as_deref(), Some("Planning Review"));
+        assert_eq!(first_record.title_source.as_deref(), Some("manual"));
+        assert_eq!(
+            MeetingRepository::get(&conn, second)
+                .unwrap()
+                .unwrap()
+                .title,
+            None
+        );
+
+        assert!(MeetingRepository::set_manual_title(&conn, first, "   ").is_err());
+        let unchanged = MeetingRepository::get(&conn, first).unwrap().unwrap();
+        assert_eq!(unchanged.title.as_deref(), Some("Planning Review"));
+        assert_eq!(unchanged.title_source.as_deref(), Some("manual"));
+    }
+
+    #[test]
+    fn generated_title_only_claims_an_unowned_meeting() {
+        let conn = setup_db();
+        let manual =
+            MeetingRepository::insert(&conn, Some("Manual Wins"), "/tmp/manual.wav").unwrap();
+        let untitled = MeetingRepository::insert(&conn, None, "/tmp/generated.wav").unwrap();
+
+        assert!(!MeetingRepository::set_generated_title_if_unowned(
+            &conn,
+            manual,
+            "Generated Loses",
+            0,
+        )
+        .unwrap());
+        assert!(MeetingRepository::set_generated_title_if_unowned(
+            &conn,
+            untitled,
+            "Specific Generated Topic",
+            0,
+        )
+        .unwrap());
+
+        let manual_record = MeetingRepository::get(&conn, manual).unwrap().unwrap();
+        assert_eq!(manual_record.title.as_deref(), Some("Manual Wins"));
+        assert_eq!(manual_record.title_source.as_deref(), Some("manual"));
+        let generated_record = MeetingRepository::get(&conn, untitled).unwrap().unwrap();
+        assert_eq!(
+            generated_record.title.as_deref(),
+            Some("Specific Generated Topic")
+        );
+        assert_eq!(generated_record.title_source.as_deref(), Some("generated"));
+    }
+
+    #[test]
+    fn regeneration_releases_manual_ownership_before_generation() {
+        let conn = setup_db();
+        let id =
+            MeetingRepository::insert(&conn, Some("Manual Planning"), "/tmp/manual.wav").unwrap();
+        MeetingRepository::complete(&conn, id, "/tmp/manual.txt", "Transcript text", None, 10)
+            .unwrap();
+
+        assert!(MeetingRepository::release_title_for_regeneration(&conn, id).unwrap());
+        let title_version = MeetingRepository::get(&conn, id)
+            .unwrap()
+            .unwrap()
+            .title_version;
+        assert!(MeetingRepository::set_generated_title_if_unowned(
+            &conn,
+            id,
+            "Generated Planning Decisions",
+            title_version,
+        )
+        .unwrap());
+        let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        assert_eq!(
+            meeting.title.as_deref(),
+            Some("Generated Planning Decisions")
+        );
+        assert_eq!(meeting.title_source.as_deref(), Some("generated"));
+    }
+
+    #[test]
+    fn regeneration_rejects_an_older_generation_result() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, None, "/tmp/meeting.wav").unwrap();
+        MeetingRepository::complete(&conn, id, "/tmp/meeting.txt", "Transcript text", None, 10)
+            .unwrap();
+        let stale_version = MeetingRepository::get(&conn, id)
+            .unwrap()
+            .unwrap()
+            .title_version;
+
+        assert!(MeetingRepository::release_title_for_regeneration(&conn, id).unwrap());
+        let current_version = MeetingRepository::get(&conn, id)
+            .unwrap()
+            .unwrap()
+            .title_version;
+        assert_ne!(stale_version, current_version);
+        assert!(!MeetingRepository::set_generated_title_if_unowned(
+            &conn,
+            id,
+            "Stale Automatic Generation",
+            stale_version,
+        )
+        .unwrap());
+        assert!(MeetingRepository::set_generated_title_if_unowned(
+            &conn,
+            id,
+            "Fresh Explicit Regeneration",
+            current_version,
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn recent_manual_titles_are_distinct_and_ordered_by_latest_use() {
+        let conn = setup_db();
+        let older_duplicate =
+            MeetingRepository::insert(&conn, Some("Weekly Planning"), "/tmp/one.wav").unwrap();
+        let other =
+            MeetingRepository::insert(&conn, Some("Design Review"), "/tmp/two.wav").unwrap();
+        let newer_duplicate =
+            MeetingRepository::insert(&conn, Some("Weekly Planning"), "/tmp/three.wav").unwrap();
+        let generated = MeetingRepository::insert(&conn, None, "/tmp/four.wav").unwrap();
+        MeetingRepository::set_generated_title_if_unowned(&conn, generated, "Generated Topic", 0)
+            .unwrap();
+        conn.execute(
+            "UPDATE meetings SET title_updated_at = ?1 WHERE id = ?2",
+            params!["2026-01-01 09:00:00", older_duplicate],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE meetings SET title_updated_at = ?1 WHERE id = ?2",
+            params!["2026-01-02 09:00:00", other],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE meetings SET title_updated_at = ?1 WHERE id = ?2",
+            params!["2026-01-03 09:00:00", newer_duplicate],
+        )
+        .unwrap();
+
+        assert_eq!(
+            MeetingRepository::recent_manual_titles(&conn, 10).unwrap(),
+            vec!["Weekly Planning", "Design Review"]
+        );
     }
 
     /// Insert a meeting already in a terminal (deletable) state. `insert`

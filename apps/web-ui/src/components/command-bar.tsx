@@ -76,6 +76,7 @@ function DictationToggleButton() {
         const recording = phase === "recording";
         const processing = phase === "processing";
         const meetingLive = store.meetings.active;
+        const meetingReview = store.meetings.phase === "review";
         const meetingPipeline =
           store.meetings.phase === "compressing" ||
           store.meetings.phase === "transcribing" ||
@@ -86,7 +87,7 @@ function DictationToggleButton() {
         // not actionable. Show a spinner, disable, and explain why.
         // Dictation and meeting share the audio pipeline.
         const inFlight = processing;
-        const blockedByMeeting = meetingLive || meetingPipeline;
+        const blockedByMeeting = meetingLive || meetingReview || meetingPipeline;
         const disabled =
           submitting || inFlight || blockedByMeeting || !reachable;
 
@@ -106,6 +107,8 @@ function DictationToggleButton() {
           label = "Transcribing dictation…";
         } else if (meetingLive) {
           label = "Meeting in progress — dictation unavailable";
+        } else if (meetingReview) {
+          label = "Meeting awaiting review — dictation unavailable";
         } else if (meetingPipeline) {
           label = "Meeting pipeline running — dictation unavailable";
         }
@@ -151,6 +154,7 @@ function MeetingToggleButton() {
     <Observer>
       {() => {
         const meetingLive = store.meetings.active;
+        const meetingReview = store.meetings.phase === "review";
         const meetingPipeline =
           store.meetings.phase === "compressing" ||
           store.meetings.phase === "transcribing" ||
@@ -164,7 +168,7 @@ function MeetingToggleButton() {
         const inFlight = meetingPipeline;
         const blockedByDictation = !meetingLive && dictationBusy;
         const disabled =
-          submitting || inFlight || blockedByDictation || !reachable;
+          submitting || inFlight || meetingReview || blockedByDictation || !reachable;
 
         let Icon = Radio;
         let variant: "ghost" | "default" = "ghost";
@@ -181,6 +185,8 @@ function MeetingToggleButton() {
         } else if (meetingPipeline) {
           // Orb spins for the pipeline; button stays inert.
           label = `Meeting ${meetingPhaseVerb(store.meetings.phase)}…`;
+        } else if (meetingReview) {
+          label = "Review the stopped meeting before starting another";
         } else if (dictationBusy) {
           label = "Dictation in progress — meeting unavailable";
         }

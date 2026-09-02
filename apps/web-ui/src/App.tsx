@@ -24,7 +24,7 @@ export function AppShell() {
         <OnboardingOverlay />
         <CommandBar />
         <div className="flex flex-1 min-h-0">
-          <aside className="w-52 shrink-0 border-r bg-card">
+          <aside className="w-14 shrink-0 border-r bg-card sm:w-52">
             <nav className="px-2 pt-4 space-y-1">
               {navItems.map((item) => {
                 const Icon = item.icon;
@@ -35,7 +35,7 @@ export function AppShell() {
                     end={item.end}
                     className={({ isActive }) =>
                       cn(
-                        "flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors",
+                        "flex items-center justify-center gap-2 rounded-md px-2 py-2 text-sm transition-colors sm:justify-start sm:px-3",
                         isActive
                           ? "bg-accent text-accent-foreground"
                           : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
@@ -43,7 +43,7 @@ export function AppShell() {
                     }
                   >
                     <Icon className="h-4 w-4" />
-                    {item.label}
+                    <span className="sr-only sm:not-sr-only">{item.label}</span>
                   </NavLink>
                 );
               })}

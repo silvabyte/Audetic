@@ -62,7 +62,10 @@ use super::routes::{
         meetings::toggle_meeting,
         meetings::meeting_status,
         meetings::list_meetings,
+        meetings::recent_meeting_titles,
         meetings::get_meeting,
+        meetings::update_meeting_title,
+        meetings::regenerate_meeting_title,
         meetings::delete_meeting,
         meetings::meeting_audio,
         meetings::retry_meeting,
@@ -127,6 +130,11 @@ use super::routes::{
         meetings::MeetingSummary,
         meetings::MeetingsListResponse,
         meetings::MeetingDetailResponse,
+        meetings::MeetingTitleSource,
+        meetings::RecentMeetingTitlesResponse,
+        meetings::MeetingTitleUpdateRequest,
+        meetings::MeetingTitleResponse,
+        meetings::MeetingTitleRegenerationResponse,
         audetic_core::jobs_client::Segment,
         meetings::MeetingRetryResponse,
         meetings::MeetingDeleteResponse,
@@ -264,5 +272,19 @@ mod tests {
             .unwrap()
             .iter()
             .any(|field| field == "capture_degraded"));
+    }
+
+    #[test]
+    fn meeting_title_operations_and_presentation_fields_are_public() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert!(spec["paths"]["/meetings/recent-titles"]["get"].is_object());
+        assert!(spec["paths"]["/meetings/{id}/title"]["patch"].is_object());
+        assert!(spec["paths"]["/meetings/{id}/regenerate-title"]["post"].is_object());
+        for schema_name in ["MeetingSummary", "MeetingDetailResponse"] {
+            let properties = &spec["components"]["schemas"][schema_name]["properties"];
+            assert!(properties["title_source"].is_object());
+            assert!(properties["source_filename"].is_object());
+        }
     }
 }

@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { MEETING_INTENTS } from "@/routes/meetings";
+import { meetingDisplayTitle } from "@/lib/meeting-title";
 
 /**
  * Shown when a stopped meeting is parked in the `review` phase. Lets the user
@@ -19,10 +20,12 @@ export function MeetingReviewPanel({
   meetingId,
   durationSeconds,
   title,
+  startedAt,
 }: {
   meetingId: number;
   durationSeconds: number;
   title: string | null;
+  startedAt: string | null;
 }) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [startSec, setStartSec] = useState(0);
@@ -62,7 +65,9 @@ export function MeetingReviewPanel({
         <div className="flex items-center gap-2">
           <Scissors className="h-4 w-4 text-primary" />
           <div className="text-sm">
-            <span className="font-medium">{title ?? "Untitled meeting"}</span>
+            <span className="font-medium">
+              {meetingDisplayTitle({ title, startedAt })}
+            </span>
             <span className="text-muted-foreground">
               {" "}
               · Review before transcribing
