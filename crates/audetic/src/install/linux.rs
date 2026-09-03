@@ -19,8 +19,8 @@ use std::process::Command;
 use std::time::Duration;
 
 const SERVICE_TEMPLATE: &str = include_str!("audetic.service.tmpl");
-const SERVICE_NAME: &str = "audeticd.service";
-const LEGACY_SERVICE_NAME: &str = "audetic.service";
+const CURRENT_SERVICE: &str = "audeticd.service";
+const SUPERSEDED_SERVICES: &[&str] = &["audetic.service"];
 const SESSION_ENVIRONMENT: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "DISPLAY",
@@ -43,7 +43,7 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     place_binary(&paths)?;
     place_cli();
     ensure_runtime_dirs(&paths)?;
-    retire_legacy_service(&paths)?;
+    retire_superseded_services(&paths)?;
     write_unit(&paths)?;
     daemon_reload()?;
     enable_and_restart()?;
@@ -57,8 +57,7 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
 struct InstallPaths {
     installed_dir: PathBuf,
     installed_binary: PathBuf,
-    systemd_unit: PathBuf,
-    legacy_systemd_unit: PathBuf,
+    systemd_user_dir: PathBuf,
     // Audetic's own paths must exist before the service starts. Hyprland is
     // rendered as an optional ReadWritePaths entry and may be created later.
     config_dir: PathBuf,
@@ -76,23 +75,26 @@ impl InstallPaths {
         let data_dir = data.join("audetic");
         let installed_dir = data_dir.join("bin");
         let installed_binary = installed_dir.join("audeticd");
-        let systemd_unit = config.join("systemd").join("user").join(SERVICE_NAME);
-        let legacy_systemd_unit = config
-            .join("systemd")
-            .join("user")
-            .join(LEGACY_SERVICE_NAME);
+        let systemd_user_dir = config.join("systemd").join("user");
         let config_dir = config.join("audetic");
         let hyprland_config_dir = resolved_hyprland_config_dir(&config);
 
         Ok(Self {
             installed_dir,
             installed_binary,
-            systemd_unit,
-            legacy_systemd_unit,
+            systemd_user_dir,
             config_dir,
             data_dir,
             hyprland_config_dir,
         })
+    }
+
+    fn systemd_unit(&self, service_name: &str) -> PathBuf {
+        self.systemd_user_dir.join(service_name)
+    }
+
+    fn current_systemd_unit(&self) -> PathBuf {
+        self.systemd_unit(CURRENT_SERVICE)
     }
 }
 
@@ -137,14 +139,13 @@ fn place_cli() {
 }
 
 fn write_unit(paths: &InstallPaths) -> Result<()> {
-    if let Some(parent) = paths.systemd_unit.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create {}", parent.display()))?;
-    }
+    fs::create_dir_all(&paths.systemd_user_dir)
+        .with_context(|| format!("Failed to create {}", paths.systemd_user_dir.display()))?;
+    let systemd_unit = paths.current_systemd_unit();
     let unit = render_unit(paths)?;
-    fs::write(&paths.systemd_unit, unit)
-        .with_context(|| format!("Failed to write {}", paths.systemd_unit.display()))?;
-    println!("  · Wrote {}", paths.systemd_unit.display());
+    fs::write(&systemd_unit, unit)
+        .with_context(|| format!("Failed to write {}", systemd_unit.display()))?;
+    println!("  · Wrote {}", systemd_unit.display());
     Ok(())
 }
 
@@ -189,39 +190,43 @@ fn resolved_hyprland_config_dir(config_home: &Path) -> PathBuf {
     }
 }
 
-/// Stop and disable the pre-daemon-split unit before writing the replacement.
-/// If a legacy unit is known to systemd, failures are fatal: continuing could
-/// leave two daemons competing for the same database and HTTP port.
-fn retire_legacy_service(paths: &InstallPaths) -> Result<()> {
-    if !legacy_service_is_present(paths) {
+/// Stop and disable superseded identities before writing the current unit.
+/// Failures are fatal: continuing could leave two daemons competing for the
+/// same database and HTTP port.
+fn retire_superseded_services(paths: &InstallPaths) -> Result<()> {
+    let services = present_services(SUPERSEDED_SERVICES.iter().copied(), |service| {
+        service_is_present(&paths.systemd_unit(service), service)
+    });
+    if services.is_empty() {
         return Ok(());
     }
 
-    println!("  · Retiring legacy {LEGACY_SERVICE_NAME}");
-    for verb in ["stop", "disable"] {
-        let status = Command::new("systemctl")
-            .args(["--user", verb, LEGACY_SERVICE_NAME])
-            .status()
-            .with_context(|| format!("Failed to run systemctl {verb} for legacy service"))?;
-        if !status.success() {
-            bail!("`systemctl --user {verb} {LEGACY_SERVICE_NAME}` exited with {status}");
+    for service in services {
+        println!("  · Retiring superseded {service}");
+        for verb in ["stop", "disable"] {
+            let status = Command::new("systemctl")
+                .args(["--user", verb, service])
+                .status()
+                .with_context(|| {
+                    format!("Failed to run systemctl {verb} for superseded service {service}")
+                })?;
+            if !status.success() {
+                bail!("`systemctl --user {verb} {service}` exited with {status}");
+            }
         }
-    }
 
-    if paths.legacy_systemd_unit.exists() || paths.legacy_systemd_unit.is_symlink() {
-        fs::remove_file(&paths.legacy_systemd_unit).with_context(|| {
-            format!(
-                "Failed to remove legacy unit {}",
-                paths.legacy_systemd_unit.display()
-            )
-        })?;
+        let systemd_unit = paths.systemd_unit(service);
+        if systemd_unit.exists() || systemd_unit.is_symlink() {
+            fs::remove_file(&systemd_unit).with_context(|| {
+                format!(
+                    "Failed to remove superseded unit {}",
+                    systemd_unit.display()
+                )
+            })?;
+        }
     }
     daemon_reload()?;
     Ok(())
-}
-
-fn legacy_service_is_present(paths: &InstallPaths) -> bool {
-    service_is_present(&paths.legacy_systemd_unit, LEGACY_SERVICE_NAME)
 }
 
 fn service_is_present(unit: &Path, service_name: &str) -> bool {
@@ -239,11 +244,25 @@ fn service_is_present(unit: &Path, service_name: &str) -> bool {
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned());
 
-    legacy_service_needs_retirement(unit_exists, load_state.as_deref())
+    service_presence_detected(unit_exists, load_state.as_deref())
 }
 
-fn legacy_service_needs_retirement(unit_exists: bool, load_state: Option<&str>) -> bool {
+fn service_presence_detected(unit_exists: bool, load_state: Option<&str>) -> bool {
     unit_exists || load_state.is_some_and(|state| !state.is_empty() && state != "not-found")
+}
+
+fn all_services() -> impl Iterator<Item = &'static str> {
+    std::iter::once(CURRENT_SERVICE).chain(SUPERSEDED_SERVICES.iter().copied())
+}
+
+fn present_services<'a>(
+    services: impl IntoIterator<Item = &'a str>,
+    mut is_present: impl FnMut(&str) -> bool,
+) -> Vec<&'a str> {
+    services
+        .into_iter()
+        .filter(|service| is_present(service))
+        .collect()
 }
 
 fn daemon_reload() -> Result<()> {
@@ -269,24 +288,24 @@ fn daemon_reload() -> Result<()> {
 /// `restart` is the honest verb: it picks up the new `ExecStart` inode, and it
 /// also starts a unit that isn't running, which covers first install.
 fn enable_and_restart() -> Result<()> {
-    println!("  · systemctl --user enable {SERVICE_NAME}");
+    println!("  · systemctl --user enable {CURRENT_SERVICE}");
     let status = Command::new("systemctl")
-        .args(["--user", "enable", SERVICE_NAME])
+        .args(["--user", "enable", CURRENT_SERVICE])
         .status()
         .context("Failed to run systemctl enable")?;
     if !status.success() {
-        bail!("`systemctl --user enable {SERVICE_NAME}` exited with {status}");
+        bail!("`systemctl --user enable {CURRENT_SERVICE}` exited with {status}");
     }
 
     import_session_environment()?;
 
-    println!("  · systemctl --user restart {SERVICE_NAME}");
+    println!("  · systemctl --user restart {CURRENT_SERVICE}");
     let status = Command::new("systemctl")
-        .args(["--user", "restart", SERVICE_NAME])
+        .args(["--user", "restart", CURRENT_SERVICE])
         .status()
         .context("Failed to run systemctl restart")?;
     if !status.success() {
-        bail!("`systemctl --user restart {SERVICE_NAME}` exited with {status}");
+        bail!("`systemctl --user restart {CURRENT_SERVICE}` exited with {status}");
     }
     Ok(())
 }
@@ -388,15 +407,12 @@ pub fn uninstall(opts: UninstallOptions) -> Result<()> {
     println!("→ Uninstalling audeticd (systemd user service)");
 
     let mut plan = UninstallPlan::default();
-    plan.remove(paths.systemd_unit.clone(), "Systemd service unit");
-    plan.remove(
-        paths.legacy_systemd_unit.clone(),
-        "Legacy systemd service unit",
-    );
-    let services = uninstall_services(
-        service_is_present(&paths.systemd_unit, SERVICE_NAME),
-        service_is_present(&paths.legacy_systemd_unit, LEGACY_SERVICE_NAME),
-    );
+    for service in all_services() {
+        plan.remove(paths.systemd_unit(service), "Systemd service unit");
+    }
+    let services = present_services(all_services(), |service| {
+        service_is_present(&paths.systemd_unit(service), service)
+    });
     for service in &services {
         plan.action(format!("Stop and disable systemd user service {service}"));
     }
@@ -438,17 +454,6 @@ fn stop_and_disable(services: &[&str]) {
     }
 }
 
-fn uninstall_services(modern_present: bool, legacy_present: bool) -> Vec<&'static str> {
-    let mut services = Vec::with_capacity(2);
-    if modern_present {
-        services.push(SERVICE_NAME);
-    }
-    if legacy_present {
-        services.push(LEGACY_SERVICE_NAME);
-    }
-    services
-}
-
 fn same_file(a: &Path, b: &Path) -> bool {
     fs::canonicalize(a)
         .ok()
@@ -467,15 +472,26 @@ mod tests {
         InstallPaths {
             installed_dir: data_dir.join("bin"),
             installed_binary: data_dir.join("bin").join("audeticd"),
-            systemd_unit: config_home.join("systemd").join("user").join(SERVICE_NAME),
-            legacy_systemd_unit: config_home
-                .join("systemd")
-                .join("user")
-                .join(LEGACY_SERVICE_NAME),
+            systemd_user_dir: config_home.join("systemd").join("user"),
             config_dir: config_home.join("audetic"),
             data_dir,
             hyprland_config_dir: hyprland,
         }
+    }
+
+    #[test]
+    fn service_unit_paths_are_derived_from_the_shared_systemd_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = test_paths(temp.path(), temp.path().join("hypr"));
+
+        assert_eq!(
+            paths.current_systemd_unit(),
+            paths.systemd_user_dir.join(CURRENT_SERVICE)
+        );
+        assert_eq!(
+            paths.systemd_unit(SUPERSEDED_SERVICES[0]),
+            paths.systemd_user_dir.join(SUPERSEDED_SERVICES[0])
+        );
     }
 
     #[test]
@@ -534,21 +550,46 @@ mod tests {
     }
 
     #[test]
-    fn legacy_retirement_decision_uses_disk_or_systemd_state() {
-        assert!(legacy_service_needs_retirement(true, None));
-        assert!(legacy_service_needs_retirement(false, Some("loaded")));
-        assert!(!legacy_service_needs_retirement(false, Some("not-found")));
-        assert!(!legacy_service_needs_retirement(false, None));
+    fn service_presence_uses_disk_or_systemd_state() {
+        assert!(service_presence_detected(true, None));
+        assert!(service_presence_detected(false, Some("loaded")));
+        assert!(!service_presence_detected(false, Some("not-found")));
+        assert!(!service_presence_detected(false, None));
     }
 
     #[test]
-    fn uninstall_decision_includes_modern_and_legacy_services_independently() {
+    fn retirement_selection_includes_present_superseded_services_only() {
+        let superseded = ["old-a.service", "old-b.service", "old-c.service"];
+        let selected = present_services(superseded, |service| service != "old-b.service");
+
+        assert_eq!(selected, vec!["old-a.service", "old-c.service"]);
+    }
+
+    #[test]
+    fn uninstall_selection_handles_current_and_superseded_services_independently() {
         assert_eq!(
-            uninstall_services(true, true),
-            vec![SERVICE_NAME, LEGACY_SERVICE_NAME]
+            present_services(all_services(), |service| service == CURRENT_SERVICE),
+            vec![CURRENT_SERVICE]
         );
-        assert_eq!(uninstall_services(false, true), vec![LEGACY_SERVICE_NAME]);
-        assert!(uninstall_services(false, false).is_empty());
+        assert_eq!(
+            present_services(all_services(), |service| service != CURRENT_SERVICE),
+            SUPERSEDED_SERVICES
+        );
+        assert!(present_services(all_services(), |_| false).is_empty());
+    }
+
+    #[test]
+    fn service_inventory_has_current_and_superseded_identities_without_duplicates() {
+        use std::collections::HashSet;
+
+        assert_eq!(CURRENT_SERVICE, "audeticd.service");
+        assert_eq!(SUPERSEDED_SERVICES, &["audetic.service"]);
+
+        let services = all_services().collect::<Vec<_>>();
+        assert_eq!(
+            services.len(),
+            services.iter().copied().collect::<HashSet<_>>().len()
+        );
     }
 
     #[test]
