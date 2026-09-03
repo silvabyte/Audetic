@@ -1,16 +1,21 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use std::path::Path;
 use std::time::Duration;
 
 pub fn init_db() -> Result<Connection> {
     let db_path = crate::global::db_file()?;
 
+    init_db_at(&db_path)
+}
+
+pub fn init_db_at(db_path: &Path) -> Result<Connection> {
     // Ensure parent directory exists
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).context("Failed to create database directory")?;
     }
 
-    let conn = Connection::open(&db_path).context("Failed to open database connection")?;
+    let conn = Connection::open(db_path).context("Failed to open database connection")?;
 
     // The daemon opens a fresh connection per request, so recording-history
     // writes, meeting writes, and API reads overlap. Wait for the write lock

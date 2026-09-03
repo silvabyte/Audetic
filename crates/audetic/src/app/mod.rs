@@ -279,9 +279,10 @@ pub async fn run_service() -> Result<()> {
         Indicator::from_config(&config.ui).with_audio_feedback(config.behavior.audio_feedback);
 
     // Post-processing service is shared across both pipelines + the API
-    // server. Cheap to clone (zero-sized), so the Arc is only for the
-    // explicit `&Arc<...>` shape MeetingMachine/RecordingMachine accept.
-    let post_processing = Arc::new(PostProcessingService::new());
+    // server. It carries the database path so every dispatched job reads the
+    // same store as the daemon and tests can use an isolated store.
+    let db_path = crate::global::db_file()?;
+    let post_processing = Arc::new(PostProcessingService::new(db_path.clone()));
 
     let status_handle = RecordingStatusHandle::default();
     let recording_machine = RecordingMachine::new(

@@ -1,6 +1,7 @@
 //! Transcript-derived Meeting Title generation through configured local agents.
 
 use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
 use crate::agents::{run_agent, AgentRunPaths, AgentRunRequest};
@@ -14,8 +15,12 @@ const TITLE_AGENT_TIMEOUT_SECONDS: u64 = 120;
 /// Generate and persist a title when the meeting still has no title owner.
 /// A concurrent Manual Title causes the final guarded write to be discarded.
 pub async fn generate_meeting_title(meeting_id: i64) -> Result<Option<String>> {
+    generate_meeting_title_at(meeting_id, &crate::global::db_file()?).await
+}
+
+async fn generate_meeting_title_at(meeting_id: i64, db_path: &Path) -> Result<Option<String>> {
     let (transcript, title_version, profile) = {
-        let conn = crate::db::init_db().context("Failed to open audetic database")?;
+        let conn = crate::db::init_db_at(db_path).context("Failed to open audetic database")?;
         AgentProfileRepository::ensure_builtin_profiles(&conn)?;
         let meeting = MeetingRepository::get(&conn, meeting_id)?
             .ok_or_else(|| anyhow::anyhow!("meeting {meeting_id} not found"))?;
@@ -31,7 +36,10 @@ pub async fn generate_meeting_title(meeting_id: i64) -> Result<Option<String>> {
         (transcript, meeting.title_version, profile)
     };
 
-    let paths = prepare_title_run(meeting_id, &transcript, &profile.name)?;
+    let data_dir = db_path
+        .parent()
+        .context("Audetic database path has no parent directory")?;
+    let paths = prepare_title_run(data_dir, meeting_id, &transcript, &profile.name)?;
     let prompt = std::fs::read_to_string(&paths.prompt_path)
         .with_context(|| format!("Failed to read title prompt at {:?}", paths.prompt_path))?;
     let run_dir = paths.run_dir.clone();
@@ -57,7 +65,7 @@ pub async fn generate_meeting_title(meeting_id: i64) -> Result<Option<String>> {
     let title = normalize_generated_title(&output.stdout)
         .ok_or_else(|| anyhow::anyhow!("title agent returned an invalid Generated Title"))?;
 
-    let conn = crate::db::init_db().context("Failed to reopen audetic database")?;
+    let conn = crate::db::init_db_at(db_path).context("Failed to reopen audetic database")?;
     if MeetingRepository::set_generated_title_if_unowned(&conn, meeting_id, &title, title_version)?
     {
         info!("Generated title for meeting {}: {}", meeting_id, title);
@@ -69,8 +77,16 @@ pub async fn generate_meeting_title(meeting_id: i64) -> Result<Option<String>> {
 
 /// Start title generation without joining it to meeting completion.
 pub fn spawn_title_generation(meeting_id: i64) {
+    let Ok(db_path) = crate::global::db_file() else {
+        warn!("Best-effort title generation could not resolve the database path");
+        return;
+    };
+    spawn_title_generation_at(meeting_id, db_path);
+}
+
+pub(crate) fn spawn_title_generation_at(meeting_id: i64, db_path: PathBuf) {
     tokio::spawn(async move {
-        if let Err(error) = generate_meeting_title(meeting_id).await {
+        if let Err(error) = generate_meeting_title_at(meeting_id, &db_path).await {
             warn!(
                 "Best-effort title generation failed for meeting {}: {:#}",
                 meeting_id, error
@@ -108,11 +124,12 @@ pub fn prepare_title_regeneration(meeting_id: i64) -> Result<()> {
 }
 
 fn prepare_title_run(
+    data_dir: &Path,
     meeting_id: i64,
     transcript: &str,
     profile_name: &str,
 ) -> Result<AgentRunPaths> {
-    let run_dir = crate::global::data_dir()?.join("agent-runs").join(format!(
+    let run_dir = data_dir.join("agent-runs").join(format!(
         "title-{meeting_id}-{}",
         uuid::Uuid::new_v4().simple()
     ));
