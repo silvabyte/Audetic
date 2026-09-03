@@ -3,13 +3,15 @@
 //! The interactive wizard runs locally, but all reads/writes/tests go through
 //! the daemon's REST API (`GET`/`PUT /api/provider/config`,
 //! `POST /api/provider/reset`, `POST /api/provider/test`,
-//! `GET /api/provider/status`). The daemon owns `config.toml` (and its backups),
+//! `GET /api/provider/status`). Provider status and tests describe the active
+//! daemon process; the daemon owns `config.toml` (and its backups),
 //! so there is a single writer.
 
 use crate::args::{ProviderCliArgs, ProviderCommand};
-use crate::client::{base_url, json_or_error, CONNECT_HINT};
-use anyhow::{Context, Result};
+use crate::client::{json_or_error, CONNECT_HINT};
+use anyhow::{bail, Context, Result};
 use audetic_core::config::WhisperConfig;
+use audetic_core::url::{api_url, paths};
 use dialoguer::{theme::ColorfulTheme, Confirm, Input, Password, Select};
 use serde_json::json;
 use std::fs;
@@ -35,7 +37,7 @@ pub async fn handle_provider_command(args: ProviderCliArgs) -> Result<()> {
 /// Fetch the raw provider config from the daemon.
 async fn fetch_config() -> Result<WhisperConfig> {
     let response = reqwest::Client::new()
-        .get(format!("{}/provider/config", base_url()))
+        .get(api_url(paths::PROVIDER_CONFIG))
         .send()
         .await
         .context(CONNECT_HINT)?;
@@ -46,7 +48,7 @@ async fn fetch_config() -> Result<WhisperConfig> {
 /// Persist a provider config via the daemon (it backs up `config.toml` first).
 async fn save_config(whisper: &WhisperConfig) -> Result<()> {
     let response = reqwest::Client::new()
-        .put(format!("{}/provider/config", base_url()))
+        .put(api_url(paths::PROVIDER_CONFIG))
         .json(whisper)
         .send()
         .await
@@ -221,16 +223,16 @@ async fn handle_configure(dry_run: bool) -> Result<()> {
 
     println!();
     println!("Next steps:");
-    println!("  audetic provider test    - Verify the provider works");
     println!("  Restart the Audetic daemon to apply changes to the running service");
+    println!("  audetic provider test    - Verify the active provider after restart");
 
     Ok(())
 }
 
 async fn handle_test(file: Option<String>) -> Result<()> {
     println!();
-    println!("Provider Test");
-    println!("=============");
+    println!("Active Provider Test");
+    println!("====================");
     println!();
 
     if let Some(f) = &file {
@@ -239,7 +241,7 @@ async fn handle_test(file: Option<String>) -> Result<()> {
     print!("Testing... ");
 
     let response = reqwest::Client::new()
-        .post(format!("{}/provider/test", base_url()))
+        .post(api_url(paths::PROVIDER_TEST))
         .json(&json!({ "file": file }))
         .send()
         .await
@@ -253,11 +255,8 @@ async fn handle_test(file: Option<String>) -> Result<()> {
     println!("{}", if success { "OK" } else { "failed" });
     println!();
 
-    if let Some(err) = body.get("error").and_then(|v| v.as_str()) {
-        if !err.is_empty() {
-            println!("Error: {err}");
-            return Ok(());
-        }
+    if let Some(message) = provider_test_error(&body) {
+        bail!("{message}");
     }
 
     if let Some(text) = body.get("transcription").and_then(|v| v.as_str()) {
@@ -278,9 +277,27 @@ async fn handle_test(file: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn provider_test_error(body: &serde_json::Value) -> Option<String> {
+    if body
+        .get("success")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return None;
+    }
+
+    Some(
+        body.get("error")
+            .and_then(|value| value.as_str())
+            .filter(|message| !message.is_empty())
+            .unwrap_or("Provider initialization validation failed")
+            .to_string(),
+    )
+}
+
 async fn handle_status() -> Result<()> {
     let response = reqwest::Client::new()
-        .get(format!("{}/provider/status", base_url()))
+        .get(api_url(paths::PROVIDER_STATUS))
         .send()
         .await
         .context(CONNECT_HINT)?;
@@ -371,7 +388,7 @@ async fn handle_reset(force: bool) -> Result<()> {
     }
 
     let response = reqwest::Client::new()
-        .post(format!("{}/provider/reset", base_url()))
+        .post(api_url(paths::PROVIDER_RESET))
         .send()
         .await
         .context(CONNECT_HINT)?;
@@ -837,5 +854,19 @@ mod tests {
             mask_secret(&Some("sk-1234567890abcdef".to_string())),
             "sk-1****ef"
         );
+    }
+
+    #[test]
+    fn failed_provider_test_becomes_a_cli_error() {
+        let body = serde_json::json!({
+            "success": false,
+            "error": "API key is invalid",
+        });
+
+        assert_eq!(
+            provider_test_error(&body).as_deref(),
+            Some("API key is invalid")
+        );
+        assert!(provider_test_error(&serde_json::json!({ "success": true })).is_none());
     }
 }

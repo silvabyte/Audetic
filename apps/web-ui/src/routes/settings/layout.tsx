@@ -1,5 +1,5 @@
 import { NavLink, Outlet, type RouteObject } from "react-router-dom";
-import { FileText, Keyboard, Mic, Palette, Zap } from "lucide-react";
+import { FileText, Keyboard, Mic, Palette, Waypoints, Zap } from "lucide-react";
 import { getRootStore } from "@/stores/singleton";
 import { cn } from "@/lib/utils";
 
@@ -27,6 +27,7 @@ interface SettingsNavItem {
 }
 
 const navItems: SettingsNavItem[] = [
+  { to: "/settings/setup", label: "Setup", icon: Waypoints },
   { to: "/settings", label: "Provider", icon: Mic, end: true },
   { to: "/settings/keybind", label: "Keybind", icon: Keyboard },
   { to: "/settings/post-processing", label: "Post-processing", icon: Zap },
@@ -36,12 +37,12 @@ const navItems: SettingsNavItem[] = [
 
 function SettingsLayout() {
   return (
-    <div className="mx-auto flex w-full max-w-5xl gap-6 p-8">
-      <aside className="w-44 shrink-0">
+    <div className="mx-auto flex w-full max-w-5xl flex-col gap-5 p-4 sm:p-6 lg:flex-row lg:gap-6 lg:p-8">
+      <aside className="min-w-0 lg:w-44 lg:shrink-0">
         <h1 className="mb-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
           Settings
         </h1>
-        <nav className="space-y-1">
+        <nav className="flex gap-1 overflow-x-auto pb-1 lg:block lg:space-y-1 lg:overflow-visible lg:pb-0" aria-label="Settings sections">
           {navItems.map((item) => {
             const Icon = item.icon;
             return (
@@ -51,7 +52,7 @@ function SettingsLayout() {
                 end={item.end}
                 className={({ isActive }) =>
                   cn(
-                    "flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors",
+                    "flex shrink-0 items-center gap-2 whitespace-nowrap rounded-md px-3 py-2 text-sm transition-colors",
                     isActive
                       ? "bg-accent text-accent-foreground"
                       : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",

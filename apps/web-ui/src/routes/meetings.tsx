@@ -134,7 +134,7 @@ export const meetingsRoute: RouteObject = {
  * recording" rather than trimming to zero.
  */
 function parseOptionalSeconds(raw: FormDataEntryValue | null): number | undefined {
-  if (raw == null) return undefined;
+  if (raw === null) return undefined;
   const s = String(raw).trim();
   if (s === "") return undefined;
   const n = Number(s);
@@ -144,7 +144,7 @@ function parseOptionalSeconds(raw: FormDataEntryValue | null): number | undefine
 function MeetingsRoute() {
   return (
     <ImportDropZone>
-      <div className="mx-auto max-w-3xl p-8 space-y-6">
+      <div className="mx-auto max-w-3xl space-y-6 p-4 sm:p-8">
         <header className="flex flex-col items-start justify-between gap-4 sm:flex-row">
           <div>
             <h1 className="text-2xl font-semibold">Meetings</h1>

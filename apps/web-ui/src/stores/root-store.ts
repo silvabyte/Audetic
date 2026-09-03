@@ -8,6 +8,7 @@ import { MetaStore } from "./meta-store";
 import { OnboardingStore } from "./onboarding-store";
 import { PostProcessingStore } from "./post-processing-store";
 import { StatusStore } from "./status-store";
+import { SetupStore } from "./setup-store";
 import { UiStore } from "./ui-store";
 
 /**
@@ -24,6 +25,7 @@ export class RootStore {
   config: ConfigStore;
   postProcessing: PostProcessingStore;
   onboarding: OnboardingStore;
+  setup: SetupStore;
   ui: UiStore;
 
   constructor() {
@@ -35,6 +37,7 @@ export class RootStore {
     this.config = new ConfigStore(this);
     this.postProcessing = new PostProcessingStore(this);
     this.onboarding = new OnboardingStore(this);
+    this.setup = new SetupStore(this);
     this.ui = new UiStore(this);
     makeAutoObservable(this);
   }
@@ -43,8 +46,8 @@ export class RootStore {
   start(): void {
     this.status.start();
     this.meetings.start();
-    // First-run check for ffmpeg. Fire-and-forget — overlay reacts to
-    // store state, so a slow daemon doesn't block app render.
+    // Prime the optional FFmpeg installer state. Missing FFmpeg affects
+    // meeting readiness but never blocks app render.
     void this.onboarding.check();
     // UiStore.start is async (kept for parity even though localStorage
     // reads are sync). Fire-and-forget — theme flicker is bounded.

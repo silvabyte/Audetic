@@ -8,7 +8,7 @@ use utoipa::OpenApi;
 
 use super::routes::{
     agents, history, keybind, logs, meeting_artifacts, meetings, models, post_processing, provider,
-    recording, summary_templates, system, transcribe,
+    recording, setup, summary_templates, system, transcribe,
 };
 
 #[derive(OpenApi)]
@@ -41,8 +41,10 @@ use super::routes::{
         // Provider
         provider::get_config,
         provider::get_status,
+        provider::get_runtime_status,
         provider::get_raw_config,
         provider::set_raw_config,
+        provider::validate_config,
         provider::reset_config,
         provider::run_test,
         // Local models + on-device transcription
@@ -51,7 +53,9 @@ use super::routes::{
         models::download_model,
         transcribe::transcribe,
         // System
+        setup::get_setup,
         system::get_deps,
+        system::restart_daemon,
         system::start_install_ffmpeg,
         system::get_install_ffmpeg_status,
         // Meetings
@@ -99,10 +103,13 @@ use super::routes::{
         // History
         crate::history::HistoryEntry,
         // Keybind
+        audetic_core::keybind::KeybindTarget,
+        crate::keybind::KeybindConflict,
         crate::keybind::KeybindStatus,
+        crate::keybind::KeybindStatuses,
+        crate::keybind::InstallResult,
+        crate::keybind::UninstallResult,
         keybind::InstallRequest,
-        keybind::InstallResponse,
-        keybind::UninstallResponse,
         // Logs
         crate::logs::LogsResult,
         // Provider
@@ -111,13 +118,22 @@ use super::routes::{
         crate::transcription::ProviderTestResult,
         crate::config::WhisperConfig,
         provider::ProviderTestRequest,
+        provider::ProviderRuntimeStatus,
         // Local models + on-device transcription
         crate::transcription::models::ModelDescriptor,
         crate::transcription::models::DownloadProgress,
         models::ModelsListResponse,
         transcribe::TranscribeResponse,
         // System
+        audetic_core::setup::SetupState,
+        audetic_core::setup::SetupCapabilityId,
+        audetic_core::setup::ToolReadiness,
+        audetic_core::setup::SetupCapability,
+        audetic_core::setup::PlatformInfo,
+        audetic_core::setup::WorkflowReadiness,
+        audetic_core::setup::SetupAssessment,
         system::SystemDeps,
+        system::RestartAccepted,
         system::InstallPhase,
         system::InstallStatusResponse,
         // Meetings
@@ -178,6 +194,7 @@ use super::routes::{
         (name = "models", description = "On-device transcription model management"),
         (name = "transcribe", description = "One-shot file transcription"),
         (name = "system", description = "External tool / dependency availability"),
+        (name = "setup", description = "Unified host setup assessment"),
         (name = "update", description = "Daemon self-update"),
         (name = "logs", description = "Application and transcription logs"),
         (name = "post_processing", description = "User-defined commands fired on daemon events"),
@@ -234,11 +251,18 @@ mod tests {
             paths::POST_PROCESSING_EVENTS,
             paths::PROVIDER,
             paths::PROVIDER_STATUS,
+            paths::PROVIDER_RUNTIME,
             paths::PROVIDER_CONFIG,
+            paths::PROVIDER_VALIDATE,
             paths::PROVIDER_RESET,
             paths::PROVIDER_TEST,
             paths::MODELS,
             paths::TRANSCRIBE,
+            paths::SETUP,
+            paths::SYSTEM_RESTART,
+            paths::KEYBIND_STATUS,
+            paths::KEYBIND_INSTALL,
+            paths::KEYBIND,
         ] {
             assert!(
                 spec_paths.contains(known),
@@ -246,6 +270,58 @@ mod tests {
                  spec has no such operation. Spec paths: {spec_paths:?}"
             );
         }
+    }
+
+    #[test]
+    fn setup_operation_and_stable_enums_are_registered() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert_eq!(
+            spec["paths"][paths::SETUP]["get"]["operationId"],
+            "get_setup_assessment"
+        );
+        assert!(spec["components"]["schemas"]["SetupAssessment"].is_object());
+        assert!(spec["components"]["schemas"]["SetupCapabilityId"].is_object());
+        assert!(spec["components"]["schemas"]["SetupState"].is_object());
+    }
+
+    #[test]
+    fn keybind_contract_registers_stable_targets_and_both_statuses() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert!(spec["components"]["schemas"]["KeybindTarget"].is_object());
+        assert!(
+            spec["components"]["schemas"]["KeybindStatuses"]["properties"]["dictation"].is_object()
+        );
+        assert!(
+            spec["components"]["schemas"]["KeybindStatuses"]["properties"]["meeting"].is_object()
+        );
+        assert_eq!(
+            spec["paths"][paths::KEYBIND_INSTALL]["post"]["operationId"],
+            "install_keybind"
+        );
+    }
+
+    #[test]
+    fn provider_validation_and_restart_operations_are_typed() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert_eq!(
+            spec["paths"][paths::PROVIDER_VALIDATE]["post"]["operationId"],
+            "validate_provider_config"
+        );
+        assert!(
+            spec["paths"][paths::PROVIDER_VALIDATE]["post"]["requestBody"]["content"]
+                ["application/json"]["schema"]["$ref"]
+                .as_str()
+                .is_some_and(|reference| reference.ends_with("/WhisperConfig"))
+        );
+        assert_eq!(
+            spec["paths"][paths::SYSTEM_RESTART]["post"]["operationId"],
+            "restart_daemon"
+        );
+        assert!(spec["components"]["schemas"]["RestartAccepted"].is_object());
+        assert!(spec["components"]["schemas"]["ProviderRuntimeStatus"].is_object());
     }
 
     #[test]

@@ -4,7 +4,6 @@ import { History, Radio, Settings } from "lucide-react";
 import { Toaster } from "sonner";
 import { CommandBar } from "./components/command-bar";
 import { MeetingAutoNav } from "./components/meeting-auto-nav";
-import { OnboardingOverlay } from "./components/onboarding-overlay";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { useStore } from "./stores/root-store";
 import { cn } from "./lib/utils";
@@ -19,13 +18,15 @@ export function AppShell() {
   const store = useStore();
   return (
     <TooltipProvider delayDuration={300}>
-      <div className="flex h-screen flex-col">
+      <div className="flex h-dvh min-h-0 flex-col">
         <MeetingAutoNav />
-        <OnboardingOverlay />
         <CommandBar />
-        <div className="flex flex-1 min-h-0">
-          <aside className="w-14 shrink-0 border-r bg-card sm:w-52">
-            <nav className="px-2 pt-4 space-y-1">
+        <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
+          <aside className="w-full shrink-0 border-b bg-card sm:w-52 sm:border-b-0 sm:border-r">
+            <nav
+              className="flex gap-1 overflow-x-auto p-2 sm:block sm:space-y-1 sm:px-2 sm:pt-4"
+              aria-label="Application sections"
+            >
               {navItems.map((item) => {
                 const Icon = item.icon;
                 return (
@@ -35,7 +36,7 @@ export function AppShell() {
                     end={item.end}
                     className={({ isActive }) =>
                       cn(
-                        "flex items-center justify-center gap-2 rounded-md px-2 py-2 text-sm transition-colors sm:justify-start sm:px-3",
+                        "flex shrink-0 items-center gap-2 whitespace-nowrap rounded-md px-3 py-2 text-sm transition-colors",
                         isActive
                           ? "bg-accent text-accent-foreground"
                           : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
@@ -49,7 +50,7 @@ export function AppShell() {
               })}
             </nav>
           </aside>
-          <main className="flex-1 overflow-auto">
+          <main className="min-w-0 flex-1 overflow-auto">
             <Outlet />
           </main>
         </div>

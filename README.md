@@ -20,8 +20,9 @@ make install
 
 `make install` detects your platform, builds in release mode, and hands off to
 `audeticd install`, which registers the background service, puts the `audetic`
-CLI on your PATH, waits for the daemon to bind `127.0.0.1:3737`, and opens the
-web UI.
+CLI on your PATH, and waits for the daemon to bind `127.0.0.1:3737`. On Linux,
+finish setup in the guided terminal flow (`audetic setup`) or the web Setup
+Center (`http://127.0.0.1:3737/settings/setup`).
 
 It's idempotent, so it's also the upgrade path:
 
@@ -31,8 +32,8 @@ git pull && make install
 
 ### Linux
 
-Needs a Rust toolchain and ALSA headers (`libasound2-dev`). Copies the binary
-to `~/.local/share/audetic/bin/`, installs a systemd **user** service at
+Needs a Rust toolchain, Bun, CMake, pkg-config, and ALSA/XKB headers. Copies the
+binary to `~/.local/share/audetic/bin/`, installs a systemd **user** service at
 `~/.config/systemd/user/audeticd.service`, and `enable --now`s it.
 
 ### macOS
@@ -44,11 +45,9 @@ troubleshooting: **[macOS Install Guide](./docs/macos-install.md)**.
 
 **After installation:**
 
-1. Finish provider and ffmpeg setup in the web UI the installer opened (or visit `http://127.0.0.1:3737/`).
-2. Add a keybind:
-   - Hyprland: `bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/api/toggle`
-   - macOS: System Settings → Keyboard → Keyboard Shortcuts → Services / Shortcuts.app calling the same `curl` command.
-3. Press the keybind to start/stop recording!
+1. On Linux, run `audetic setup` or visit `http://127.0.0.1:3737/settings/setup` to check provider, text delivery, shortcuts, and meeting tools.
+2. The Setup Center can preview and install separate Hyprland shortcuts for dictation and meetings, with a backup before each change.
+3. Press the configured shortcut to start/stop recording.
 
 ## Web UI
 

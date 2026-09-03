@@ -144,11 +144,7 @@ impl MicAudioSource {
         let data_clock = self.clock.clone();
         let on_data: InputDataCallback = Box::new(move |data, channels| {
             callback_first_data.lock().unwrap().get_or_insert_with(|| {
-                let frames = if channels == 0 {
-                    0
-                } else {
-                    data.len() / channels
-                };
+                let frames = data.len().checked_div(channels).unwrap_or(0);
                 (data_clock.now(), frames)
             });
             push_mono_f32(data, channels, &callback_samples);

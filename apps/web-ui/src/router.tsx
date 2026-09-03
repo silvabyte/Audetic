@@ -9,6 +9,7 @@ import { settingsKeybindRoute } from "./routes/settings/keybind";
 import { settingsLayoutRoute } from "./routes/settings/layout";
 import { settingsPostProcessingRoute } from "./routes/settings/post-processing";
 import { settingsProviderRoute } from "./routes/settings/provider";
+import { settingsSetupRoute } from "./routes/settings/setup";
 
 /**
  * `createBrowserRouter` eagerly invokes the initial-match loader at
@@ -26,6 +27,7 @@ export function createRouter(): ReturnType<typeof createBrowserRouter> {
         meetingsRoute,
         meetingDetailRoute,
         settingsLayoutRoute([
+          settingsSetupRoute,
           settingsProviderRoute,
           settingsKeybindRoute,
           settingsPostProcessingRoute,

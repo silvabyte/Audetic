@@ -1,44 +1,43 @@
 //! Keybind API routes.
 
-use crate::api::error::{ApiError, ApiResult};
-use crate::keybind::{self, InstallResult, KeybindStatus, UninstallResult};
+use audetic_core::keybind::KeybindTarget;
 use axum::{
+    extract::Query,
     response::Json,
     routing::{delete, get, post},
     Router,
 };
-use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use serde::Deserialize;
+use utoipa::{IntoParams, ToSchema};
 
-/// Request body for keybind install.
+use crate::api::error::{ApiError, ApiResult};
+use crate::keybind::{self, InstallResult, KeybindStatuses, UninstallResult};
+
+/// Request body for install or server-authoritative preview.
 #[derive(Debug, Deserialize, Default, ToSchema)]
 pub struct InstallRequest {
-    /// Custom key string (e.g., "SUPER+R" or "SUPER SHIFT, T")
+    /// Shortcut action. Defaults to dictation.
+    #[serde(default)]
+    pub target: KeybindTarget,
+    /// Custom key string (for example `SUPER+R` or `SUPER SHIFT, T`).
     pub key: Option<String>,
+    /// Preview without changing the config.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Alias for clients that call this operation a preview.
+    #[serde(default)]
+    pub preview: bool,
 }
 
-/// Result of installing a hyprland binding: the resulting key
-/// combination, where the config was edited, and the backup path.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct InstallResponse {
-    pub success: bool,
-    pub message: String,
-    pub display_key: Option<String>,
-    pub backup_path: Option<String>,
-    pub config_path: Option<String>,
+/// Query parameters for removing or previewing removal of one target.
+#[derive(Debug, Deserialize, Default, IntoParams)]
+pub struct UninstallRequest {
+    #[serde(default)]
+    pub target: KeybindTarget,
+    #[serde(default)]
+    pub dry_run: bool,
 }
 
-/// Result of removing an Audetic-managed hyprland binding.
-#[derive(Debug, Serialize, ToSchema)]
-pub struct UninstallResponse {
-    pub success: bool,
-    pub removed: Option<bool>,
-    pub message: String,
-    pub backup_path: Option<String>,
-    pub config_path: Option<String>,
-}
-
-/// Create the keybind router.
 pub fn router() -> Router {
     Router::new()
         .route("/status", get(get_status))
@@ -46,92 +45,91 @@ pub fn router() -> Router {
         .route("/", delete(uninstall_keybind))
 }
 
-/// Get keybinding status.
+/// Get status for both stable shortcut targets.
 #[utoipa::path(
     get,
     path = "/keybind/status",
     tag = "keybind",
     operation_id = "get_keybind_status",
     responses(
-        (status = 200, description = "Current keybind installation state", body = KeybindStatus),
+        (status = 200, description = "Dictation and meeting keybind installation state", body = KeybindStatuses),
     ),
 )]
-pub async fn get_status() -> ApiResult<Json<KeybindStatus>> {
-    let status = keybind::get_status().map_err(ApiError::from)?;
-    Ok(Json(status))
+pub async fn get_status() -> ApiResult<Json<KeybindStatuses>> {
+    keybind::get_statuses()
+        .map(Json)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
-/// Install a keybinding.
+/// Install or preview one keybinding target.
 #[utoipa::path(
     post,
     path = "/keybind/install",
     tag = "keybind",
+    operation_id = "install_keybind",
     request_body = InstallRequest,
     responses(
-        (status = 200, description = "Install result", body = InstallResponse),
+        (status = 200, description = "Install or preview result, including generated line and conflicts", body = InstallResult),
+        (status = 400, description = "Invalid key or unavailable Hyprland config"),
     ),
 )]
 pub async fn install_keybind(
     Json(request): Json<InstallRequest>,
-) -> ApiResult<Json<InstallResponse>> {
-    let result = keybind::install(request.key.as_deref(), false).map_err(ApiError::from)?;
-
-    Ok(Json(match result {
-        Some(InstallResult {
-            backup_path,
-            display_key,
-            config_path,
-        }) => InstallResponse {
-            success: true,
-            message: format!("Installed keybinding: {}", display_key),
-            display_key: Some(display_key),
-            backup_path: Some(backup_path.to_string_lossy().into_owned()),
-            config_path: Some(config_path.to_string_lossy().into_owned()),
-        },
-        None => InstallResponse {
-            success: false,
-            message: "No changes made (dry run)".to_string(),
-            display_key: None,
-            backup_path: None,
-            config_path: None,
-        },
-    }))
+) -> ApiResult<Json<InstallResult>> {
+    keybind::install(
+        request.target,
+        request.key.as_deref(),
+        request.dry_run || request.preview,
+    )
+    .map(Json)
+    .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
-/// Uninstall the keybinding.
+/// Remove or preview removing one managed target.
 #[utoipa::path(
     delete,
     path = "/keybind",
     tag = "keybind",
+    operation_id = "uninstall_keybind",
+    params(UninstallRequest),
     responses(
-        (status = 200, description = "Uninstall result", body = UninstallResponse),
+        (status = 200, description = "Target-scoped uninstall result", body = UninstallResult),
+        (status = 400, description = "Hyprland config is unavailable"),
     ),
 )]
-pub async fn uninstall_keybind() -> ApiResult<Json<UninstallResponse>> {
-    let result = keybind::uninstall(false).map_err(ApiError::from)?;
+pub async fn uninstall_keybind(
+    Query(request): Query<UninstallRequest>,
+) -> ApiResult<Json<UninstallResult>> {
+    keybind::uninstall(request.target, request.dry_run)
+        .map(Json)
+        .map_err(|error| ApiError::bad_request(error.to_string()))
+}
 
-    Ok(Json(match result {
-        Some(UninstallResult {
-            removed,
-            backup_path,
-            config_path,
-        }) => UninstallResponse {
-            success: true,
-            removed: Some(removed),
-            message: if removed {
-                "Keybinding removed".to_string()
-            } else {
-                "No keybinding found to remove".to_string()
-            },
-            backup_path: backup_path.map(|p| p.to_string_lossy().into_owned()),
-            config_path: Some(config_path.to_string_lossy().into_owned()),
-        },
-        None => UninstallResponse {
-            success: false,
-            removed: None,
-            message: "No changes made (dry run)".to_string(),
-            backup_path: None,
-            config_path: None,
-        },
-    }))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn install_request_defaults_to_dictation_and_accepts_preview_alias() {
+        let request: InstallRequest =
+            serde_json::from_value(serde_json::json!({ "preview": true })).unwrap();
+
+        assert_eq!(request.target, KeybindTarget::Dictation);
+        assert!(request.preview);
+        assert!(!request.dry_run);
+    }
+
+    #[test]
+    fn install_request_accepts_meeting_target_and_dry_run() {
+        let request: InstallRequest = serde_json::from_value(serde_json::json!({
+            "target": "meeting",
+            "key": "SUPER ALT+M",
+            "dry_run": true
+        }))
+        .unwrap();
+
+        assert_eq!(request.target, KeybindTarget::Meeting);
+        assert_eq!(request.key.as_deref(), Some("SUPER ALT+M"));
+        assert!(request.dry_run);
+    }
 }

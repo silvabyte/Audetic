@@ -41,13 +41,25 @@ pub struct Modifiers(pub Vec<Modifier>);
 
 impl Modifiers {
     pub fn parse(s: &str) -> Self {
-        let mods: Vec<Modifier> = s.split_whitespace().filter_map(Modifier::parse).collect();
-        Modifiers(mods)
+        Self::from_parsed(s.split_whitespace().filter_map(Modifier::parse))
     }
 
     pub fn from_strs(strs: &[&str]) -> Self {
-        let mods: Vec<Modifier> = strs.iter().filter_map(|s| Modifier::parse(s)).collect();
-        Modifiers(mods)
+        Self::from_parsed(strs.iter().filter_map(|s| Modifier::parse(s)))
+    }
+
+    fn from_parsed(modifiers: impl Iterator<Item = Modifier>) -> Self {
+        let parsed = modifiers.collect::<Vec<_>>();
+        let canonical = [
+            Modifier::Super,
+            Modifier::Shift,
+            Modifier::Ctrl,
+            Modifier::Alt,
+        ]
+        .into_iter()
+        .filter(|modifier| parsed.contains(modifier))
+        .collect();
+        Modifiers(canonical)
     }
 
     pub fn contains(&self, modifier: &Modifier) -> bool {
@@ -301,5 +313,9 @@ mod tests {
 
         assert_eq!(mods1, mods2);
         assert_ne!(mods1, mods3);
+        assert_eq!(
+            Modifiers::from_strs(&["SHIFT", "SUPER"]),
+            Modifiers::from_strs(&["SUPER", "SHIFT"])
+        );
     }
 }

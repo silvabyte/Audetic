@@ -96,7 +96,7 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        /** Uninstall the keybinding. */
+        /** Remove or preview removing one managed target. */
         delete: operations["uninstall_keybind"];
         options?: never;
         head?: never;
@@ -112,7 +112,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Install a keybinding. */
+        /** Install or preview one keybinding target. */
         post: operations["install_keybind"];
         delete?: never;
         options?: never;
@@ -127,7 +127,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get keybinding status. */
+        /** Get status for both stable shortcut targets. */
         get: operations["get_keybind_status"];
         put?: never;
         post?: never;
@@ -586,7 +586,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get provider configuration. */
+        /** Get the sanitized provider configuration active in this daemon process. */
         get: operations["get_provider_config"];
         put?: never;
         post?: never;
@@ -638,6 +638,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/provider/runtime": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Compare the active process provider with the latest persisted provider. */
+        get: operations["get_provider_runtime_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/provider/status": {
         parameters: {
             query?: never;
@@ -645,7 +662,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Get provider status and health. */
+        /** Get status and health for the provider active in this daemon process. */
         get: operations["get_provider_status"];
         put?: never;
         post?: never;
@@ -664,8 +681,47 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Test the currently-configured provider, optionally against an audio file. */
+        /** Test the provider active in this daemon process, optionally against an audio file. */
         post: operations["run_test"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/provider/validate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Validate a proposed provider configuration without persisting it.
+         * @description This deliberately uses the same validation and provider initialization path
+         *     as `GET /provider/status`, including the on-disk catalog check for local
+         *     models.
+         */
+        post: operations["validate_provider_config"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/setup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Assess host capabilities used by dictation and meeting recording. */
+        get: operations["get_setup_assessment"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -762,6 +818,28 @@ export interface paths {
         get: operations["get_install_ffmpeg_status"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/system/restart": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Ask the host's per-user service manager to restart this daemon.
+         * @description There is intentionally no request body: callers cannot supply a command,
+         *     unit, or launchd label. The only possible targets are the two constants
+         *     compiled into Audetic.
+         */
+        post: operations["restart_daemon"];
         delete?: never;
         options?: never;
         head?: never;
@@ -943,21 +1021,30 @@ export interface components {
          * @enum {string}
          */
         InstallPhase: "idle" | "starting" | "downloading" | "extracting" | "done" | "error";
-        /** @description Request body for keybind install. */
+        /** @description Request body for install or server-authoritative preview. */
         InstallRequest: {
-            /** @description Custom key string (e.g., "SUPER+R" or "SUPER SHIFT, T") */
+            /** @description Preview without changing the config. */
+            dry_run?: boolean;
+            /** @description Custom key string (for example `SUPER+R` or `SUPER SHIFT, T`). */
             key?: string | null;
+            /** @description Alias for clients that call this operation a preview. */
+            preview?: boolean;
+            /** @description Shortcut action. Defaults to dictation. */
+            target?: components["schemas"]["KeybindTarget"];
         };
-        /**
-         * @description Result of installing a hyprland binding: the resulting key
-         *     combination, where the config was edited, and the backup path.
-         */
-        InstallResponse: {
+        /** @description Server-authoritative install or preview result. */
+        InstallResult: {
+            already_installed: boolean;
             backup_path?: string | null;
-            config_path?: string | null;
-            display_key?: string | null;
+            changed: boolean;
+            config_path: string;
+            conflicts: components["schemas"]["KeybindConflict"][];
+            display_key: string;
+            generated_line: string;
             message: string;
+            preview: boolean;
             success: boolean;
+            target: components["schemas"]["KeybindTarget"];
         };
         /**
          * @description Flattened install state — easier to consume from TypeScript than a tagged
@@ -999,23 +1086,43 @@ export interface components {
         JobsListResponse: {
             jobs: components["schemas"]["Job"][];
         };
-        /** @description Status of Audetic keybinding installation */
-        KeybindStatus: {
-            /** @description The command bound to the key */
+        /** @description A binding occupying the requested shortcut. */
+        KeybindConflict: {
             command: string;
             config_path: string;
-            /** @description Display string for the keybinding (e.g., "SUPER + R") */
             display_key: string;
+            line: number;
+            managed_target?: null | components["schemas"]["KeybindTarget"];
+        };
+        /** @description Status of one stable Audetic keybind target. */
+        KeybindStatus: {
+            command: string;
+            config_path: string;
+            display_key: string;
+            generated_line: string;
             /** @enum {string} */
             status: "installed";
+            target: components["schemas"]["KeybindTarget"];
         } | {
             config_path?: string | null;
             /** @enum {string} */
             status: "not_installed";
+            target: components["schemas"]["KeybindTarget"];
         } | {
             /** @enum {string} */
             status: "no_config";
+            target: components["schemas"]["KeybindTarget"];
         };
+        /** @description Status response for every stable target. */
+        KeybindStatuses: {
+            dictation: components["schemas"]["KeybindStatus"];
+            meeting: components["schemas"]["KeybindStatus"];
+        };
+        /**
+         * @description Stable Audetic actions that can be installed as Hyprland shortcuts.
+         * @enum {string}
+         */
+        KeybindTarget: "dictation" | "meeting";
         /** @description Combined logs result containing both app logs and transcription history. */
         LogsResult: {
             /** @description Application logs from systemd journal */
@@ -1252,6 +1359,12 @@ export interface components {
             event: components["schemas"]["EventKind"];
             name: string;
         };
+        PlatformInfo: {
+            arch_linux: boolean;
+            architecture: string;
+            distribution?: string | null;
+            os: string;
+        };
         /**
          * @description How the rendered meeting prompt is delivered to the agent CLI.
          * @enum {string}
@@ -1266,6 +1379,17 @@ export interface components {
             model?: string | null;
             model_path?: string | null;
             provider?: string | null;
+        };
+        /**
+         * @description Sanitized comparison between the provider used by this process and the
+         *     provider currently persisted on disk.
+         */
+        ProviderRuntimeStatus: {
+            active: components["schemas"]["ProviderInfo"];
+            active_status: components["schemas"]["ProviderStatus"];
+            persisted: components["schemas"]["ProviderInfo"];
+            persisted_status: components["schemas"]["ProviderStatus"];
+            restart_required: boolean;
         };
         /** @description Status of the transcription provider */
         ProviderStatus: {
@@ -1320,6 +1444,16 @@ export interface components {
             phase: string;
             recording: boolean;
         };
+        /**
+         * @description Acknowledgement returned before the daemon asks its service manager to
+         *     restart it.
+         */
+        RestartAccepted: {
+            accepted: boolean;
+            /** Format: int64 */
+            delay_ms: number;
+            service: string;
+        };
         /** @description A segment of transcription with timestamps. */
         Segment: {
             /** Format: double */
@@ -1334,6 +1468,38 @@ export interface components {
             status: string;
             version: string;
         };
+        SetupAssessment: {
+            /** @description A copyable command only. The daemon never executes this command or sudo. */
+            arch_package_command?: string | null;
+            capabilities: components["schemas"]["SetupCapability"][];
+            /** @description Deduplicated packages needed for a complete setup on Arch Linux. */
+            missing_arch_packages: string[];
+            platform: components["schemas"]["PlatformInfo"];
+            /**
+             * @description The provider config on disk differs from the config used by this daemon
+             *     process. A daemon restart is required before the persisted provider is
+             *     active.
+             */
+            restart_required: boolean;
+            state: components["schemas"]["SetupState"];
+            workflows: components["schemas"]["WorkflowReadiness"];
+        };
+        SetupCapability: {
+            action?: string | null;
+            detail?: string | null;
+            id: components["schemas"]["SetupCapabilityId"];
+            /** @description Whether this capability participates in basic dictation readiness. */
+            required_for_dictation: boolean;
+            /** @description Whether this capability participates in meeting readiness. */
+            required_for_meetings: boolean;
+            state: components["schemas"]["SetupState"];
+            summary: string;
+            tools: components["schemas"]["ToolReadiness"][];
+        };
+        /** @enum {string} */
+        SetupCapabilityId: "omarchy" | "hyprland_session" | "hyprland_config" | "transcription_provider" | "text_delivery" | "clipboard_fallback" | "dictation_keybind" | "meeting_keybind" | "ffmpeg" | "meeting_audio";
+        /** @enum {string} */
+        SetupState: "ready" | "needs_action" | "unavailable" | "not_applicable";
         SummaryTemplate: {
             description: string;
             id: string;
@@ -1386,17 +1552,26 @@ export interface components {
             phase: string;
             success: boolean;
         };
+        ToolReadiness: {
+            /** @description Arch package that supplies this executable, when known. */
+            arch_package?: string | null;
+            available: boolean;
+            /** @description Stable executable name, for example `wtype` or `pw-cat`. */
+            id: string;
+            path?: string | null;
+        };
         /** @description Response for `POST /transcribe`. */
         TranscribeResponse: {
             text: string;
         };
-        /** @description Result of removing an Audetic-managed hyprland binding. */
-        UninstallResponse: {
+        /** @description Result of removing or previewing removal of one target. */
+        UninstallResult: {
             backup_path?: string | null;
-            config_path?: string | null;
-            message: string;
-            removed?: boolean | null;
-            success: boolean;
+            config_path: string;
+            preview: boolean;
+            /** @description True when the target was removed, or would be removed in preview mode. */
+            removed: boolean;
+            target: components["schemas"]["KeybindTarget"];
         };
         /**
          * @description Request body for `PATCH /api/post-processing/jobs/:id`. All fields
@@ -1410,6 +1585,8 @@ export interface components {
         };
         /** @description Response for GET /version. */
         VersionInfo: {
+            /** @description Random identity generated once for this daemon process. */
+            instance_id: string;
             name: string;
             version: string;
         };
@@ -1428,6 +1605,10 @@ export interface components {
             model_path: string | null;
             /** @default audetic-api */
             provider: string | null;
+        };
+        WorkflowReadiness: {
+            dictation: components["schemas"]["SetupState"];
+            meetings: components["schemas"]["SetupState"];
         };
     };
     responses: never;
@@ -1569,21 +1750,31 @@ export interface operations {
     };
     uninstall_keybind: {
         parameters: {
-            query?: never;
+            query?: {
+                target?: components["schemas"]["KeybindTarget"];
+                dry_run?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Uninstall result */
+            /** @description Target-scoped uninstall result */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["UninstallResponse"];
+                    "application/json": components["schemas"]["UninstallResult"];
                 };
+            };
+            /** @description Hyprland config is unavailable */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -1600,14 +1791,21 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Install result */
+            /** @description Install or preview result, including generated line and conflicts */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["InstallResponse"];
+                    "application/json": components["schemas"]["InstallResult"];
                 };
+            };
+            /** @description Invalid key or unavailable Hyprland config */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -1620,13 +1818,13 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Current keybind installation state */
+            /** @description Dictation and meeting keybind installation state */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["KeybindStatus"];
+                    "application/json": components["schemas"]["KeybindStatuses"];
                 };
             };
         };
@@ -2541,7 +2739,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Current provider configuration */
+            /** @description Active provider configuration */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2616,6 +2814,26 @@ export interface operations {
             };
         };
     };
+    get_provider_runtime_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Active and persisted provider state */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderRuntimeStatus"];
+                };
+            };
+        };
+    };
     get_provider_status: {
         parameters: {
             query?: never;
@@ -2625,7 +2843,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Provider availability */
+            /** @description Active provider availability */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -2656,6 +2874,50 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ProviderTestResult"];
+                };
+            };
+        };
+    };
+    validate_provider_config: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["WhisperConfig"];
+            };
+        };
+        responses: {
+            /** @description Status of the proposed provider config */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ProviderStatus"];
+                };
+            };
+        };
+    };
+    get_setup_assessment: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current setup capability assessment */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SetupAssessment"];
                 };
             };
         };
@@ -2777,6 +3039,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["InstallStatusResponse"];
+                };
+            };
+        };
+    };
+    restart_daemon: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Daemon restart scheduled */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RestartAccepted"];
                 };
             };
         };

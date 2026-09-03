@@ -10,11 +10,8 @@ const POLL_INTERVAL_MS = 500;
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
- * Drives the SPA onboarding overlay: check system deps, prompt the user
- * to install missing ones, poll until install finishes, re-check, clear.
- *
- * Daemon binary install is handled by `audetic install` before the user
- * ever loads the SPA, so the only first-run gate left here is ffmpeg.
+ * Owns the optional app-local FFmpeg installer shown in Setup Center.
+ * Missing FFmpeg affects meeting readiness but never blocks the SPA.
  */
 export class OnboardingStore {
   state: DepsState = "unknown";
@@ -28,11 +25,6 @@ export class OnboardingStore {
   constructor(root: RootStore) {
     this.root = root;
     makeAutoObservable<this, "root">(this, { root: false });
-  }
-
-  get blocking(): boolean {
-    return this.state === "needs-ffmpeg" || this.installPhase === "downloading"
-      || this.installPhase === "extracting" || this.installPhase === "starting";
   }
 
   async check(): Promise<void> {

@@ -1,176 +1,190 @@
-//! Safe file modification for Hyprland keybindings.
+//! Safe, target-scoped file modification for Hyprland keybindings.
 
-use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
-use super::{ProposedBinding, AUDETIC_SECTION_MARKER};
+use anyhow::{Context, Result};
+use audetic_core::keybind::KeybindTarget;
 
-/// Write a binding to the config file
-///
-/// This function will:
-/// 1. Look for an existing Audetic section and update it
-/// 2. Or append a new section at the end of the file
-pub fn write_binding(config_path: &Path, binding: &ProposedBinding) -> Result<()> {
+use super::{marker_for_target, ProposedBinding};
+
+/// Write or update only the requested target's managed section.
+pub fn write_binding(
+    config_path: &Path,
+    target: KeybindTarget,
+    binding: &ProposedBinding,
+) -> Result<()> {
     let content = fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
-
-    let new_content = update_or_append_binding(&content, binding);
+    let new_content = update_or_append_binding(&content, target, binding);
 
     fs::write(config_path, new_content)
-        .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
-
-    Ok(())
+        .with_context(|| format!("Failed to write config file: {:?}", config_path))
 }
 
-/// Update existing Audetic binding or append new one
-fn update_or_append_binding(content: &str, binding: &ProposedBinding) -> String {
-    let binding_line = binding.to_hyprland_line();
-    let section = format!("{}\n{}", AUDETIC_SECTION_MARKER, binding_line);
+fn update_or_append_binding(
+    content: &str,
+    target: KeybindTarget,
+    binding: &ProposedBinding,
+) -> String {
+    let marker = marker_for_target(target);
+    let section = format!("{marker}\n{}", binding.to_hyprland_line());
 
-    // Check if there's an existing Audetic section
-    if let Some(start_idx) = content.find(AUDETIC_SECTION_MARKER) {
-        // Find the end of the Audetic section (next blank line or comment section)
-        let after_marker = &content[start_idx..];
-        let section_end = find_section_end(after_marker);
-        let end_idx = start_idx + section_end;
-
-        // Replace the existing section
-        let mut new_content = String::new();
-        new_content.push_str(&content[..start_idx]);
-        new_content.push_str(&section);
-        new_content.push('\n');
-        new_content.push_str(&content[end_idx..]);
-
-        new_content
+    if let Some((start, end)) = managed_section_range(content, marker) {
+        let mut updated = String::with_capacity(content.len() + section.len());
+        updated.push_str(&content[..start]);
+        updated.push_str(&section);
+        updated.push('\n');
+        updated.push_str(&content[end..]);
+        updated
     } else {
-        // Append to end of file
-        let mut new_content = content.to_string();
-
-        // Ensure there's a newline before our section
-        if !new_content.ends_with('\n') {
-            new_content.push('\n');
+        let mut updated = content.to_string();
+        if !updated.ends_with('\n') {
+            updated.push('\n');
         }
-        new_content.push('\n');
-        new_content.push_str(&section);
-        new_content.push('\n');
-
-        new_content
+        if !updated.ends_with("\n\n") {
+            updated.push('\n');
+        }
+        updated.push_str(&section);
+        updated.push('\n');
+        updated
     }
 }
 
-/// Find the end of the Audetic section
-fn find_section_end(section: &str) -> usize {
-    let mut in_section = false;
-    let mut last_content_end = 0;
-
-    for (idx, line) in section.lines().enumerate() {
-        let trimmed = line.trim();
-
-        if idx == 0 {
-            // Skip the marker line
-            in_section = true;
-            last_content_end = line.len() + 1; // +1 for newline
-            continue;
-        }
-
-        if in_section {
-            if trimmed.is_empty() {
-                // End of section at blank line
-                break;
-            } else if trimmed.starts_with('#') && !trimmed.contains("Audetic") {
-                // New comment section starts
-                break;
-            } else if trimmed.starts_with("bind")
-                || trimmed.contains("audetic")
-                || trimmed.to_lowercase().contains("audetic")
-            {
-                // Part of our section
-                last_content_end += line.len() + 1;
-            } else if trimmed.starts_with("bind") {
-                // Another bind that's not ours
-                break;
-            } else {
-                last_content_end += line.len() + 1;
-            }
-        }
-    }
-
-    last_content_end
-}
-
-/// Remove Audetic binding from the config file
-pub fn remove_binding(config_path: &Path) -> Result<bool> {
+/// Whether this file contains the target's managed section.
+pub fn has_binding(config_path: &Path, target: KeybindTarget) -> Result<bool> {
     let content = fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
+    Ok(managed_section_range(&content, marker_for_target(target)).is_some())
+}
 
-    if let Some(start_idx) = content.find(AUDETIC_SECTION_MARKER) {
-        let after_marker = &content[start_idx..];
-        let section_end = find_section_end(after_marker);
-        let end_idx = start_idx + section_end;
+/// Remove only the requested target's managed section.
+pub fn remove_binding(config_path: &Path, target: KeybindTarget) -> Result<bool> {
+    let content = fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read config file: {:?}", config_path))?;
+    let marker = marker_for_target(target);
+    let Some((start, end)) = managed_section_range(&content, marker) else {
+        return Ok(false);
+    };
 
-        let mut new_content = String::new();
-        new_content.push_str(&content[..start_idx]);
-
-        // Skip any trailing newlines from the removed section
-        let remaining = content[end_idx..].trim_start_matches('\n');
-        if !remaining.is_empty() {
-            new_content.push_str(remaining);
-        }
-
-        // Ensure file ends with newline
-        if !new_content.ends_with('\n') {
-            new_content.push('\n');
-        }
-
-        fs::write(config_path, new_content)
-            .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
-
-        Ok(true)
-    } else {
-        Ok(false)
+    let mut updated = String::with_capacity(content.len());
+    updated.push_str(&content[..start]);
+    updated.push_str(content[end..].trim_start_matches('\n'));
+    if !updated.ends_with('\n') {
+        updated.push('\n');
     }
+
+    fs::write(config_path, updated)
+        .with_context(|| format!("Failed to write config file: {:?}", config_path))?;
+    Ok(true)
+}
+
+/// Byte range containing a marker and its one generated binding line.
+fn managed_section_range(content: &str, marker: &str) -> Option<(usize, usize)> {
+    let mut offset = 0;
+    let mut marker_range = None;
+    for line in content.split_inclusive('\n') {
+        let line_end = offset + line.len();
+        if line.trim_end_matches(['\n', '\r']).trim() == marker {
+            marker_range = Some((offset, line_end));
+            break;
+        }
+        offset = line_end;
+    }
+    let (start, marker_end) = marker_range?;
+
+    if marker_end == content.len() {
+        return Some((start, marker_end));
+    }
+
+    let next_line_end = content[marker_end..]
+        .find('\n')
+        .map(|offset| marker_end + offset + 1)
+        .unwrap_or(content.len());
+    let next_line = content[marker_end..next_line_end].trim();
+    let end = if next_line.to_ascii_lowercase().starts_with("bind") {
+        next_line_end
+    } else {
+        marker_end
+    };
+    Some((start, end))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keybind::{audetic_toggle_endpoint, Modifiers};
+    use crate::keybind::{target_endpoint, AUDETIC_MEETING_SECTION_MARKER, AUDETIC_SECTION_MARKER};
 
     #[test]
-    fn test_append_binding() {
-        let content = "# Existing config\nbind = SUPER, SPACE, exec, rofi\n";
-        let binding = ProposedBinding {
-            modifiers: Modifiers::from_strs(&["SUPER"]),
-            key: "R".to_string(),
-            description: "Audetic".to_string(),
-            command: format!("curl -X POST {}", audetic_toggle_endpoint()),
-        };
+    fn target_sections_coexist_and_update_independently() {
+        let original = "# Existing config\nbind = SUPER, SPACE, exec, rofi\n";
+        let dictation = ProposedBinding::for_target(KeybindTarget::Dictation);
+        let meeting = ProposedBinding::for_target(KeybindTarget::Meeting);
 
-        let result = update_or_append_binding(content, &binding);
+        let both = update_or_append_binding(
+            &update_or_append_binding(original, KeybindTarget::Dictation, &dictation),
+            KeybindTarget::Meeting,
+            &meeting,
+        );
+        assert!(both.contains(AUDETIC_SECTION_MARKER));
+        assert!(both.contains(AUDETIC_MEETING_SECTION_MARKER));
+        assert!(both.contains(&target_endpoint(KeybindTarget::Dictation)));
+        assert!(both.contains(&target_endpoint(KeybindTarget::Meeting)));
 
-        assert!(result.contains(AUDETIC_SECTION_MARKER));
-        assert!(result.contains("bindd = SUPER, R, Audetic"));
-        assert!(result.contains("# Existing config"));
+        let changed = ProposedBinding::new(KeybindTarget::Dictation, &["SUPER", "ALT"], "D");
+        let updated = update_or_append_binding(&both, KeybindTarget::Dictation, &changed);
+        assert!(updated.contains("bindd = SUPER ALT, D, Audetic"));
+        assert!(updated.contains(&meeting.to_hyprland_line()));
     }
 
     #[test]
-    fn test_update_existing_binding() {
-        let content = format!(
-            "# Existing config\n{}\nbindd = SUPER, R, Audetic, exec, old-command\n\n# Other stuff\n",
-            AUDETIC_SECTION_MARKER
+    fn removing_one_target_preserves_the_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("bindings.conf");
+        let dictation = ProposedBinding::for_target(KeybindTarget::Dictation);
+        let meeting = ProposedBinding::for_target(KeybindTarget::Meeting);
+        let content = update_or_append_binding(
+            &update_or_append_binding("", KeybindTarget::Dictation, &dictation),
+            KeybindTarget::Meeting,
+            &meeting,
         );
-        let binding = ProposedBinding {
-            modifiers: Modifiers::from_strs(&["SUPER", "SHIFT"]),
-            key: "R".to_string(),
-            description: "Audetic".to_string(),
-            command: format!("curl -X POST {}", audetic_toggle_endpoint()),
-        };
+        fs::write(&config, content).unwrap();
 
-        let result = update_or_append_binding(&content, &binding);
+        assert!(remove_binding(&config, KeybindTarget::Dictation).unwrap());
+        let remaining = fs::read_to_string(&config).unwrap();
+        assert!(!remaining.contains(AUDETIC_SECTION_MARKER));
+        assert!(remaining.contains(AUDETIC_MEETING_SECTION_MARKER));
+        assert!(remaining.contains(&meeting.to_hyprland_line()));
+    }
 
-        assert!(result.contains("SUPER SHIFT, R"));
-        assert!(!result.contains("old-command"));
-        assert!(result.contains("# Other stuff"));
+    #[test]
+    fn legacy_dictation_marker_is_updated_without_touching_following_comment() {
+        let content = format!(
+            "{AUDETIC_SECTION_MARKER}\nbindd = SUPER, R, Audetic, exec, old\n# Other section\nbind = ALT, X, exec, other\n"
+        );
+        let binding = ProposedBinding::for_target(KeybindTarget::Dictation);
+        let updated = update_or_append_binding(&content, KeybindTarget::Dictation, &binding);
+
+        assert!(!updated.contains("exec, old"));
+        assert!(updated.contains("/toggle\n# Other section\nbind = ALT, X, exec, other"));
+    }
+
+    #[test]
+    fn marker_text_inside_a_comment_never_claims_the_next_user_binding() {
+        let content = format!(
+            "# Keep this note mentioning {AUDETIC_SECTION_MARKER} for documentation\nbind = SUPER, U, exec, user-command\n"
+        );
+        let binding = ProposedBinding::for_target(KeybindTarget::Dictation);
+
+        let updated = update_or_append_binding(&content, KeybindTarget::Dictation, &binding);
+        assert!(updated.starts_with(&content));
+        assert!(updated.contains("bind = SUPER, U, exec, user-command"));
+        assert!(updated.contains(&binding.to_hyprland_line()));
+
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("bindings.conf");
+        fs::write(&config, &content).unwrap();
+        assert!(!remove_binding(&config, KeybindTarget::Dictation).unwrap());
+        assert_eq!(fs::read_to_string(config).unwrap(), content);
     }
 }
