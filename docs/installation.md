@@ -18,7 +18,7 @@ make install
 - Builds the workspace in release mode (on macOS, also assembles and ad-hoc signs `Audetic.app`).
 - Hands off to `audeticd install`, which copies the daemon to `~/.local/share/audetic/bin/audeticd` (macOS: `~/Applications/Audetic.app`) and puts the standalone `audetic` CLI on your PATH at `~/.local/bin/audetic`.
 - Registers the background service — a systemd **user** unit at `~/.config/systemd/user/audeticd.service` on Linux, a LaunchAgent (`ai.audetic.daemon`) on macOS — and starts it.
-- Waits for the daemon to bind `127.0.0.1:3737`, then opens the web UI (`http://127.0.0.1:3737/`) so you can finish onboarding (ffmpeg install, provider config) in the SPA.
+- Waits for the daemon to bind `127.0.0.1:3737`, then offers the terminal setup flow (`audetic setup`), the web Setup Center (`http://127.0.0.1:3737/settings/setup`), or setup later. Non-interactive installs print both follow-up paths.
 - Everything lives under `$HOME` — no `/usr/local/bin`, no sudo.
 
 It is idempotent, so it doubles as the upgrade path — see [Updating](#updating).
@@ -28,8 +28,8 @@ story of its own: see the **[macOS Install Guide](./macos-install.md)**.
 
 After install:
 1. The service is already enabled and started. Confirm with `make status`.
-2. Finish provider and ffmpeg setup in the web UI (or visit `http://127.0.0.1:3737/`).
-3. Add a keybind in Hyprland (or your compositor) that calls `curl -X POST http://127.0.0.1:3737/api/toggle`.
+2. Run `audetic setup` or open `http://127.0.0.1:3737/settings/setup` to check provider, text delivery, shortcuts, and meeting support.
+3. Preview and install dictation and meeting keybinds from either setup flow surface.
 4. Edit `~/.config/audetic/config.toml` if you need custom providers, models, or behavior tweaks.
 
 ## Prerequisites and system dependencies
@@ -40,6 +40,8 @@ After install:
 
 All systems require:
 - **Rust toolchain** (1.70+)
+- **Bun** (builds the bundled web Setup Center)
+- **CMake, pkg-config, and a C/C++ build toolchain**
 - **Whisper implementation** (see [Whisper Installation Options](#whisper-installation-options))
 - **Text injection tool**: `ydotool` (recommended) or `wtype`
 - **Clipboard tools**: `wl-clipboard` (Wayland) or `xclip`/`xsel` (X11)
@@ -51,8 +53,13 @@ All systems require:
 #### Arch Linux
 
 ```bash
-sudo pacman -S rust ydotool wtype wl-clipboard alsa-lib curl cmake make gcc
+sudo pacman -S --needed base-devel rustup bun cmake pkgconf alsa-lib libxkbcommon curl
 ```
+
+Text-delivery and meeting tools (`wtype` or `ydotool`, `wl-clipboard`,
+`pipewire-audio`, and `libpulse`) are diagnosed after installation. The Setup
+Center produces one minimal `pacman` command for whatever is missing; Audetic
+never runs that privileged command from the browser.
 
 #### Ubuntu/Debian
 

@@ -16,14 +16,14 @@ Routes / surface:
 - `/dictations` — voice-to-text history (the index route; `/` redirects here)
 - `/meetings` and `/meetings/:id` — meeting list + detail, with an auto-nav reaction that jumps to
   `/meetings/:id` when a meeting finishes its pipeline
-- `/settings/{provider,keybind,updates,appearance,config-file}`
+- `/settings/{setup,provider,keybind,post-processing,appearance,config-file}` — Setup Center is the
+  read-only machine capability overview; Provider offers typed validation, save, and daemon restart
 - `components/command-bar.tsx` — omnipresent sticky strip: a live state orb (pulses/glows on the
   daemon's dictation / meeting / pipeline state), a daemon-down chip, and icon actions to toggle
   dictation and meeting. `<ActiveMeetingBanner/>` renders below it for meeting-only affordances.
-- `components/onboarding-overlay.tsx` — first-run gate driven by `onboarding-store`: checks
-  `GET /api/system/deps` for ffmpeg, and if missing walks the user through
-  `POST /api/system/install-ffmpeg` + status polling. (Daemon binary install is done by
-  `audetic install` before the SPA ever loads, so ffmpeg is the only first-run gate left.)
+- `stores/setup-store.ts` — consumes `GET /api/setup` for workflow and machine readiness. Missing
+  FFmpeg never blocks the application; Settings → Setup offers the app-local installer using
+  `onboarding-store`'s existing `POST /api/system/install-ffmpeg` status polling.
 
 ## How it's built and embedded
 
@@ -54,8 +54,8 @@ make ui-dev                 # cd apps/web-ui && bun run dev — vite at :5173 (o
 ```
 
 Vite proxies `/api` to the daemon at `127.0.0.1:3737` (see `vite.config.ts`), so the dev SPA talks to
-a real running daemon. Permissive CORS on the daemon makes this work cross-origin; in production the
-SPA is same-origin.
+a real running daemon. The daemon allowlists the local Vite origins; in production the SPA is
+same-origin, and browser requests from other origins are rejected before handlers run.
 
 `make codegen` (`bun run codegen`) regenerates `src/api/schema.ts` from the running daemon's
 `GET /api/openapi.json` (utoipa). Run it after changing daemon routes/schemas.

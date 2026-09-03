@@ -15,12 +15,12 @@ StandardError=journal
 Environment="RUST_LOG=info"
 
 # Security and resource limits.
-# The ReadWritePaths directories must exist before the unit starts, or
-# systemd fails with status=226/NAMESPACE — the installer creates them.
+# Audetic's config/data directories exist before startup. The optional (`-`)
+# Hyprland path may be created later without failing the service namespace.
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=%h/.config/audetic %h/.local/share/audetic %t
+ReadWritePaths=__CONFIG_DIR__ __DATA_DIR__ -__HYPRLAND_CONFIG_DIR__
 # Whisper models can need significant memory.
 MemoryMax=6G
 CPUQuota=80%

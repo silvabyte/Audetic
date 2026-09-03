@@ -11,6 +11,13 @@ use tokio::sync::mpsc;
 const SETTLE_INTERVAL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[cfg_attr(
+    target_os = "linux",
+    allow(
+        dead_code,
+        reason = "Linux Device Watcher backend is not implemented yet"
+    )
+)]
 pub(crate) enum RawDeviceSwitch {
     Input,
     Output,

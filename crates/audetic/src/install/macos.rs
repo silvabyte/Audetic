@@ -464,13 +464,12 @@ pub fn uninstall(opts: UninstallOptions) -> Result<()> {
     }
     super::plan_state_dirs(&mut plan, &paths.config_dir, &paths.data_dir, &opts);
 
-    if !opts.dry_run {
+    let outcome = plan.execute(&opts, || {
         bootout_agents();
-    }
+        Ok(())
+    })?;
 
-    plan.execute(&opts)?;
-
-    if !opts.dry_run {
+    if outcome.removed_anything() {
         remove_dir_if_empty(&paths.config_dir);
         remove_dir_if_empty(&paths.data_dir);
         println!("✓ Audetic has been uninstalled");

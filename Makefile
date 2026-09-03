@@ -10,7 +10,7 @@ SERVICE_NAME  ?= audeticd.service
 LAUNCH_LABEL  ?= ai.audetic.daemon
 
 .PHONY: help build release check test clean run lint fmt fix quality \
-        install install-linux install-macos uninstall \
+        install install-linux install-macos install-preflight-linux uninstall \
         logs start restart stop status \
         ui-install ui-dev ui-build ui-preview ui-typecheck ui-lint codegen \
         macos-sign macos-sign-release macos-app macos-app-debug macos-menubar
@@ -104,8 +104,25 @@ install:
 	  *) echo "✗ Unsupported platform: $$(uname -s)"; exit 1 ;; \
 	esac
 
-install-linux: release
+install-linux: install-preflight-linux release
 	./target/release/audeticd install
+
+install-preflight-linux:
+	@missing=""; \
+	for command in bun cmake pkg-config curl systemctl cc; do \
+	  command -v "$$command" >/dev/null 2>&1 || missing="$$missing $$command"; \
+	done; \
+	if ! pkg-config --exists alsa 2>/dev/null; then missing="$$missing alsa"; fi; \
+	if ! pkg-config --exists xkbcommon 2>/dev/null; then missing="$$missing xkbcommon"; fi; \
+	if [ -n "$$missing" ]; then \
+	  echo "✗ Missing source-build prerequisites:$$missing"; \
+	  if command -v pacman >/dev/null 2>&1; then \
+	    echo "  Omarchy / Arch: sudo pacman -S --needed base-devel rustup bun cmake pkgconf alsa-lib libxkbcommon curl"; \
+	  else \
+	    echo "  See docs/installation.md#prerequisites-and-system-dependencies"; \
+	  fi; \
+	  exit 1; \
+	fi
 
 install-macos: macos-app
 	"$(MACOS_APP_DIR)/Contents/MacOS/audeticd" install

@@ -186,7 +186,7 @@ pub(crate) fn set_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Poll the daemon's HTTP API until it responds OK or the timeout fires.
+/// Poll the daemon's HTTP API until the newly installed version responds.
 ///
 /// Shared between Linux and macOS — the readiness check is identical once
 /// the supervisor has been told to start the service.
@@ -203,7 +203,11 @@ async fn wait_for_daemon(timeout: Duration) -> Result<()> {
     while start.elapsed() < timeout {
         if let Ok(resp) = client.get(&probe_url).send().await {
             if resp.status().is_success() {
-                return Ok(());
+                if let Ok(info) = resp.json::<crate::api::VersionInfo>().await {
+                    if daemon_version_is_current(&info, env!("CARGO_PKG_VERSION")) {
+                        return Ok(());
+                    }
+                }
             }
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
@@ -215,6 +219,10 @@ async fn wait_for_daemon(timeout: Duration) -> Result<()> {
         timeout.as_secs(),
         log_hint(),
     );
+}
+
+fn daemon_version_is_current(info: &crate::api::VersionInfo, expected: &str) -> bool {
+    info.version == expected
 }
 
 #[cfg(target_os = "linux")]
@@ -241,6 +249,23 @@ fn log_hint() -> &'static str {
 pub(crate) struct UninstallPlan {
     remove: Vec<(PathBuf, &'static str)>,
     keep: Vec<(PathBuf, &'static str)>,
+    actions: Vec<String>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UninstallOutcome {
+    NoArtifacts,
+    DryRun,
+    Cancelled,
+    Removed,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl UninstallOutcome {
+    pub(crate) fn removed_anything(self) -> bool {
+        self == Self::Removed
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -260,11 +285,21 @@ impl UninstallPlan {
         }
     }
 
+    /// Record a supervisor action that has no on-disk artifact. This keeps
+    /// registered legacy services visible in the confirmation plan and makes
+    /// confirmation happen before stop/disable side effects.
+    pub(crate) fn action(&mut self, description: impl Into<String>) {
+        self.actions.push(description.into());
+    }
+
     fn print(&self) {
-        if self.remove.is_empty() {
+        if self.remove.is_empty() && self.actions.is_empty() {
             println!("✓ No Audetic artifacts found to remove.");
         } else {
-            println!("The following will be removed:");
+            println!("The following changes will be made:");
+            for action in &self.actions {
+                println!("  ✗ {action}");
+            }
             for (path, label) in &self.remove {
                 println!("  ✗ {label} — {}", path.display());
             }
@@ -278,25 +313,40 @@ impl UninstallPlan {
         }
     }
 
-    /// Print the plan, confirm, and delete. Returns `Ok(())` even when nothing
-    /// was found — uninstalling a machine that has no install is a no-op, not
-    /// an error. Fails only if a removal that was supposed to happen didn't.
-    pub(crate) fn execute(self, opts: &UninstallOptions) -> Result<()> {
+    /// Print the plan, confirm, run supervisor teardown, and then delete.
+    /// The returned outcome lets platform cleanup distinguish a completed
+    /// uninstall from a dry run, cancellation, or no-op.
+    pub(crate) fn execute(
+        self,
+        opts: &UninstallOptions,
+        before_remove: impl FnOnce() -> Result<()>,
+    ) -> Result<UninstallOutcome> {
+        self.execute_with_confirmation(opts, confirm, before_remove)
+    }
+
+    fn execute_with_confirmation(
+        self,
+        opts: &UninstallOptions,
+        mut confirmer: impl FnMut(&str) -> Result<bool>,
+        before_remove: impl FnOnce() -> Result<()>,
+    ) -> Result<UninstallOutcome> {
         println!();
         self.print();
         println!();
 
-        if self.remove.is_empty() {
-            return Ok(());
+        if self.remove.is_empty() && self.actions.is_empty() {
+            return Ok(UninstallOutcome::NoArtifacts);
         }
         if opts.dry_run {
             println!("Dry run — nothing was changed.");
-            return Ok(());
+            return Ok(UninstallOutcome::DryRun);
         }
-        if !opts.yes && !confirm("Proceed with uninstall? [y/N] ")? {
+        if !opts.yes && !confirmer("Proceed with uninstall? [y/N] ")? {
             println!("Uninstall cancelled.");
-            return Ok(());
+            return Ok(UninstallOutcome::Cancelled);
         }
+
+        before_remove()?;
 
         let mut failed = 0usize;
         for (path, label) in &self.remove {
@@ -311,7 +361,7 @@ impl UninstallPlan {
         if failed > 0 {
             bail!("Uninstall finished with {failed} error(s)");
         }
-        Ok(())
+        Ok(UninstallOutcome::Removed)
     }
 }
 
@@ -415,4 +465,134 @@ fn confirm(prompt: &str) -> Result<bool> {
         answer.trim().to_ascii_lowercase().as_str(),
         "y" | "yes"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    fn options() -> UninstallOptions {
+        UninstallOptions {
+            yes: false,
+            dry_run: false,
+            keep_config: false,
+            keep_database: false,
+        }
+    }
+
+    #[test]
+    fn readiness_requires_the_exact_build_version() {
+        let info = crate::api::VersionInfo {
+            name: "audetic".to_string(),
+            version: "1.2.3".to_string(),
+            instance_id: "test-process".to_string(),
+        };
+
+        assert!(daemon_version_is_current(&info, "1.2.3"));
+        assert!(!daemon_version_is_current(&info, "1.2.2"));
+    }
+
+    #[test]
+    fn cancelled_uninstall_does_not_teardown_or_remove() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("artifact");
+        std::fs::write(&artifact, "keep").unwrap();
+        let teardown_called = Cell::new(false);
+        let mut plan = UninstallPlan::default();
+        plan.remove(artifact.clone(), "Test artifact");
+
+        let outcome = plan
+            .execute_with_confirmation(
+                &options(),
+                |_| Ok(false),
+                || {
+                    teardown_called.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, UninstallOutcome::Cancelled);
+        assert!(!teardown_called.get());
+        assert!(artifact.exists());
+    }
+
+    #[test]
+    fn action_only_legacy_service_plan_confirms_before_teardown() {
+        let teardown_called = Cell::new(false);
+        let mut plan = UninstallPlan::default();
+        plan.action("Stop and disable legacy audetic.service");
+
+        let outcome = plan
+            .execute_with_confirmation(
+                &options(),
+                |_| Ok(false),
+                || {
+                    teardown_called.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, UninstallOutcome::Cancelled);
+        assert!(!teardown_called.get());
+    }
+
+    #[test]
+    fn dry_run_does_not_confirm_teardown_or_remove() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("artifact");
+        std::fs::write(&artifact, "keep").unwrap();
+        let confirm_called = Cell::new(false);
+        let teardown_called = Cell::new(false);
+        let mut opts = options();
+        opts.dry_run = true;
+        let mut plan = UninstallPlan::default();
+        plan.remove(artifact.clone(), "Test artifact");
+
+        let outcome = plan
+            .execute_with_confirmation(
+                &opts,
+                |_| {
+                    confirm_called.set(true);
+                    Ok(true)
+                },
+                || {
+                    teardown_called.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, UninstallOutcome::DryRun);
+        assert!(!confirm_called.get());
+        assert!(!teardown_called.get());
+        assert!(artifact.exists());
+    }
+
+    #[test]
+    fn confirmed_uninstall_tears_down_before_removing() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("artifact");
+        std::fs::write(&artifact, "remove").unwrap();
+        let teardown_saw_artifact = Cell::new(false);
+        let mut plan = UninstallPlan::default();
+        plan.remove(artifact.clone(), "Test artifact");
+
+        let outcome = plan
+            .execute_with_confirmation(
+                &options(),
+                |_| Ok(true),
+                || {
+                    teardown_saw_artifact.set(artifact.exists());
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        assert_eq!(outcome, UninstallOutcome::Removed);
+        assert!(teardown_saw_artifact.get());
+        assert!(!artifact.exists());
+    }
 }

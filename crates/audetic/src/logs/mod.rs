@@ -45,7 +45,7 @@ pub fn get_logs(options: &LogsOptions) -> Result<LogsResult> {
 
 /// Get application logs from the platform's log store.
 ///
-/// Linux: systemd journal via `journalctl --user -u audetic.service`.
+/// Linux: systemd journal via `journalctl --user -u audeticd.service`.
 /// macOS: tail `~/Library/Logs/Audetic/audetic.log` (written by launchd).
 /// Other: empty (no log integration yet).
 ///
@@ -71,7 +71,7 @@ fn get_app_logs_journalctl(lines: usize) -> Result<Vec<String>> {
     let output = Command::new("journalctl")
         .arg("--user")
         .arg("-u")
-        .arg("audetic.service")
+        .arg("audeticd.service")
         .arg("-n")
         .arg(lines.to_string())
         .arg("--output=short-iso")

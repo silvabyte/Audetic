@@ -13,7 +13,7 @@ pub struct Config {
     pub behavior: BehaviorConfig,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 #[serde(default)]
 pub struct WhisperConfig {

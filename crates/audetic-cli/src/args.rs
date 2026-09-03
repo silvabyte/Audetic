@@ -1,6 +1,8 @@
 use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
+use audetic_core::keybind::KeybindTarget;
+
 #[derive(Parser, Debug)]
 #[command(name = "audetic")]
 #[command(about = "Voice to text for Hyprland", long_about = None)]
@@ -18,6 +20,8 @@ pub enum CliCommand {
     Version,
     /// Inspect or configure transcription providers
     Provider(ProviderCliArgs),
+    /// Assess dictation and meeting setup readiness
+    Setup,
     /// Search and view transcription history
     History(HistoryCliArgs),
     /// View application and transcription logs
@@ -198,9 +202,9 @@ pub enum ProviderCommand {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Test the configured provider with a sample transcription
+    /// Validate provider initialization, or transcribe a supplied audio file
     Test {
-        /// Path to audio file to test with (records brief sample if not provided)
+        /// Path to an audio file; without one, only validates initialization
         #[arg(short, long)]
         file: Option<String>,
     },
@@ -248,8 +252,11 @@ pub struct KeybindCliArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum KeybindCommand {
-    /// Install Audetic keybinding (default: SUPER+R)
+    /// Install an Audetic keybinding (dictation defaults to SUPER+R)
     Install {
+        /// Shortcut action to install: dictation or meeting
+        #[arg(short, long, default_value_t)]
+        target: KeybindTarget,
         /// Custom keybinding (e.g., "SUPER SHIFT, R" or "SUPER+T")
         #[arg(short, long)]
         key: Option<String>,
@@ -259,12 +266,19 @@ pub enum KeybindCommand {
     },
     /// Remove Audetic keybinding from config
     Uninstall {
+        /// Shortcut action to remove: dictation or meeting
+        #[arg(short, long, default_value_t)]
+        target: KeybindTarget,
         /// Preview changes without applying
         #[arg(long)]
         dry_run: bool,
     },
-    /// Show current keybinding status
-    Status,
+    /// Show current keybinding status (both targets by default)
+    Status {
+        /// Show only one shortcut action
+        #[arg(short, long)]
+        target: Option<KeybindTarget>,
+    },
 }
 
 /// Transcribe audio or video files to text.
@@ -307,6 +321,65 @@ pub struct TranscribeCliArgs {
     /// Skip compression (send file in original format)
     #[arg(long)]
     pub no_compress: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn keybind_install_defaults_to_dictation() {
+        let cli = Cli::try_parse_from(["audetic", "keybind", "install"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Keybind(KeybindCliArgs {
+                command: Some(KeybindCommand::Install {
+                    target: KeybindTarget::Dictation,
+                    ..
+                }),
+            }))
+        ));
+    }
+
+    #[test]
+    fn keybind_commands_accept_meeting_target() {
+        let cli = Cli::try_parse_from([
+            "audetic",
+            "keybind",
+            "install",
+            "--target",
+            "meeting",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Keybind(KeybindCliArgs {
+                command: Some(KeybindCommand::Install {
+                    target: KeybindTarget::Meeting,
+                    dry_run: true,
+                    ..
+                }),
+            }))
+        ));
+    }
+
+    #[test]
+    fn provider_test_help_describes_initialization_without_claiming_to_record() {
+        let mut command = Cli::command();
+        let provider = command
+            .find_subcommand_mut("provider")
+            .unwrap()
+            .find_subcommand_mut("test")
+            .unwrap();
+        let mut help = Vec::new();
+        provider.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("validates initialization"));
+        assert!(!help.contains("records brief sample"));
+    }
 }
 
 #[derive(Clone, Debug, ValueEnum)]

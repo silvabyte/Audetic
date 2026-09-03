@@ -17,6 +17,7 @@ pub mod meeting;
 pub mod meeting_artifacts;
 pub mod normalizer;
 pub mod post_processing;
+pub mod setup;
 pub mod summary_templates;
 pub mod system;
 pub mod text_io;

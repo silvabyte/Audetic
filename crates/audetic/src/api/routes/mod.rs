@@ -10,6 +10,7 @@ pub mod models;
 pub mod post_processing;
 pub mod provider;
 pub mod recording;
+pub mod setup;
 pub mod summary_templates;
 pub mod system;
 pub mod transcribe;

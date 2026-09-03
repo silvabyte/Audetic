@@ -40,13 +40,17 @@ pub mod paths {
     pub const POST_PROCESSING_EVENTS: &str = "/post-processing/events";
     pub const PROVIDER: &str = "/provider";
     pub const PROVIDER_STATUS: &str = "/provider/status";
+    pub const PROVIDER_RUNTIME: &str = "/provider/runtime";
     pub const PROVIDER_CONFIG: &str = "/provider/config";
+    pub const PROVIDER_VALIDATE: &str = "/provider/validate";
     pub const PROVIDER_RESET: &str = "/provider/reset";
     pub const PROVIDER_TEST: &str = "/provider/test";
     pub const HISTORY: &str = "/history";
     pub const LOGS: &str = "/logs";
     pub const MODELS: &str = "/models";
     pub const TRANSCRIBE: &str = "/transcribe";
+    pub const SETUP: &str = "/setup";
+    pub const SYSTEM_RESTART: &str = "/system/restart";
     pub const KEYBIND_STATUS: &str = "/keybind/status";
     pub const KEYBIND_INSTALL: &str = "/keybind/install";
     pub const KEYBIND: &str = "/keybind";
@@ -110,6 +114,11 @@ mod tests {
             "http://127.0.0.1:3737/api/meetings/toggle"
         );
         assert_eq!(api_url(paths::VERSION), "http://127.0.0.1:3737/api/version");
+        assert_eq!(api_url(paths::SETUP), "http://127.0.0.1:3737/api/setup");
+        assert_eq!(
+            api_url(paths::KEYBIND_INSTALL),
+            "http://127.0.0.1:3737/api/keybind/install"
+        );
     }
 
     #[test]
