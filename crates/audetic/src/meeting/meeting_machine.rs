@@ -83,6 +83,7 @@ pub struct MeetingMachine {
     indicator: Indicator,
     status: MeetingStatusHandle,
     meetings_dir: PathBuf,
+    db_path: PathBuf,
 }
 
 impl MeetingMachine {
@@ -95,6 +96,7 @@ impl MeetingMachine {
         status: MeetingStatusHandle,
         meetings_dir: PathBuf,
     ) -> Self {
+        let db_path = post_processing.db_path().to_path_buf();
         Self {
             mic_source,
             system_source,
@@ -103,6 +105,7 @@ impl MeetingMachine {
             indicator,
             status,
             meetings_dir,
+            db_path,
         }
     }
 
@@ -134,7 +137,7 @@ impl MeetingMachine {
 
         // Insert meeting record in DB
         let meeting_id = {
-            let conn = db::init_db()?;
+            let conn = db::init_db_at(&self.db_path)?;
             MeetingRepository::insert(&conn, opts.title.as_deref(), &audio_path.to_string_lossy())?
         };
 
@@ -167,7 +170,7 @@ impl MeetingMachine {
                 let _ = self.mic_source.stop();
                 let _ = self.system_source.stop();
                 // Clean up DB row so we don't leave a dangling "recording" meeting
-                if let Ok(conn) = db::init_db() {
+                if let Ok(conn) = db::init_db_at(&self.db_path) {
                     let _ = MeetingRepository::fail(
                         &conn,
                         meeting_id,
@@ -352,7 +355,7 @@ impl MeetingMachine {
 
         if !mic_captured_audio && !system_captured_audio {
             // Persist failure so the meeting row isn't left stuck in `recording`.
-            if let Ok(conn) = db::init_db() {
+            if let Ok(conn) = db::init_db_at(&self.db_path) {
                 let _ = MeetingRepository::fail(
                     &conn,
                     meeting_id,
@@ -388,7 +391,7 @@ impl MeetingMachine {
         // the captured duration and freeze the live timer so the UI shows the
         // recording's length (and the trim end bound). The user proceeds via
         // `confirm` (optionally trimming) or discards via `cancel`.
-        if let Ok(conn) = db::init_db() {
+        if let Ok(conn) = db::init_db_at(&self.db_path) {
             if let Err(e) =
                 MeetingRepository::set_review(&conn, meeting_id, duration_seconds as i64)
             {
@@ -473,10 +476,11 @@ impl MeetingMachine {
             meeting_id,
             audio_path,
             duration_seconds,
-            services: ProcessingServices {
-                transcription: Arc::clone(&self.transcription),
-                post_processing: Arc::clone(&self.post_processing),
-            },
+            services: ProcessingServices::new(
+                Arc::clone(&self.transcription),
+                Arc::clone(&self.post_processing),
+                self.db_path.clone(),
+            ),
             observer,
         };
         tokio::spawn(async move { process_meeting(args).await });
@@ -516,7 +520,7 @@ impl MeetingMachine {
         }
 
         // Persist cancelled status.
-        if let Ok(conn) = db::init_db() {
+        if let Ok(conn) = db::init_db_at(&self.db_path) {
             let _ = MeetingRepository::cancel(&conn, meeting_id, duration_seconds as i64);
         }
 
@@ -928,6 +932,7 @@ mod tests {
         );
         let status = MeetingStatusHandle::default();
         let meetings_dir = tempfile::tempdir().unwrap();
+        let db_path = meetings_dir.path().join("audetic.db");
         let mut machine = MeetingMachine::new(
             Box::new(mic),
             Box::new(ContinuousSystemSource {
@@ -935,7 +940,7 @@ mod tests {
                 active: false,
             }),
             Arc::new(UnusedTranscription),
-            Arc::new(PostProcessingService::new()),
+            Arc::new(PostProcessingService::new(db_path.clone())),
             Indicator::new().with_audio_feedback(false),
             status.clone(),
             meetings_dir.path().to_path_buf(),
@@ -996,11 +1001,12 @@ mod tests {
         );
         let status = MeetingStatusHandle::default();
         let meetings_dir = tempfile::tempdir().unwrap();
+        let db_path = meetings_dir.path().join("audetic.db");
         let mut machine = MeetingMachine::new(
             Box::new(mic),
             Box::new(system),
             Arc::new(UnusedTranscription),
-            Arc::new(PostProcessingService::new()),
+            Arc::new(PostProcessingService::new(db_path.clone())),
             Indicator::new().with_audio_feedback(false),
             status.clone(),
             meetings_dir.path().to_path_buf(),
@@ -1059,11 +1065,12 @@ mod tests {
         );
         let status = MeetingStatusHandle::default();
         let meetings_dir = tempfile::tempdir().unwrap();
+        let db_path = meetings_dir.path().join("audetic.db");
         let mut machine = MeetingMachine::new(
             Box::new(mic),
             Box::new(system),
             Arc::new(UnusedTranscription),
-            Arc::new(PostProcessingService::new()),
+            Arc::new(PostProcessingService::new(db_path.clone())),
             Indicator::new().with_audio_feedback(false),
             status.clone(),
             meetings_dir.path().to_path_buf(),
@@ -1130,11 +1137,12 @@ mod tests {
         );
         let status = MeetingStatusHandle::default();
         let meetings_dir = tempfile::tempdir().unwrap();
+        let db_path = meetings_dir.path().join("audetic.db");
         let mut machine = MeetingMachine::new(
             Box::new(mic),
             Box::new(system),
             Arc::new(UnusedTranscription),
-            Arc::new(PostProcessingService::new()),
+            Arc::new(PostProcessingService::new(db_path.clone())),
             Indicator::new().with_audio_feedback(false),
             status.clone(),
             meetings_dir.path().to_path_buf(),
@@ -1178,6 +1186,7 @@ mod tests {
         );
         let status = MeetingStatusHandle::default();
         let meetings_dir = tempfile::tempdir().unwrap();
+        let db_path = meetings_dir.path().join("audetic.db");
         let mut machine = MeetingMachine::new(
             Box::new(mic),
             Box::new(ContinuousSystemSource {
@@ -1185,7 +1194,7 @@ mod tests {
                 active: false,
             }),
             Arc::new(UnusedTranscription),
-            Arc::new(PostProcessingService::new()),
+            Arc::new(PostProcessingService::new(db_path.clone())),
             Indicator::new().with_audio_feedback(false),
             status.clone(),
             meetings_dir.path().to_path_buf(),
@@ -1240,6 +1249,7 @@ mod tests {
         );
         let status = MeetingStatusHandle::default();
         let meetings_dir = tempfile::tempdir().unwrap();
+        let db_path = meetings_dir.path().join("audetic.db");
         let mut machine = MeetingMachine::new(
             Box::new(mic),
             Box::new(ContinuousSystemSource {
@@ -1247,7 +1257,7 @@ mod tests {
                 active: false,
             }),
             Arc::new(UnusedTranscription),
-            Arc::new(PostProcessingService::new()),
+            Arc::new(PostProcessingService::new(db_path.clone())),
             Indicator::new().with_audio_feedback(false),
             status.clone(),
             meetings_dir.path().to_path_buf(),
@@ -1284,6 +1294,7 @@ mod tests {
         );
         let status = MeetingStatusHandle::default();
         let meetings_dir = tempfile::tempdir().unwrap();
+        let db_path = meetings_dir.path().join("audetic.db");
         let mut machine = MeetingMachine::new(
             Box::new(mic),
             Box::new(ContinuousSystemSource {
@@ -1291,7 +1302,7 @@ mod tests {
                 active: false,
             }),
             Arc::new(UnusedTranscription),
-            Arc::new(PostProcessingService::new()),
+            Arc::new(PostProcessingService::new(db_path.clone())),
             Indicator::new().with_audio_feedback(false),
             status.clone(),
             meetings_dir.path().to_path_buf(),
@@ -1324,6 +1335,7 @@ mod tests {
         );
         let status = MeetingStatusHandle::default();
         let meetings_dir = tempfile::tempdir().unwrap();
+        let db_path = meetings_dir.path().join("audetic.db");
         let mut machine = MeetingMachine::new(
             Box::new(mic),
             Box::new(ContinuousSystemSource {
@@ -1331,7 +1343,7 @@ mod tests {
                 active: false,
             }),
             Arc::new(UnusedTranscription),
-            Arc::new(PostProcessingService::new()),
+            Arc::new(PostProcessingService::new(db_path.clone())),
             Indicator::new().with_audio_feedback(false),
             status.clone(),
             meetings_dir.path().to_path_buf(),
@@ -1370,6 +1382,7 @@ mod tests {
         );
         let status = MeetingStatusHandle::default();
         let meetings_dir = tempfile::tempdir().unwrap();
+        let db_path = meetings_dir.path().join("audetic.db");
         let mut machine = MeetingMachine::new(
             Box::new(mic),
             Box::new(ContinuousSystemSource {
@@ -1377,7 +1390,7 @@ mod tests {
                 active: false,
             }),
             Arc::new(UnusedTranscription),
-            Arc::new(PostProcessingService::new()),
+            Arc::new(PostProcessingService::new(db_path.clone())),
             Indicator::new().with_audio_feedback(false),
             status.clone(),
             meetings_dir.path().to_path_buf(),

@@ -7,6 +7,8 @@
 //! back to the caller — a slow or failing hook must not stall the
 //! meeting/dictation pipeline.
 
+use std::path::{Path, PathBuf};
+
 use tracing::{info, warn};
 
 use super::event::Event;
@@ -16,16 +18,20 @@ use super::repository::JobRepository;
 
 /// Service handed to the meeting and recording machines.
 ///
-/// The DB connection is opened per-dispatch (same shape as the rest of
-/// the daemon — `meeting::api` and friends call `db::init_db()?` on
-/// demand). Keeping the service stateless means no Mutex contention and
-/// the service can be cloned freely.
-#[derive(Clone, Default)]
-pub struct PostProcessingService;
+/// The DB connection is opened per-dispatch. Carrying the path keeps tests
+/// isolated from the user's database without holding a shared connection.
+#[derive(Clone)]
+pub struct PostProcessingService {
+    db_path: PathBuf,
+}
 
 impl PostProcessingService {
-    pub fn new() -> Self {
-        Self
+    pub fn new(db_path: PathBuf) -> Self {
+        Self { db_path }
+    }
+
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
     }
 
     /// Fire matching jobs for `event`. Returns immediately; spawned
@@ -34,7 +40,7 @@ impl PostProcessingService {
         let kind = event.kind();
         let payload = event.to_envelope();
 
-        let jobs = match load_jobs(kind) {
+        let jobs = match load_jobs(&self.db_path, kind) {
             Ok(j) => j,
             Err(e) => {
                 warn!(
@@ -75,8 +81,8 @@ impl PostProcessingService {
     }
 }
 
-fn load_jobs(kind: super::event::EventKind) -> anyhow::Result<Vec<Job>> {
-    let conn = crate::db::init_db()?;
+fn load_jobs(db_path: &Path, kind: super::event::EventKind) -> anyhow::Result<Vec<Job>> {
+    let conn = crate::db::init_db_at(db_path)?;
     JobRepository::list_enabled_for_event(&conn, kind)
 }
 

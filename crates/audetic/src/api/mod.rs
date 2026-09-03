@@ -101,10 +101,12 @@ impl ApiServer {
         inspector: std::sync::Arc<dyn crate::meeting::MediaInspector>,
         meetings_dir: std::path::PathBuf,
     ) -> Self {
-        let services = crate::meeting::ProcessingServices {
-            transcription: transcription.clone(),
+        let db_path = post_processing.db_path().to_path_buf();
+        let services = crate::meeting::ProcessingServices::new(
+            transcription.clone(),
             post_processing,
-        };
+            db_path,
+        );
         self.meeting_state = Some(routes::meetings::MeetingState {
             tx: self.recording_state.tx.clone(),
             status: meeting_status,

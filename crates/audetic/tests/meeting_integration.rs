@@ -141,20 +141,20 @@ fn build_test_machine(
     mic_samples: Vec<f32>,
     system_samples: Vec<f32>,
     transcription: Arc<dyn TranscriptionJobService>,
-) -> (MeetingMachine, MeetingStatusHandle) {
+) -> (MeetingMachine, MeetingStatusHandle, std::path::PathBuf) {
     let mic: Box<dyn MeetingMicSource> = Box::new(MockAudioSource::new(mic_samples, 16000));
     let system: Box<dyn MeetingSystemSource> =
         Box::new(MockAudioSource::new(system_samples, 16000));
     let indicator = Indicator::new().with_audio_feedback(false);
     let status = MeetingStatusHandle::default();
-    let post_processing = Arc::new(PostProcessingService::new());
 
-    // Each test gets its own meetings dir under /tmp so concurrent test threads
-    // can't clobber one another's audio files. Matches what `app::mod`
-    // computes from `dirs::data_dir()` in production.
+    // Each test gets its own meetings dir and database under /tmp so concurrent
+    // tests cannot clobber one another or write into the user's database.
     let meetings_dir = tempfile::tempdir()
         .expect("create test meetings dir")
         .keep();
+    let db_path = meetings_dir.join("audetic.db");
+    let post_processing = Arc::new(PostProcessingService::new(db_path.clone()));
     let machine = MeetingMachine::new(
         mic,
         system,
@@ -164,7 +164,7 @@ fn build_test_machine(
         status.clone(),
         meetings_dir,
     );
-    (machine, status)
+    (machine, status, db_path)
 }
 
 /// Generate a small sine-ish buffer so downstream ffmpeg has real audio.
@@ -204,7 +204,7 @@ async fn wait_for_terminal(status: &MeetingStatusHandle, timeout: Duration) -> M
 #[tokio::test]
 async fn test_meeting_stop_when_idle_errors() {
     let (transcription, _count) = MockTranscription::ok("ignored");
-    let (mut machine, _status) =
+    let (mut machine, _status, _db_path) =
         build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription));
 
     let result = machine.stop().await;
@@ -224,13 +224,19 @@ async fn test_meeting_stop_when_idle_errors() {
 #[tokio::test]
 async fn test_meeting_start_while_recording_errors() {
     let (transcription, _count) = MockTranscription::ok("ignored");
-    let (mut machine, status) =
+    let (mut machine, status, db_path) =
         build_test_machine(fake_audio(0.5), fake_audio(0.5), Arc::new(transcription));
 
     let first = machine
         .start(None)
         .await
         .expect("first start should succeed");
+
+    let conn = audetic::db::init_db_at(&db_path).expect("open isolated test database");
+    let persisted = audetic::db::meetings::MeetingRepository::get(&conn, first.meeting_id)
+        .expect("query isolated test database")
+        .expect("meeting should be persisted in isolated test database");
+    assert_eq!(persisted.audio_path, first.audio_path.to_string_lossy());
 
     let second = machine.start(None).await;
     assert!(second.is_err(), "second start must return Err");
@@ -256,7 +262,7 @@ async fn test_meeting_start_while_recording_errors() {
 async fn test_meeting_cancel_during_recording() {
     let (transcription, count) = MockTranscription::ok("should not be called");
     let transcription = Arc::new(transcription);
-    let (mut machine, status) = build_test_machine(
+    let (mut machine, status, _db_path) = build_test_machine(
         fake_audio(0.5),
         fake_audio(0.5),
         Arc::clone(&transcription) as Arc<dyn TranscriptionJobService>,
@@ -280,7 +286,7 @@ async fn test_meeting_cancel_during_recording() {
 #[tokio::test]
 async fn test_meeting_cancel_when_idle_errors() {
     let (transcription, _count) = MockTranscription::ok("ignored");
-    let (mut machine, _status) =
+    let (mut machine, _status, _db_path) =
         build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription));
 
     let result = machine.cancel().await;
@@ -296,7 +302,7 @@ async fn test_meeting_cancel_when_idle_errors() {
 #[tokio::test]
 async fn test_meeting_happy_path() {
     let (transcription, call_count) = MockTranscription::ok("hello world from the mock");
-    let (mut machine, status) =
+    let (mut machine, status, _db_path) =
         build_test_machine(fake_audio(0.5), fake_audio(0.5), Arc::new(transcription));
 
     let start = machine
@@ -332,7 +338,7 @@ async fn test_meeting_happy_path() {
 #[tokio::test]
 async fn test_meeting_transcription_failure() {
     let (transcription, _count) = MockTranscription::failing();
-    let (mut machine, status) =
+    let (mut machine, status, _db_path) =
         build_test_machine(fake_audio(0.5), fake_audio(0.5), Arc::new(transcription));
 
     let _start = machine.start(None).await.expect("start");
@@ -357,7 +363,7 @@ async fn test_meeting_transcription_failure() {
 #[tokio::test]
 async fn test_confirm_when_not_in_review_errors() {
     let (transcription, _count) = MockTranscription::ok("ignored");
-    let (mut machine, _status) =
+    let (mut machine, _status, _db_path) =
         build_test_machine(Vec::new(), Vec::new(), Arc::new(transcription));
 
     // No meeting recorded yet — confirm has nothing to act on.
@@ -374,7 +380,7 @@ async fn test_confirm_when_not_in_review_errors() {
 #[tokio::test]
 async fn test_cancel_from_review_discards_recording() {
     let (transcription, count) = MockTranscription::ok("should not be called");
-    let (mut machine, status) =
+    let (mut machine, status, _db_path) =
         build_test_machine(fake_audio(0.5), fake_audio(0.5), Arc::new(transcription));
 
     let _start = machine.start(None).await.expect("start");
@@ -399,7 +405,7 @@ async fn test_cancel_from_review_discards_recording() {
 async fn test_confirm_with_trim_shortens_duration() {
     let (transcription, _count) = MockTranscription::ok("trimmed");
     // 2 seconds of audio so a [0.5, 1.0) trim is well within range.
-    let (mut machine, status) =
+    let (mut machine, status, _db_path) =
         build_test_machine(fake_audio(2.0), fake_audio(2.0), Arc::new(transcription));
 
     let _start = machine.start(None).await.expect("start");

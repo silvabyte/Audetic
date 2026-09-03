@@ -31,6 +31,25 @@ use super::status::MeetingPhase;
 pub struct ProcessingServices {
     pub transcription: Arc<dyn TranscriptionJobService>,
     pub post_processing: Arc<PostProcessingService>,
+    pub db_path: PathBuf,
+}
+
+impl ProcessingServices {
+    pub fn new(
+        transcription: Arc<dyn TranscriptionJobService>,
+        post_processing: Arc<PostProcessingService>,
+        db_path: PathBuf,
+    ) -> Self {
+        Self {
+            transcription,
+            post_processing,
+            db_path,
+        }
+    }
+
+    fn open_db(&self) -> anyhow::Result<rusqlite::Connection> {
+        db::init_db_at(&self.db_path)
+    }
 }
 
 /// One pipeline invocation. The audio file at `audio_path` must already be
@@ -66,7 +85,7 @@ pub async fn process_meeting(args: ProcessingArgs) {
         Err(e) => {
             let error_msg = e.to_string();
             error!("Meeting {} compression failed: {}", meeting_id, error_msg);
-            if let Ok(conn) = db::init_db() {
+            if let Ok(conn) = services.open_db() {
                 let _ =
                     MeetingRepository::fail(&conn, meeting_id, &error_msg, duration_seconds as i64);
             }
@@ -105,7 +124,7 @@ pub async fn process_meeting(args: ProcessingArgs) {
     );
 
     observer.on_phase(MeetingPhase::Transcribing).await;
-    if let Ok(conn) = db::init_db() {
+    if let Ok(conn) = services.open_db() {
         let _ = MeetingRepository::update_status(&conn, meeting_id, MeetingPhase::Transcribing);
         // Keep the DB row pointing at the file that actually exists. The
         // source is gone after a successful copy; retries / file UI need
@@ -135,7 +154,7 @@ pub async fn process_meeting(args: ProcessingArgs) {
                 error!("Failed to write transcript file: {}", e);
             }
 
-            let canonical_title = if let Ok(conn) = db::init_db() {
+            let canonical_title = if let Ok(conn) = services.open_db() {
                 let _ = MeetingRepository::complete(
                     &conn,
                     meeting_id,
@@ -176,13 +195,13 @@ pub async fn process_meeting(args: ProcessingArgs) {
                 ));
 
             observer.on_complete(&result.text).await;
-            super::title::spawn_title_generation(meeting_id);
+            super::title::spawn_title_generation_at(meeting_id, services.db_path.clone());
         }
         Err(e) => {
             error!("Meeting {} transcription failed: {}", meeting_id, e);
             let error_msg = e.to_string();
 
-            if let Ok(conn) = db::init_db() {
+            if let Ok(conn) = services.open_db() {
                 let _ =
                     MeetingRepository::fail(&conn, meeting_id, &error_msg, duration_seconds as i64);
             }
