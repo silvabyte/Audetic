@@ -180,7 +180,7 @@ pub enum MeetingCommand {
     Import {
         /// Path to the media file (audio or video) to import
         path: PathBuf,
-        /// Optional meeting title; defaults to the filename
+        /// Optional Manual Title; otherwise generated from the transcript
         #[arg(short, long)]
         title: Option<String>,
     },

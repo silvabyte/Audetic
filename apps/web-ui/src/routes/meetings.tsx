@@ -5,11 +5,9 @@ import {
   type ActionFunctionArgs,
   type RouteObject,
 } from "react-router-dom";
-import { Radio, Upload } from "lucide-react";
+import { ChevronDown, Radio, Upload } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
 import {
   Card,
   CardContent,
@@ -18,15 +16,12 @@ import {
   CardTitle,
 } from "@/components/ui/card";
 import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from "@/components/ui/popover";
 import { Skeleton } from "@/components/ui/skeleton";
+import { MeetingTitlePickerContent } from "@/components/meeting-title-picker";
 import { MeetingRow } from "@/components/meeting-row";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
@@ -59,7 +54,7 @@ const ACCEPTED_EXTENSIONS = [
 const ACCEPTED_ATTR = ACCEPTED_EXTENSIONS.join(",");
 
 /**
- * /meetings — list + start dialog.
+ * /meetings — list + immediate start control.
  *
  * Loader kicks off the list fetch (idempotent). The banner on the
  * AppShell handles in-flight meetings; this page is for "what's in
@@ -161,7 +156,7 @@ function MeetingsRoute() {
               to toggle via hotkey, or drop an audio/video file to import.
             </p>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex w-full flex-wrap items-center justify-end gap-2 sm:w-auto">
             <ImportFileButton />
             <StartMeetingButton />
           </div>
@@ -326,13 +321,11 @@ function StartMeetingButton() {
   const [title, setTitle] = useState("");
   const submitting = fetcher.state !== "idle";
 
-  // Close dialog once a successful submit resolves. fetcher.data stays
-  // null (our actions return null) so we key off idle + previously submit.
-  // Simple approach: reset + close on submit happening.
-  function handleSubmit(e: React.FormEvent<HTMLFormElement>): void {
-    e.preventDefault();
-    const formData = new FormData(e.currentTarget);
-    fetcher.submit(formData, { method: "post", action: "/meetings" });
+  function startWithTitle(selectedTitle: string): void {
+    fetcher.submit(
+      { intent: MEETING_INTENTS.start, title: selectedTitle },
+      { method: "post", action: "/meetings" },
+    );
     setOpen(false);
     setTitle("");
   }
@@ -349,56 +342,56 @@ function StartMeetingButton() {
           phase === "running_hook";
 
         return (
-          <Dialog open={open} onOpenChange={setOpen}>
-            <DialogTrigger asChild>
-              <Button disabled={inProgress || submitting}>
+          <div className="inline-flex rounded-md shadow-xs">
+            <fetcher.Form method="post" action="/meetings">
+              <input type="hidden" name="intent" value={MEETING_INTENTS.start} />
+              <Button
+                type="submit"
+                disabled={inProgress || submitting}
+                className="rounded-r-none"
+              >
                 <Radio className="mr-2 h-4 w-4" />
-                New meeting
+                {submitting ? "Starting…" : "New meeting"}
               </Button>
-            </DialogTrigger>
-            <DialogContent>
-              <DialogHeader>
-                <DialogTitle>Start a meeting</DialogTitle>
-                <DialogDescription>
-                  Optional title helps find it later. After you press Stop you
-                  can trim the recording before it's transcribed.
-                </DialogDescription>
-              </DialogHeader>
-              <form onSubmit={handleSubmit} className="space-y-4">
-                <input
-                  type="hidden"
-                  name="intent"
-                  value={MEETING_INTENTS.start}
-                />
-                <div className="space-y-2">
-                  <Label htmlFor="meeting-title">Title</Label>
-                  <Input
-                    id="meeting-title"
-                    name="title"
-                    type="text"
-                    placeholder="e.g. Design sync with Alex"
-                    value={title}
-                    onChange={(e) => setTitle(e.target.value)}
-                    autoFocus
-                    autoComplete="off"
-                  />
+            </fetcher.Form>
+            <Popover
+              open={open}
+              onOpenChange={(nextOpen) => {
+                setOpen(nextOpen);
+                if (!nextOpen) setTitle("");
+              }}
+            >
+              <PopoverTrigger asChild>
+                <Button
+                  type="button"
+                  disabled={inProgress || submitting}
+                  className="rounded-l-none border-l border-primary-foreground/20 px-2"
+                  aria-label="Start meeting with a title"
+                >
+                  <ChevronDown className="h-4 w-4" />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent
+                align="end"
+                className="w-80 p-2"
+                aria-label="Choose a meeting title"
+              >
+                <div className="px-2 pb-2 pt-1">
+                  <p className="text-xs font-medium">Start with a title</p>
+                  <p className="text-[11px] text-muted-foreground">
+                    Search recent titles or enter a new one.
+                  </p>
                 </div>
-                <DialogFooter>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => setOpen(false)}
-                  >
-                    Cancel
-                  </Button>
-                  <Button type="submit" disabled={submitting}>
-                    <Radio className="mr-2 h-4 w-4" />
-                    Start
-                  </Button>
-                </DialogFooter>
-              </form>
-            </DialogContent>
-          </Dialog>
+                <MeetingTitlePickerContent
+                  value={title}
+                  onValueChange={setTitle}
+                  onSubmit={startWithTitle}
+                  submitLabel="Start"
+                  disabled={submitting}
+                />
+              </PopoverContent>
+            </Popover>
+          </div>
         );
       }}
     </Observer>

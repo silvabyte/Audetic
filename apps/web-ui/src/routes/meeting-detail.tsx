@@ -13,17 +13,22 @@ import {
   AlertTriangle,
   ArrowLeft,
   Bot,
+  Check,
+  ChevronDown,
   Copy,
   FileText,
   FolderOpen,
   Loader2,
+  Pencil,
   RefreshCcw,
   Sparkles,
   Trash2,
   Wrench,
+  X,
 } from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import {
   Card,
   CardContent,
@@ -33,11 +38,18 @@ import {
 } from "@/components/ui/card";
 import { Skeleton } from "@/components/ui/skeleton";
 import {
+  Popover,
+  PopoverAnchor,
+  PopoverContent,
+} from "@/components/ui/popover";
+import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
+import { meetingDisplayTitle } from "@/lib/meeting-title";
+import { RecentTitleSuggestions } from "@/components/meeting-title-picker";
 import { useStore } from "@/stores/root-store";
 import { getRootStore } from "@/stores/singleton";
 import {
@@ -169,7 +181,11 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
   }, [meetingArtifacts, meetingId]);
 
   const handleDelete = async (): Promise<void> => {
-    const label = detail.title ?? "this meeting";
+    const label = meetingDisplayTitle({
+      title: detail.title,
+      sourceFilename: detail.source_filename,
+      startedAt: detail.started_at,
+    });
     if (!window.confirm(`Delete "${label}"? This hides it from all views.`)) {
       return;
     }
@@ -184,34 +200,20 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
 
   return (
     <>
-      <header className="flex items-start justify-between gap-4">
-        <div className="min-w-0">
-          <h1 className="text-2xl font-semibold">
-            {detail.title ?? <span className="text-muted-foreground">Untitled meeting</span>}
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            {new Date(detail.started_at).toLocaleString()}
-            {typeof detail.duration_seconds === "number"
-              ? ` · ${formatDuration(detail.duration_seconds)}`
-              : ""}
-            {" · "}
-            <span className="font-mono text-xs">{detail.status}</span>
-          </p>
-        </div>
-        {isDeletableMeetingStatus(detail.status) && (
-          <Button
-            variant="ghost"
-            size="sm"
-            className="shrink-0 text-muted-foreground hover:text-destructive"
-            onClick={() => {
-              void handleDelete();
-            }}
-          >
-            <Trash2 className="mr-1 h-3.5 w-3.5" />
-            Delete
-          </Button>
-        )}
-      </header>
+      <MeetingTitleHeader
+        meetingId={meetingId}
+        title={detail.title ?? null}
+        sourceFilename={detail.source_filename ?? null}
+        startedAt={detail.started_at}
+        durationSeconds={detail.duration_seconds ?? null}
+        status={detail.status}
+        showGenerate={detail.status === "completed"}
+        canGenerate={
+          detail.status === "completed" && Boolean(detail.transcript_text)
+        }
+        canDelete={isDeletableMeetingStatus(detail.status)}
+        onDelete={handleDelete}
+      />
 
       {isTranscribing && (
         <Card>
@@ -332,6 +334,270 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
     </>
   );
 });
+
+function MeetingTitleHeader({
+  meetingId,
+  title,
+  sourceFilename,
+  startedAt,
+  durationSeconds,
+  status,
+  showGenerate,
+  canGenerate,
+  canDelete,
+  onDelete,
+}: {
+  meetingId: number;
+  title: string | null;
+  sourceFilename: string | null;
+  startedAt: string;
+  durationSeconds: number | null;
+  status: string;
+  showGenerate: boolean;
+  canGenerate: boolean;
+  canDelete: boolean;
+  onDelete: () => Promise<void>;
+}) {
+  const store = useStore();
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState(title ?? "");
+  const [validationError, setValidationError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!editing) setDraft(title ?? "");
+  }, [editing, title]);
+
+  useEffect(() => {
+    if (status === "completed" && !title?.trim()) {
+      store.meetings.watchForGeneratedTitle(meetingId);
+    }
+  }, [meetingId, status, store, title]);
+
+  useEffect(() => {
+    if (!editing) return;
+    inputRef.current?.focus();
+    inputRef.current?.select();
+  }, [editing]);
+
+  function cancelEditing(): void {
+    setDraft(title ?? "");
+    setValidationError(null);
+    store.meetings.clearTitleMutationFeedback(meetingId);
+    setEditing(false);
+  }
+
+  async function saveTitle(nextTitle = draft): Promise<void> {
+    const trimmed = nextTitle.trim();
+    if (!trimmed) {
+      setValidationError("Title cannot be blank.");
+      inputRef.current?.focus();
+      return;
+    }
+    setValidationError(null);
+    const saved = await store.meetings.updateTitle(meetingId, trimmed);
+    if (saved) {
+      setDraft(trimmed);
+      setEditing(false);
+    }
+  }
+
+  async function generateTitle(): Promise<void> {
+    const accepted = await store.meetings.regenerateTitle(meetingId);
+    if (accepted) {
+      setEditing(false);
+      toast.message("Generating title from transcript", {
+        description: "The title will update here when generation finishes.",
+      });
+    }
+  }
+
+  return (
+    <Observer>
+      {() => {
+        const mutationStatus = store.meetings.titleMutationStatus[meetingId] ?? "idle";
+        const mutationError = store.meetings.titleMutationError[meetingId];
+        const saving = mutationStatus === "saving";
+        const generating = mutationStatus === "generating";
+        const displayTitle = meetingDisplayTitle({
+          title,
+          sourceFilename,
+          startedAt,
+        });
+        const usingDateFallback = !title?.trim() && !sourceFilename?.trim();
+
+        return (
+          <header className="flex flex-col items-start justify-between gap-4 sm:flex-row">
+            <div className="min-w-0 flex-1">
+              {editing ? (
+                <Popover open onOpenChange={(open) => !open && cancelEditing()}>
+                  <PopoverAnchor asChild>
+                    <div className="flex max-w-2xl items-center gap-1 rounded-md border border-primary/50 bg-background p-1 shadow-sm ring-2 ring-primary/10">
+                      <Input
+                        ref={inputRef}
+                        value={draft}
+                        onChange={(event) => {
+                          setDraft(event.target.value);
+                          setValidationError(null);
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") {
+                            event.preventDefault();
+                            void saveTitle();
+                          } else if (event.key === "Escape") {
+                            event.preventDefault();
+                            cancelEditing();
+                          }
+                        }}
+                        aria-label="Meeting title"
+                        aria-invalid={Boolean(validationError || mutationError)}
+                        autoComplete="off"
+                        disabled={saving}
+                        className="h-9 min-w-0 border-0 bg-transparent px-2 text-xl font-semibold shadow-none focus-visible:ring-0"
+                      />
+                      <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 shrink-0"
+                        aria-label="Save title"
+                        disabled={saving}
+                        onClick={() => void saveTitle()}
+                      >
+                        {saving ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Check className="h-4 w-4" />
+                        )}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8 shrink-0"
+                        aria-label="Cancel title edit"
+                        disabled={saving}
+                        onClick={cancelEditing}
+                      >
+                        <X className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </PopoverAnchor>
+                  <PopoverContent
+                    align="start"
+                    className="w-[min(24rem,calc(100vw-2rem))] p-2"
+                    onOpenAutoFocus={(event) => event.preventDefault()}
+                    aria-label="Recent meeting titles"
+                  >
+                    <div className="px-2 pb-1 pt-0.5 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                      Recent titles
+                    </div>
+                    <RecentTitleSuggestions
+                      query={draft === (title ?? "") ? "" : draft}
+                      disabled={saving}
+                      onSelect={(selectedTitle) => {
+                        setDraft(selectedTitle);
+                        void saveTitle(selectedTitle);
+                      }}
+                    />
+                  </PopoverContent>
+                </Popover>
+              ) : (
+                <div className="group flex max-w-full items-center gap-2">
+                  <h1
+                    className={cn(
+                      "min-w-0 truncate text-2xl font-semibold",
+                      !title?.trim() && "text-muted-foreground",
+                      !generating && "cursor-text",
+                    )}
+                    onClick={() => {
+                      if (generating) return;
+                      store.meetings.clearTitleMutationFeedback(meetingId);
+                      setDraft(title ?? "");
+                      setValidationError(null);
+                      setEditing(true);
+                    }}
+                  >
+                    {displayTitle}
+                  </h1>
+                  <button
+                    type="button"
+                    className="shrink-0 rounded-sm p-1 text-muted-foreground opacity-0 outline-none transition-opacity hover:text-foreground group-hover:opacity-100 focus-visible:opacity-100 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+                    onClick={() => {
+                      store.meetings.clearTitleMutationFeedback(meetingId);
+                      setDraft(title ?? "");
+                      setValidationError(null);
+                      setEditing(true);
+                    }}
+                    aria-label={`Edit meeting title: ${displayTitle}`}
+                    disabled={generating}
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+
+              <p className="mt-1 text-sm text-muted-foreground">
+                {!usingDateFallback && new Date(startedAt).toLocaleString()}
+                {typeof durationSeconds === "number"
+                  ? `${usingDateFallback ? "" : " · "}${formatDuration(durationSeconds)}`
+                  : ""}
+                {(durationSeconds !== null || !usingDateFallback) && " · "}
+                <span className="font-mono text-xs">{status}</span>
+              </p>
+              {(validationError || mutationError || generating) && (
+                <p
+                  className={cn(
+                    "mt-1 flex items-center gap-1.5 text-xs",
+                    generating ? "text-muted-foreground" : "text-destructive",
+                  )}
+                  role="status"
+                >
+                  {generating && <Loader2 className="h-3 w-3 animate-spin" />}
+                  {generating
+                    ? "Generating a title from the transcript…"
+                    : validationError ?? mutationError}
+                </p>
+              )}
+            </div>
+
+            <div className="flex shrink-0 flex-wrap items-center gap-1">
+              {showGenerate && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  disabled={!canGenerate || saving || generating}
+                  onClick={() => void generateTitle()}
+                  title={canGenerate ? undefined : "A transcript is required"}
+                >
+                  {generating ? (
+                    <Loader2 className="mr-1 h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Sparkles className="mr-1 h-3.5 w-3.5" />
+                  )}
+                  {generating ? "Generating…" : "Generate from transcript"}
+                </Button>
+              )}
+              {canDelete && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground hover:text-destructive"
+                  onClick={() => void onDelete()}
+                >
+                  <Trash2 className="mr-1 h-3.5 w-3.5" />
+                  Delete
+                </Button>
+              )}
+            </div>
+          </header>
+        );
+      }}
+    </Observer>
+  );
+}
 
 type TranscriptSegment = NonNullable<MeetingDetail["transcript_segments"]>[number];
 

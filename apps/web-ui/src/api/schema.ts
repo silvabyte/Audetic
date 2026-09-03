@@ -215,8 +215,8 @@ export interface paths {
          * Import a media file as a new meeting.
          * @description Accepts a `multipart/form-data` body with:
          *     - `file`: the audio or video bytes (required)
-         *     - `title`: optional human-readable title; defaults to the filename
-         *       stem if absent
+         *     - `title`: optional Manual Title; absent or blank imports remain untitled
+         *       until transcript-derived generation succeeds
          *
          *     The file is streamed chunk-by-chunk into a temp file under the meetings
          *     directory, then handed to `meeting::import_meeting_file`, which moves
@@ -226,6 +226,22 @@ export interface paths {
          *     callers shouldn't depend on the filesystem layout.
          */
         post: operations["import_meeting"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/meetings/recent-titles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["recent_meeting_titles"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -382,6 +398,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/meetings/{id}/regenerate-title": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["regenerate_meeting_title"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/meetings/{id}/retry": {
         parameters: {
             query?: never;
@@ -404,6 +436,22 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/meetings/{id}/title": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["update_meeting_title"];
         trace?: never;
     };
     "/models": {
@@ -1141,9 +1189,11 @@ export interface components {
             error?: string | null;
             /** Format: int64 */
             id: number;
+            source_filename?: string | null;
             started_at: string;
             status: string;
             title?: string | null;
+            title_source?: null | components["schemas"]["MeetingTitleSource"];
             transcript_path?: string | null;
             /**
              * @description Per-segment timestamps for clickable transcript lines. `None` for
@@ -1227,10 +1277,30 @@ export interface components {
             duration_seconds?: number | null;
             /** Format: int64 */
             id: number;
+            source_filename?: string | null;
             started_at: string;
             status: string;
             title?: string | null;
+            title_source?: null | components["schemas"]["MeetingTitleSource"];
             transcript_path?: string | null;
+        };
+        MeetingTitleRegenerationResponse: {
+            /** Format: int64 */
+            meeting_id: number;
+            message: string;
+            success: boolean;
+        };
+        MeetingTitleResponse: {
+            /** Format: int64 */
+            meeting_id: number;
+            title?: string | null;
+            title_source?: null | components["schemas"]["MeetingTitleSource"];
+        };
+        /** @enum {string} */
+        MeetingTitleSource: "manual" | "generated";
+        MeetingTitleUpdateRequest: {
+            /** @description New non-empty Manual Title. */
+            title: string;
         };
         /**
          * @description Result of a meeting toggle. Shape varies by whether a meeting was
@@ -1358,6 +1428,9 @@ export interface components {
             success: boolean;
             /** @description Transcription result (if successful) */
             transcription?: string | null;
+        };
+        RecentMeetingTitlesResponse: {
+            titles: string[];
         };
         /**
          * @description Default (non-waybar) recording status snapshot. The waybar variant
@@ -1906,6 +1979,29 @@ export interface operations {
             };
         };
     };
+    recent_meeting_titles: {
+        parameters: {
+            query?: {
+                /** @description Maximum distinct Manual Titles to return (default 10, maximum 50). */
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Distinct recent Manual Titles ordered by latest use */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecentMeetingTitlesResponse"];
+                };
+            };
+        };
+    };
     start_meeting: {
         parameters: {
             query?: never;
@@ -2227,6 +2323,43 @@ export interface operations {
             };
         };
     };
+    regenerate_meeting_title: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Meeting id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Title ownership released and regeneration started */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeetingTitleRegenerationResponse"];
+                };
+            };
+            /** @description Meeting not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Meeting is not completed or has no transcript */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     retry_meeting: {
         parameters: {
             query?: never;
@@ -2257,6 +2390,47 @@ export interface operations {
             };
             /** @description Meeting is not in a retry-eligible state, or audio file missing */
             409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_meeting_title: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Meeting id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["MeetingTitleUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Meeting Title updated with manual ownership */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MeetingTitleResponse"];
+                };
+            };
+            /** @description Meeting Title is blank */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Meeting not found */
+            404: {
                 headers: {
                     [name: string]: unknown;
                 };

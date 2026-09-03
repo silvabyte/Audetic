@@ -23,7 +23,10 @@ export function AppShell() {
         <CommandBar />
         <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
           <aside className="w-full shrink-0 border-b bg-card sm:w-52 sm:border-b-0 sm:border-r">
-            <nav className="flex gap-1 overflow-x-auto p-2 sm:block sm:space-y-1 sm:px-2 sm:pt-4" aria-label="Application sections">
+            <nav
+              className="flex gap-1 overflow-x-auto p-2 sm:block sm:space-y-1 sm:px-2 sm:pt-4"
+              aria-label="Application sections"
+            >
               {navItems.map((item) => {
                 const Icon = item.icon;
                 return (
@@ -41,7 +44,7 @@ export function AppShell() {
                     }
                   >
                     <Icon className="h-4 w-4" />
-                    {item.label}
+                    <span className="sr-only sm:not-sr-only">{item.label}</span>
                   </NavLink>
                 );
               })}
