@@ -95,11 +95,15 @@ pub fn resample_mono_f32(input: &[f32], from_rate: u32, to_rate: u32) -> Result<
     }
 
     while output.len() < required_len {
+        // FftFixedIn can buffer a flush chunk without emitting until it has a full FFT window.
+        let expected_output_frames = resampler.output_frames_next();
         let (_, produced) = resampler
             .process_partial_into_buffer::<&[f32], Vec<f32>>(None, &mut output_buffer, None)
             .context("rubato resampler flush failed")?;
-        if produced == 0 {
-            bail!("rubato resampler stopped before producing the expected clip length");
+        if produced == 0 && expected_output_frames != 0 {
+            bail!(
+                "rubato resampler produced no frames when {expected_output_frames} were expected"
+            );
         }
         output.extend_from_slice(&output_buffer[0][..produced]);
     }
@@ -137,5 +141,14 @@ mod tests {
         let second = resample_mono_f32(&vec![-0.5; 1_000], 44_100, 16_000).unwrap();
 
         assert_eq!(first.len() + second.len(), 724);
+    }
+
+    #[test]
+    fn normalizes_when_flush_temporarily_produces_no_frames() {
+        let input = vec![0.25; 135_168];
+
+        let output = resample_mono_f32(&input, 44_100, 16_000).unwrap();
+
+        assert_eq!(output.len(), 49_040);
     }
 }
