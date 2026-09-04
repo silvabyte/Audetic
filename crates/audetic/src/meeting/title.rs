@@ -1,6 +1,7 @@
 //! Transcript-derived Meeting Title generation through configured local agents.
 
 use anyhow::{Context, Result};
+use audetic_core::sync::RecordId;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 
@@ -39,7 +40,12 @@ async fn generate_meeting_title_at(meeting_id: i64, db_path: &Path) -> Result<Op
     let data_dir = db_path
         .parent()
         .context("Audetic database path has no parent directory")?;
-    let paths = prepare_title_run(data_dir, meeting_id, &transcript, &profile.name)?;
+    let paths = prepare_title_run(
+        data_dir,
+        &meeting_id.to_string(),
+        &transcript,
+        &profile.name,
+    )?;
     let prompt = std::fs::read_to_string(&paths.prompt_path)
         .with_context(|| format!("Failed to read title prompt at {:?}", paths.prompt_path))?;
     let run_dir = paths.run_dir.clone();
@@ -73,6 +79,48 @@ async fn generate_meeting_title_at(meeting_id: i64, db_path: &Path) -> Result<Op
     } else {
         Ok(None)
     }
+}
+
+pub async fn generate_shared_meeting_title(
+    meeting_id: RecordId,
+    transcript: &str,
+    db_path: &Path,
+) -> Result<String> {
+    if transcript.trim().is_empty() {
+        anyhow::bail!("meeting {meeting_id} has no transcript text");
+    }
+    let conn = crate::db::open_db_at(db_path).context("Failed to open audetic database")?;
+    AgentProfileRepository::ensure_builtin_profiles(&conn)?;
+    let profile = AgentProfileRepository::first_available(&conn)?
+        .ok_or_else(|| anyhow::anyhow!("no available enabled agent profiles configured"))?;
+    let data_dir = db_path
+        .parent()
+        .context("Audetic database path has no parent directory")?;
+    let paths = prepare_title_run(data_dir, &meeting_id.to_string(), transcript, &profile.name)?;
+    let prompt = std::fs::read_to_string(&paths.prompt_path)
+        .with_context(|| format!("Failed to read title prompt at {:?}", paths.prompt_path))?;
+    let run_dir = paths.run_dir.clone();
+    let output = run_agent(AgentRunRequest {
+        profile,
+        prompt,
+        paths,
+        timeout_seconds: TITLE_AGENT_TIMEOUT_SECONDS,
+    })
+    .await;
+    let _ = std::fs::remove_dir_all(run_dir);
+    let output = output?;
+    if !output.success {
+        anyhow::bail!(
+            "title agent failed{}: {}",
+            output
+                .exit_code
+                .map(|code| format!(" with exit code {code}"))
+                .unwrap_or_default(),
+            output.stderr.trim()
+        );
+    }
+    normalize_generated_title(&output.stdout)
+        .ok_or_else(|| anyhow::anyhow!("title agent returned an invalid Generated Title"))
 }
 
 /// Start title generation without joining it to meeting completion.
@@ -125,7 +173,7 @@ pub fn prepare_title_regeneration(meeting_id: i64) -> Result<()> {
 
 fn prepare_title_run(
     data_dir: &Path,
-    meeting_id: i64,
+    meeting_id: &str,
     transcript: &str,
     profile_name: &str,
 ) -> Result<AgentRunPaths> {
@@ -169,7 +217,7 @@ fn prepare_title_run(
     })
 }
 
-fn render_title_prompt(meeting_id: i64, transcript_path: &std::path::Path) -> String {
+fn render_title_prompt(meeting_id: &str, transcript_path: &std::path::Path) -> String {
     format!(
         r#"Create a concise Meeting Title for Audetic meeting {meeting_id}.
 
@@ -293,7 +341,7 @@ mod tests {
 
     #[test]
     fn prompt_states_the_public_title_constraints() {
-        let prompt = render_title_prompt(42, std::path::Path::new("/tmp/transcript.md"));
+        let prompt = render_title_prompt("42", std::path::Path::new("/tmp/transcript.md"));
         assert!(prompt.contains("3 to 8 specific words"));
         assert!(prompt.contains("dates, attendee or person names"));
         assert!(prompt.contains("quotation marks, or trailing punctuation"));

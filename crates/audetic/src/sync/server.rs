@@ -1,9 +1,9 @@
 use audetic_core::sync::HubId;
-use axum::extract::{DefaultBodyLimit, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header::ORIGIN, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use thiserror::Error;
@@ -17,8 +17,9 @@ use std::sync::Arc;
 use super::identity::{parse_stored_tailscale_login, parse_tailscale_login, LoginParseError};
 use super::library::HubLibrary;
 use super::protocol::{
-    DictationPage, HubApiError, HubInfo, ProtocolRange, SnapshotBatch, SnapshotBatchResponse,
-    HUB_DICTATIONS_ROUTE, HUB_ID_HEADER, HUB_INFO_ROUTE, HUB_SNAPSHOTS_ROUTE, MAX_DICTATION_PAGE,
+    DictationPage, HubApiError, HubInfo, MeetingPage, MeetingTitlePatch, ProtocolRange, RecordKind,
+    SharedMeeting, SnapshotBatch, SnapshotBatchResponse, HUB_DICTATIONS_ROUTE, HUB_ID_HEADER,
+    HUB_INFO_ROUTE, HUB_MEETINGS_ROUTE, HUB_SNAPSHOTS_ROUTE, MAX_DICTATION_PAGE, MAX_MEETING_PAGE,
     PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, TAILSCALE_FUNNEL_REQUEST_HEADER,
 };
 
@@ -78,6 +79,15 @@ impl HubServer {
             .route(HUB_INFO_ROUTE, get(info))
             .route(HUB_SNAPSHOTS_ROUTE, post(apply_snapshots))
             .route(HUB_DICTATIONS_ROUTE, get(page_dictations))
+            .route(HUB_MEETINGS_ROUTE, get(page_meetings))
+            .route(
+                "/v1/meetings/:sync_id",
+                get(get_meeting)
+                    .patch(update_meeting_title)
+                    .delete(delete_meeting),
+            )
+            .route("/v1/dictations/:sync_id", delete(delete_dictation))
+            .route("/v1/artifacts/:sync_id", delete(delete_artifact))
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .layer(middleware::from_fn_with_state(
                 self.state.clone(),
@@ -219,6 +229,192 @@ async fn page_dictations(
         )
             .into_response(),
     }
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+struct MeetingPageQuery {
+    q: Option<String>,
+    cursor: Option<String>,
+    /// Maximum meetings to return (default 50, maximum 100).
+    limit: Option<usize>,
+}
+
+#[utoipa::path(get,path="/v1/meetings",tag="hub_meetings",params(MeetingPageQuery),responses((status=200,body=MeetingPage),(status=400,body=HubApiError)))]
+async fn page_meetings(
+    State(state): State<Arc<HubServerConfig>>,
+    Query(query): Query<MeetingPageQuery>,
+) -> Response {
+    let Some(library) = &state.library else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HubApiError::new(
+                "library_unavailable",
+                "Shared Library is not active",
+            )),
+        )
+            .into_response();
+    };
+    match library.page_meetings(
+        query.q.as_deref(),
+        query.cursor.as_deref(),
+        query.limit.unwrap_or(50).min(MAX_MEETING_PAGE),
+    ) {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(HubApiError::new("invalid_page", error.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+#[utoipa::path(get,path="/v1/meetings/{sync_id}",tag="hub_meetings",params(("sync_id"=String,Path)),responses((status=200,body=SharedMeeting),(status=404,body=HubApiError)))]
+async fn get_meeting(
+    State(state): State<Arc<HubServerConfig>>,
+    Path(sync_id): Path<String>,
+) -> Response {
+    let Some(library) = &state.library else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HubApiError::new(
+                "library_unavailable",
+                "Shared Library is not active",
+            )),
+        )
+            .into_response();
+    };
+    let Ok(id) = sync_id.parse() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(HubApiError::new(
+                "invalid_record_id",
+                "record UUID is malformed",
+            )),
+        )
+            .into_response();
+    };
+    match library.meeting(id) {
+        Ok(Some(value)) => Json(value).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(HubApiError::new("not_found", "meeting not found")),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(HubApiError::new("storage_error", error.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+#[utoipa::path(patch,path="/v1/meetings/{sync_id}",tag="hub_meetings",params(("sync_id"=String,Path)),request_body=MeetingTitlePatch,responses((status=200,body=SharedMeeting),(status=409,body=HubApiError)))]
+async fn update_meeting_title(
+    State(state): State<Arc<HubServerConfig>>,
+    Path(sync_id): Path<String>,
+    Json(patch): Json<MeetingTitlePatch>,
+) -> Response {
+    let Some(library) = &state.library else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HubApiError::new(
+                "library_unavailable",
+                "Shared Library is not active",
+            )),
+        )
+            .into_response();
+    };
+    let Ok(id) = sync_id.parse() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(HubApiError::new(
+                "invalid_record_id",
+                "record UUID is malformed",
+            )),
+        )
+            .into_response();
+    };
+    match library.update_meeting_title(id, &patch) {
+        Ok(Some(value)) => Json(value).into_response(),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(HubApiError::new("not_found", "meeting not found")),
+        )
+            .into_response(),
+        Err(error) if error.to_string().contains("title_version_conflict") => (
+            StatusCode::CONFLICT,
+            Json(HubApiError::new(
+                "title_version_conflict",
+                "meeting title changed; reload and retry",
+            )),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(HubApiError::new("invalid_title", error.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+async fn delete_kind(state: Arc<HubServerConfig>, sync_id: String, kind: RecordKind) -> Response {
+    let Some(library) = &state.library else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HubApiError::new(
+                "library_unavailable",
+                "Shared Library is not active",
+            )),
+        )
+            .into_response();
+    };
+    let Ok(id) = sync_id.parse() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(HubApiError::new(
+                "invalid_record_id",
+                "record UUID is malformed",
+            )),
+        )
+            .into_response();
+    };
+    match library.delete(id, kind) {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(crate::db::shared_library::ApplySnapshotError::KindChanged) => (
+            StatusCode::CONFLICT,
+            Json(HubApiError::new(
+                "kind_changed",
+                "record UUID is reserved for another kind",
+            )),
+        )
+            .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(HubApiError::new("storage_error", error.to_string())),
+        )
+            .into_response(),
+    }
+}
+#[utoipa::path(delete,path="/v1/dictations/{sync_id}",tag="hub_dictations",params(("sync_id"=String,Path)),responses((status=204),(status=409,body=HubApiError)))]
+async fn delete_dictation(
+    State(state): State<Arc<HubServerConfig>>,
+    Path(id): Path<String>,
+) -> Response {
+    delete_kind(state, id, RecordKind::Dictation).await
+}
+#[utoipa::path(delete,path="/v1/meetings/{sync_id}",tag="hub_meetings",params(("sync_id"=String,Path)),responses((status=204),(status=409,body=HubApiError)))]
+async fn delete_meeting(
+    State(state): State<Arc<HubServerConfig>>,
+    Path(id): Path<String>,
+) -> Response {
+    delete_kind(state, id, RecordKind::Meeting).await
+}
+#[utoipa::path(delete,path="/v1/artifacts/{sync_id}",tag="hub_artifacts",params(("sync_id"=String,Path)),responses((status=204),(status=409,body=HubApiError)))]
+async fn delete_artifact(
+    State(state): State<Arc<HubServerConfig>>,
+    Path(id): Path<String>,
+) -> Response {
+    delete_kind(state, id, RecordKind::Artifact).await
 }
 
 async fn enforce_hub_policy(
@@ -375,7 +571,7 @@ fn insert_hub_id(headers: &mut HeaderMap, hub_id: HubId) {
     servers(
         (url = "http://127.0.0.1:3738", description = "Loopback listener behind Tailscale Serve"),
     ),
-    paths(info, apply_snapshots, page_dictations),
+    paths(info, apply_snapshots, page_dictations, page_meetings, get_meeting, update_meeting_title, delete_dictation, delete_meeting, delete_artifact),
     components(schemas(
         HubInfo, ProtocolRange, HubApiError, audetic_core::sync::HubId,
         audetic_core::sync::RecordId, audetic_core::sync::DeviceId,
@@ -385,6 +581,10 @@ fn insert_hub_id(headers: &mut HeaderMap, hub_id: HubId) {
         super::protocol::SnapshotBatchResponse, super::protocol::SharedDictation,
         super::protocol::DictationPage, super::protocol::ChangeOperation,
         super::protocol::ChangeEnvelope
+        ,super::protocol::MeetingPayload, super::protocol::MeetingSnapshot,
+        super::protocol::CompletedArtifactPayload, super::protocol::CompletedArtifactSnapshot,
+        super::protocol::Snapshot, super::protocol::SharedMeeting, super::protocol::SharedArtifact,
+        super::protocol::MeetingPage, super::protocol::MeetingTitlePatch
     )),
     tags(
         (name = "hub_discovery", description = "Home Hub discovery and compatibility"),
@@ -611,7 +811,7 @@ mod tests {
             },
         };
         let body = serde_json::to_vec(&SnapshotBatch {
-            snapshots: vec![snapshot],
+            snapshots: vec![snapshot.into()],
         })
         .unwrap();
         let make_request = |expected: HubId, body: Vec<u8>| {
@@ -677,16 +877,23 @@ mod tests {
     }
 
     #[test]
-    fn hub_api_document_contains_slice_two_dictation_operations() {
+    fn hub_api_document_contains_slice_three_library_operations() {
         let document = HubApiDoc::openapi();
         assert_eq!(
             document.servers.as_ref().unwrap()[0].url,
             super::super::protocol::HUB_LOOPBACK_BASE_URL
         );
-        assert_eq!(document.paths.paths.len(), 3);
+        assert_eq!(document.paths.paths.len(), 7);
         assert!(document.paths.paths.contains_key("/v1/info"));
         assert!(document.paths.paths.contains_key("/v1/snapshots"));
         assert!(document.paths.paths.contains_key("/v1/dictations"));
+        assert!(document
+            .paths
+            .paths
+            .contains_key("/v1/dictations/{sync_id}"));
+        assert!(document.paths.paths.contains_key("/v1/meetings"));
+        assert!(document.paths.paths.contains_key("/v1/meetings/{sync_id}"));
+        assert!(document.paths.paths.contains_key("/v1/artifacts/{sync_id}"));
         let operation = document
             .paths
             .paths

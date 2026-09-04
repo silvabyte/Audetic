@@ -13,8 +13,12 @@ pub const HUB_SNAPSHOTS_ROUTE: &str = "/v1/snapshots";
 pub const HUB_SNAPSHOTS_PATH: &str = "v1/snapshots";
 pub const HUB_DICTATIONS_ROUTE: &str = "/v1/dictations";
 pub const HUB_DICTATIONS_PATH: &str = "v1/dictations";
+pub const HUB_MEETINGS_ROUTE: &str = "/v1/meetings";
+pub const HUB_MEETINGS_PATH: &str = "v1/meetings";
+pub const HUB_ARTIFACTS_ROUTE: &str = "/v1/artifacts";
 pub const MAX_SNAPSHOT_BATCH: usize = 25;
 pub const MAX_DICTATION_PAGE: usize = 100;
+pub const MAX_MEETING_PAGE: usize = 100;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -27,6 +31,8 @@ pub const TAILSCALE_FUNNEL_REQUEST_HEADER: &str = "tailscale-funnel-request";
 #[serde(rename_all = "snake_case")]
 pub enum RecordKind {
     Dictation,
+    Meeting,
+    Artifact,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -48,9 +54,111 @@ pub struct DictationSnapshot {
     pub payload: DictationPayload,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MeetingPayload {
+    pub title: Option<String>,
+    pub title_source: Option<String>,
+    pub title_version: u64,
+    pub source_filename: Option<String>,
+    pub transcript_text: String,
+    pub transcript_segments: Option<Vec<audetic_core::jobs_client::Segment>>,
+    pub duration_seconds: u64,
+    pub status: String,
+    pub completed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MeetingSnapshot {
+    pub kind: RecordKind,
+    pub schema_version: u16,
+    pub record_id: RecordId,
+    pub origin_device_id: DeviceId,
+    pub local_version: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub payload: MeetingPayload,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct CompletedArtifactPayload {
+    pub artifact_kind: String,
+    pub title: String,
+    pub template_id: Option<String>,
+    pub agent_profile_name: Option<String>,
+    pub content_markdown: String,
+    pub completed_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct CompletedArtifactSnapshot {
+    pub kind: RecordKind,
+    pub schema_version: u16,
+    pub record_id: RecordId,
+    pub parent_record_id: RecordId,
+    pub origin_device_id: DeviceId,
+    pub local_version: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub payload: CompletedArtifactPayload,
+}
+
+/// A bounded upload item. The untagged representation preserves the domain
+/// envelope on the wire: every variant carries and validates its own `kind`.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+#[serde(untagged)]
+pub enum Snapshot {
+    Dictation(DictationSnapshot),
+    Meeting(MeetingSnapshot),
+    Artifact(CompletedArtifactSnapshot),
+}
+
+impl Snapshot {
+    pub const fn record_id(&self) -> RecordId {
+        match self {
+            Self::Dictation(value) => value.record_id,
+            Self::Meeting(value) => value.record_id,
+            Self::Artifact(value) => value.record_id,
+        }
+    }
+
+    pub const fn kind(&self) -> RecordKind {
+        match self {
+            Self::Dictation(_) => RecordKind::Dictation,
+            Self::Meeting(_) => RecordKind::Meeting,
+            Self::Artifact(_) => RecordKind::Artifact,
+        }
+    }
+
+    pub const fn local_version(&self) -> u64 {
+        match self {
+            Self::Dictation(value) => value.local_version,
+            Self::Meeting(value) => value.local_version,
+            Self::Artifact(value) => value.local_version,
+        }
+    }
+}
+
+impl From<DictationSnapshot> for Snapshot {
+    fn from(value: DictationSnapshot) -> Self {
+        Self::Dictation(value)
+    }
+}
+
+impl From<MeetingSnapshot> for Snapshot {
+    fn from(value: MeetingSnapshot) -> Self {
+        Self::Meeting(value)
+    }
+}
+
+impl From<CompletedArtifactSnapshot> for Snapshot {
+    fn from(value: CompletedArtifactSnapshot) -> Self {
+        Self::Artifact(value)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct SnapshotBatch {
-    pub snapshots: Vec<DictationSnapshot>,
+    pub snapshots: Vec<Snapshot>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -91,6 +199,57 @@ pub struct DictationPage {
     pub next_cursor: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct SharedMeeting {
+    pub record_id: RecordId,
+    pub origin_device_id: DeviceId,
+    pub title: Option<String>,
+    pub title_source: Option<String>,
+    pub title_version: u64,
+    pub source_filename: Option<String>,
+    pub transcript_text: String,
+    pub transcript_segments: Option<Vec<audetic_core::jobs_client::Segment>>,
+    pub duration_seconds: u64,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: String,
+    pub local_version: u64,
+    pub authoritative_revision: u64,
+    pub artifacts: Vec<SharedArtifact>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct SharedArtifact {
+    pub record_id: RecordId,
+    pub parent_record_id: RecordId,
+    pub origin_device_id: DeviceId,
+    pub artifact_kind: String,
+    pub title: String,
+    pub template_id: Option<String>,
+    pub agent_profile_name: Option<String>,
+    pub content_markdown: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub completed_at: String,
+    pub local_version: u64,
+    pub authoritative_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct MeetingPage {
+    pub items: Vec<SharedMeeting>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct MeetingTitlePatch {
+    pub title: String,
+    pub expected_title_version: u64,
+    #[serde(default)]
+    pub title_source: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeOperation {
@@ -98,14 +257,15 @@ pub enum ChangeOperation {
     Delete,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ChangeEnvelope {
     pub cursor: Option<u64>,
     pub operation: ChangeOperation,
+    pub kind: RecordKind,
     pub record_id: RecordId,
     pub origin_device_id: Option<DeviceId>,
     pub authoritative_revision: u64,
-    pub snapshot: Option<DictationSnapshot>,
+    pub snapshot: Option<Snapshot>,
     pub changed_at: String,
 }
 
@@ -114,11 +274,12 @@ impl ChangeEnvelope {
         Self {
             cursor: None,
             operation: ChangeOperation::Upsert,
+            kind: RecordKind::Dictation,
             record_id: snapshot.record_id,
             origin_device_id: Some(snapshot.origin_device_id),
             authoritative_revision,
             changed_at: chrono::Utc::now().to_rfc3339(),
-            snapshot: Some(snapshot),
+            snapshot: Some(Snapshot::Dictation(snapshot)),
         }
     }
 }
@@ -214,5 +375,57 @@ mod tests {
         assert!(json.get("audio_path").is_none());
         assert!(json.get("transcript_path").is_none());
         assert_eq!(json["kind"], "dictation");
+    }
+
+    #[test]
+    fn meeting_and_artifact_snapshots_are_portable_and_uuid_linked() {
+        let meeting_id = RecordId::new();
+        let origin = DeviceId::new();
+        let meeting = MeetingSnapshot {
+            kind: RecordKind::Meeting,
+            schema_version: 1,
+            record_id: meeting_id,
+            origin_device_id: origin,
+            local_version: 1,
+            created_at: "2026-09-04T10:00:00Z".into(),
+            updated_at: "2026-09-04T10:01:00Z".into(),
+            payload: MeetingPayload {
+                title: Some("Portable meeting".into()),
+                title_source: Some("manual".into()),
+                title_version: 1,
+                source_filename: Some("capture.wav".into()),
+                transcript_text: "portable transcript".into(),
+                transcript_segments: None,
+                duration_seconds: 60,
+                status: "completed".into(),
+                completed_at: "2026-09-04T10:01:00Z".into(),
+            },
+        };
+        let artifact = CompletedArtifactSnapshot {
+            kind: RecordKind::Artifact,
+            schema_version: 1,
+            record_id: RecordId::new(),
+            parent_record_id: meeting_id,
+            origin_device_id: origin,
+            local_version: 1,
+            created_at: "2026-09-04T10:02:00Z".into(),
+            updated_at: "2026-09-04T10:02:00Z".into(),
+            payload: CompletedArtifactPayload {
+                artifact_kind: "summary".into(),
+                title: "Summary".into(),
+                template_id: Some("standard_meeting".into()),
+                agent_profile_name: Some("Local agent".into()),
+                content_markdown: "# Summary".into(),
+                completed_at: "2026-09-04T10:02:00Z".into(),
+            },
+        };
+        let meeting_json = serde_json::to_value(meeting).unwrap();
+        let artifact_json = serde_json::to_value(artifact).unwrap();
+        for json in [&meeting_json, &artifact_json] {
+            assert!(json.get("audio_path").is_none());
+            assert!(json.get("transcript_path").is_none());
+            assert!(json.get("meeting_id").is_none());
+        }
+        assert_eq!(artifact_json["parent_record_id"], meeting_id.to_string());
     }
 }

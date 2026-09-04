@@ -1,6 +1,7 @@
 //! Meeting recording API endpoints. See OpenAPI spec at
 //! `/api/openapi.json` for the canonical method/path list.
 
+use audetic_core::sync::{DeviceId, PayloadAvailability, RecordId, UploadState};
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
@@ -49,6 +50,7 @@ pub struct MeetingState {
     /// Uploaded files are staged into a `.uploads` sub-dir, then moved
     /// alongside live recordings on success.
     pub meetings_dir: PathBuf,
+    pub sync: Option<Arc<crate::sync::SyncService>>,
 }
 
 /// Request body for start/toggle endpoints.
@@ -62,8 +64,7 @@ pub struct MeetingStartRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingStartResponse {
     pub success: bool,
-    pub meeting_id: i64,
-    pub audio_path: String,
+    pub meeting_id: RecordId,
     pub capture_state: String,
     pub message: String,
 }
@@ -73,7 +74,7 @@ pub struct MeetingStartResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingStopResponse {
     pub success: bool,
-    pub meeting_id: i64,
+    pub meeting_id: RecordId,
     pub duration_seconds: u64,
     pub message: String,
 }
@@ -84,10 +85,8 @@ pub struct MeetingStopResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingToggleResponse {
     pub success: bool,
-    pub meeting_id: i64,
+    pub meeting_id: RecordId,
     pub phase: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub audio_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_state: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,11 +100,10 @@ pub struct MeetingToggleResponse {
 pub struct MeetingStatusResponse {
     pub active: bool,
     pub capture_degraded: bool,
-    pub meeting_id: Option<i64>,
+    pub meeting_id: Option<RecordId>,
     pub phase: String,
     pub duration_seconds: Option<i64>,
     pub title: Option<String>,
-    pub audio_path: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -113,15 +111,19 @@ pub struct MeetingStatusResponse {
 /// without loading the full transcript.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingSummary {
-    pub id: i64,
+    pub id: RecordId,
+    pub origin_device_id: DeviceId,
     pub title: Option<String>,
     pub title_source: Option<MeetingTitleSource>,
     pub source_filename: Option<String>,
     pub status: String,
     pub duration_seconds: Option<i64>,
     pub started_at: String,
-    pub audio_path: String,
-    pub transcript_path: Option<String>,
+    pub upload_state: Option<UploadState>,
+    pub payload_availability: PayloadAvailability,
+    pub source: String,
+    pub offline: bool,
+    pub read_only: bool,
 }
 
 /// Paginated list of meeting summaries.
@@ -133,13 +135,12 @@ pub struct MeetingsListResponse {
 /// Full meeting record including transcript text when available.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingDetailResponse {
-    pub id: i64,
+    pub id: RecordId,
+    pub origin_device_id: DeviceId,
     pub title: Option<String>,
     pub title_source: Option<MeetingTitleSource>,
     pub source_filename: Option<String>,
     pub status: String,
-    pub audio_path: String,
-    pub transcript_path: Option<String>,
     pub transcript_text: Option<String>,
     /// Per-segment timestamps for clickable transcript lines. `None` for
     /// meetings transcribed before timestamps were captured.
@@ -149,13 +150,20 @@ pub struct MeetingDetailResponse {
     pub completed_at: Option<String>,
     pub error: Option<String>,
     pub created_at: String,
+    pub upload_state: Option<UploadState>,
+    pub payload_availability: PayloadAvailability,
+    pub source: String,
+    pub offline: bool,
+    pub read_only: bool,
 }
 
 /// Pagination + filter knobs shared by list and status endpoints.
 #[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct MeetingsListQuery {
-    /// Maximum meetings to return (default 20)
+    /// Maximum meetings to return (default 20, maximum 100).
     pub limit: Option<usize>,
+    pub offset: Option<usize>,
+    pub q: Option<String>,
 }
 
 /// Confirmation that an imported media file has been accepted as a new
@@ -164,7 +172,7 @@ pub struct MeetingsListQuery {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingImportResponse {
     pub success: bool,
-    pub meeting_id: i64,
+    pub meeting_id: RecordId,
     pub message: String,
 }
 
@@ -204,7 +212,7 @@ pub struct MeetingTitleUpdateRequest {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingTitleResponse {
-    pub meeting_id: i64,
+    pub meeting_id: RecordId,
     pub title: Option<String>,
     pub title_source: Option<MeetingTitleSource>,
 }
@@ -212,7 +220,7 @@ pub struct MeetingTitleResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingTitleRegenerationResponse {
     pub success: bool,
-    pub meeting_id: i64,
+    pub meeting_id: RecordId,
     pub message: String,
 }
 
@@ -253,7 +261,7 @@ pub fn router(state: MeetingState) -> Router {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingRetryResponse {
     pub success: bool,
-    pub meeting_id: i64,
+    pub meeting_id: RecordId,
     pub message: String,
 }
 
@@ -263,7 +271,7 @@ pub struct MeetingRetryResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct MeetingDeleteResponse {
     pub success: bool,
-    pub meeting_id: i64,
+    pub meeting_id: RecordId,
     pub message: String,
 }
 
@@ -295,6 +303,29 @@ fn error_response(err: anyhow::Error, context: &str) -> Response {
         })),
     )
         .into_response()
+}
+
+fn parse_record_id(value: &str) -> Result<RecordId, ApiError> {
+    value.parse().map_err(ApiError::bad_request)
+}
+
+fn resolve_local_meeting(
+    db_path: &std::path::Path,
+    value: &str,
+) -> Result<(i64, RecordId), ApiError> {
+    let record_id = parse_record_id(value)?;
+    let conn = crate::db::open_db_at(db_path).map_err(ApiError::from)?;
+    let local_id = crate::db::meetings::MeetingRepository::internal_id(&conn, record_id)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("Meeting {record_id} not found")))?;
+    Ok((local_id, record_id))
+}
+
+fn sync_id_for_local(db_path: &std::path::Path, local_id: i64) -> anyhow::Result<RecordId> {
+    let conn = crate::db::open_db_at(db_path)?;
+    crate::db::meetings::MeetingRepository::get(&conn, local_id)?
+        .map(|meeting| meeting.sync_id)
+        .ok_or_else(|| anyhow::anyhow!("meeting {local_id} not found"))
 }
 
 /// Helper: send a daemon command and await the machine's reply.
@@ -349,17 +380,22 @@ pub async fn start_meeting(
     };
 
     match dispatch(&state.tx, reply_rx, command, "start meeting").await {
-        Ok(result) => Json(MeetingStartResponse {
-            success: true,
-            meeting_id: result.meeting_id,
-            audio_path: result.audio_path.to_string_lossy().into_owned(),
-            capture_state: result.capture_state.tag().to_string(),
-            message: format!(
-                "Meeting recording started ({})",
-                result.capture_state.as_str()
-            ),
-        })
-        .into_response(),
+        Ok(result) => {
+            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+                Ok(id) => id,
+                Err(error) => return error_response(error, "resolve meeting UUID"),
+            };
+            Json(MeetingStartResponse {
+                success: true,
+                meeting_id,
+                capture_state: result.capture_state.tag().to_string(),
+                message: format!(
+                    "Meeting recording started ({})",
+                    result.capture_state.as_str()
+                ),
+            })
+            .into_response()
+        }
         Err(resp) => resp,
     }
 }
@@ -380,13 +416,19 @@ pub async fn stop_meeting(State(state): State<MeetingState>) -> Response {
     let command = ApiCommand::MeetingStop { reply: reply_tx };
 
     match dispatch(&state.tx, reply_rx, command, "stop meeting").await {
-        Ok(result) => Json(MeetingStopResponse {
-            success: true,
-            meeting_id: result.meeting_id,
-            duration_seconds: result.duration_seconds,
-            message: "Meeting recording stopped; review and confirm to transcribe".to_string(),
-        })
-        .into_response(),
+        Ok(result) => {
+            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+                Ok(id) => id,
+                Err(error) => return error_response(error, "resolve meeting UUID"),
+            };
+            Json(MeetingStopResponse {
+                success: true,
+                meeting_id,
+                duration_seconds: result.duration_seconds,
+                message: "Meeting recording stopped; review and confirm to transcribe".to_string(),
+            })
+            .into_response()
+        }
         Err(resp) => resp,
     }
 }
@@ -430,13 +472,19 @@ pub async fn confirm_meeting(
     };
 
     match dispatch(&state.tx, reply_rx, command, "confirm meeting").await {
-        Ok(result) => Json(MeetingStopResponse {
-            success: true,
-            meeting_id: result.meeting_id,
-            duration_seconds: result.duration_seconds,
-            message: "Meeting confirmed, transcription started in background".to_string(),
-        })
-        .into_response(),
+        Ok(result) => {
+            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+                Ok(id) => id,
+                Err(error) => return error_response(error, "resolve meeting UUID"),
+            };
+            Json(MeetingStopResponse {
+                success: true,
+                meeting_id,
+                duration_seconds: result.duration_seconds,
+                message: "Meeting confirmed, transcription started in background".to_string(),
+            })
+            .into_response()
+        }
         Err(resp) => resp,
     }
 }
@@ -457,13 +505,19 @@ pub async fn cancel_meeting(State(state): State<MeetingState>) -> Response {
     let command = ApiCommand::MeetingCancel { reply: reply_tx };
 
     match dispatch(&state.tx, reply_rx, command, "cancel meeting").await {
-        Ok(result) => Json(MeetingStopResponse {
-            success: true,
-            meeting_id: result.meeting_id,
-            duration_seconds: result.duration_seconds,
-            message: "Meeting recording cancelled".to_string(),
-        })
-        .into_response(),
+        Ok(result) => {
+            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+                Ok(id) => id,
+                Err(error) => return error_response(error, "resolve meeting UUID"),
+            };
+            Json(MeetingStopResponse {
+                success: true,
+                meeting_id,
+                duration_seconds: result.duration_seconds,
+                message: "Meeting recording cancelled".to_string(),
+            })
+            .into_response()
+        }
         Err(resp) => resp,
     }
 }
@@ -492,26 +546,37 @@ pub async fn toggle_meeting(
 
     match dispatch(&state.tx, reply_rx, command, "toggle meeting").await {
         Ok(outcome) => match outcome {
-            crate::meeting::ToggleOutcome::Started(r) => Json(MeetingToggleResponse {
-                success: true,
-                meeting_id: r.meeting_id,
-                phase: "recording".to_string(),
-                audio_path: Some(r.audio_path.to_string_lossy().into_owned()),
-                capture_state: Some(r.capture_state.tag().to_string()),
-                duration_seconds: None,
-                message: format!("Meeting recording started ({})", r.capture_state.as_str()),
-            })
-            .into_response(),
-            crate::meeting::ToggleOutcome::Stopped(r) => Json(MeetingToggleResponse {
-                success: true,
-                meeting_id: r.meeting_id,
-                phase: "review".to_string(),
-                audio_path: None,
-                capture_state: None,
-                duration_seconds: Some(r.duration_seconds),
-                message: "Meeting recording stopped; review and confirm to transcribe".to_string(),
-            })
-            .into_response(),
+            crate::meeting::ToggleOutcome::Started(r) => {
+                let meeting_id = match sync_id_for_local(&state.services.db_path, r.meeting_id) {
+                    Ok(id) => id,
+                    Err(error) => return error_response(error, "resolve meeting UUID"),
+                };
+                Json(MeetingToggleResponse {
+                    success: true,
+                    meeting_id,
+                    phase: "recording".to_string(),
+                    capture_state: Some(r.capture_state.tag().to_string()),
+                    duration_seconds: None,
+                    message: format!("Meeting recording started ({})", r.capture_state.as_str()),
+                })
+                .into_response()
+            }
+            crate::meeting::ToggleOutcome::Stopped(r) => {
+                let meeting_id = match sync_id_for_local(&state.services.db_path, r.meeting_id) {
+                    Ok(id) => id,
+                    Err(error) => return error_response(error, "resolve meeting UUID"),
+                };
+                Json(MeetingToggleResponse {
+                    success: true,
+                    meeting_id,
+                    phase: "review".to_string(),
+                    capture_state: None,
+                    duration_seconds: Some(r.duration_seconds),
+                    message: "Meeting recording stopped; review and confirm to transcribe"
+                        .to_string(),
+                })
+                .into_response()
+            }
         },
         Err(resp) => resp,
     }
@@ -561,18 +626,23 @@ pub async fn meeting_status(
         }));
     }
 
-    Json(default_meeting_status_json(&status))
+    let public_id = status
+        .meeting_id
+        .and_then(|id| sync_id_for_local(&state.services.db_path, id).ok());
+    Json(default_meeting_status_json(&status, public_id))
 }
 
-fn default_meeting_status_json(status: &crate::meeting::MeetingState) -> Value {
+fn default_meeting_status_json(
+    status: &crate::meeting::MeetingState,
+    public_id: Option<RecordId>,
+) -> Value {
     json!({
         "active": status.phase == MeetingPhase::Recording,
         "capture_degraded": status.capture_degraded,
-        "meeting_id": status.meeting_id,
+        "meeting_id": public_id,
         "phase": status.phase.as_str(),
         "duration_seconds": status.duration_seconds(),
         "title": status.title,
-        "audio_path": status.audio_path.as_ref().map(|p| p.to_string_lossy().to_string()),
         "last_error": status.last_error,
     })
 }
@@ -588,13 +658,40 @@ fn default_meeting_status_json(status: &crate::meeting::MeetingState) -> Value {
 )]
 pub async fn list_meetings(
     Query(params): Query<MeetingsListQuery>,
-    State(_state): State<MeetingState>,
+    State(state): State<MeetingState>,
 ) -> Result<Json<MeetingsListResponse>, StatusCode> {
-    let limit = params.limit.unwrap_or(20);
+    let limit = params
+        .limit
+        .unwrap_or(20)
+        .clamp(1, crate::sync::protocol::MAX_MEETING_PAGE);
+    let offset = params.offset.unwrap_or(0);
+    if let Some(sync) = &state.sync {
+        let meetings = sync
+            .meetings(params.q.as_deref(), offset, limit)
+            .await
+            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        return Ok(Json(MeetingsListResponse {
+            meetings: meetings.into_iter().map(summary_from_library).collect(),
+        }));
+    }
+    let db_path = state.services.db_path.clone();
 
     let meetings = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db()?;
-        crate::db::meetings::MeetingRepository::list(&conn, limit)
+        let conn = crate::db::open_db_at(&db_path)?;
+        let meetings =
+            crate::db::meetings::MeetingRepository::list(&conn, offset.saturating_add(limit))?;
+        meetings
+            .into_iter()
+            .skip(offset)
+            .map(|meeting| {
+                let upload = crate::db::sync_outbox::SyncOutboxRepository::state_for_kind(
+                    &conn,
+                    meeting.sync_id,
+                    crate::sync::protocol::RecordKind::Meeting,
+                )?;
+                Ok((meeting, upload))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()
     })
     .await
     .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
@@ -602,20 +699,69 @@ pub async fn list_meetings(
 
     let entries: Vec<MeetingSummary> = meetings
         .into_iter()
-        .map(|m| MeetingSummary {
-            id: m.id,
+        .map(|(m, upload_state)| MeetingSummary {
+            id: m.sync_id,
+            origin_device_id: m.origin_device_id,
             title: m.title,
             title_source: MeetingTitleSource::from_stored(m.title_source.as_deref()),
             source_filename: m.source_filename,
             status: m.status,
             duration_seconds: m.duration_seconds,
             started_at: m.started_at,
-            audio_path: m.audio_path,
-            transcript_path: m.transcript_path,
+            upload_state,
+            payload_availability: if std::path::Path::new(&m.audio_path).exists() {
+                PayloadAvailability::Available
+            } else {
+                PayloadAvailability::Unavailable
+            },
+            source: "local".into(),
+            offline: false,
+            read_only: false,
         })
         .collect();
 
     Ok(Json(MeetingsListResponse { meetings: entries }))
+}
+
+fn summary_from_library(m: crate::sync::library_reader::LibraryMeeting) -> MeetingSummary {
+    MeetingSummary {
+        id: m.id,
+        origin_device_id: m.origin_device_id,
+        title: m.title,
+        title_source: MeetingTitleSource::from_stored(m.title_source.as_deref()),
+        source_filename: m.source_filename,
+        status: m.status,
+        duration_seconds: m.duration_seconds,
+        started_at: m.started_at,
+        upload_state: m.upload_state,
+        payload_availability: m.payload_availability,
+        source: m.source.into(),
+        offline: m.offline,
+        read_only: m.read_only,
+    }
+}
+
+fn detail_from_library(m: crate::sync::library_reader::LibraryMeeting) -> MeetingDetailResponse {
+    MeetingDetailResponse {
+        id: m.id,
+        origin_device_id: m.origin_device_id,
+        title: m.title,
+        title_source: MeetingTitleSource::from_stored(m.title_source.as_deref()),
+        source_filename: m.source_filename,
+        status: m.status,
+        transcript_text: m.transcript_text,
+        transcript_segments: m.transcript_segments,
+        duration_seconds: m.duration_seconds,
+        started_at: m.started_at,
+        completed_at: m.completed_at,
+        error: m.error,
+        created_at: m.created_at,
+        upload_state: m.upload_state,
+        payload_availability: m.payload_availability,
+        source: m.source.into(),
+        offline: m.offline,
+        read_only: m.read_only,
+    }
 }
 
 #[utoipa::path(
@@ -646,7 +792,7 @@ pub async fn recent_meeting_titles(
     patch,
     path = "/meetings/{id}/title",
     tag = "meetings",
-    params(("id" = i64, Path, description = "Meeting id")),
+    params(("id" = String, Path, description = "Meeting UUID")),
     request_body = MeetingTitleUpdateRequest,
     responses(
         (status = 200, description = "Meeting Title updated with manual ownership", body = MeetingTitleResponse),
@@ -655,32 +801,67 @@ pub async fn recent_meeting_titles(
     ),
 )]
 pub async fn update_meeting_title(
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     State(state): State<MeetingState>,
     Json(request): Json<MeetingTitleUpdateRequest>,
 ) -> ApiResult<Json<MeetingTitleResponse>> {
+    let record_id = parse_record_id(&id)?;
     let title = request.title.trim().to_string();
     if title.is_empty() {
         return Err(ApiError::bad_request("Meeting Title cannot be blank"));
     }
+    if let Some(sync) = &state.sync {
+        if let Some(current) = sync
+            .meeting(record_id)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+        {
+            if current.source == "shared" {
+                let updated = sync
+                    .update_shared_meeting_title(record_id, title, current.title_version, None)
+                    .await
+                    .map_err(|error| {
+                        if error.to_string().contains("conflict")
+                            || error.to_string().contains("HTTP 409")
+                        {
+                            ApiError::new(StatusCode::CONFLICT, error.to_string())
+                        } else {
+                            ApiError::internal(error.to_string())
+                        }
+                    })?;
+                return Ok(Json(MeetingTitleResponse {
+                    meeting_id: record_id,
+                    title: updated.title,
+                    title_source: MeetingTitleSource::from_stored(updated.title_source.as_deref()),
+                }));
+            }
+            if current.offline && current.read_only {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Home Hub is unavailable; shared title edits are not queued offline",
+                ));
+            }
+        }
+    }
+    let (local_id, record_id) = resolve_local_meeting(&state.services.db_path, &id)?;
     let meeting = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = crate::db::open_db()?;
-        if !crate::db::meetings::MeetingRepository::set_manual_title(&conn, id, &title)? {
+        if !crate::db::meetings::MeetingRepository::set_manual_title(&conn, local_id, &title)? {
             return Ok(None);
         }
-        crate::db::meetings::MeetingRepository::get(&conn, id)
+        crate::db::meetings::MeetingRepository::get(&conn, local_id)
     })
     .await
     .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
     .map_err(ApiError::from)?
-    .ok_or_else(|| ApiError::not_found(format!("Meeting {id} not found")))?;
+    .ok_or_else(|| ApiError::not_found(format!("Meeting {record_id} not found")))?;
 
     state
         .status
-        .set_title_if_current(id, meeting.title.clone())
+        .set_title_if_current(local_id, meeting.title.clone())
         .await;
     Ok(Json(MeetingTitleResponse {
-        meeting_id: id,
+        meeting_id: record_id,
         title: meeting.title,
         title_source: MeetingTitleSource::from_stored(meeting.title_source.as_deref()),
     }))
@@ -690,7 +871,7 @@ pub async fn update_meeting_title(
     post,
     path = "/meetings/{id}/regenerate-title",
     tag = "meetings",
-    params(("id" = i64, Path, description = "Meeting id")),
+    params(("id" = String, Path, description = "Meeting UUID")),
     responses(
         (status = 202, description = "Title ownership released and regeneration started", body = MeetingTitleRegenerationResponse),
         (status = 404, description = "Meeting not found"),
@@ -698,27 +879,85 @@ pub async fn update_meeting_title(
     ),
 )]
 pub async fn regenerate_meeting_title(
-    Path(id): Path<i64>,
+    Path(id): Path<String>,
     State(state): State<MeetingState>,
 ) -> ApiResult<(StatusCode, Json<MeetingTitleRegenerationResponse>)> {
-    tokio::task::spawn_blocking(move || crate::meeting::title::prepare_title_regeneration(id))
-        .await
-        .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("not found") {
-                ApiError::not_found(message)
-            } else {
-                ApiError::new(StatusCode::CONFLICT, message)
+    let record_id = parse_record_id(&id)?;
+    if let Some(sync) = &state.sync {
+        if let Some(meeting) = sync
+            .meeting(record_id)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()))?
+        {
+            if meeting.offline && meeting.read_only {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Home Hub is unavailable; generated titles are not queued offline",
+                ));
             }
-        })?;
-    state.status.set_title_if_current(id, None).await;
-    crate::meeting::title::spawn_title_generation(id);
+            if meeting.source == "shared" {
+                let transcript = meeting
+                    .transcript_text
+                    .as_deref()
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| {
+                        ApiError::new(StatusCode::CONFLICT, "meeting has no transcript")
+                    })?;
+                let generated = crate::meeting::title::generate_shared_meeting_title(
+                    record_id,
+                    transcript,
+                    sync.db_path(),
+                )
+                .await
+                .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
+                sync.update_shared_meeting_title(
+                    record_id,
+                    generated,
+                    meeting.title_version,
+                    Some("generated".into()),
+                )
+                .await
+                .map_err(|error| {
+                    if error.to_string().contains("conflict")
+                        || error.to_string().contains("HTTP 409")
+                    {
+                        ApiError::new(StatusCode::CONFLICT, error.to_string())
+                    } else {
+                        ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
+                    }
+                })?;
+                return Ok((
+                    StatusCode::ACCEPTED,
+                    Json(MeetingTitleRegenerationResponse {
+                        success: true,
+                        meeting_id: record_id,
+                        message: "Generated title committed to Home Hub".into(),
+                    }),
+                ));
+            }
+        }
+    }
+    let (local_id, record_id) = resolve_local_meeting(&state.services.db_path, &id)?;
+    tokio::task::spawn_blocking(move || {
+        crate::meeting::title::prepare_title_regeneration(local_id)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
+    .map_err(|error| {
+        let message = error.to_string();
+        if message.contains("not found") {
+            ApiError::not_found(message)
+        } else {
+            ApiError::new(StatusCode::CONFLICT, message)
+        }
+    })?;
+    state.status.set_title_if_current(local_id, None).await;
+    crate::meeting::title::spawn_title_generation(local_id);
     Ok((
         StatusCode::ACCEPTED,
         Json(MeetingTitleRegenerationResponse {
             success: true,
-            meeting_id: id,
+            meeting_id: record_id,
             message: "Title regeneration started".to_string(),
         }),
     ))
@@ -729,7 +968,7 @@ pub async fn regenerate_meeting_title(
     path = "/meetings/{id}",
     tag = "meetings",
     params(
-        ("id" = i64, Path, description = "Meeting id"),
+        ("id" = String, Path, description = "Meeting UUID"),
     ),
     responses(
         (status = 200, description = "Meeting detail", body = MeetingDetailResponse),
@@ -737,12 +976,27 @@ pub async fn regenerate_meeting_title(
     ),
 )]
 pub async fn get_meeting(
-    Path(id): Path<i64>,
-    State(_state): State<MeetingState>,
+    Path(id): Path<String>,
+    State(state): State<MeetingState>,
 ) -> Result<Json<MeetingDetailResponse>, Response> {
+    let record_id = parse_record_id(&id).map_err(IntoResponse::into_response)?;
+    if let Some(sync) = &state.sync {
+        return sync
+            .meeting(record_id)
+            .await
+            .map_err(|error| ApiError::internal(error.to_string()).into_response())?
+            .map(detail_from_library)
+            .map(Json)
+            .ok_or_else(|| {
+                ApiError::not_found(format!("Meeting {record_id} not found")).into_response()
+            });
+    }
+    let (_, record_id) =
+        resolve_local_meeting(&state.services.db_path, &id).map_err(IntoResponse::into_response)?;
+    let db_path = state.services.db_path.clone();
     let meeting = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db()?;
-        crate::db::meetings::MeetingRepository::get(&conn, id)
+        let conn = crate::db::open_db_at(&db_path)?;
+        crate::db::meetings::MeetingRepository::get_by_sync_id(&conn, record_id)
     })
     .await
     .map_err(|_| {
@@ -763,13 +1017,12 @@ pub async fn get_meeting(
 
     match meeting {
         Some(m) => Ok(Json(MeetingDetailResponse {
-            id: m.id,
+            id: m.sync_id,
+            origin_device_id: m.origin_device_id,
             title: m.title,
             title_source: MeetingTitleSource::from_stored(m.title_source.as_deref()),
             source_filename: m.source_filename,
             status: m.status,
-            audio_path: m.audio_path,
-            transcript_path: m.transcript_path,
             transcript_text: m.transcript_text,
             transcript_segments: m.transcript_segments,
             duration_seconds: m.duration_seconds,
@@ -777,6 +1030,15 @@ pub async fn get_meeting(
             completed_at: m.completed_at,
             error: m.error,
             created_at: m.created_at,
+            upload_state: None,
+            payload_availability: if std::path::Path::new(&m.audio_path).exists() {
+                PayloadAvailability::Available
+            } else {
+                PayloadAvailability::Unavailable
+            },
+            source: "local".into(),
+            offline: false,
+            read_only: false,
         })),
         None => Err((
             StatusCode::NOT_FOUND,
@@ -799,7 +1061,7 @@ pub async fn get_meeting(
     path = "/meetings/{id}/audio",
     tag = "meetings",
     params(
-        ("id" = i64, Path, description = "Meeting id"),
+        ("id" = String, Path, description = "Meeting UUID"),
     ),
     responses(
         (status = 200, description = "Audio bytes (supports Range)"),
@@ -807,19 +1069,24 @@ pub async fn get_meeting(
     ),
 )]
 pub async fn meeting_audio(
-    Path(id): Path<i64>,
-    State(_state): State<MeetingState>,
+    Path(id): Path<String>,
+    State(state): State<MeetingState>,
     request: axum::extract::Request,
 ) -> Response {
+    let (local_id, record_id) = match resolve_local_meeting(&state.services.db_path, &id) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let db_path = state.services.db_path.clone();
     let lookup = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db()?;
-        crate::db::meetings::MeetingRepository::get(&conn, id)
+        let conn = crate::db::open_db_at(&db_path)?;
+        crate::db::meetings::MeetingRepository::get(&conn, local_id)
     })
     .await;
 
     let meeting = match lookup {
         Ok(Ok(Some(m))) => m,
-        Ok(Ok(None)) => return audio_not_found(id),
+        Ok(Ok(None)) => return audio_not_found(record_id),
         Ok(Err(e)) => {
             error!("Failed to load meeting {} for audio: {}", id, e);
             return (
@@ -849,7 +1116,7 @@ pub async fn meeting_audio(
         if mp3.exists() {
             mp3
         } else {
-            return audio_not_found(id);
+            return audio_not_found(record_id);
         }
     };
 
@@ -866,7 +1133,7 @@ pub async fn meeting_audio(
     }
 }
 
-fn audio_not_found(id: i64) -> Response {
+fn audio_not_found(id: RecordId) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(json!({
@@ -889,7 +1156,7 @@ fn audio_not_found(id: i64) -> Response {
     path = "/meetings/{id}/retry",
     tag = "meetings",
     params(
-        ("id" = i64, Path, description = "Meeting id"),
+        ("id" = String, Path, description = "Meeting UUID"),
     ),
     responses(
         (status = 202, description = "Retry kicked off; poll /meetings/:id", body = MeetingRetryResponse),
@@ -897,12 +1164,17 @@ fn audio_not_found(id: i64) -> Response {
         (status = 409, description = "Meeting is not in a retry-eligible state, or audio file missing"),
     ),
 )]
-pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState>) -> Response {
+pub async fn retry_meeting(Path(id): Path<String>, State(state): State<MeetingState>) -> Response {
     info!("Meeting {} retry requested", id);
+    let (local_id, record_id) = match resolve_local_meeting(&state.services.db_path, &id) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let db_path = state.services.db_path.clone();
 
     let join = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db()?;
-        crate::db::meetings::MeetingRepository::get(&conn, id)
+        let conn = crate::db::open_db_at(&db_path)?;
+        crate::db::meetings::MeetingRepository::get(&conn, local_id)
     })
     .await;
 
@@ -974,9 +1246,10 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
             );
             // Heal the row so future calls don't pay this lookup again.
             let mp3_str = mp3_sibling.to_string_lossy().into_owned();
+            let heal_db_path = state.services.db_path.clone();
             let _ = tokio::task::spawn_blocking(move || {
-                let conn = crate::db::open_db()?;
-                crate::db::meetings::MeetingRepository::update_audio_path(&conn, id, &mp3_str)
+                let conn = crate::db::open_db_at(&heal_db_path)?;
+                crate::db::meetings::MeetingRepository::update_audio_path(&conn, local_id, &mp3_str)
             })
             .await;
             mp3_sibling
@@ -1002,9 +1275,10 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
     // the transition here (last, after the file-missing 409s, so a bail can't
     // strand the row in `transcribing`) and reject if the row is no longer the
     // failed meeting we loaded — e.g. a concurrent retry or delete won.
+    let retry_db_path = state.services.db_path.clone();
     let marked = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db()?;
-        crate::db::meetings::MeetingRepository::begin_retry(&conn, id)
+        let conn = crate::db::open_db_at(&retry_db_path)?;
+        crate::db::meetings::MeetingRepository::begin_retry(&conn, local_id)
     })
     .await;
 
@@ -1044,15 +1318,20 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
     let duration = meeting.duration_seconds.unwrap_or(0);
     let transcription = state.transcription.clone();
     tokio::spawn(async move {
-        crate::meeting::retry_meeting_transcription(id, resolved_path, duration, transcription)
-            .await;
+        crate::meeting::retry_meeting_transcription(
+            local_id,
+            resolved_path,
+            duration,
+            transcription,
+        )
+        .await;
     });
 
     (
         StatusCode::ACCEPTED,
         Json(MeetingRetryResponse {
             success: true,
-            meeting_id: id,
+            meeting_id: record_id,
             message: "Retry started; poll /meetings/:id for status".to_string(),
         }),
     )
@@ -1078,7 +1357,7 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
     path = "/meetings/{id}",
     tag = "meetings",
     params(
-        ("id" = i64, Path, description = "Meeting id"),
+        ("id" = String, Path, description = "Meeting UUID"),
     ),
     responses(
         (status = 200, description = "Meeting deleted (hidden from all views)", body = MeetingDeleteResponse),
@@ -1086,12 +1365,114 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
         (status = 409, description = "Meeting is still in progress; stop or cancel it first"),
     ),
 )]
-pub async fn delete_meeting(Path(id): Path<i64>, State(state): State<MeetingState>) -> Response {
+pub async fn delete_meeting(Path(id): Path<String>, State(state): State<MeetingState>) -> Response {
     info!("Meeting {} delete requested", id);
+    let record_id = match parse_record_id(&id) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    if let Some(sync) = &state.sync {
+        let meeting = match sync.meeting(record_id).await {
+            Ok(meeting) => meeting,
+            Err(error) => {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"success":false,"message":error.to_string()})),
+                )
+                    .into_response();
+            }
+        };
+        let Some(meeting) = meeting else {
+            return ApiError::not_found(format!("Meeting {record_id} not found")).into_response();
+        };
+        if !crate::meeting::MeetingPhase::is_terminal(&meeting.status) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "success": false,
+                    "message": format!(
+                        "Meeting {id} is still in progress; stop or cancel it before deleting"
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        if meeting.source == "shared" {
+            return match sync
+                .delete_shared_record(record_id, crate::sync::protocol::RecordKind::Meeting)
+                .await
+            {
+                Ok(()) => {
+                    let conn = match crate::db::open_db_at(&state.services.db_path) {
+                        Ok(conn) => conn,
+                        Err(error) => return ApiError::internal(error.to_string()).into_response(),
+                    };
+                    let local_cleanup = match crate::db::meetings::MeetingRepository::internal_id(
+                        &conn, record_id,
+                    ) {
+                        Ok(Some(local_id)) => {
+                            match crate::db::meetings::MeetingRepository::soft_delete_after_hub_delete(
+                                &conn, local_id,
+                            ) {
+                                Ok(crate::db::meetings::SoftDeleteOutcome::Deleted) => Some(local_id),
+                                Ok(other) => {
+                                    return ApiError::internal(format!(
+                                        "local meeting cleanup was refused: {other:?}"
+                                    ))
+                                    .into_response();
+                                }
+                                Err(error) => {
+                                    return ApiError::internal(error.to_string()).into_response()
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            if let Err(error) = crate::db::meetings::MeetingRepository::cleanup_deleted_sync_work(
+                                &conn, record_id,
+                            ) {
+                                return ApiError::internal(error.to_string()).into_response();
+                            }
+                            None
+                        }
+                        Err(error) => return ApiError::internal(error.to_string()).into_response(),
+                    };
+                    if let Some(local_id) = local_cleanup {
+                        state.status.clear_if_current(local_id).await;
+                    }
+                    (
+                        StatusCode::OK,
+                        Json(MeetingDeleteResponse {
+                            success: true,
+                            meeting_id: record_id,
+                            message: format!("Meeting {record_id} deleted"),
+                        }),
+                    )
+                        .into_response()
+                }
+                Err(error) => (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"success":false,"message":error.to_string()})),
+                )
+                    .into_response(),
+            };
+        }
+        if meeting.read_only {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"success":false,"message":"Home Hub is unavailable; shared deletions are not queued offline"})),
+            )
+                .into_response();
+        }
+    }
+    let (local_id, record_id) = match resolve_local_meeting(&state.services.db_path, &id) {
+        Ok(value) => value,
+        Err(error) => return error.into_response(),
+    };
+    let db_path = state.services.db_path.clone();
 
     let outcome = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db()?;
-        crate::db::meetings::MeetingRepository::soft_delete(&conn, id)
+        let conn = crate::db::open_db_at(&db_path)?;
+        crate::db::meetings::MeetingRepository::soft_delete(&conn, local_id)
     })
     .await;
 
@@ -1103,14 +1484,14 @@ pub async fn delete_meeting(Path(id): Path<i64>, State(state): State<MeetingStat
             // there so the UI can show the outcome). Clear it if it still
             // points at this meeting, or GET /meetings/status would keep
             // reporting the deleted meeting until the next recording starts.
-            if state.status.clear_if_current(id).await {
+            if state.status.clear_if_current(local_id).await {
                 info!("Meeting {} cleared from live status after delete", id);
             }
             (
                 StatusCode::OK,
                 Json(MeetingDeleteResponse {
                     success: true,
-                    meeting_id: id,
+                    meeting_id: record_id,
                     message: format!("Meeting {id} deleted"),
                 }),
             )
@@ -1134,6 +1515,54 @@ pub async fn delete_meeting(Path(id): Path<i64>, State(state): State<MeetingStat
             })),
         )
             .into_response(),
+        Ok(Ok(SoftDeleteOutcome::RequiresHub)) => {
+            let Some(sync) = &state.sync else {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"success":false,"message":"Home Hub deletion is required"})),
+                )
+                    .into_response();
+            };
+            if let Err(error) = sync
+                .delete_shared_record(record_id, crate::sync::protocol::RecordKind::Meeting)
+                .await
+            {
+                return (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(json!({"success":false,"message":error.to_string()})),
+                )
+                    .into_response();
+            }
+            let db_path = state.services.db_path.clone();
+            match tokio::task::spawn_blocking(move || {
+                let conn = crate::db::open_db_at(&db_path)?;
+                crate::db::meetings::MeetingRepository::soft_delete_after_hub_delete(
+                    &conn, local_id,
+                )
+            })
+            .await
+            {
+                Ok(Ok(SoftDeleteOutcome::Deleted | SoftDeleteOutcome::NotFound)) => {
+                    state.status.clear_if_current(local_id).await;
+                    (
+                        StatusCode::OK,
+                        Json(MeetingDeleteResponse {
+                            success: true,
+                            meeting_id: record_id,
+                            message: format!("Meeting {record_id} deleted"),
+                        }),
+                    )
+                        .into_response()
+                }
+                Ok(Ok(_)) => {
+                    ApiError::internal("local meeting cleanup was refused").into_response()
+                }
+                Ok(Err(error)) => ApiError::internal(error.to_string()).into_response(),
+                Err(error) => {
+                    ApiError::internal(format!("db task panicked: {error}")).into_response()
+                }
+            }
+        }
         Ok(Err(e)) => {
             error!("Failed to delete meeting {}: {}", id, e);
             (
@@ -1279,15 +1708,21 @@ pub async fn import_meeting(
     };
 
     match import_meeting_file(args).await {
-        Ok(result) => (
-            StatusCode::ACCEPTED,
-            Json(MeetingImportResponse {
-                success: true,
-                meeting_id: result.meeting_id,
-                message: "Import accepted; poll /meetings/:id for status".to_string(),
-            }),
-        )
-            .into_response(),
+        Ok(result) => {
+            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+                Ok(id) => id,
+                Err(error) => return error_response(error, "resolve meeting UUID"),
+            };
+            (
+                StatusCode::ACCEPTED,
+                Json(MeetingImportResponse {
+                    success: true,
+                    meeting_id,
+                    message: "Import accepted; poll /meetings/:id for status".to_string(),
+                }),
+            )
+                .into_response()
+        }
         Err(e) => {
             // import_meeting_file cleans up its own destination file on
             // DB-insert failure, but if it bailed before staging (e.g.
@@ -1352,23 +1787,23 @@ mod tests {
             .start_recording(1, None, PathBuf::from("/tmp/meeting.wav"), false, true)
             .await;
 
-        let recording = default_meeting_status_json(&status.get().await);
+        let recording = default_meeting_status_json(&status.get().await, None);
         assert_eq!(recording["capture_degraded"], true);
 
         status
             .apply_microphone_recovery(crate::audio::capture_recovery::CaptureRecovery::Capturing)
             .await;
         status.mark_system_degraded().await;
-        let system_degraded = default_meeting_status_json(&status.get().await);
+        let system_degraded = default_meeting_status_json(&status.get().await, None);
         assert_eq!(system_degraded["capture_degraded"], true);
         status
             .apply_system_recovery(crate::audio::capture_recovery::CaptureRecovery::Capturing)
             .await;
-        let recovered = default_meeting_status_json(&status.get().await);
+        let recovered = default_meeting_status_json(&status.get().await, None);
         assert_eq!(recovered["capture_degraded"], false);
 
         status.enter_review(1).await;
-        let review = default_meeting_status_json(&status.get().await);
+        let review = default_meeting_status_json(&status.get().await, None);
         assert_eq!(review["capture_degraded"], false);
     }
 }

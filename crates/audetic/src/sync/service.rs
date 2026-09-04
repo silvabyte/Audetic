@@ -24,7 +24,10 @@ use super::client::{
 };
 use super::library::HubLibrary;
 use super::outbox::OutboxWorker;
-use super::protocol::{DictationPage, SnapshotBatch, SnapshotBatchResponse};
+use super::protocol::{
+    DictationPage, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting, SnapshotBatch,
+    SnapshotBatchResponse,
+};
 use super::protocol::{
     HUB_API_MOUNT_PATH, HUB_LISTENER_ADDRESS, HUB_LOOPBACK_BASE_URL, TAILSCALE_HTTPS_PORT,
 };
@@ -64,6 +67,47 @@ pub trait HubAccess: Send + Sync {
     ) -> Result<DictationPage, HubTransferError> {
         Err(HubTransferError::Retryable(
             "Home Hub is unavailable".to_owned(),
+        ))
+    }
+
+    async fn page_meetings(
+        &self,
+        _hub: &HubConnection,
+        _query: Option<&str>,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<MeetingPage, HubTransferError> {
+        Err(HubTransferError::Retryable(
+            "Home Hub is unavailable".into(),
+        ))
+    }
+    async fn meeting(
+        &self,
+        _hub: &HubConnection,
+        _id: RecordId,
+    ) -> Result<Option<SharedMeeting>, HubTransferError> {
+        Err(HubTransferError::Retryable(
+            "Home Hub is unavailable".into(),
+        ))
+    }
+    async fn update_meeting_title(
+        &self,
+        _hub: &HubConnection,
+        _id: RecordId,
+        _patch: MeetingTitlePatch,
+    ) -> Result<SharedMeeting, HubTransferError> {
+        Err(HubTransferError::Retryable(
+            "Home Hub is unavailable".into(),
+        ))
+    }
+    async fn delete_record(
+        &self,
+        _hub: &HubConnection,
+        _id: RecordId,
+        _kind: RecordKind,
+    ) -> Result<(), HubTransferError> {
+        Err(HubTransferError::Retryable(
+            "Home Hub is unavailable".into(),
         ))
     }
 }
@@ -137,6 +181,55 @@ impl HubAccess for NetworkHubAccess {
             .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?;
         client
             .page_dictations(hub.hub_id, query, from, to, cursor, limit)
+            .await
+            .map_err(classify_client_error)
+    }
+
+    async fn page_meetings(
+        &self,
+        hub: &HubConnection,
+        query: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<MeetingPage, HubTransferError> {
+        HubClient::new(&hub.base_url)
+            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
+            .page_meetings(hub.hub_id, query, cursor, limit)
+            .await
+            .map_err(classify_client_error)
+    }
+    async fn meeting(
+        &self,
+        hub: &HubConnection,
+        id: RecordId,
+    ) -> Result<Option<SharedMeeting>, HubTransferError> {
+        HubClient::new(&hub.base_url)
+            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
+            .meeting(hub.hub_id, id)
+            .await
+            .map_err(classify_client_error)
+    }
+    async fn update_meeting_title(
+        &self,
+        hub: &HubConnection,
+        id: RecordId,
+        patch: MeetingTitlePatch,
+    ) -> Result<SharedMeeting, HubTransferError> {
+        HubClient::new(&hub.base_url)
+            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
+            .update_meeting_title(hub.hub_id, id, &patch)
+            .await
+            .map_err(classify_client_error)
+    }
+    async fn delete_record(
+        &self,
+        hub: &HubConnection,
+        id: RecordId,
+        kind: RecordKind,
+    ) -> Result<(), HubTransferError> {
+        HubClient::new(&hub.base_url)
+            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
+            .delete_record(hub.hub_id, id, kind)
             .await
             .map_err(classify_client_error)
     }
@@ -237,6 +330,10 @@ pub struct SyncService {
 }
 
 impl SyncService {
+    pub(crate) fn db_path(&self) -> &std::path::Path {
+        &self.db_path
+    }
+
     pub fn production(db_path: PathBuf) -> Self {
         Self::with_dependencies(
             db_path,
@@ -338,6 +435,105 @@ impl SyncService {
             offset = offset.saturating_add(page.len());
         }
         Ok(None)
+    }
+
+    pub async fn meetings(
+        &self,
+        query: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<super::library_reader::LibraryMeeting>, SyncServiceError> {
+        let _transition = self.transition.lock().await;
+        let (_, settings) = self.load()?;
+        let result = super::library_reader::MeetingLibraryReader::new(
+            self.db_path.clone(),
+            Arc::clone(&self.hubs),
+        )
+        .read(&settings, query, offset, limit)
+        .await
+        .map_err(SyncServiceError::Persistence)?;
+        *self.hub_reachable.write().await = result.hub_reachable;
+        if settings.role != SyncRole::Standalone {
+            let mut contact = settings;
+            if result.hub_reachable {
+                contact.last_contact_at = Some(now());
+                contact.last_error = None;
+            } else if let Some(error) = result.error {
+                contact.last_error = Some(error);
+            }
+            self.save_settings(&contact)?;
+        }
+        Ok(result.meetings)
+    }
+
+    pub async fn meeting(
+        &self,
+        id: RecordId,
+    ) -> Result<Option<super::library_reader::LibraryMeeting>, SyncServiceError> {
+        let mut offset = 0;
+        loop {
+            let page = self.meetings(None, offset, 100).await?;
+            if let Some(value) = page.iter().find(|value| value.id == id) {
+                return Ok(Some(value.clone()));
+            }
+            if page.len() < 100 {
+                return Ok(None);
+            }
+            offset += page.len();
+        }
+    }
+
+    pub async fn update_shared_meeting_title(
+        &self,
+        id: RecordId,
+        title: String,
+        expected_title_version: u64,
+        title_source: Option<String>,
+    ) -> Result<SharedMeeting, SyncServiceError> {
+        let _transition = self.transition.lock().await;
+        let (_, settings) = self.load()?;
+        let patch = MeetingTitlePatch {
+            title,
+            expected_title_version,
+            title_source,
+        };
+        match settings.role {
+            SyncRole::Standalone => Err(SyncServiceError::InvalidRequest(
+                "meeting is not shared".into(),
+            )),
+            SyncRole::HomeHub => HubLibrary::new(self.db_path.clone())
+                .update_meeting_title(id, &patch)
+                .map_err(SyncServiceError::Persistence)?
+                .ok_or_else(|| SyncServiceError::InvalidRequest("meeting not found".into())),
+            SyncRole::ConnectedDevice => self
+                .hubs
+                .update_meeting_title(settings.hub.as_ref().expect("connected hub"), id, patch)
+                .await
+                .map_err(|error| SyncServiceError::HubVerification(error.to_string())),
+        }
+    }
+
+    pub async fn delete_shared_record(
+        &self,
+        id: RecordId,
+        kind: RecordKind,
+    ) -> Result<(), SyncServiceError> {
+        let _transition = self.transition.lock().await;
+        let (_, settings) = self.load()?;
+        match settings.role {
+            SyncRole::Standalone => Err(SyncServiceError::InvalidRequest(
+                "record is not shared".into(),
+            )),
+            SyncRole::HomeHub => HubLibrary::new(self.db_path.clone())
+                .delete(id, kind)
+                .map(|_| ())
+                .map_err(|error| SyncServiceError::Persistence(anyhow::anyhow!(error))),
+            SyncRole::ConnectedDevice => self
+                .hubs
+                .delete_record(settings.hub.as_ref().expect("connected hub"), id, kind)
+                .await
+                .map_err(|error| SyncServiceError::HubVerification(error.to_string())),
+        }
     }
 
     pub async fn retry(&self) -> Result<u64, SyncServiceError> {
@@ -913,6 +1109,8 @@ impl SyncService {
             .map_err(SyncServiceError::Persistence)?;
         crate::db::backfill_visible_dictations(&connection, settings.role)
             .map_err(SyncServiceError::Persistence)?;
+        crate::db::backfill_visible_meetings(&connection, settings.role)
+            .map_err(SyncServiceError::Persistence)?;
         let prepared = self.prepare_dictation_transfer(settings).await?;
         self.activate_prepared_outbox(prepared).await;
         Ok(())
@@ -1041,6 +1239,8 @@ impl SyncService {
             .map_err(SyncServiceError::Persistence)?;
         crate::db::backfill_visible_dictations_in_transaction(&transaction, settings.role)
             .map_err(SyncServiceError::Persistence)?;
+        crate::db::backfill_visible_meetings_in_transaction(&transaction, settings.role)
+            .map_err(SyncServiceError::Persistence)?;
         transaction
             .commit()
             .context("committing Home Hub settings transaction")
@@ -1058,6 +1258,8 @@ impl SyncService {
         SyncSettingsRepository::save(&transaction, settings)
             .map_err(SyncServiceError::Persistence)?;
         crate::db::backfill_visible_dictations_in_transaction(&transaction, settings.role)
+            .map_err(SyncServiceError::Persistence)?;
+        crate::db::backfill_visible_meetings_in_transaction(&transaction, settings.role)
             .map_err(SyncServiceError::Persistence)?;
         transaction
             .commit()

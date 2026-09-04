@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_SCHEMA_VERSION: i64 = 4;
+const LATEST_SCHEMA_VERSION: i64 = 5;
 
 /// Open the application database and run pending migrations.
 ///
@@ -140,6 +140,12 @@ fn apply_pending_migrations(conn: &Connection) -> Result<()> {
         4,
         "dictation_shared_library",
         migrate_dictation_shared_library,
+    )?;
+    apply_migration(
+        conn,
+        5,
+        "meeting_artifact_shared_library",
+        migrate_meeting_artifact_shared_library,
     )?;
     Ok(())
 }
@@ -488,6 +494,297 @@ fn migrate_dictation_shared_library(conn: &Connection) -> Result<()> {
             ON shared_library_changes(record_id, cursor);",
     )
     .context("Failed to create dictation Shared Library schema")?;
+    Ok(())
+}
+
+fn migrate_meeting_artifact_shared_library(conn: &Connection) -> Result<()> {
+    let device_id: String = conn
+        .query_row(
+            "SELECT device_id FROM sync_identity WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .context("Missing device identity for meeting migration")?;
+
+    conn.execute_batch(
+        "CREATE TABLE meetings_v5 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            title_source TEXT,
+            title_updated_at TIMESTAMP,
+            title_version INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'recording',
+            audio_path TEXT NOT NULL,
+            source_filename TEXT,
+            transcript_path TEXT,
+            transcript_text TEXT,
+            transcript_segments TEXT,
+            duration_seconds INTEGER,
+            started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            error TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            deleted_at TIMESTAMP,
+            sync_id TEXT NOT NULL UNIQUE,
+            origin_device_id TEXT NOT NULL,
+            sync_version INTEGER NOT NULL DEFAULT 1 CHECK (sync_version >= 1)
+        );
+        CREATE TABLE meeting_artifacts_v5 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            meeting_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            template_id TEXT,
+            agent_profile_id INTEGER,
+            status TEXT NOT NULL,
+            content_markdown TEXT,
+            error TEXT,
+            stdout TEXT,
+            stderr TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP,
+            sync_id TEXT NOT NULL UNIQUE,
+            origin_device_id TEXT NOT NULL,
+            sync_version INTEGER NOT NULL DEFAULT 1 CHECK (sync_version >= 1),
+            FOREIGN KEY(meeting_id) REFERENCES meetings_v5(id),
+            FOREIGN KEY(agent_profile_id) REFERENCES agent_profiles(id)
+        );",
+    )
+    .context("Failed to create UUID-backed meeting tables")?;
+
+    let meetings = {
+        let mut statement = conn.prepare(
+            "SELECT id, title, title_source, title_updated_at, title_version, status, audio_path,
+                    source_filename, transcript_path, transcript_text, transcript_segments,
+                    duration_seconds, started_at, completed_at, error, created_at, deleted_at
+             FROM meetings ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, Option<i64>>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                    row.get::<_, Option<String>>(14)?,
+                    row.get::<_, String>(15)?,
+                    row.get::<_, Option<String>>(16)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for row in meetings {
+        conn.execute(
+            "INSERT INTO meetings_v5 VALUES
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,1)",
+            rusqlite::params![
+                row.0,
+                row.1,
+                row.2,
+                row.3,
+                row.4,
+                row.5,
+                row.6,
+                row.7,
+                row.8,
+                row.9,
+                row.10,
+                row.11,
+                row.12,
+                row.13,
+                row.14,
+                row.15,
+                row.16,
+                uuid::Uuid::new_v4().hyphenated().to_string(),
+                device_id
+            ],
+        )?;
+    }
+    let artifacts = {
+        let mut statement = conn.prepare(
+            "SELECT id, meeting_id, kind, title, template_id, agent_profile_id, status,
+                    content_markdown, error, stdout, stderr, created_at, updated_at, completed_at
+             FROM meeting_artifacts ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<String>>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, String>(12)?,
+                    row.get::<_, Option<String>>(13)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for row in artifacts {
+        conn.execute(
+            "INSERT INTO meeting_artifacts_v5 VALUES
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,1)",
+            rusqlite::params![
+                row.0,
+                row.1,
+                row.2,
+                row.3,
+                row.4,
+                row.5,
+                row.6,
+                row.7,
+                row.8,
+                row.9,
+                row.10,
+                row.11,
+                row.12,
+                row.13,
+                uuid::Uuid::new_v4().hyphenated().to_string(),
+                device_id
+            ],
+        )?;
+    }
+
+    conn.execute_batch(
+        "DROP TABLE meeting_artifacts;
+         DROP TABLE meetings;
+         ALTER TABLE meetings_v5 RENAME TO meetings;
+         ALTER TABLE meeting_artifacts_v5 RENAME TO meeting_artifacts;
+         CREATE INDEX idx_meetings_started_at ON meetings(started_at DESC);
+         CREATE INDEX idx_meetings_status ON meetings(status);
+         CREATE INDEX idx_meetings_deleted_at ON meetings(deleted_at);
+         CREATE INDEX idx_meetings_visible_uuid ON meetings(deleted_at, sync_id);
+         CREATE INDEX idx_meeting_artifacts_meeting_created ON meeting_artifacts(meeting_id, created_at DESC);
+         CREATE INDEX idx_meeting_artifacts_status ON meeting_artifacts(status);
+
+         ALTER TABLE shared_dictations RENAME TO shared_dictations_v4;
+         ALTER TABLE shared_record_index RENAME TO shared_record_index_v4;
+         CREATE TABLE shared_record_index (
+            record_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind IN ('dictation','meeting','artifact')),
+            origin_device_id TEXT,
+            authoritative_revision INTEGER NOT NULL DEFAULT 0 CHECK (authoritative_revision >= 0),
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         INSERT INTO shared_record_index SELECT * FROM shared_record_index_v4;
+         CREATE TABLE shared_dictations (
+            record_id TEXT PRIMARY KEY, origin_device_id TEXT NOT NULL, text TEXT NOT NULL,
+            source_created_at TEXT NOT NULL, source_updated_at TEXT NOT NULL,
+            local_version INTEGER NOT NULL CHECK(local_version >= 1),
+            authoritative_revision INTEGER NOT NULL CHECK(authoritative_revision >= 1), deleted_at TEXT,
+            FOREIGN KEY(record_id) REFERENCES shared_record_index(record_id)
+         );
+         INSERT INTO shared_dictations SELECT * FROM shared_dictations_v4;
+         DROP TABLE shared_dictations_v4;
+         DROP TABLE shared_record_index_v4;
+         CREATE INDEX idx_shared_dictations_visible ON shared_dictations(deleted_at, source_created_at DESC, record_id DESC);
+
+         CREATE TABLE shared_meetings (
+            record_id TEXT PRIMARY KEY,
+            origin_device_id TEXT NOT NULL,
+            title TEXT,
+            title_source TEXT,
+            title_version INTEGER NOT NULL DEFAULT 0,
+            title_authority TEXT NOT NULL DEFAULT 'origin' CHECK(title_authority IN ('origin','hub')),
+            source_filename TEXT,
+            transcript_text TEXT NOT NULL,
+            transcript_segments TEXT,
+            duration_seconds INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK(status = 'completed'),
+            source_created_at TEXT NOT NULL,
+            source_updated_at TEXT NOT NULL,
+            source_completed_at TEXT NOT NULL,
+            local_version INTEGER NOT NULL CHECK(local_version >= 1),
+            authoritative_revision INTEGER NOT NULL CHECK(authoritative_revision >= 1),
+            deleted_at TEXT,
+            FOREIGN KEY(record_id) REFERENCES shared_record_index(record_id)
+         );
+         CREATE INDEX idx_shared_meetings_visible ON shared_meetings(deleted_at, source_created_at DESC, record_id DESC);
+         CREATE TABLE shared_artifacts (
+            record_id TEXT PRIMARY KEY,
+            parent_record_id TEXT NOT NULL,
+            origin_device_id TEXT NOT NULL,
+            artifact_kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            template_id TEXT,
+            agent_profile_name TEXT,
+            content_markdown TEXT NOT NULL,
+            source_created_at TEXT NOT NULL,
+            source_updated_at TEXT NOT NULL,
+            source_completed_at TEXT NOT NULL,
+            local_version INTEGER NOT NULL CHECK(local_version >= 1),
+            authoritative_revision INTEGER NOT NULL CHECK(authoritative_revision >= 1),
+            deleted_at TEXT,
+            FOREIGN KEY(record_id) REFERENCES shared_record_index(record_id),
+            FOREIGN KEY(parent_record_id) REFERENCES shared_meetings(record_id)
+         );
+         CREATE INDEX idx_shared_artifacts_parent ON shared_artifacts(parent_record_id, deleted_at, source_created_at DESC);
+         CREATE TABLE sync_artifact_runs (
+            run_id TEXT PRIMARY KEY,
+            artifact_record_id TEXT NOT NULL UNIQUE,
+            parent_record_id TEXT NOT NULL,
+            origin_device_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            template_id TEXT,
+            agent_profile_name TEXT,
+            agent_profile_id INTEGER,
+            status TEXT NOT NULL CHECK(status IN ('pending','running','completed','error')),
+            content_markdown TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT,
+            FOREIGN KEY(agent_profile_id) REFERENCES agent_profiles(id)
+         );
+
+         ALTER TABLE sync_outbox_items RENAME TO sync_outbox_items_v4;
+         CREATE TABLE sync_outbox_items (
+            record_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting','artifact')),
+            local_version INTEGER NOT NULL CHECK(local_version >= 1), snapshot_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','uploading','synced','needs_attention')),
+            accepted_hub_revision INTEGER, attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+            lease_owner TEXT, lease_expires_at TEXT, next_attempt_at TEXT, last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(record_id,kind)
+         );
+         INSERT INTO sync_outbox_items SELECT * FROM sync_outbox_items_v4;
+         DROP TABLE sync_outbox_items_v4;
+         CREATE INDEX idx_sync_outbox_claim ON sync_outbox_items(state,next_attempt_at,lease_expires_at,created_at);
+
+         ALTER TABLE sync_tombstones RENAME TO sync_tombstones_v4;
+         CREATE TABLE sync_tombstones(record_id TEXT PRIMARY KEY, kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting','artifact')), deleted_version INTEGER NOT NULL CHECK(deleted_version >= 1), deleted_at TEXT NOT NULL);
+         INSERT INTO sync_tombstones SELECT * FROM sync_tombstones_v4;
+         DROP TABLE sync_tombstones_v4;
+         ALTER TABLE shared_library_changes RENAME TO shared_library_changes_v4;
+         CREATE TABLE shared_library_changes(cursor INTEGER PRIMARY KEY AUTOINCREMENT, operation TEXT NOT NULL CHECK(operation IN ('upsert','delete')), kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting','artifact')), record_id TEXT NOT NULL, authoritative_revision INTEGER NOT NULL, change_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+         INSERT INTO shared_library_changes SELECT * FROM shared_library_changes_v4;
+         DROP TABLE shared_library_changes_v4;
+         CREATE INDEX idx_shared_library_changes_record ON shared_library_changes(record_id,cursor);"
+    ).context("Failed to install meeting Shared Library schema")?;
     Ok(())
 }
 

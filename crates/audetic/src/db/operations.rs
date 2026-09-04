@@ -60,7 +60,8 @@ pub fn insert_workflow_record(conn: &Connection, workflow: &Workflow) -> Result<
                 created_at: portable_created_at.clone(),
                 updated_at: portable_created_at,
                 payload: DictationPayload { text: text.clone() },
-            },
+            }
+            .into(),
         )?;
     }
     transaction.commit().context("Failed to commit workflow")?;
@@ -348,10 +349,62 @@ pub fn backfill_visible_dictations_in_transaction(
                 payload: DictationPayload {
                     text: row.3.clone(),
                 },
-            },
+            }
+            .into(),
         )?;
     }
     Ok(snapshots.len())
+}
+
+pub fn backfill_visible_meetings(conn: &Connection, target_role: SyncRole) -> Result<usize> {
+    let transaction = conn.unchecked_transaction()?;
+    let count = backfill_visible_meetings_in_transaction(&transaction, target_role)?;
+    transaction.commit()?;
+    Ok(count)
+}
+
+pub fn backfill_visible_meetings_in_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+    target_role: SyncRole,
+) -> Result<usize> {
+    if !matches!(target_role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
+        return Ok(0);
+    }
+    let identity = SyncIdentityRepository::get_or_create_device(transaction)?;
+    let meeting_ids = {
+        let mut statement = transaction.prepare(
+            "SELECT id FROM meetings WHERE deleted_at IS NULL AND status = 'completed'
+             AND origin_device_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([identity.device_id.to_string()], |row| row.get::<_, i64>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    let mut count = 0;
+    for meeting_id in meeting_ids {
+        let meeting = crate::db::meetings::MeetingRepository::get(transaction, meeting_id)?
+            .context("visible meeting disappeared during backfill")?;
+        SyncOutboxRepository::enqueue_snapshot(transaction, &meeting.snapshot()?.into())?;
+        count += 1;
+        for artifact in
+            crate::db::meeting_artifacts::MeetingArtifactRepository::list_for_live_meeting(
+                transaction,
+                meeting_id,
+            )?
+        {
+            if artifact.status == crate::db::meeting_artifacts::ArtifactStatus::Completed
+                && artifact.origin_device_id == identity.device_id
+            {
+                SyncOutboxRepository::enqueue_snapshot(
+                    transaction,
+                    &artifact.snapshot(transaction)?.into(),
+                )?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
 }
 
 fn portable_timestamp(value: &str) -> Result<String> {

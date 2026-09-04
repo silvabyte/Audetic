@@ -1,6 +1,7 @@
 //! Generate and persist meeting artifacts using local agent CLIs.
 
 use anyhow::{Context, Result};
+use audetic_core::sync::{RecordId, SyncRole};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use utoipa::ToSchema;
@@ -66,8 +67,8 @@ pub async fn generate_meeting_artifact(
 
     let output = async {
         let paths = prepare_run_files(
-            artifact_id,
-            meeting_id,
+            &artifact_id.to_string(),
+            &meeting_id.to_string(),
             meeting.title.as_deref(),
             &transcript,
             &template,
@@ -122,6 +123,148 @@ pub async fn generate_meeting_artifact(
         .ok_or_else(|| anyhow::anyhow!("artifact {artifact_id} disappeared after generation"))
 }
 
+pub async fn generate_shared_meeting_artifact(
+    db_path: &Path,
+    meeting_id: RecordId,
+    meeting_title: Option<&str>,
+    transcript: &str,
+    request: GenerateArtifactRequest,
+) -> Result<MeetingArtifact> {
+    if transcript.trim().is_empty() {
+        anyhow::bail!("meeting {meeting_id} has no transcript text");
+    }
+    let conn = crate::db::open_db_at(db_path).context("Failed to open audetic database")?;
+    AgentProfileRepository::ensure_builtin_profiles(&conn)?;
+    let template = get_template(&request.template_id)?;
+    template.validate()?;
+    let profile = resolve_profile(&conn, request.agent_profile_id)?;
+    let title = format!("{} — {}", template.name, profile.name);
+    let run_id = RecordId::new();
+    let artifact_id = RecordId::new();
+    let identity = crate::db::sync_identity::SyncIdentityRepository::get_or_create_device(&conn)?;
+    conn.execute(
+        "INSERT INTO sync_artifact_runs (run_id, artifact_record_id, parent_record_id, origin_device_id, kind, title, template_id, agent_profile_name, agent_profile_id, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')",
+        rusqlite::params![run_id.to_string(),artifact_id.to_string(),meeting_id.to_string(),identity.device_id.to_string(),request.kind,&title,template.id,profile.name,profile.id],
+    )?;
+    conn.execute("UPDATE sync_artifact_runs SET status='running', updated_at=CURRENT_TIMESTAMP WHERE run_id=?1",[run_id.to_string()])?;
+
+    let output = async {
+        let paths = prepare_run_files(
+            &run_id.to_string(),
+            &meeting_id.to_string(),
+            meeting_title,
+            transcript,
+            &template,
+            request.custom_context.as_deref(),
+            &profile,
+        )?;
+        let prompt = std::fs::read_to_string(&paths.prompt_path)
+            .with_context(|| format!("Failed to read prompt at {:?}", paths.prompt_path))?;
+        run_agent(AgentRunRequest {
+            profile: profile.clone(),
+            prompt,
+            paths,
+            timeout_seconds: DEFAULT_AGENT_TIMEOUT_SECONDS,
+        })
+        .await
+    }
+    .await;
+
+    let (status, content, error, stdout, stderr) = match output {
+        Ok(output) if output.success && !output.stdout.trim().is_empty() => (
+            crate::db::meeting_artifacts::ArtifactStatus::Completed,
+            Some(output.stdout.trim().to_string()),
+            None,
+            Some(output.stdout),
+            Some(output.stderr),
+        ),
+        Ok(output) => {
+            let message = if output.timed_out {
+                "agent command timed out".to_string()
+            } else if output.stdout.trim().is_empty() && output.success {
+                "agent command succeeded but produced no stdout".to_string()
+            } else {
+                format!("agent command failed (exit {:?})", output.exit_code)
+            };
+            (
+                crate::db::meeting_artifacts::ArtifactStatus::Error,
+                None,
+                Some(message),
+                Some(output.stdout),
+                Some(output.stderr),
+            )
+        }
+        Err(error) => (
+            crate::db::meeting_artifacts::ArtifactStatus::Error,
+            None,
+            Some(error.to_string()),
+            None,
+            None,
+        ),
+    };
+    let completed_at = chrono::Utc::now().to_rfc3339();
+    let transaction = conn.unchecked_transaction()?;
+    let affected = transaction.execute(
+        "UPDATE sync_artifact_runs SET status=?1, content_markdown=?2, error=?3, updated_at=?4, completed_at=?4 \
+         WHERE run_id=?5 AND NOT EXISTS ( \
+             SELECT 1 FROM sync_tombstones t \
+             WHERE t.record_id=sync_artifact_runs.parent_record_id AND t.kind='meeting' \
+         )",
+        rusqlite::params![status.as_str(),content,error,completed_at,run_id.to_string()],
+    )?;
+    if affected == 0 {
+        anyhow::bail!("shared artifact run was cancelled because its meeting was deleted");
+    }
+    if status == crate::db::meeting_artifacts::ArtifactStatus::Completed {
+        let snapshot = crate::sync::protocol::CompletedArtifactSnapshot {
+            kind: crate::sync::protocol::RecordKind::Artifact,
+            schema_version: 1,
+            record_id: artifact_id,
+            parent_record_id: meeting_id,
+            origin_device_id: identity.device_id,
+            local_version: 1,
+            created_at: completed_at.clone(),
+            updated_at: completed_at.clone(),
+            payload: crate::sync::protocol::CompletedArtifactPayload {
+                artifact_kind: request.kind.clone(),
+                title: title.clone(),
+                template_id: Some(template.id.clone()),
+                agent_profile_name: Some(profile.name.clone()),
+                content_markdown: content.clone().expect("completed artifact has content"),
+                completed_at: completed_at.clone(),
+            },
+        };
+        let role = crate::db::sync_settings::SyncSettingsRepository::get(&transaction)?.role;
+        if matches!(role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
+            crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
+                &transaction,
+                &snapshot.into(),
+            )?;
+        }
+    }
+    transaction.commit()?;
+    Ok(MeetingArtifact {
+        id: artifact_id,
+        meeting_id,
+        local_id: 0,
+        local_meeting_id: 0,
+        origin_device_id: identity.device_id,
+        sync_version: 1,
+        kind: request.kind,
+        title,
+        template_id: Some(template.id),
+        agent_profile_id: Some(profile.id),
+        status,
+        content_markdown: content,
+        error,
+        stdout,
+        stderr,
+        created_at: completed_at.clone(),
+        updated_at: completed_at.clone(),
+        completed_at: Some(completed_at),
+    })
+}
+
 fn resolve_profile(conn: &rusqlite::Connection, id: Option<i64>) -> Result<AgentProfile> {
     match id {
         Some(id) => AgentProfileRepository::get(conn, id)?
@@ -132,17 +275,15 @@ fn resolve_profile(conn: &rusqlite::Connection, id: Option<i64>) -> Result<Agent
 }
 
 fn prepare_run_files(
-    artifact_id: i64,
-    meeting_id: i64,
+    run_key: &str,
+    meeting_id: &str,
     meeting_title: Option<&str>,
     transcript: &str,
     template: &SummaryTemplate,
     custom_context: Option<&str>,
     profile: &AgentProfile,
 ) -> Result<AgentRunPaths> {
-    let run_dir = crate::global::data_dir()?
-        .join("agent-runs")
-        .join(artifact_id.to_string());
+    let run_dir = crate::global::data_dir()?.join("agent-runs").join(run_key);
     std::fs::create_dir_all(&run_dir)
         .with_context(|| format!("Failed to create agent run dir at {run_dir:?}"))?;
 
@@ -156,7 +297,7 @@ fn prepare_run_files(
     std::fs::write(&template_path, serde_json::to_string_pretty(template)?)
         .with_context(|| format!("Failed to write template to {template_path:?}"))?;
     let metadata = serde_json::json!({
-        "artifact_id": artifact_id,
+        "artifact_id": run_key,
         "meeting_id": meeting_id,
         "meeting_title": meeting_title,
         "agent_profile": {
@@ -190,7 +331,7 @@ fn prepare_run_files(
 }
 
 fn render_prompt(
-    meeting_id: i64,
+    meeting_id: &str,
     meeting_title: Option<&str>,
     template: &SummaryTemplate,
     custom_context: Option<&str>,

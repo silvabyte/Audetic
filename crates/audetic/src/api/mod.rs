@@ -118,11 +118,15 @@ impl ApiServer {
             services,
             inspector,
             meetings_dir,
+            sync: None,
         });
         self
     }
 
     pub fn with_sync_service(mut self, service: std::sync::Arc<crate::sync::SyncService>) -> Self {
+        if let Some(meeting_state) = self.meeting_state.as_mut() {
+            meeting_state.sync = Some(service.clone());
+        }
         self.sync_state = Some(routes::sync::SyncApiState::new(service));
         self
     }
@@ -139,6 +143,7 @@ impl ApiServer {
         // can serve the bundled web-ui at `/` without colliding with API
         // paths (e.g. /meetings is also a SPA route).
         let history_sync = self.sync_state.as_ref().map(|state| state.service.clone());
+        let artifact_sync = self.sync_state.as_ref().map(|state| state.service.clone());
         let mut api = Router::new()
             .route("/", get(status))
             .route("/version", get(version))
@@ -161,7 +166,7 @@ impl ApiServer {
             .merge(routes::transcribe::router())
             .merge(routes::agents::router())
             .merge(routes::summary_templates::router())
-            .merge(routes::meeting_artifacts::router())
+            .merge(routes::meeting_artifacts::router(artifact_sync))
             .merge(routes::post_processing::router(self.post_processing_state))
             .layer(Extension(self.instance_id));
 

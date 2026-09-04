@@ -281,6 +281,7 @@ mod tests {
         .with_retry_jitter(fixed);
         let item = OutboxItem {
             record_id: audetic_core::sync::RecordId::new(),
+            kind: crate::sync::protocol::RecordKind::Dictation,
             local_version: 1,
             snapshot: crate::sync::protocol::DictationSnapshot {
                 kind: crate::sync::protocol::RecordKind::Dictation,
@@ -291,7 +292,8 @@ mod tests {
                 created_at: "2026-09-04T10:00:00Z".into(),
                 updated_at: "2026-09-04T10:00:00Z".into(),
                 payload: crate::sync::protocol::DictationPayload { text: "x".into() },
-            },
+            }
+            .into(),
             attempts: 1,
             lease_owner: "worker".into(),
         };

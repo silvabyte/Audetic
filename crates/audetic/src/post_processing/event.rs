@@ -68,6 +68,7 @@ pub struct DictationCompletedPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MeetingCompletedPayload {
     pub meeting_id: i64,
+    pub record_id: RecordId,
     pub title: Option<String>,
     pub audio_path: PathBuf,
     pub transcript_path: PathBuf,
@@ -124,6 +125,7 @@ impl Event {
             }),
             EventKind::MeetingCompleted => Self::MeetingCompleted(MeetingCompletedPayload {
                 meeting_id: 0,
+                record_id: RecordId::from_uuid(uuid::Uuid::nil()),
                 title: Some("Synthetic test meeting".to_string()),
                 audio_path: PathBuf::from("/tmp/audetic/test-meeting.mp3"),
                 transcript_path: PathBuf::from("/tmp/audetic/test-meeting.txt"),

@@ -423,4 +423,39 @@ mod tests {
             assert!(properties["source_filename"].is_object());
         }
     }
+
+    #[test]
+    fn slice_three_meeting_and_artifact_contracts_use_portable_uuids() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        for path in [
+            "/meetings/{id}",
+            "/meetings/{id}/audio",
+            "/meetings/{id}/title",
+            "/meetings/{id}/regenerate-title",
+            "/meetings/{id}/retry",
+            "/meetings/{id}/artifacts",
+            "/meetings/{id}/artifacts/{artifact_id}",
+        ] {
+            assert!(spec["paths"][path].is_object(), "missing path {path}");
+        }
+        for schema_name in ["MeetingSummary", "MeetingDetailResponse"] {
+            let properties = &spec["components"]["schemas"][schema_name]["properties"];
+            assert_eq!(properties["id"]["$ref"], "#/components/schemas/RecordId");
+            assert_eq!(
+                properties["origin_device_id"]["$ref"],
+                "#/components/schemas/DeviceId"
+            );
+            assert!(properties["source"].is_object());
+            assert!(properties["upload_state"].is_object());
+            assert!(properties["payload_availability"].is_object());
+            assert!(properties["audio_path"].is_null());
+            assert!(properties["transcript_path"].is_null());
+        }
+        let artifact = &spec["components"]["schemas"]["MeetingArtifact"]["properties"];
+        assert_eq!(artifact["id"]["$ref"], "#/components/schemas/RecordId");
+        assert_eq!(
+            artifact["meeting_id"]["$ref"],
+            "#/components/schemas/RecordId"
+        );
+    }
 }

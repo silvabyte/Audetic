@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use audetic_core::sync::{HubCandidate, HubConnection, HubId};
+use audetic_core::sync::{HubCandidate, HubConnection, HubId, RecordId};
 use reqwest::Url;
 use thiserror::Error;
 
@@ -7,8 +7,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::protocol::{
-    DictationPage, HubApiError, HubInfo, SnapshotBatch, SnapshotBatchResponse, HUB_API_MOUNT_PATH,
-    HUB_DICTATIONS_PATH, HUB_ID_HEADER, HUB_INFO_PATH, HUB_SNAPSHOTS_PATH, PROTOCOL_VERSION,
+    DictationPage, HubApiError, HubInfo, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting,
+    SnapshotBatch, SnapshotBatchResponse, HUB_API_MOUNT_PATH, HUB_DICTATIONS_PATH, HUB_ID_HEADER,
+    HUB_INFO_PATH, HUB_MEETINGS_PATH, HUB_SNAPSHOTS_PATH, PROTOCOL_VERSION,
     PROTOCOL_VERSION_HEADER, TAILSCALE_HTTPS_PORT,
 };
 
@@ -34,6 +35,22 @@ pub trait HubTransport: Clone + Send + Sync + 'static {
         _body: Vec<u8>,
     ) -> Result<TransportResponse, String> {
         Err("POST is not implemented by this transport".to_owned())
+    }
+
+    async fn patch(
+        &self,
+        _url: Url,
+        _headers: BTreeMap<String, String>,
+        _body: Vec<u8>,
+    ) -> Result<TransportResponse, String> {
+        Err("PATCH is not implemented by this transport".into())
+    }
+    async fn delete(
+        &self,
+        _url: Url,
+        _headers: BTreeMap<String, String>,
+    ) -> Result<TransportResponse, String> {
+        Err("DELETE is not implemented by this transport".into())
     }
 }
 
@@ -103,6 +120,34 @@ impl HubTransport for ReqwestHubTransport {
             .await
             .map_err(|error| error.to_string())?;
         response_from_reqwest(response).await
+    }
+
+    async fn patch(
+        &self,
+        url: Url,
+        headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+    ) -> Result<TransportResponse, String> {
+        let mut request = self
+            .client
+            .patch(url)
+            .body(body)
+            .header("content-type", "application/json");
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        response_from_reqwest(request.send().await.map_err(|error| error.to_string())?).await
+    }
+    async fn delete(
+        &self,
+        url: Url,
+        headers: BTreeMap<String, String>,
+    ) -> Result<TransportResponse, String> {
+        let mut request = self.client.delete(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        response_from_reqwest(request.send().await.map_err(|error| error.to_string())?).await
     }
 }
 
@@ -344,6 +389,118 @@ impl<T: HubTransport> HubClient<T> {
             return Err(http_error(response));
         }
         serde_json::from_slice(&response.body).map_err(HubClientError::InvalidInfo)
+    }
+
+    pub async fn page_meetings(
+        &self,
+        hub_id: HubId,
+        query: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<MeetingPage, HubClientError> {
+        let mut url = self
+            .base_url
+            .join(HUB_MEETINGS_PATH)
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("limit", &limit.to_string());
+            if let Some(value) = query {
+                pairs.append_pair("q", value);
+            }
+            if let Some(value) = cursor {
+                pairs.append_pair("cursor", value);
+            }
+        }
+        let response = self
+            .transport
+            .get(url, protocol_headers(hub_id))
+            .await
+            .map_err(HubClientError::Transport)?;
+        verify_hub_response(&response, hub_id)?;
+        if !(200..300).contains(&response.status) {
+            return Err(http_error(response));
+        }
+        serde_json::from_slice(&response.body).map_err(HubClientError::InvalidInfo)
+    }
+
+    pub async fn meeting(
+        &self,
+        hub_id: HubId,
+        id: RecordId,
+    ) -> Result<Option<SharedMeeting>, HubClientError> {
+        let url = self
+            .base_url
+            .join(&format!("v1/meetings/{id}"))
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        let response = self
+            .transport
+            .get(url, protocol_headers(hub_id))
+            .await
+            .map_err(HubClientError::Transport)?;
+        verify_hub_response(&response, hub_id)?;
+        if response.status == 404 {
+            return Ok(None);
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(http_error(response));
+        }
+        serde_json::from_slice(&response.body)
+            .map(Some)
+            .map_err(HubClientError::InvalidInfo)
+    }
+
+    pub async fn update_meeting_title(
+        &self,
+        hub_id: HubId,
+        id: RecordId,
+        patch: &MeetingTitlePatch,
+    ) -> Result<SharedMeeting, HubClientError> {
+        let url = self
+            .base_url
+            .join(&format!("v1/meetings/{id}"))
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        let response = self
+            .transport
+            .patch(
+                url,
+                protocol_headers(hub_id),
+                serde_json::to_vec(patch).map_err(HubClientError::InvalidInfo)?,
+            )
+            .await
+            .map_err(HubClientError::Transport)?;
+        verify_hub_response(&response, hub_id)?;
+        if !(200..300).contains(&response.status) {
+            return Err(http_error(response));
+        }
+        serde_json::from_slice(&response.body).map_err(HubClientError::InvalidInfo)
+    }
+
+    pub async fn delete_record(
+        &self,
+        hub_id: HubId,
+        id: RecordId,
+        kind: RecordKind,
+    ) -> Result<(), HubClientError> {
+        let segment = match kind {
+            RecordKind::Dictation => "dictations",
+            RecordKind::Meeting => "meetings",
+            RecordKind::Artifact => "artifacts",
+        };
+        let url = self
+            .base_url
+            .join(&format!("v1/{segment}/{id}"))
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        let response = self
+            .transport
+            .delete(url, protocol_headers(hub_id))
+            .await
+            .map_err(HubClientError::Transport)?;
+        verify_hub_response(&response, hub_id)?;
+        if !(200..300).contains(&response.status) {
+            return Err(http_error(response));
+        }
+        Ok(())
     }
 }
 

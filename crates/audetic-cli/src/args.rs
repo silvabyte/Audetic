@@ -2,7 +2,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use audetic_core::keybind::KeybindTarget;
-use audetic_core::sync::HubId;
+use audetic_core::sync::{HubId, RecordId};
 
 #[derive(Parser, Debug)]
 #[command(name = "audetic")]
@@ -194,12 +194,12 @@ pub enum MeetingCommand {
     /// Show details of a specific meeting
     Show {
         /// Meeting ID
-        id: i64,
+        id: RecordId,
     },
     /// Delete a meeting (hides it from all views; audio stays on disk)
     Delete {
         /// Meeting ID
-        id: i64,
+        id: RecordId,
     },
     /// Import an existing audio or video file as a new meeting
     Import {
@@ -456,6 +456,15 @@ mod tests {
             "https://home.example.ts.net:8443/audetic/"
         ])
         .is_err());
+    }
+
+    #[test]
+    fn meeting_item_commands_require_public_uuid_ids() {
+        let id = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        for command in ["show", "delete"] {
+            assert!(Cli::try_parse_from(["audetic", "meeting", command, id]).is_ok());
+            assert!(Cli::try_parse_from(["audetic", "meeting", command, "42"]).is_err());
+        }
     }
 }
 

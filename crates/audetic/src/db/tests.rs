@@ -46,9 +46,31 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
             text TEXT NOT NULL,
             audio_path TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        INSERT INTO workflows (workflow_type, text, audio_path)
-        VALUES ('VoiceToText', 'legacy text', '/tmp/legacy.wav');",
+         );
+         INSERT INTO workflows (workflow_type, text, audio_path)
+         VALUES ('VoiceToText', 'legacy text', '/tmp/legacy.wav');
+         CREATE TABLE meetings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, title_source TEXT,
+            title_updated_at TIMESTAMP, title_version INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'recording', audio_path TEXT NOT NULL,
+            source_filename TEXT, transcript_path TEXT, transcript_text TEXT,
+            transcript_segments TEXT, duration_seconds INTEGER,
+            started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP, error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, deleted_at TIMESTAMP
+         );
+         INSERT INTO meetings (id,title,status,audio_path,transcript_text,duration_seconds,completed_at)
+         VALUES (41,'Legacy meeting','completed','/tmp/meeting.wav','legacy transcript',30,CURRENT_TIMESTAMP);
+         CREATE TABLE meeting_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, meeting_id INTEGER NOT NULL,
+            kind TEXT NOT NULL, title TEXT NOT NULL, template_id TEXT,
+            agent_profile_id INTEGER, status TEXT NOT NULL, content_markdown TEXT,
+            error TEXT, stdout TEXT, stderr TEXT,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TIMESTAMP
+         );
+         INSERT INTO meeting_artifacts (id,meeting_id,kind,title,status,content_markdown,completed_at)
+         VALUES (73,41,'summary','Legacy summary','completed','# Legacy',CURRENT_TIMESTAMP);",
     )
     .unwrap();
 
@@ -60,6 +82,20 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
+    let first_meeting_identity: (i64, String, String) = conn
+        .query_row(
+            "SELECT id, sync_id, origin_device_id FROM meetings WHERE id = 41",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let first_artifact_identity: (i64, i64, String, String) = conn
+        .query_row(
+            "SELECT id, meeting_id, sync_id, origin_device_id FROM meeting_artifacts WHERE id = 73",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
     migrate(&conn).unwrap();
 
     let applied: i64 = conn
@@ -67,7 +103,7 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(applied, 4);
+    assert_eq!(applied, 5);
 
     let legacy: (String, String) = conn
         .query_row(
@@ -85,6 +121,25 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
         )
         .unwrap();
     assert_eq!(first_identity, second_identity);
+    let second_meeting_identity: (i64, String, String) = conn
+        .query_row(
+            "SELECT id, sync_id, origin_device_id FROM meetings WHERE id = 41",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let second_artifact_identity: (i64, i64, String, String) = conn
+        .query_row(
+            "SELECT id, meeting_id, sync_id, origin_device_id FROM meeting_artifacts WHERE id = 73",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(first_meeting_identity, second_meeting_identity);
+    assert_eq!(first_artifact_identity, second_artifact_identity);
+    assert_eq!(first_artifact_identity.1, first_meeting_identity.0);
+    assert!(first_meeting_identity.1.parse::<uuid::Uuid>().is_ok());
+    assert!(first_artifact_identity.2.parse::<uuid::Uuid>().is_ok());
     assert!(first_identity.0.parse::<uuid::Uuid>().is_ok());
     assert!(first_identity.1.parse::<uuid::Uuid>().is_ok());
     assert_eq!(first_identity.2, 1);
@@ -134,6 +189,99 @@ fn home_hub_workflow_write_and_outbox_enqueue_are_atomic() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn home_hub_meeting_completion_and_outbox_enqueue_are_atomic() {
+    let conn = setup_test_db().unwrap();
+    super::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+    conn.execute(
+        "UPDATE sync_settings SET role = 'home_hub' WHERE singleton = 1",
+        [],
+    )
+    .unwrap();
+    let meeting_id =
+        super::meetings::MeetingRepository::insert(&conn, Some("Review"), "/tmp/review.wav")
+            .unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_meeting_outbox BEFORE INSERT ON sync_outbox_items
+         WHEN NEW.kind = 'meeting'
+         BEGIN SELECT RAISE(ABORT, 'simulated meeting outbox failure'); END;",
+    )
+    .unwrap();
+
+    assert!(super::meetings::MeetingRepository::complete(
+        &conn,
+        meeting_id,
+        "/tmp/review.txt",
+        "portable transcript",
+        None,
+        30,
+    )
+    .is_err());
+    let meeting = super::meetings::MeetingRepository::get(&conn, meeting_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(meeting.status, "recording");
+    assert!(meeting.transcript_text.is_none());
+}
+
+#[test]
+fn home_hub_artifact_completion_and_outbox_enqueue_are_atomic() {
+    let conn = setup_test_db().unwrap();
+    super::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+    conn.execute(
+        "UPDATE sync_settings SET role = 'home_hub' WHERE singleton = 1",
+        [],
+    )
+    .unwrap();
+    let meeting_id =
+        super::meetings::MeetingRepository::insert(&conn, Some("Review"), "/tmp/review.wav")
+            .unwrap();
+    super::meetings::MeetingRepository::complete(
+        &conn,
+        meeting_id,
+        "/tmp/review.txt",
+        "portable transcript",
+        None,
+        30,
+    )
+    .unwrap();
+    let artifact_id = super::meeting_artifacts::MeetingArtifactRepository::insert_pending(
+        &conn,
+        meeting_id,
+        "summary",
+        "Summary",
+        Some("standard_meeting"),
+        None,
+    )
+    .unwrap();
+    super::meeting_artifacts::MeetingArtifactRepository::set_running(&conn, artifact_id).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_artifact_outbox BEFORE INSERT ON sync_outbox_items
+         WHEN NEW.kind = 'artifact'
+         BEGIN SELECT RAISE(ABORT, 'simulated artifact outbox failure'); END;",
+    )
+    .unwrap();
+
+    assert!(
+        super::meeting_artifacts::MeetingArtifactRepository::complete(
+            &conn,
+            artifact_id,
+            "# Summary",
+            "# Summary",
+            "",
+        )
+        .is_err()
+    );
+    let artifact = super::meeting_artifacts::MeetingArtifactRepository::get(&conn, artifact_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        artifact.status,
+        super::meeting_artifacts::ArtifactStatus::Running
+    );
+    assert!(artifact.content_markdown.is_none());
 }
 
 #[test]

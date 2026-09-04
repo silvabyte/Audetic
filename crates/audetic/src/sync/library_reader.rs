@@ -1,5 +1,5 @@
 use anyhow::Result;
-use audetic_core::sync::{PayloadAvailability, SyncRole, UploadState};
+use audetic_core::sync::{DeviceId, PayloadAvailability, RecordId, SyncRole, UploadState};
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -21,6 +21,235 @@ pub struct LibraryReadResult {
 pub struct LibraryReader {
     db_path: PathBuf,
     hubs: Arc<dyn HubAccess>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LibraryMeeting {
+    pub id: RecordId,
+    pub local_id: Option<i64>,
+    pub origin_device_id: DeviceId,
+    pub title: Option<String>,
+    pub title_source: Option<String>,
+    pub title_version: u64,
+    pub source_filename: Option<String>,
+    pub status: String,
+    pub transcript_text: Option<String>,
+    pub transcript_segments: Option<Vec<audetic_core::jobs_client::Segment>>,
+    pub duration_seconds: Option<i64>,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub error: Option<String>,
+    pub created_at: String,
+    pub upload_state: Option<UploadState>,
+    pub payload_availability: PayloadAvailability,
+    pub source: &'static str,
+    pub offline: bool,
+    pub read_only: bool,
+    pub artifacts: Vec<super::protocol::SharedArtifact>,
+}
+
+pub struct MeetingLibraryReader {
+    db_path: PathBuf,
+    hubs: Arc<dyn HubAccess>,
+}
+impl MeetingLibraryReader {
+    pub fn new(db_path: PathBuf, hubs: Arc<dyn HubAccess>) -> Self {
+        Self { db_path, hubs }
+    }
+    pub async fn read(
+        &self,
+        settings: &SyncSettings,
+        query: Option<&str>,
+        offset: usize,
+        limit: usize,
+    ) -> Result<LibraryReadResultMeetings> {
+        let connection = crate::db::open_db_at(&self.db_path)?;
+        let limit = limit.clamp(1, super::protocol::MAX_MEETING_PAGE);
+        let fetch = offset.saturating_add(limit);
+        let mut entries = BTreeMap::new();
+        let local_fetch = if query.is_some() { usize::MAX } else { fetch };
+        for meeting in crate::db::meetings::MeetingRepository::list(&connection, local_fetch)? {
+            if query.is_some_and(|query| {
+                !contains_case_insensitive(meeting.title.as_deref().unwrap_or(""), query)
+                    && !contains_case_insensitive(
+                        meeting.transcript_text.as_deref().unwrap_or(""),
+                        query,
+                    )
+            }) {
+                continue;
+            }
+            let upload = SyncOutboxRepository::state_for_kind(
+                &connection,
+                meeting.sync_id,
+                super::protocol::RecordKind::Meeting,
+            )?;
+            entries.insert(meeting.sync_id, local_meeting(meeting, upload));
+        }
+        let (reachable, error) = match settings.role {
+            SyncRole::Standalone => (false, None),
+            SyncRole::HomeHub => {
+                for meeting in
+                    SharedLibraryRepository::page_meetings(&connection, query, None, fetch)?
+                {
+                    let id = meeting.record_id;
+                    let shared = shared_meeting(meeting, false, false);
+                    let shared = overlay_local_payload(entries.get(&id), shared);
+                    entries.insert(id, shared);
+                }
+                (true, None)
+            }
+            SyncRole::ConnectedDevice => {
+                let hub = settings
+                    .hub
+                    .as_ref()
+                    .expect("connected settings contain a hub");
+                let mut cursor = None;
+                let mut fetched = 0;
+                let mut failure = None;
+                loop {
+                    match self
+                        .hubs
+                        .page_meetings(
+                            hub,
+                            query,
+                            cursor.as_deref(),
+                            fetch
+                                .saturating_sub(fetched)
+                                .clamp(1, super::protocol::MAX_MEETING_PAGE),
+                        )
+                        .await
+                    {
+                        Ok(page) => {
+                            let len = page.items.len();
+                            fetched += len;
+                            for meeting in page.items {
+                                let id = meeting.record_id;
+                                let shared = shared_meeting(meeting, false, false);
+                                let shared = overlay_local_payload(entries.get(&id), shared);
+                                entries.insert(id, shared);
+                            }
+                            cursor = page.next_cursor;
+                            if fetched >= fetch || cursor.is_none() || len == 0 {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            failure = Some(err.to_string());
+                            break;
+                        }
+                    }
+                }
+                if failure.is_some() {
+                    entries.retain(|_, value| value.source == "local");
+                    for value in entries.values_mut() {
+                        value.offline = true;
+                        value.read_only = SyncOutboxRepository::may_have_reached_hub(
+                            &connection,
+                            value.id,
+                            super::protocol::RecordKind::Meeting,
+                        )?;
+                    }
+                    (false, failure)
+                } else {
+                    (true, None)
+                }
+            }
+        };
+        let mut meetings: Vec<_> = entries.into_values().collect();
+        meetings.sort_by(|a, b| {
+            b.started_at
+                .cmp(&a.started_at)
+                .then_with(|| b.id.cmp(&a.id))
+        });
+        let meetings = meetings.into_iter().skip(offset).take(limit).collect();
+        Ok(LibraryReadResultMeetings {
+            meetings,
+            hub_reachable: reachable,
+            error,
+        })
+    }
+}
+pub struct LibraryReadResultMeetings {
+    pub meetings: Vec<LibraryMeeting>,
+    pub hub_reachable: bool,
+    pub error: Option<String>,
+}
+fn local_meeting(
+    value: crate::db::meetings::MeetingRecord,
+    upload_state: Option<UploadState>,
+) -> LibraryMeeting {
+    LibraryMeeting {
+        id: value.sync_id,
+        local_id: Some(value.id),
+        origin_device_id: value.origin_device_id,
+        title: value.title,
+        title_source: value.title_source,
+        title_version: value.title_version.try_into().unwrap_or_default(),
+        source_filename: value.source_filename,
+        status: value.status,
+        transcript_text: value.transcript_text,
+        transcript_segments: value.transcript_segments,
+        duration_seconds: value.duration_seconds,
+        started_at: value.started_at,
+        completed_at: value.completed_at,
+        error: value.error,
+        created_at: value.created_at,
+        upload_state,
+        payload_availability: if std::path::Path::new(&value.audio_path).exists() {
+            PayloadAvailability::Available
+        } else {
+            PayloadAvailability::Unavailable
+        },
+        source: "local",
+        offline: false,
+        read_only: false,
+        artifacts: vec![],
+    }
+}
+fn shared_meeting(
+    value: super::protocol::SharedMeeting,
+    offline: bool,
+    read_only: bool,
+) -> LibraryMeeting {
+    LibraryMeeting {
+        id: value.record_id,
+        local_id: None,
+        origin_device_id: value.origin_device_id,
+        title: value.title,
+        title_source: value.title_source,
+        title_version: value.title_version,
+        source_filename: value.source_filename,
+        status: value.status,
+        transcript_text: Some(value.transcript_text),
+        transcript_segments: value.transcript_segments,
+        duration_seconds: value.duration_seconds.try_into().ok(),
+        started_at: value.created_at.clone(),
+        completed_at: Some(value.completed_at),
+        error: None,
+        created_at: value.created_at,
+        upload_state: Some(UploadState::Synced),
+        payload_availability: PayloadAvailability::Unavailable,
+        source: "shared",
+        offline,
+        read_only,
+        artifacts: value.artifacts,
+    }
+}
+
+fn overlay_local_payload(
+    local: Option<&LibraryMeeting>,
+    mut shared: LibraryMeeting,
+) -> LibraryMeeting {
+    if let Some(local) = local {
+        shared.local_id = local.local_id;
+        shared.payload_availability = local.payload_availability;
+        shared.upload_state = local.upload_state;
+    }
+    shared
+}
+
+fn contains_case_insensitive(value: &str, query: &str) -> bool {
+    value.to_lowercase().contains(&query.to_lowercase())
 }
 
 impl LibraryReader {
@@ -312,6 +541,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shared_meeting_overlay_keeps_origin_audio_available_without_duplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("meetings.sqlite");
+        let audio_path = temp.path().join("meeting.wav");
+        std::fs::write(&audio_path, b"audio").unwrap();
+        let mut conn = crate::db::migrate_db_at(&path).unwrap();
+        let local_id = crate::db::meetings::MeetingRepository::insert(
+            &conn,
+            Some("Local title"),
+            audio_path.to_str().unwrap(),
+        )
+        .unwrap();
+        crate::db::meetings::MeetingRepository::complete(
+            &conn,
+            local_id,
+            "/tmp/transcript.txt",
+            "portable transcript",
+            None,
+            30,
+        )
+        .unwrap();
+        let local = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+            .unwrap()
+            .unwrap();
+        SharedLibraryRepository::apply_meeting_snapshot(&mut conn, &local.snapshot().unwrap())
+            .unwrap();
+        drop(conn);
+
+        let result = MeetingLibraryReader::new(path, Arc::new(OfflineHub))
+            .read(&settings(SyncRole::HomeHub), None, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(result.meetings.len(), 1);
+        assert_eq!(result.meetings[0].id, local.sync_id);
+        assert_eq!(result.meetings[0].source, "shared");
+        assert_eq!(result.meetings[0].local_id, Some(local_id));
+        assert_eq!(
+            result.meetings[0].payload_availability,
+            PayloadAvailability::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn meeting_pages_are_capped_at_one_hundred_without_losing_deep_offsets() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("meeting-pages.sqlite");
+        let conn = crate::db::migrate_db_at(&path).unwrap();
+        for index in 0..120 {
+            let id = crate::db::meetings::MeetingRepository::insert(
+                &conn,
+                Some(&format!("Meeting {index:03}")),
+                "/missing.mp3",
+            )
+            .unwrap();
+            crate::db::meetings::MeetingRepository::complete(
+                &conn,
+                id,
+                "/missing.txt",
+                "transcript",
+                None,
+                10,
+            )
+            .unwrap();
+        }
+        drop(conn);
+        let reader = MeetingLibraryReader::new(path, Arc::new(OfflineHub));
+
+        let first = reader
+            .read(&settings(SyncRole::Standalone), None, 0, 500)
+            .await
+            .unwrap();
+        assert_eq!(first.meetings.len(), 100);
+        let deep = reader
+            .read(&settings(SyncRole::Standalone), None, 100, 500)
+            .await
+            .unwrap();
+        assert_eq!(deep.meetings.len(), 20);
+    }
+
+    #[tokio::test]
     async fn connected_live_only_falls_back_to_local_rows_with_offline_state() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("db.sqlite");
@@ -335,6 +644,53 @@ mod tests {
         assert!(!result.hub_reachable);
         assert_eq!(result.entries.len(), 1);
         assert!(result.entries[0].offline);
+    }
+
+    #[tokio::test]
+    async fn accepted_local_meeting_is_read_only_while_connected_hub_is_offline() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("meeting-offline.db");
+        let conn = crate::db::migrate_db_at(&path).unwrap();
+        let local_id = crate::db::meetings::MeetingRepository::insert(
+            &conn,
+            Some("Accepted meeting"),
+            "/missing.wav",
+        )
+        .unwrap();
+        crate::db::meetings::MeetingRepository::complete(
+            &conn,
+            local_id,
+            "/missing.txt",
+            "already shared transcript",
+            None,
+            30,
+        )
+        .unwrap();
+        let meeting = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+            .unwrap()
+            .unwrap();
+        crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
+            &conn,
+            &meeting.snapshot().unwrap().into(),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sync_outbox_items SET state = 'synced', accepted_hub_revision = 1 \
+             WHERE record_id = ?1 AND kind = 'meeting'",
+            [meeting.sync_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let result = MeetingLibraryReader::new(path, Arc::new(OfflineHub))
+            .read(&settings(SyncRole::ConnectedDevice), None, 0, 10)
+            .await
+            .unwrap();
+
+        assert_eq!(result.meetings.len(), 1);
+        assert!(result.meetings[0].offline);
+        assert!(result.meetings[0].read_only);
+        assert_eq!(result.meetings[0].upload_state, Some(UploadState::Synced));
     }
 
     #[tokio::test]

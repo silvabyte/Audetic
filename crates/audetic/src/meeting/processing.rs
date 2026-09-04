@@ -154,22 +154,35 @@ pub async fn process_meeting(args: ProcessingArgs) {
                 error!("Failed to write transcript file: {}", e);
             }
 
-            let canonical_title = if let Ok(conn) = services.open_db() {
-                let _ = MeetingRepository::complete(
-                    &conn,
-                    meeting_id,
-                    &transcript_path.to_string_lossy(),
-                    &result.text,
-                    result.segments.as_deref(),
-                    duration_seconds as i64,
-                );
-                MeetingRepository::get(&conn, meeting_id)
-                    .ok()
-                    .flatten()
-                    .and_then(|meeting| meeting.title)
-            } else {
-                None
+            let conn = match services.open_db() {
+                Ok(conn) => conn,
+                Err(error) => {
+                    let message = format!("Failed to persist completed meeting: {error}");
+                    error!("Meeting {}: {}", meeting_id, message);
+                    observer.on_error(&message).await;
+                    return;
+                }
             };
+            if let Err(error) = MeetingRepository::complete(
+                &conn,
+                meeting_id,
+                &transcript_path.to_string_lossy(),
+                &result.text,
+                result.segments.as_deref(),
+                duration_seconds as i64,
+            ) {
+                let message = format!("Failed to persist completed meeting: {error}");
+                error!("Meeting {}: {}", meeting_id, message);
+                let _ =
+                    MeetingRepository::fail(&conn, meeting_id, &message, duration_seconds as i64);
+                observer.on_error(&message).await;
+                return;
+            }
+            let meeting_identity = MeetingRepository::get(&conn, meeting_id)
+                .map_err(|error| error.to_string())
+                .ok()
+                .flatten()
+                .map(|meeting| (meeting.sync_id, meeting.title));
 
             info!(
                 "Meeting {} transcription complete: {} chars",
@@ -181,18 +194,21 @@ pub async fn process_meeting(args: ProcessingArgs) {
             // Dispatch is fire-and-forget: each matching job runs in its own
             // spawned task, and failures are logged but never flip the meeting
             // to `error` (the transcription itself succeeded).
-            services
-                .post_processing
-                .dispatch(PostProcessingEvent::MeetingCompleted(
-                    MeetingCompletedPayload {
-                        meeting_id,
-                        title: canonical_title,
-                        audio_path: durable_audio,
-                        transcript_path,
-                        transcript_text: result.text.clone(),
-                        duration_seconds,
-                    },
-                ));
+            if let Some((record_id, canonical_title)) = meeting_identity {
+                services
+                    .post_processing
+                    .dispatch(PostProcessingEvent::MeetingCompleted(
+                        MeetingCompletedPayload {
+                            meeting_id,
+                            record_id,
+                            title: canonical_title,
+                            audio_path: durable_audio,
+                            transcript_path,
+                            transcript_text: result.text.clone(),
+                            duration_seconds,
+                        },
+                    ));
+            }
 
             observer.on_complete(&result.text).await;
             super::title::spawn_title_generation_at(meeting_id, services.db_path.clone());
@@ -208,5 +224,110 @@ pub async fn process_meeting(args: ProcessingArgs) {
 
             observer.on_error(&error_msg).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use std::path::Path;
+    use tokio::sync::Mutex;
+
+    use crate::post_processing::{Action, EventKind, JobRepository, NewJob};
+    use crate::transcription::job_service::TranscriptionJobResult;
+
+    struct SuccessfulTranscription;
+
+    #[async_trait]
+    impl TranscriptionJobService for SuccessfulTranscription {
+        async fn submit_and_poll(
+            &self,
+            _file_path: &Path,
+            _language: Option<&str>,
+        ) -> Result<TranscriptionJobResult> {
+            Ok(TranscriptionJobResult {
+                text: "persist me".into(),
+                segments: None,
+            })
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver {
+        errors: Mutex<Vec<String>>,
+        completions: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl MeetingProgressObserver for RecordingObserver {
+        async fn on_phase(&self, _phase: MeetingPhase) {}
+
+        async fn on_error(&self, message: &str) {
+            self.errors.lock().await.push(message.into());
+        }
+
+        async fn on_complete(&self, transcript_preview: &str) {
+            self.completions
+                .lock()
+                .await
+                .push(transcript_preview.into());
+        }
+    }
+
+    #[tokio::test]
+    async fn completion_persistence_failure_suppresses_success_side_effects() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let db_path = directory.path().join("audetic.db");
+        crate::db::migrate_db_at(&db_path)?;
+        let audio_path = directory.path().join("meeting.mp3");
+        std::fs::write(&audio_path, b"fake mp3")?;
+        let marker = directory.path().join("post-processing-ran");
+        let conn = crate::db::open_db_at(&db_path)?;
+        let meeting_id = MeetingRepository::insert(&conn, None, audio_path.to_str().unwrap())?;
+        JobRepository::insert(
+            &conn,
+            &NewJob {
+                name: "completion marker".into(),
+                event: EventKind::MeetingCompleted,
+                action: Action::Command {
+                    command: format!("touch '{}'", marker.display()),
+                    timeout_seconds: 5,
+                },
+                enabled: true,
+            },
+        )?;
+        conn.execute_batch(&format!(
+            "CREATE TRIGGER reject_meeting_completion \
+             BEFORE UPDATE OF status ON meetings \
+             WHEN NEW.id = {meeting_id} AND NEW.status = 'completed' \
+             BEGIN SELECT RAISE(ABORT, 'forced completion failure'); END;"
+        ))?;
+        drop(conn);
+
+        let observer = Arc::new(RecordingObserver::default());
+        process_meeting(ProcessingArgs {
+            meeting_id,
+            audio_path,
+            duration_seconds: 12,
+            services: ProcessingServices::new(
+                Arc::new(SuccessfulTranscription),
+                Arc::new(PostProcessingService::new(db_path.clone())),
+                db_path.clone(),
+            ),
+            observer: Arc::clone(&observer) as Arc<dyn MeetingProgressObserver>,
+        })
+        .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert!(observer.completions.lock().await.is_empty());
+        assert_eq!(observer.errors.lock().await.len(), 1);
+        assert!(!marker.exists(), "post-processing must not be dispatched");
+        let conn = crate::db::open_db_at(&db_path)?;
+        let meeting = MeetingRepository::get(&conn, meeting_id)?.unwrap();
+        assert_eq!(meeting.status, MeetingPhase::Error.as_str());
+        assert!(meeting.title.is_none(), "title generation must not start");
+        Ok(())
     }
 }

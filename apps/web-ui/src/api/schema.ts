@@ -1020,8 +1020,7 @@ export interface components {
             text: string;
         };
         DeleteArtifactResponse: {
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
             success: boolean;
         };
         DeleteResponse: {
@@ -1230,14 +1229,15 @@ export interface components {
             content_markdown?: string | null;
             created_at: string;
             error?: string | null;
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
             kind: string;
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
+            origin_device_id: components["schemas"]["DeviceId"];
             status: components["schemas"]["ArtifactStatus"];
             stderr?: string | null;
             stdout?: string | null;
+            /** Format: int64 */
+            sync_version: number;
             template_id?: string | null;
             title: string;
             updated_at: string;
@@ -1267,33 +1267,35 @@ export interface components {
          *     survive.
          */
         MeetingDeleteResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
         /** @description Full meeting record including transcript text when available. */
         MeetingDetailResponse: {
-            audio_path: string;
             completed_at?: string | null;
             created_at: string;
             /** Format: int64 */
             duration_seconds?: number | null;
             error?: string | null;
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
+            offline: boolean;
+            origin_device_id: components["schemas"]["DeviceId"];
+            payload_availability: components["schemas"]["PayloadAvailability"];
+            read_only: boolean;
+            source: string;
             source_filename?: string | null;
             started_at: string;
             status: string;
             title?: string | null;
             title_source?: null | components["schemas"]["MeetingTitleSource"];
-            transcript_path?: string | null;
             /**
              * @description Per-segment timestamps for clickable transcript lines. `None` for
              *     meetings transcribed before timestamps were captured.
              */
             transcript_segments?: components["schemas"]["Segment"][] | null;
             transcript_text?: string | null;
+            upload_state?: null | components["schemas"]["UploadState"];
         };
         /**
          * @description Confirmation that an imported media file has been accepted as a new
@@ -1301,8 +1303,7 @@ export interface components {
          *     `GET /meetings/{id}` for phase progression and the final transcript.
          */
         MeetingImportResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
@@ -1311,8 +1312,7 @@ export interface components {
          *     re-queued; the actual work runs in the background.
          */
         MeetingRetryResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
@@ -1325,10 +1325,8 @@ export interface components {
          *     where audio is being written, and capture-source state.
          */
         MeetingStartResponse: {
-            audio_path: string;
             capture_state: string;
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
@@ -1338,13 +1336,11 @@ export interface components {
          */
         MeetingStatusResponse: {
             active: boolean;
-            audio_path?: string | null;
             capture_degraded: boolean;
             /** Format: int64 */
             duration_seconds?: number | null;
             last_error?: string | null;
-            /** Format: int64 */
-            meeting_id?: number | null;
+            meeting_id?: null | components["schemas"]["RecordId"];
             phase: string;
             title?: string | null;
         };
@@ -1355,8 +1351,7 @@ export interface components {
         MeetingStopResponse: {
             /** Format: int64 */
             duration_seconds: number;
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
@@ -1365,27 +1360,28 @@ export interface components {
          *     without loading the full transcript.
          */
         MeetingSummary: {
-            audio_path: string;
             /** Format: int64 */
             duration_seconds?: number | null;
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
+            offline: boolean;
+            origin_device_id: components["schemas"]["DeviceId"];
+            payload_availability: components["schemas"]["PayloadAvailability"];
+            read_only: boolean;
+            source: string;
             source_filename?: string | null;
             started_at: string;
             status: string;
             title?: string | null;
             title_source?: null | components["schemas"]["MeetingTitleSource"];
-            transcript_path?: string | null;
+            upload_state?: null | components["schemas"]["UploadState"];
         };
         MeetingTitleRegenerationResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
         MeetingTitleResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             title?: string | null;
             title_source?: null | components["schemas"]["MeetingTitleSource"];
         };
@@ -1401,12 +1397,10 @@ export interface components {
          *     `duration_seconds` appears on stop, hence the optional fields.
          */
         MeetingToggleResponse: {
-            audio_path?: string | null;
             capture_state?: string | null;
             /** Format: int64 */
             duration_seconds?: number | null;
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             phase: string;
             success: boolean;
@@ -2016,8 +2010,10 @@ export interface operations {
     list_meetings: {
         parameters: {
             query?: {
-                /** @description Maximum meetings to return (default 20) */
+                /** @description Maximum meetings to return (default 20, maximum 100). */
                 limit?: number | null;
+                offset?: number | null;
+                q?: string | null;
             };
             header?: never;
             path?: never;
@@ -2273,8 +2269,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2303,8 +2299,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2340,8 +2336,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2363,8 +2359,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2397,10 +2393,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
-                /** @description Artifact id */
-                artifact_id: number;
+                /** @description Meeting UUID */
+                id: string;
+                /** @description Artifact UUID */
+                artifact_id: string;
             };
             cookie?: never;
         };
@@ -2429,10 +2425,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
-                /** @description Artifact id */
-                artifact_id: number;
+                /** @description Meeting UUID */
+                id: string;
+                /** @description Artifact UUID */
+                artifact_id: string;
             };
             cookie?: never;
         };
@@ -2461,8 +2457,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2489,8 +2485,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2526,8 +2522,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2563,8 +2559,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };

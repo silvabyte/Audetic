@@ -42,7 +42,10 @@ export function MeetingRow({ meeting }: { meeting: MeetingSummary }) {
   return (
     <Observer>
       {() => {
-        const deletable = isDeletableMeetingStatus(meeting.status);
+        const deletable =
+          isDeletableMeetingStatus(meeting.status) &&
+          !meeting.offline &&
+          !meeting.read_only;
         const title = meetingDisplayTitle({
           title: meeting.title,
           sourceFilename: meeting.source_filename,
@@ -69,6 +72,12 @@ export function MeetingRow({ meeting }: { meeting: MeetingSummary }) {
                       ? `${usingDateFallback ? "" : " · "}${formatDuration(meeting.duration_seconds)}`
                       : ""}
                   </div>
+                  <div className="mt-1 flex flex-wrap gap-1 text-[10px] text-muted-foreground">
+                    <span className="font-mono">{compactMeetingLabel(meeting.id, meeting.origin_device_id)}</span>
+                    <span>· {meeting.source}</span>
+                    {meeting.upload_state && <span>· {meeting.upload_state}</span>}
+                    {meeting.offline && <span className="text-destructive">· hub offline</span>}
+                  </div>
                 </div>
                 <StatusPill status={meeting.status} />
                 {deletable && (
@@ -94,6 +103,10 @@ export function MeetingRow({ meeting }: { meeting: MeetingSummary }) {
       }}
     </Observer>
   );
+}
+
+function compactMeetingLabel(id: string, originDeviceId: string): string {
+  return `${id.slice(0, 8)}@${originDeviceId.slice(0, 4)}`;
 }
 
 function StatusIcon({ status }: { status: string }) {

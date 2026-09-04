@@ -19,7 +19,8 @@ pub use init::{
     open_db_at,
 };
 pub use operations::{
-    backfill_visible_dictations, backfill_visible_dictations_in_transaction, count_workflows,
+    backfill_visible_dictations, backfill_visible_dictations_in_transaction,
+    backfill_visible_meetings, backfill_visible_meetings_in_transaction, count_workflows,
     get_recent_workflows, get_workflow_by_sync_id, insert_workflow, insert_workflow_record,
     list_visible_workflows, prune_old_workflows, search_workflows,
 };

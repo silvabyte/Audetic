@@ -1,14 +1,15 @@
 use anyhow::{bail, Context, Result};
 use audetic_core::sync::{RecordId, UploadState};
-use rusqlite::{params, Connection, Transaction};
+use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::sync::protocol::DictationSnapshot;
+use crate::sync::protocol::{RecordKind, Snapshot};
 
 #[derive(Clone, Debug)]
 pub struct OutboxItem {
     pub record_id: RecordId,
+    pub kind: RecordKind,
     pub local_version: u64,
-    pub snapshot: DictationSnapshot,
+    pub snapshot: Snapshot,
     pub attempts: u32,
     pub lease_owner: String,
 }
@@ -16,13 +17,14 @@ pub struct OutboxItem {
 pub struct SyncOutboxRepository;
 
 impl SyncOutboxRepository {
-    pub fn enqueue_snapshot(tx: &Transaction<'_>, snapshot: &DictationSnapshot) -> Result<()> {
-        let json = serde_json::to_string(snapshot).context("serializing dictation snapshot")?;
+    pub fn enqueue_snapshot(tx: &Connection, snapshot: &Snapshot) -> Result<()> {
+        let json = serde_json::to_string(snapshot).context("serializing snapshot")?;
+        let kind = kind_name(snapshot.kind());
         let changed = tx
             .execute(
                 "INSERT INTO sync_outbox_items
                  (record_id, kind, local_version, snapshot_json, state)
-              VALUES (?1, 'dictation', ?2, ?3, 'pending')
+               VALUES (?1, ?2, ?3, ?4, 'pending')
               ON CONFLICT(record_id, kind) DO UPDATE SET
                  local_version = excluded.local_version,
                  snapshot_json = excluded.snapshot_json,
@@ -31,26 +33,28 @@ impl SyncOutboxRepository {
                  last_error = NULL, updated_at = CURRENT_TIMESTAMP
               WHERE excluded.local_version > sync_outbox_items.local_version",
                 params![
-                    snapshot.record_id.to_string(),
-                    snapshot.local_version,
+                    snapshot.record_id().to_string(),
+                    kind,
+                    snapshot.local_version(),
                     &json
                 ],
             )
-            .context("enqueueing dictation snapshot")?;
+            .context("enqueueing sync snapshot")?;
         if changed == 0 {
             let (version, existing_json) = tx
                 .query_row(
                     "SELECT local_version, snapshot_json FROM sync_outbox_items
-                     WHERE record_id = ?1 AND kind = 'dictation'",
-                    [snapshot.record_id.to_string()],
+                     WHERE record_id = ?1 AND kind = ?2",
+                    params![snapshot.record_id().to_string(), kind],
                     |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
                 )
-                .context("reading unchanged dictation outbox snapshot")?;
-            if snapshot.local_version == version && json != existing_json {
+                .context("reading unchanged sync outbox snapshot")?;
+            if snapshot.local_version() == version && json != existing_json {
                 bail!(
-                    "dictation {} local version {} conflicts with its durable outbox snapshot",
-                    snapshot.record_id,
-                    snapshot.local_version
+                    "{} {} local version {} conflicts with its durable outbox snapshot",
+                    kind,
+                    snapshot.record_id(),
+                    snapshot.local_version()
                 );
             }
         }
@@ -76,28 +80,31 @@ impl SyncOutboxRepository {
         .context("releasing expired outbox leases")?;
         let candidates = {
             let mut statement = tx.prepare(
-                "SELECT record_id FROM sync_outbox_items
+                "SELECT record_id, kind FROM sync_outbox_items
                  WHERE state = 'pending'
                    AND (next_attempt_at IS NULL OR next_attempt_at <= ?1)
-                 ORDER BY created_at, record_id LIMIT ?2",
+                  ORDER BY CASE kind WHEN 'dictation' THEN 0 WHEN 'meeting' THEN 1 ELSE 2 END,
+                           created_at, record_id LIMIT ?2",
             )?;
             let rows = statement
-                .query_map(params![now, limit], |row| row.get::<_, String>(0))?
+                .query_map(params![now, limit], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             rows
         };
         let mut claimed = Vec::with_capacity(candidates.len());
-        for record_id in candidates {
+        for (record_id, kind) in candidates {
             tx.execute(
                 "UPDATE sync_outbox_items SET state = 'uploading', attempts = attempts + 1,
-                    lease_owner = ?2, lease_expires_at = ?3, updated_at = CURRENT_TIMESTAMP
-                 WHERE record_id = ?1 AND kind = 'dictation' AND state = 'pending'",
-                params![record_id, lease_owner, lease_expires_at],
+                    lease_owner = ?3, lease_expires_at = ?4, updated_at = CURRENT_TIMESTAMP
+                 WHERE record_id = ?1 AND kind = ?2 AND state = 'pending'",
+                params![record_id, kind, lease_owner, lease_expires_at],
             )?;
             let item = tx.query_row(
                 "SELECT record_id, local_version, snapshot_json, attempts, lease_owner
-                 FROM sync_outbox_items WHERE record_id = ?1 AND kind = 'dictation'",
-                [&record_id],
+                 FROM sync_outbox_items WHERE record_id = ?1 AND kind = ?2",
+                params![&record_id, &kind],
                 |row| {
                     let id: String = row.get(0)?;
                     let json: String = row.get(2)?;
@@ -112,6 +119,7 @@ impl SyncOutboxRepository {
             )?;
             claimed.push(OutboxItem {
                 record_id: item.0.parse().map_err(anyhow::Error::msg)?,
+                kind: parse_kind(&kind)?,
                 local_version: item.1,
                 snapshot: serde_json::from_str(&item.2)?,
                 attempts: item.3,
@@ -131,13 +139,14 @@ impl SyncOutboxRepository {
             "UPDATE sync_outbox_items SET state = 'synced', accepted_hub_revision = ?3,
                 lease_owner = NULL, lease_expires_at = NULL, next_attempt_at = NULL,
                 last_error = NULL, updated_at = CURRENT_TIMESTAMP
-             WHERE record_id = ?1 AND kind = 'dictation' AND local_version = ?2
+             WHERE record_id = ?1 AND kind = ?5 AND local_version = ?2
                 AND lease_owner = ?4",
             params![
                 item.record_id.to_string(),
                 item.local_version,
                 revision,
-                item.lease_owner
+                item.lease_owner,
+                kind_name(item.kind)
             ],
         )?;
         Ok(())
@@ -148,14 +157,15 @@ impl SyncOutboxRepository {
             "UPDATE sync_outbox_items SET state = 'pending', lease_owner = NULL,
                 lease_expires_at = NULL, next_attempt_at = ?4, last_error = ?5,
                 updated_at = CURRENT_TIMESTAMP
-             WHERE record_id = ?1 AND kind = 'dictation' AND local_version = ?2
+             WHERE record_id = ?1 AND kind = ?6 AND local_version = ?2
                 AND lease_owner = ?3",
             params![
                 item.record_id.to_string(),
                 item.local_version,
                 item.lease_owner,
                 next,
-                error
+                error,
+                kind_name(item.kind)
             ],
         )?;
         Ok(())
@@ -166,13 +176,14 @@ impl SyncOutboxRepository {
             "UPDATE sync_outbox_items SET state = 'needs_attention', lease_owner = NULL,
                  lease_expires_at = NULL, next_attempt_at = NULL, last_error = ?4,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE record_id = ?1 AND kind = 'dictation' AND local_version = ?2
+             WHERE record_id = ?1 AND kind = ?5 AND local_version = ?2
                 AND lease_owner = ?3",
             params![
                 item.record_id.to_string(),
                 item.local_version,
                 item.lease_owner,
-                error
+                error,
+                kind_name(item.kind)
             ],
         )?;
         Ok(())
@@ -207,10 +218,18 @@ impl SyncOutboxRepository {
     }
 
     pub fn state_for(conn: &Connection, record_id: RecordId) -> Result<Option<UploadState>> {
+        Self::state_for_kind(conn, record_id, RecordKind::Dictation)
+    }
+
+    pub fn state_for_kind(
+        conn: &Connection,
+        record_id: RecordId,
+        kind: RecordKind,
+    ) -> Result<Option<UploadState>> {
         let value = conn
             .query_row(
-                "SELECT state FROM sync_outbox_items WHERE record_id = ?1 AND kind = 'dictation'",
-                [record_id.to_string()],
+                "SELECT state FROM sync_outbox_items WHERE record_id = ?1 AND kind = ?2",
+                params![record_id.to_string(), kind_name(kind)],
                 |row| row.get::<_, String>(0),
             )
             .ok();
@@ -222,12 +241,49 @@ impl SyncOutboxRepository {
             _ => None,
         }))
     }
+
+    /// Whether an upload attempt could have committed on the Home Hub even if
+    /// this device did not receive the acceptance response. Deleting such a
+    /// record locally is unsafe: an in-flight or previously interrupted upload
+    /// could otherwise make the supposedly deleted record reappear remotely.
+    pub fn may_have_reached_hub(
+        conn: &Connection,
+        record_id: RecordId,
+        kind: RecordKind,
+    ) -> Result<bool> {
+        conn.query_row(
+            "SELECT attempts > 0 OR accepted_hub_revision IS NOT NULL OR state = 'synced' \
+             FROM sync_outbox_items WHERE record_id = ?1 AND kind = ?2",
+            params![record_id.to_string(), kind_name(kind)],
+            |row| row.get(0),
+        )
+        .optional()
+        .map(|value| value.unwrap_or(false))
+        .context("checking whether a sync record may have reached the Home Hub")
+    }
+}
+
+pub const fn kind_name(kind: RecordKind) -> &'static str {
+    match kind {
+        RecordKind::Dictation => "dictation",
+        RecordKind::Meeting => "meeting",
+        RecordKind::Artifact => "artifact",
+    }
+}
+
+fn parse_kind(value: &str) -> Result<RecordKind> {
+    match value {
+        "dictation" => Ok(RecordKind::Dictation),
+        "meeting" => Ok(RecordKind::Meeting),
+        "artifact" => Ok(RecordKind::Artifact),
+        _ => bail!("unknown outbox record kind {value}"),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::protocol::{DictationPayload, RecordKind};
+    use crate::sync::protocol::{DictationPayload, DictationSnapshot, RecordKind};
     use audetic_core::sync::DeviceId;
 
     fn snapshot(record_id: RecordId, version: u64, text: &str) -> DictationSnapshot {
@@ -249,7 +305,7 @@ mod tests {
         crate::db::migrate(&conn).unwrap();
         let tx = conn.transaction().unwrap();
         let snapshot = snapshot(RecordId::new(), 1, "recover me");
-        SyncOutboxRepository::enqueue_snapshot(&tx, &snapshot).unwrap();
+        SyncOutboxRepository::enqueue_snapshot(&tx, &snapshot.into()).unwrap();
         tx.commit().unwrap();
         let first = SyncOutboxRepository::claim_items(
             &mut conn,
@@ -287,10 +343,10 @@ mod tests {
         conflicting.origin_device_id = origin;
 
         let tx = conn.transaction().unwrap();
-        SyncOutboxRepository::enqueue_snapshot(&tx, &newer).unwrap();
+        SyncOutboxRepository::enqueue_snapshot(&tx, &newer.clone().into()).unwrap();
         tx.commit().unwrap();
         let tx = conn.transaction().unwrap();
-        SyncOutboxRepository::enqueue_snapshot(&tx, &stale).unwrap();
+        SyncOutboxRepository::enqueue_snapshot(&tx, &stale.into()).unwrap();
         tx.commit().unwrap();
 
         let stored: (u64, String, String) = conn
@@ -302,13 +358,16 @@ mod tests {
             .unwrap();
         assert_eq!(stored.0, 2);
         assert_eq!(
-            serde_json::from_str::<DictationSnapshot>(&stored.1).unwrap(),
+            match serde_json::from_str::<Snapshot>(&stored.1).unwrap() {
+                Snapshot::Dictation(value) => value,
+                _ => panic!("wrong kind"),
+            },
             newer
         );
         assert_eq!(stored.2, "pending");
 
         let tx = conn.transaction().unwrap();
-        assert!(SyncOutboxRepository::enqueue_snapshot(&tx, &conflicting).is_err());
+        assert!(SyncOutboxRepository::enqueue_snapshot(&tx, &conflicting.into()).is_err());
         drop(tx);
         let json: String = conn
             .query_row("SELECT snapshot_json FROM sync_outbox_items", [], |row| {
@@ -316,7 +375,10 @@ mod tests {
             })
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<DictationSnapshot>(&json).unwrap(),
+            match serde_json::from_str::<Snapshot>(&json).unwrap() {
+                Snapshot::Dictation(value) => value,
+                _ => panic!("wrong kind"),
+            },
             newer
         );
     }
@@ -332,7 +394,7 @@ mod tests {
         let mut second = snapshot(record_id, 2, "second");
         second.origin_device_id = origin;
         let tx = conn.transaction().unwrap();
-        SyncOutboxRepository::enqueue_snapshot(&tx, &first).unwrap();
+        SyncOutboxRepository::enqueue_snapshot(&tx, &first.into()).unwrap();
         tx.commit().unwrap();
         let claimed = SyncOutboxRepository::claim_items(
             &mut conn,
@@ -346,7 +408,7 @@ mod tests {
         .unwrap();
 
         let tx = conn.transaction().unwrap();
-        SyncOutboxRepository::enqueue_snapshot(&tx, &second).unwrap();
+        SyncOutboxRepository::enqueue_snapshot(&tx, &second.into()).unwrap();
         tx.commit().unwrap();
         SyncOutboxRepository::mark_snapshot_accepted(&conn, &claimed, 1).unwrap();
         SyncOutboxRepository::mark_retry(&conn, &claimed, "2026-09-04T11:00:00Z", "stale retry")
@@ -369,7 +431,7 @@ mod tests {
         crate::db::migrate(&conn).unwrap();
         let item = snapshot(RecordId::new(), 1, "same");
         let tx = conn.transaction().unwrap();
-        SyncOutboxRepository::enqueue_snapshot(&tx, &item).unwrap();
+        SyncOutboxRepository::enqueue_snapshot(&tx, &item.clone().into()).unwrap();
         tx.commit().unwrap();
         SyncOutboxRepository::claim_items(
             &mut conn,
@@ -380,7 +442,7 @@ mod tests {
         )
         .unwrap();
         let tx = conn.transaction().unwrap();
-        SyncOutboxRepository::enqueue_snapshot(&tx, &item).unwrap();
+        SyncOutboxRepository::enqueue_snapshot(&tx, &item.into()).unwrap();
         tx.commit().unwrap();
 
         let state: (String, Option<String>) = conn
@@ -391,5 +453,45 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("uploading".into(), Some("worker".into())));
+    }
+
+    #[test]
+    fn deletion_requires_hub_after_an_upload_attempt_may_have_reached_it() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let item = snapshot(RecordId::new(), 1, "delete race");
+        SyncOutboxRepository::enqueue_snapshot(&conn, &item.clone().into()).unwrap();
+        assert!(!SyncOutboxRepository::may_have_reached_hub(
+            &conn,
+            item.record_id,
+            RecordKind::Dictation,
+        )
+        .unwrap());
+
+        let claimed = SyncOutboxRepository::claim_items(
+            &mut conn,
+            "worker",
+            "2026-09-04T10:00:00Z",
+            "2026-09-04T10:00:30Z",
+            1,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        assert!(SyncOutboxRepository::may_have_reached_hub(
+            &conn,
+            item.record_id,
+            RecordKind::Dictation,
+        )
+        .unwrap());
+
+        SyncOutboxRepository::mark_retry(&conn, &claimed, "2026-09-04T11:00:00Z", "response lost")
+            .unwrap();
+        assert!(SyncOutboxRepository::may_have_reached_hub(
+            &conn,
+            item.record_id,
+            RecordKind::Dictation,
+        )
+        .unwrap());
     }
 }
