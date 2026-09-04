@@ -4,7 +4,9 @@ pub mod meeting_artifacts;
 pub mod meetings;
 mod operations;
 mod schemas;
+pub mod shared_library;
 pub mod sync_identity;
+pub mod sync_outbox;
 pub mod sync_serve;
 pub mod sync_settings;
 
@@ -17,6 +19,8 @@ pub use init::{
     open_db_at,
 };
 pub use operations::{
-    count_workflows, get_recent_workflows, insert_workflow, prune_old_workflows, search_workflows,
+    backfill_visible_dictations, backfill_visible_dictations_in_transaction, count_workflows,
+    get_recent_workflows, get_workflow_by_sync_id, insert_workflow, insert_workflow_record,
+    list_visible_workflows, prune_old_workflows, search_workflows,
 };
 pub use schemas::{VoiceToTextData, Workflow, WorkflowData, WorkflowType};

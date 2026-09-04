@@ -7,7 +7,8 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use super::protocol::{
-    HubApiError, HubInfo, HUB_API_MOUNT_PATH, HUB_ID_HEADER, HUB_INFO_PATH, PROTOCOL_VERSION,
+    DictationPage, HubApiError, HubInfo, SnapshotBatch, SnapshotBatchResponse, HUB_API_MOUNT_PATH,
+    HUB_DICTATIONS_PATH, HUB_ID_HEADER, HUB_INFO_PATH, HUB_SNAPSHOTS_PATH, PROTOCOL_VERSION,
     PROTOCOL_VERSION_HEADER, TAILSCALE_HTTPS_PORT,
 };
 
@@ -25,6 +26,15 @@ pub trait HubTransport: Clone + Send + Sync + 'static {
         url: Url,
         headers: BTreeMap<String, String>,
     ) -> Result<TransportResponse, String>;
+
+    async fn post(
+        &self,
+        _url: Url,
+        _headers: BTreeMap<String, String>,
+        _body: Vec<u8>,
+    ) -> Result<TransportResponse, String> {
+        Err("POST is not implemented by this transport".to_owned())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +86,48 @@ impl HubTransport for ReqwestHubTransport {
             body,
         })
     }
+
+    async fn post(
+        &self,
+        url: Url,
+        headers: BTreeMap<String, String>,
+        body: Vec<u8>,
+    ) -> Result<TransportResponse, String> {
+        let mut request = self.client.post(url).body(body);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        let response = request
+            .header("content-type", "application/json")
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        response_from_reqwest(response).await
+    }
+}
+
+async fn response_from_reqwest(response: reqwest::Response) -> Result<TransportResponse, String> {
+    let status = response.status().as_u16();
+    let headers = response
+        .headers()
+        .iter()
+        .filter_map(|(name, value)| {
+            value
+                .to_str()
+                .ok()
+                .map(|value| (name.as_str().to_owned(), value.to_owned()))
+        })
+        .collect();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|error| error.to_string())?
+        .to_vec();
+    Ok(TransportResponse {
+        status,
+        headers,
+        body,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -227,6 +279,98 @@ impl<T: HubTransport> HubClient<T> {
             protocol_version: u32::from(info.protocol.current),
         })
     }
+
+    pub async fn upload_snapshots(
+        &self,
+        hub_id: HubId,
+        batch: &SnapshotBatch,
+    ) -> Result<SnapshotBatchResponse, HubClientError> {
+        let url = self
+            .base_url
+            .join(HUB_SNAPSHOTS_PATH)
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        let response = self
+            .transport
+            .post(
+                url,
+                protocol_headers(hub_id),
+                serde_json::to_vec(batch).map_err(HubClientError::InvalidInfo)?,
+            )
+            .await
+            .map_err(HubClientError::Transport)?;
+        verify_hub_response(&response, hub_id)?;
+        if !(200..300).contains(&response.status) {
+            return Err(http_error(response));
+        }
+        serde_json::from_slice(&response.body).map_err(HubClientError::InvalidInfo)
+    }
+
+    pub async fn page_dictations(
+        &self,
+        hub_id: HubId,
+        query: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<DictationPage, HubClientError> {
+        let mut url = self
+            .base_url
+            .join(HUB_DICTATIONS_PATH)
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("limit", &limit.to_string());
+            if let Some(value) = query {
+                pairs.append_pair("q", value);
+            }
+            if let Some(value) = from {
+                pairs.append_pair("from", value);
+            }
+            if let Some(value) = to {
+                pairs.append_pair("to", value);
+            }
+            if let Some(value) = cursor {
+                pairs.append_pair("cursor", value);
+            }
+        }
+        let response = self
+            .transport
+            .get(url, protocol_headers(hub_id))
+            .await
+            .map_err(HubClientError::Transport)?;
+        verify_hub_response(&response, hub_id)?;
+        if !(200..300).contains(&response.status) {
+            return Err(http_error(response));
+        }
+        serde_json::from_slice(&response.body).map_err(HubClientError::InvalidInfo)
+    }
+}
+
+fn protocol_headers(hub_id: HubId) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        (HUB_ID_HEADER.to_owned(), hub_id.to_string()),
+        (
+            PROTOCOL_VERSION_HEADER.to_owned(),
+            PROTOCOL_VERSION.to_string(),
+        ),
+    ])
+}
+
+fn verify_hub_response(
+    response: &TransportResponse,
+    expected: HubId,
+) -> Result<(), HubClientError> {
+    let actual = response
+        .headers
+        .get(HUB_ID_HEADER)
+        .ok_or(HubClientError::MissingHubIdHeader)?
+        .parse::<HubId>()
+        .map_err(|_| HubClientError::InvalidHubId(HUB_ID_HEADER))?;
+    if actual != expected {
+        return Err(HubClientError::WrongHubId { expected, actual });
+    }
+    Ok(())
 }
 
 pub fn canonicalize_base_url(input: &str) -> Result<Url, HubClientError> {

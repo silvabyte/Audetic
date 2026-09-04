@@ -116,7 +116,7 @@ pub async fn list_events() -> Json<EventsListResponse> {
             },
             description: match k {
                 EventKind::DictationCompleted => {
-                    "Fires after a dictation transcription is saved to history. Payload contains the dictation_id, audio_path, and text.".to_string()
+                    "Fires after a dictation transcription is saved to history. Payload contains the stable record_id UUID, compatibility dictation_id, audio_path, and text.".to_string()
                 }
                 EventKind::MeetingCompleted => {
                     "Fires after a meeting is fully transcribed. Payload contains the meeting_id, title, audio_path, transcript_path, transcript_text, and duration_seconds.".to_string()

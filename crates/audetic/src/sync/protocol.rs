@@ -1,4 +1,4 @@
-use audetic_core::sync::HubId;
+use audetic_core::sync::{DeviceId, HubId, RecordId};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -9,6 +9,12 @@ pub const TAILSCALE_HTTPS_PORT: u16 = 8443;
 pub const HUB_API_MOUNT_PATH: &str = "/audetic/";
 pub const HUB_INFO_ROUTE: &str = "/v1/info";
 pub const HUB_INFO_PATH: &str = "v1/info";
+pub const HUB_SNAPSHOTS_ROUTE: &str = "/v1/snapshots";
+pub const HUB_SNAPSHOTS_PATH: &str = "v1/snapshots";
+pub const HUB_DICTATIONS_ROUTE: &str = "/v1/dictations";
+pub const HUB_DICTATIONS_PATH: &str = "v1/dictations";
+pub const MAX_SNAPSHOT_BATCH: usize = 25;
+pub const MAX_DICTATION_PAGE: usize = 100;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -16,6 +22,106 @@ pub const MIN_PROTOCOL_VERSION: u16 = 1;
 pub const HUB_ID_HEADER: &str = "x-audetic-hub-id";
 pub const PROTOCOL_VERSION_HEADER: &str = "x-audetic-protocol-version";
 pub const TAILSCALE_FUNNEL_REQUEST_HEADER: &str = "tailscale-funnel-request";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordKind {
+    Dictation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct DictationPayload {
+    pub text: String,
+}
+
+/// Portable origin snapshot. It intentionally contains no local row ID or
+/// filesystem path.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct DictationSnapshot {
+    pub kind: RecordKind,
+    pub schema_version: u16,
+    pub record_id: RecordId,
+    pub origin_device_id: DeviceId,
+    pub local_version: u64,
+    pub created_at: String,
+    pub updated_at: String,
+    pub payload: DictationPayload,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct SnapshotBatch {
+    pub snapshots: Vec<DictationSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotDisposition {
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct SnapshotResult {
+    pub record_id: RecordId,
+    pub disposition: SnapshotDisposition,
+    pub authoritative_revision: Option<u64>,
+    pub error_code: Option<String>,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct SnapshotBatchResponse {
+    pub results: Vec<SnapshotResult>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct SharedDictation {
+    pub record_id: RecordId,
+    pub origin_device_id: DeviceId,
+    pub text: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub local_version: u64,
+    pub authoritative_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct DictationPage {
+    pub items: Vec<SharedDictation>,
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeOperation {
+    Upsert,
+    Delete,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct ChangeEnvelope {
+    pub cursor: Option<u64>,
+    pub operation: ChangeOperation,
+    pub record_id: RecordId,
+    pub origin_device_id: Option<DeviceId>,
+    pub authoritative_revision: u64,
+    pub snapshot: Option<DictationSnapshot>,
+    pub changed_at: String,
+}
+
+impl ChangeEnvelope {
+    pub fn upsert(snapshot: DictationSnapshot, authoritative_revision: u64) -> Self {
+        Self {
+            cursor: None,
+            operation: ChangeOperation::Upsert,
+            record_id: snapshot.record_id,
+            origin_device_id: Some(snapshot.origin_device_id),
+            authoritative_revision,
+            changed_at: chrono::Utc::now().to_rfc3339(),
+            snapshot: Some(snapshot),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct ProtocolRange {
@@ -88,5 +194,25 @@ mod tests {
             HUB_LOOPBACK_BASE_URL,
             format!("http://{HUB_LISTENER_ADDRESS}")
         );
+    }
+
+    #[test]
+    fn dictation_snapshot_is_portable_and_has_no_filesystem_path() {
+        let snapshot = DictationSnapshot {
+            kind: RecordKind::Dictation,
+            schema_version: 1,
+            record_id: RecordId::new(),
+            origin_device_id: DeviceId::new(),
+            local_version: 1,
+            created_at: "2026-09-04T10:00:00Z".into(),
+            updated_at: "2026-09-04T10:00:00Z".into(),
+            payload: DictationPayload {
+                text: "hello".into(),
+            },
+        };
+        let json = serde_json::to_value(snapshot).unwrap();
+        assert!(json.get("audio_path").is_none());
+        assert!(json.get("transcript_path").is_none());
+        assert_eq!(json["kind"], "dictation");
     }
 }

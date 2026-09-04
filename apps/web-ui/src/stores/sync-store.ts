@@ -24,6 +24,7 @@ type SyncOperation =
   | "previewing_home_hub"
   | "activating_home_hub"
   | "connecting"
+  | "retrying"
   | "demoting";
 
 const POLL_MS = 10_000;
@@ -145,6 +146,24 @@ export class SyncStore {
       requestFor("standalone", preferences, null, false),
       "demoting",
     );
+  }
+
+  async retryPending(): Promise<void> {
+    runInAction(() => {
+      this.operation = "retrying";
+      this.actionError = null;
+    });
+    try {
+      const { error } = await daemon.POST("/sync/retry");
+      if (error) throw new Error(formatError(error));
+      await this.loadStatus(true);
+      runInAction(() => { this.operation = null; });
+    } catch (error) {
+      runInAction(() => {
+        this.operation = null;
+        this.actionError = error instanceof Error ? error.message : String(error);
+      });
+    }
   }
 
   private async configure(

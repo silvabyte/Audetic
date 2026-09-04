@@ -53,6 +53,7 @@ pub mod paths {
     pub const SYNC_STATUS: &str = "/sync/status";
     pub const SYNC_DISCOVER: &str = "/sync/discover";
     pub const SYNC_CONFIGURE: &str = "/sync/configure";
+    pub const SYNC_RETRY: &str = "/sync/retry";
     pub const SYSTEM_RESTART: &str = "/system/restart";
     pub const KEYBIND_STATUS: &str = "/keybind/status";
     pub const KEYBIND_INSTALL: &str = "/keybind/install";
@@ -62,6 +63,10 @@ pub mod paths {
 /// Path to one agent profile test endpoint: `AGENT_PROFILES/{id}/test`.
 pub fn agent_profile_test_path(id: i64) -> String {
     format!("{}/{id}/test", paths::AGENT_PROFILES)
+}
+
+pub fn history_entry_path(id: &crate::sync::RecordId) -> String {
+    format!("{}/{id}", paths::HISTORY)
 }
 
 /// Path to a meeting's generated artifacts: `/meetings/{id}/artifacts`.

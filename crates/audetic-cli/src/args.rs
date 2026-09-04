@@ -257,9 +257,9 @@ pub struct HistoryCliArgs {
     /// Maximum number of results to show
     #[arg(short, long, default_value = "20")]
     pub limit: usize,
-    /// ID of specific workflow to copy to clipboard
+    /// Stable UUID of a specific dictation to copy to clipboard
     #[arg(short, long)]
-    pub copy: Option<i64>,
+    pub copy: Option<audetic_core::sync::RecordId>,
 }
 
 #[derive(ClapArgs, Debug)]

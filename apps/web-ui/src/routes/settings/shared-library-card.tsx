@@ -156,6 +156,17 @@ export function SharedLibraryCard() {
                   </div>
 
                   {status.last_error ? <InlineError>{status.last_error}</InlineError> : null}
+                  {status.pending_items > 0 ? (
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      disabled={sync.operation !== null}
+                      onClick={() => void sync.retryPending()}
+                    >
+                      Retry pending uploads
+                    </Button>
+                  ) : null}
 
                   <div className="grid gap-px overflow-hidden rounded-lg border bg-border sm:grid-cols-3">
                     <SettingSummary

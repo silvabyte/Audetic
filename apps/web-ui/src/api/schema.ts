@@ -796,6 +796,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sync/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["retry_sync_outbox"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sync/status": {
         parameters: {
             query?: never;
@@ -999,8 +1015,7 @@ export interface components {
         /** @description The `last_completed_job` nested block inside `RecordingStatusResponse`. */
         CompletedJobSummary: {
             created_at: string;
-            /** Format: int64 */
-            history_id?: number | null;
+            history_id?: null | components["schemas"]["RecordId"];
             job_id: string;
             text: string;
         };
@@ -1063,14 +1078,22 @@ export interface components {
         GenerateArtifactResponse: {
             artifact: components["schemas"]["MeetingArtifact"];
         };
-        /** @description A single history entry with formatted display data. */
         HistoryEntry: {
-            audio_path: string;
             created_at: string;
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
+            offline: boolean;
+            origin_device_id: components["schemas"]["DeviceId"];
+            payload_availability: components["schemas"]["PayloadAvailability"];
+            read_only: boolean;
+            source: components["schemas"]["HistorySource"];
             text: string;
+            upload_state?: null | components["schemas"]["UploadState"];
         };
+        /**
+         * @description A single history entry with formatted display data.
+         * @enum {string}
+         */
+        HistorySource: "local" | "shared";
         HubCandidate: {
             connection: components["schemas"]["HubConnection"];
             device_name?: string | null;
@@ -1429,6 +1452,8 @@ export interface components {
             event: components["schemas"]["EventKind"];
             name: string;
         };
+        /** @enum {string} */
+        PayloadAvailability: "available" | "pending" | "unavailable" | "needs_attention";
         PlatformInfo: {
             arch_linux: boolean;
             architecture: string;
@@ -1502,6 +1527,8 @@ export interface components {
         RecentMeetingTitlesResponse: {
             titles: string[];
         };
+        /** Format: uuid */
+        RecordId: string;
         /**
          * @description Default (non-waybar) recording status snapshot. The waybar variant
          *     is a different shape — see the union response on the handler.
@@ -1601,6 +1628,10 @@ export interface components {
             ready: boolean;
             serve_mapping?: null | components["schemas"]["ServeMappingState"];
             serve_preview: string;
+        };
+        SyncRetryResponse: {
+            /** Format: int64 */
+            retried_items: number;
         };
         /** @enum {string} */
         SyncRole: "standalone" | "home_hub" | "connected_device";
@@ -1709,6 +1740,8 @@ export interface components {
             event?: null | components["schemas"]["EventKind"];
             name?: string | null;
         };
+        /** @enum {string} */
+        UploadState: "pending" | "uploading" | "synced" | "needs_attention";
         /** @description Response for GET /version. */
         VersionInfo: {
             /** @description Random identity generated once for this daemon process. */
@@ -1826,6 +1859,8 @@ export interface operations {
                 to?: string | null;
                 /** @description Maximum results (default 20) */
                 limit?: number | null;
+                /** @description Number of canonical merged results to skip. */
+                offset?: number | null;
             };
             header?: never;
             path?: never;
@@ -1849,8 +1884,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Transcription history id */
-                id: number;
+                /** @description Stable transcription UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -3180,6 +3215,35 @@ export interface operations {
             };
             /** @description Tailscale or discovery transport is unavailable */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    retry_sync_outbox: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Delayed and needs-attention items made immediately retryable */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncRetryResponse"];
+                };
+            };
+            /** @description Outbox could not be updated */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

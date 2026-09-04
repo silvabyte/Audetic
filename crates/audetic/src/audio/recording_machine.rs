@@ -1,4 +1,5 @@
 use anyhow::Result;
+use audetic_core::sync::RecordId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -43,8 +44,8 @@ impl RecordingPhase {
 pub struct CompletedJob {
     /// The job UUID assigned when recording started
     pub job_id: String,
-    /// The database history ID for retrieving via /history/:id
-    pub history_id: i64,
+    /// Stable record UUID for retrieving via /history/:id.
+    pub history_id: Option<RecordId>,
     /// The transcribed text
     pub text: String,
     /// When the job completed
@@ -456,7 +457,7 @@ impl RecordingMachine {
                     .await;
 
                     match db_result {
-                        Ok(Ok(history_id)) => {
+                        Ok(Ok((row_id, history_id))) => {
                             // Fire any post-processing jobs subscribed to
                             // `dictation.completed`. Fire-and-forget — failures
                             // are logged inside the dispatcher and never block
@@ -464,7 +465,8 @@ impl RecordingMachine {
                             ctx.post_processing
                                 .dispatch(PostProcessingEvent::DictationCompleted(
                                     DictationCompletedPayload {
-                                        dictation_id: history_id,
+                                        dictation_id: row_id,
+                                        record_id: history_id,
                                         workflow_type: "VoiceToText".to_string(),
                                         audio_path: ctx.temp_path.clone(),
                                         text: text.clone(),
@@ -473,7 +475,7 @@ impl RecordingMachine {
 
                             let completed = CompletedJob {
                                 job_id: ctx.job_id.unwrap_or_else(|| "unknown".to_string()),
-                                history_id,
+                                history_id: Some(history_id),
                                 text,
                                 created_at: chrono::Utc::now().to_rfc3339(),
                             };
@@ -481,10 +483,10 @@ impl RecordingMachine {
                         }
                         Ok(Err(e)) => {
                             error!("Failed to save transcription to database: {:?}", e);
-                            // Still return a completed job but with id 0
+                            // Still return a completed job without a persisted ID.
                             Some(CompletedJob {
                                 job_id: job_id_for_db.unwrap_or_else(|| "unknown".to_string()),
-                                history_id: 0,
+                                history_id: None,
                                 text,
                                 created_at: chrono::Utc::now().to_rfc3339(),
                             })
@@ -525,7 +527,7 @@ impl RecordingMachine {
 }
 
 /// Save transcription to database and return the history ID.
-fn save_to_database(text: &str, audio_path: &Path) -> Result<i64> {
+fn save_to_database(text: &str, audio_path: &Path) -> Result<(i64, RecordId)> {
     let conn = db::open_db()?;
 
     let workflow_data = WorkflowData::VoiceToText(VoiceToTextData {
@@ -535,8 +537,11 @@ fn save_to_database(text: &str, audio_path: &Path) -> Result<i64> {
 
     let workflow = Workflow::new(WorkflowType::VoiceToText, workflow_data);
 
-    let id = db::insert_workflow(&conn, &workflow)?;
-    debug!("Saved transcription to database with ID: {}", id);
+    let (id, sync_id) = db::insert_workflow_record(&conn, &workflow)?;
+    debug!(
+        "Saved transcription to database with ID: {} ({})",
+        id, sync_id
+    );
 
     // Prune old workflows if count exceeds 10,000
     let pruned = db::prune_old_workflows(&conn, 10_000)?;
@@ -544,7 +549,7 @@ fn save_to_database(text: &str, audio_path: &Path) -> Result<i64> {
         info!("Pruned {} old transcriptions from database", pruned);
     }
 
-    Ok(id)
+    Ok((id, sync_id))
 }
 
 #[cfg(test)]
@@ -648,7 +653,7 @@ mod tests {
 
         let completed = CompletedJob {
             job_id: "test-job-789".to_string(),
-            history_id: 42,
+            history_id: Some(RecordId::from_uuid(Uuid::from_u128(42))),
             text: "Hello world".to_string(),
             created_at: "2025-01-15T10:30:00Z".to_string(),
         };
@@ -661,7 +666,10 @@ mod tests {
 
         let last_job = status.last_completed_job.unwrap();
         assert_eq!(last_job.job_id, "test-job-789");
-        assert_eq!(last_job.history_id, 42);
+        assert_eq!(
+            last_job.history_id,
+            Some(RecordId::from_uuid(Uuid::from_u128(42)))
+        );
         assert_eq!(last_job.text, "Hello world");
     }
 
@@ -718,7 +726,7 @@ mod tests {
         // Complete
         let completed = CompletedJob {
             job_id: "lifecycle-test".to_string(),
-            history_id: 100,
+            history_id: Some(RecordId::from_uuid(Uuid::from_u128(100))),
             text: "Test transcription".to_string(),
             created_at: "2025-01-15T12:00:00Z".to_string(),
         };
@@ -729,7 +737,10 @@ mod tests {
         assert!(!status.capture_degraded);
         assert!(status.current_job_id.is_none());
         assert!(status.last_completed_job.is_some());
-        assert_eq!(status.last_completed_job.unwrap().history_id, 100);
+        assert_eq!(
+            status.last_completed_job.unwrap().history_id,
+            Some(RecordId::from_uuid(Uuid::from_u128(100)))
+        );
     }
 
     #[tokio::test]
@@ -779,7 +790,7 @@ mod tests {
         // Complete first job
         let first_job = CompletedJob {
             job_id: "first-job".to_string(),
-            history_id: 1,
+            history_id: Some(RecordId::from_uuid(Uuid::from_u128(1))),
             text: "First".to_string(),
             created_at: "2025-01-15T10:00:00Z".to_string(),
         };
@@ -841,19 +852,22 @@ mod tests {
     fn test_completed_job_serialization() {
         let job = CompletedJob {
             job_id: "test-uuid".to_string(),
-            history_id: 42,
+            history_id: Some(RecordId::from_uuid(Uuid::from_u128(42))),
             text: "Hello world".to_string(),
             created_at: "2025-01-15T10:30:00Z".to_string(),
         };
 
         let json = serde_json::to_string(&job).unwrap();
         assert!(json.contains("\"job_id\":\"test-uuid\""));
-        assert!(json.contains("\"history_id\":42"));
+        assert!(json.contains("\"history_id\":\"00000000-0000-0000-0000-00000000002a\""));
         assert!(json.contains("\"text\":\"Hello world\""));
 
         // Test round-trip
         let parsed: CompletedJob = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.job_id, "test-uuid");
-        assert_eq!(parsed.history_id, 42);
+        assert_eq!(
+            parsed.history_id,
+            Some(RecordId::from_uuid(Uuid::from_u128(42)))
+        );
     }
 }

@@ -94,6 +94,7 @@ use super::routes::{
         sync::get_status,
         sync::discover,
         sync::configure,
+        sync::retry,
     ),
     components(schemas(
         // Service
@@ -106,6 +107,7 @@ use super::routes::{
         recording::RecordingStatusResponse,
         // History
         crate::history::HistoryEntry,
+        crate::history::HistorySource,
         // Keybind
         audetic_core::keybind::KeybindTarget,
         crate::keybind::KeybindConflict,
@@ -197,6 +199,10 @@ use super::routes::{
         audetic_core::sync::SyncSetupRequest,
         audetic_core::sync::SyncSetupResult,
         audetic_core::sync::SyncStatus,
+        audetic_core::sync::RecordId,
+        audetic_core::sync::UploadState,
+        audetic_core::sync::PayloadAvailability,
+        sync::SyncRetryResponse,
         super::error::ApiErrorBody,
     )),
     tags(
@@ -281,6 +287,7 @@ mod tests {
             paths::SYNC_STATUS,
             paths::SYNC_DISCOVER,
             paths::SYNC_CONFIGURE,
+            paths::SYNC_RETRY,
             paths::SYSTEM_RESTART,
             paths::KEYBIND_STATUS,
             paths::KEYBIND_INSTALL,

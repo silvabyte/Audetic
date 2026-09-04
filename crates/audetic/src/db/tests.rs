@@ -53,6 +53,13 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
     .unwrap();
 
     migrate(&conn).unwrap();
+    let first_identity: (String, String, i64) = conn
+        .query_row(
+            "SELECT sync_id, origin_device_id, sync_version FROM workflows WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
     migrate(&conn).unwrap();
 
     let applied: i64 = conn
@@ -60,7 +67,7 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(applied, 3);
+    assert_eq!(applied, 4);
 
     let legacy: (String, String) = conn
         .query_row(
@@ -70,6 +77,17 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
         )
         .unwrap();
     assert_eq!(legacy, ("legacy text".into(), "/tmp/legacy.wav".into()));
+    let second_identity: (String, String, i64) = conn
+        .query_row(
+            "SELECT sync_id, origin_device_id, sync_version FROM workflows WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(first_identity, second_identity);
+    assert!(first_identity.0.parse::<uuid::Uuid>().is_ok());
+    assert!(first_identity.1.parse::<uuid::Uuid>().is_ok());
+    assert_eq!(first_identity.2, 1);
 }
 
 #[test]
@@ -79,6 +97,72 @@ fn test_insert_workflow() {
 
     let id = insert_workflow(&conn, &workflow).unwrap();
     assert!(id > 0);
+}
+
+#[test]
+fn home_hub_workflow_write_and_outbox_enqueue_are_atomic() {
+    let conn = setup_test_db().unwrap();
+    super::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+    conn.execute(
+        "UPDATE sync_settings SET role = 'home_hub' WHERE singleton = 1",
+        [],
+    )
+    .unwrap();
+    insert_workflow(&conn, &create_test_workflow("queued")).unwrap();
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM workflows", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM sync_outbox_items", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+
+    conn.execute_batch(
+        "CREATE TRIGGER reject_outbox BEFORE INSERT ON sync_outbox_items
+         BEGIN SELECT RAISE(ABORT, 'simulated outbox failure'); END;",
+    )
+    .unwrap();
+    assert!(insert_workflow(&conn, &create_test_workflow("must roll back")).is_err());
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM workflows", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn backfill_uses_the_intended_target_role_before_role_persistence() {
+    let conn = setup_test_db().unwrap();
+    insert_workflow(&conn, &create_test_workflow("pre-activation")).unwrap();
+    assert_eq!(
+        super::sync_settings::SyncSettingsRepository::get(&conn)
+            .unwrap()
+            .role,
+        audetic_core::sync::SyncRole::Standalone
+    );
+
+    assert_eq!(
+        backfill_visible_dictations(&conn, audetic_core::sync::SyncRole::ConnectedDevice).unwrap(),
+        1
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM sync_outbox_items", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        super::sync_settings::SyncSettingsRepository::get(&conn)
+            .unwrap()
+            .role,
+        audetic_core::sync::SyncRole::Standalone
+    );
 }
 
 #[test]

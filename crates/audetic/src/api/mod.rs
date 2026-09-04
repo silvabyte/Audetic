@@ -138,12 +138,13 @@ impl ApiServer {
         // Build the API surface. All routes nest under `/api` so the daemon
         // can serve the bundled web-ui at `/` without colliding with API
         // paths (e.g. /meetings is also a SPA route).
+        let history_sync = self.sync_state.as_ref().map(|state| state.service.clone());
         let mut api = Router::new()
             .route("/", get(status))
             .route("/version", get(version))
             .route("/openapi.json", get(openapi_spec))
             .nest("", routes::recording::router(self.recording_state))
-            .nest("/history", routes::history::router())
+            .nest("/history", routes::history::router(history_sync))
             .nest("/keybind", routes::keybind::router())
             .nest("/logs", routes::logs::router())
             .nest("/models", routes::models::router())

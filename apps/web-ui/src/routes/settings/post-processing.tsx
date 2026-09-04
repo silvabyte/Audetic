@@ -53,9 +53,10 @@ function SettingsPostProcessing(): React.JSX.Element {
             Run shell commands when Audetic events fire. Each command receives a
             JSON envelope on stdin —{" "}
             <code className="font-mono text-xs">jq</code> it or use the embedded
-            identifiers (<code className="font-mono text-xs">dictation_id</code>,{" "}
-            <code className="font-mono text-xs">meeting_id</code>) with the
-            daemon API.
+            identifiers (<code className="font-mono text-xs">record_id</code> for
+            dictation history; <code className="font-mono text-xs">dictation_id</code>{" "}
+            and <code className="font-mono text-xs">meeting_id</code> remain local
+            compatibility IDs) with the daemon API.
           </p>
         </div>
         <NewJobButton />

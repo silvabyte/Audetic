@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_SCHEMA_VERSION: i64 = 3;
+const LATEST_SCHEMA_VERSION: i64 = 4;
 
 /// Open the application database and run pending migrations.
 ///
@@ -134,6 +134,12 @@ fn apply_pending_migrations(conn: &Connection) -> Result<()> {
         3,
         "sync_serve_ownership",
         migrate_sync_serve_ownership,
+    )?;
+    apply_migration(
+        conn,
+        4,
+        "dictation_shared_library",
+        migrate_dictation_shared_library,
     )?;
     Ok(())
 }
@@ -338,6 +344,150 @@ fn migrate_sync_serve_ownership(conn: &Connection) -> Result<()> {
         );",
     )
     .context("Failed to create sync Serve ownership table")?;
+    Ok(())
+}
+
+fn migrate_dictation_shared_library(conn: &Connection) -> Result<()> {
+    // Migration 2 intentionally did not create an identity until first use.
+    // Dictation provenance is non-null, so establish that stable identity
+    // before rebuilding the operational table.
+    let device_id = conn
+        .query_row(
+            "SELECT device_id FROM sync_identity WHERE singleton = 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap_or_else(|_| uuid::Uuid::new_v4().hyphenated().to_string());
+    conn.execute(
+        "INSERT OR IGNORE INTO sync_identity (singleton, device_id) VALUES (1, ?1)",
+        [&device_id],
+    )
+    .context("Failed to establish device identity for dictation migration")?;
+
+    conn.execute_batch(
+        "CREATE TABLE workflows_v4 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_type TEXT NOT NULL,
+            text TEXT NOT NULL,
+            audio_path TEXT NOT NULL,
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            sync_id TEXT NOT NULL UNIQUE,
+            origin_device_id TEXT NOT NULL,
+            sync_version INTEGER NOT NULL DEFAULT 1 CHECK (sync_version >= 1),
+            deleted_at TIMESTAMP
+        );",
+    )
+    .context("Failed to create UUID-backed workflows table")?;
+
+    let legacy_rows = {
+        let mut statement = conn
+            .prepare(
+                "SELECT id, workflow_type, text, audio_path, created_at
+                 FROM workflows ORDER BY id",
+            )
+            .context("Failed to inspect legacy workflows")?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .context("Failed to read legacy workflows")?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to map legacy workflows")?;
+        rows
+    };
+    for (id, workflow_type, text, audio_path, created_at) in legacy_rows {
+        conn.execute(
+            "INSERT INTO workflows_v4
+                (id, workflow_type, text, audio_path, created_at, sync_id, origin_device_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                id,
+                workflow_type,
+                text,
+                audio_path,
+                created_at,
+                uuid::Uuid::new_v4().hyphenated().to_string(),
+                device_id,
+            ],
+        )
+        .context("Failed to backfill a workflow UUID")?;
+    }
+    conn.execute_batch(
+        "DROP TABLE workflows;
+         ALTER TABLE workflows_v4 RENAME TO workflows;
+         CREATE INDEX idx_workflows_created_at ON workflows(created_at DESC);
+         CREATE INDEX idx_workflows_visible ON workflows(deleted_at, created_at DESC);
+
+         CREATE TABLE shared_record_index (
+            record_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind = 'dictation'),
+            origin_device_id TEXT,
+            authoritative_revision INTEGER NOT NULL DEFAULT 0 CHECK (authoritative_revision >= 0),
+            deleted_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+
+         CREATE TABLE shared_dictations (
+            record_id TEXT PRIMARY KEY,
+            origin_device_id TEXT NOT NULL,
+            text TEXT NOT NULL,
+            source_created_at TEXT NOT NULL,
+            source_updated_at TEXT NOT NULL,
+            local_version INTEGER NOT NULL CHECK (local_version >= 1),
+            authoritative_revision INTEGER NOT NULL CHECK (authoritative_revision >= 1),
+            deleted_at TEXT,
+            FOREIGN KEY(record_id) REFERENCES shared_record_index(record_id)
+         );
+         CREATE INDEX idx_shared_dictations_visible
+            ON shared_dictations(deleted_at, source_created_at DESC, record_id DESC);
+
+         CREATE TABLE sync_outbox_items (
+            record_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind = 'dictation'),
+            local_version INTEGER NOT NULL CHECK (local_version >= 1),
+            snapshot_json TEXT NOT NULL,
+            state TEXT NOT NULL DEFAULT 'pending'
+                CHECK (state IN ('pending', 'uploading', 'synced', 'needs_attention')),
+            accepted_hub_revision INTEGER,
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(record_id, kind)
+         );
+         CREATE INDEX idx_sync_outbox_claim
+            ON sync_outbox_items(state, next_attempt_at, lease_expires_at, created_at);
+
+         CREATE TABLE sync_tombstones (
+            record_id TEXT PRIMARY KEY,
+            kind TEXT NOT NULL CHECK (kind = 'dictation'),
+            deleted_version INTEGER NOT NULL CHECK (deleted_version >= 1),
+            deleted_at TEXT NOT NULL
+         );
+
+         CREATE TABLE shared_library_changes (
+            cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL CHECK (operation IN ('upsert', 'delete')),
+            kind TEXT NOT NULL CHECK (kind = 'dictation'),
+            record_id TEXT NOT NULL,
+            authoritative_revision INTEGER NOT NULL,
+            change_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE INDEX idx_shared_library_changes_record
+            ON shared_library_changes(record_id, cursor);",
+    )
+    .context("Failed to create dictation Shared Library schema")?;
     Ok(())
 }
 

@@ -12,7 +12,7 @@ use crate::sync::{SyncService, SyncServiceError};
 
 #[derive(Clone)]
 pub struct SyncApiState {
-    service: Arc<SyncService>,
+    pub(crate) service: Arc<SyncService>,
 }
 
 impl SyncApiState {
@@ -26,7 +26,32 @@ pub fn router(state: SyncApiState) -> Router {
         .route("/sync/status", get(get_status))
         .route("/sync/discover", post(discover))
         .route("/sync/configure", post(configure))
+        .route("/sync/retry", post(retry))
         .with_state(state)
+}
+
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct SyncRetryResponse {
+    pub retried_items: u64,
+}
+
+#[utoipa::path(
+    post,
+    path = "/sync/retry",
+    tag = "sync",
+    operation_id = "retry_sync_outbox",
+    responses(
+        (status = 200, description = "Delayed and needs-attention items made immediately retryable", body = SyncRetryResponse),
+        (status = 500, description = "Outbox could not be updated", body = ApiErrorBody),
+    ),
+)]
+pub async fn retry(State(state): State<SyncApiState>) -> ApiResult<Json<SyncRetryResponse>> {
+    state
+        .service
+        .retry()
+        .await
+        .map(|retried_items| Json(SyncRetryResponse { retried_items }))
+        .map_err(map_service_error)
 }
 
 #[utoipa::path(

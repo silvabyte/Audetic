@@ -2,6 +2,9 @@
 
 pub mod client;
 pub mod identity;
+pub mod library;
+pub mod library_reader;
+pub mod outbox;
 pub mod protocol;
 pub mod server;
 pub mod service;

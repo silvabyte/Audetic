@@ -5,17 +5,22 @@
 
 use anyhow::{Context, Result};
 use audetic_core::clipboard::copy_to_clipboard_sync;
+use audetic_core::sync::{RecordId, UploadState};
+use audetic_core::url::{api_url, history_entry_path, paths};
 use dialoguer::FuzzySelect;
 use serde::Deserialize;
 
 use crate::args::HistoryCliArgs;
-use crate::client::{base_url, json_or_error, CONNECT_HINT};
+use crate::client::{json_or_error, CONNECT_HINT};
 
 #[derive(Debug, Deserialize)]
 struct HistoryEntry {
-    id: i64,
+    id: RecordId,
     created_at: String,
     text: String,
+    upload_state: Option<UploadState>,
+    offline: bool,
+    read_only: bool,
 }
 
 pub async fn handle_history_command(args: HistoryCliArgs) -> Result<()> {
@@ -35,7 +40,7 @@ pub async fn handle_history_command(args: HistoryCliArgs) -> Result<()> {
 async fn fetch_history(args: &HistoryCliArgs) -> Result<Vec<HistoryEntry>> {
     let client = reqwest::Client::new();
     let mut req = client
-        .get(format!("{}/history", base_url()))
+        .get(api_url(paths::HISTORY))
         .query(&[("limit", args.limit.to_string())]);
     if let Some(q) = &args.query {
         req = req.query(&[("q", q)]);
@@ -53,10 +58,10 @@ async fn fetch_history(args: &HistoryCliArgs) -> Result<Vec<HistoryEntry>> {
 }
 
 /// Copy a specific transcription to clipboard by ID.
-async fn handle_copy_by_id(id: i64) -> Result<()> {
+async fn handle_copy_by_id(id: RecordId) -> Result<()> {
     let client = reqwest::Client::new();
     let response = client
-        .get(format!("{}/history/{}", base_url(), id))
+        .get(api_url(&history_entry_path(&id)))
         .send()
         .await
         .context(CONNECT_HINT)?;
@@ -66,7 +71,7 @@ async fn handle_copy_by_id(id: i64) -> Result<()> {
 
     copy_to_clipboard_sync(&entry.text)?;
     println!(
-        "Copied transcription #{} to clipboard ({} chars)",
+        "Copied transcription {} to clipboard ({} chars)",
         entry.id,
         entry.text.len()
     );
@@ -97,7 +102,22 @@ async fn handle_interactive_mode(limit: usize) -> Result<()> {
             } else {
                 entry.text.clone()
             };
-            format!("[{}] {} - {}", entry.id, entry.created_at, display_text)
+            let state = if entry.offline {
+                "offline"
+            } else if entry.read_only {
+                "shared"
+            } else if matches!(
+                entry.upload_state,
+                Some(UploadState::Pending | UploadState::Uploading)
+            ) {
+                "pending"
+            } else {
+                "local"
+            };
+            format!(
+                "[{} · {}] {} - {}",
+                entry.id, state, entry.created_at, display_text
+            )
         })
         .collect();
 

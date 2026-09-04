@@ -1,10 +1,11 @@
 use audetic_core::sync::HubId;
-use axum::extract::{Request, State};
+use axum::extract::{DefaultBodyLimit, Query, Request, State};
 use axum::http::{header::ORIGIN, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
+use serde::Deserialize;
 use thiserror::Error;
 use tokio::net::TcpListener;
 use utoipa::OpenApi;
@@ -14,9 +15,11 @@ use std::io;
 use std::sync::Arc;
 
 use super::identity::{parse_stored_tailscale_login, parse_tailscale_login, LoginParseError};
+use super::library::HubLibrary;
 use super::protocol::{
-    HubApiError, HubInfo, ProtocolRange, HUB_ID_HEADER, HUB_INFO_ROUTE, PROTOCOL_VERSION,
-    PROTOCOL_VERSION_HEADER, TAILSCALE_FUNNEL_REQUEST_HEADER,
+    DictationPage, HubApiError, HubInfo, ProtocolRange, SnapshotBatch, SnapshotBatchResponse,
+    HUB_DICTATIONS_ROUTE, HUB_ID_HEADER, HUB_INFO_ROUTE, HUB_SNAPSHOTS_ROUTE, MAX_DICTATION_PAGE,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, TAILSCALE_FUNNEL_REQUEST_HEADER,
 };
 
 #[derive(Clone, Debug)]
@@ -25,6 +28,7 @@ pub struct HubServerConfig {
     pub owner_login: String,
     pub device_name: Option<String>,
     pub audetic_version: String,
+    pub library: Option<HubLibrary>,
 }
 
 impl HubServerConfig {
@@ -34,11 +38,17 @@ impl HubServerConfig {
             owner_login: parse_stored_tailscale_login(owner_login)?,
             device_name: None,
             audetic_version: env!("CARGO_PKG_VERSION").to_owned(),
+            library: None,
         })
     }
 
     pub fn with_device_name(mut self, device_name: impl Into<String>) -> Self {
         self.device_name = Some(device_name.into());
+        self
+    }
+
+    pub fn with_library(mut self, library: HubLibrary) -> Self {
+        self.library = Some(library);
         self
     }
 }
@@ -66,6 +76,9 @@ impl HubServer {
     pub fn router(&self) -> Router {
         Router::new()
             .route(HUB_INFO_ROUTE, get(info))
+            .route(HUB_SNAPSHOTS_ROUTE, post(apply_snapshots))
+            .route(HUB_DICTATIONS_ROUTE, get(page_dictations))
+            .layer(DefaultBodyLimit::max(1024 * 1024))
             .layer(middleware::from_fn_with_state(
                 self.state.clone(),
                 enforce_hub_policy,
@@ -119,6 +132,93 @@ async fn info(State(state): State<Arc<HubServerConfig>>) -> Json<HubInfo> {
         protocol: ProtocolRange::supported(),
         audetic_version: state.audetic_version.clone(),
     })
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/snapshots",
+    tag = "hub_dictations",
+    request_body = SnapshotBatch,
+    responses(
+        (status = 200, description = "Per-snapshot idempotent acceptance results", body = SnapshotBatchResponse),
+        (status = 400, description = "Malformed or unbounded batch", body = HubApiError),
+        (status = 403, description = "Untrusted caller", body = HubApiError),
+        (status = 409, description = "Wrong expected Hub ID", body = HubApiError),
+    )
+)]
+async fn apply_snapshots(
+    State(state): State<Arc<HubServerConfig>>,
+    Json(batch): Json<SnapshotBatch>,
+) -> Response {
+    let Some(library) = &state.library else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HubApiError::new(
+                "library_unavailable",
+                "Shared Library is not active",
+            )),
+        )
+            .into_response();
+    };
+    match library.apply_snapshots(batch.snapshots) {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(HubApiError::new("invalid_batch", error.to_string())),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+struct DictationPageQuery {
+    q: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    cursor: Option<String>,
+    limit: Option<usize>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/dictations",
+    tag = "hub_dictations",
+    params(DictationPageQuery),
+    responses(
+        (status = 200, description = "Canonical page of visible authoritative dictations", body = DictationPage),
+        (status = 400, description = "Invalid cursor", body = HubApiError),
+        (status = 403, description = "Untrusted caller", body = HubApiError),
+        (status = 409, description = "Wrong expected Hub ID", body = HubApiError),
+    )
+)]
+async fn page_dictations(
+    State(state): State<Arc<HubServerConfig>>,
+    Query(query): Query<DictationPageQuery>,
+) -> Response {
+    let Some(library) = &state.library else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(HubApiError::new(
+                "library_unavailable",
+                "Shared Library is not active",
+            )),
+        )
+            .into_response();
+    };
+    match library.page_dictations(
+        query.q.as_deref(),
+        query.from.as_deref(),
+        query.to.as_deref(),
+        query.cursor.as_deref(),
+        query.limit.unwrap_or(50).min(MAX_DICTATION_PAGE),
+    ) {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(HubApiError::new("invalid_page", error.to_string())),
+        )
+            .into_response(),
+    }
 }
 
 async fn enforce_hub_policy(
@@ -275,15 +375,28 @@ fn insert_hub_id(headers: &mut HeaderMap, hub_id: HubId) {
     servers(
         (url = "http://127.0.0.1:3738", description = "Loopback listener behind Tailscale Serve"),
     ),
-    paths(info),
-    components(schemas(HubInfo, ProtocolRange, HubApiError, audetic_core::sync::HubId)),
-    tags((name = "hub_discovery", description = "Home Hub discovery and compatibility")),
+    paths(info, apply_snapshots, page_dictations),
+    components(schemas(
+        HubInfo, ProtocolRange, HubApiError, audetic_core::sync::HubId,
+        audetic_core::sync::RecordId, audetic_core::sync::DeviceId,
+        super::protocol::RecordKind, super::protocol::DictationPayload,
+        super::protocol::DictationSnapshot, super::protocol::SnapshotBatch,
+        super::protocol::SnapshotDisposition, super::protocol::SnapshotResult,
+        super::protocol::SnapshotBatchResponse, super::protocol::SharedDictation,
+        super::protocol::DictationPage, super::protocol::ChangeOperation,
+        super::protocol::ChangeEnvelope
+    )),
+    tags(
+        (name = "hub_discovery", description = "Home Hub discovery and compatibility"),
+        (name = "hub_dictations", description = "Authoritative dictation text transfer and reads")
+    ),
 )]
 pub struct HubApiDoc;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::protocol::{DictationPayload, DictationSnapshot, RecordKind, SnapshotBatch};
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
     use tower::ServiceExt;
@@ -475,6 +588,84 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_route_is_bounded_idempotent_and_policy_runs_before_body_application() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("hub.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let actual_hub_id = hub_id();
+        let server = HubServer::new(
+            HubServerConfig::new(actual_hub_id, "Alice@Example.com")
+                .unwrap()
+                .with_library(HubLibrary::new(db_path.clone())),
+        );
+        let snapshot = DictationSnapshot {
+            kind: RecordKind::Dictation,
+            schema_version: 1,
+            record_id: audetic_core::sync::RecordId::new(),
+            origin_device_id: audetic_core::sync::DeviceId::new(),
+            local_version: 1,
+            created_at: "2026-09-04T10:00:00Z".into(),
+            updated_at: "2026-09-04T10:00:00Z".into(),
+            payload: DictationPayload {
+                text: "from another device".into(),
+            },
+        };
+        let body = serde_json::to_vec(&SnapshotBatch {
+            snapshots: vec![snapshot],
+        })
+        .unwrap();
+        let make_request = |expected: HubId, body: Vec<u8>| {
+            Request::post(HUB_SNAPSHOTS_ROUTE)
+                .header(
+                    super::super::identity::TAILSCALE_USER_LOGIN_HEADER,
+                    "Alice@Example.com",
+                )
+                .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
+                .header(HUB_ID_HEADER, expected.to_string())
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let rejected = server
+            .router()
+            .clone()
+            .oneshot(make_request(hub_id(), b"not json".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(rejected.status(), StatusCode::CONFLICT);
+        let conn = crate::db::open_db_at(&db_path).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM shared_dictations", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        for _ in 0..2 {
+            let accepted = server
+                .router()
+                .clone()
+                .oneshot(make_request(actual_hub_id, body.clone()))
+                .await
+                .unwrap();
+            assert_eq!(accepted.status(), StatusCode::OK);
+        }
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM shared_dictations", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM shared_library_changes", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn listener_refuses_non_loopback_bindings() {
         let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
         let (server, _) = server();
@@ -486,14 +677,16 @@ mod tests {
     }
 
     #[test]
-    fn hub_api_document_contains_only_the_slice_one_discovery_operation() {
+    fn hub_api_document_contains_slice_two_dictation_operations() {
         let document = HubApiDoc::openapi();
         assert_eq!(
             document.servers.as_ref().unwrap()[0].url,
             super::super::protocol::HUB_LOOPBACK_BASE_URL
         );
-        assert_eq!(document.paths.paths.len(), 1);
+        assert_eq!(document.paths.paths.len(), 3);
         assert!(document.paths.paths.contains_key("/v1/info"));
+        assert!(document.paths.paths.contains_key("/v1/snapshots"));
+        assert!(document.paths.paths.contains_key("/v1/dictations"));
         let operation = document
             .paths
             .paths

@@ -1,8 +1,8 @@
 use anyhow::Context;
 use async_trait::async_trait;
 use audetic_core::sync::{
-    HubCandidate, HubConnection, ServeMappingState, SyncDiscoveryFailure, SyncNetworkAssessment,
-    SyncRole, SyncSetupRequest, SyncSetupResult, SyncStatus,
+    HubCandidate, HubConnection, RecordId, ServeMappingState, SyncDiscoveryFailure,
+    SyncNetworkAssessment, SyncRole, SyncSetupRequest, SyncSetupResult, SyncStatus,
 };
 use thiserror::Error;
 use tokio::sync::{oneshot, Mutex, RwLock};
@@ -22,6 +22,9 @@ use super::client::{
     canonicalize_base_url, discover_hubs, DiscoveryOutcome, HandshakeExpectation, HubClient,
     ReqwestHubTransport,
 };
+use super::library::HubLibrary;
+use super::outbox::OutboxWorker;
+use super::protocol::{DictationPage, SnapshotBatch, SnapshotBatchResponse};
 use super::protocol::{
     HUB_API_MOUNT_PATH, HUB_LISTENER_ADDRESS, HUB_LOOPBACK_BASE_URL, TAILSCALE_HTTPS_PORT,
 };
@@ -39,6 +42,38 @@ pub trait HubAccess: Send + Sync {
         candidates: Vec<String>,
         expected_owner_login: &str,
     ) -> DiscoveryOutcome;
+
+    async fn upload_snapshots(
+        &self,
+        _hub: &HubConnection,
+        _batch: SnapshotBatch,
+    ) -> Result<SnapshotBatchResponse, HubTransferError> {
+        Err(HubTransferError::NeedsAttention(
+            "snapshot upload is unavailable".to_owned(),
+        ))
+    }
+
+    async fn page_dictations(
+        &self,
+        _hub: &HubConnection,
+        _query: Option<&str>,
+        _from: Option<&str>,
+        _to: Option<&str>,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<DictationPage, HubTransferError> {
+        Err(HubTransferError::Retryable(
+            "Home Hub is unavailable".to_owned(),
+        ))
+    }
+}
+
+#[derive(Clone, Debug, Error)]
+pub enum HubTransferError {
+    #[error("{0}")]
+    Retryable(String),
+    #[error("{0}")]
+    NeedsAttention(String),
 }
 
 #[derive(Default)]
@@ -74,6 +109,47 @@ impl HubAccess for NetworkHubAccess {
             }
         };
         discover_hubs(transport, candidates, expected_owner_login).await
+    }
+
+    async fn upload_snapshots(
+        &self,
+        hub: &HubConnection,
+        batch: SnapshotBatch,
+    ) -> Result<SnapshotBatchResponse, HubTransferError> {
+        let client = HubClient::new(&hub.base_url)
+            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?;
+        client
+            .upload_snapshots(hub.hub_id, &batch)
+            .await
+            .map_err(classify_client_error)
+    }
+
+    async fn page_dictations(
+        &self,
+        hub: &HubConnection,
+        query: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<DictationPage, HubTransferError> {
+        let client = HubClient::new(&hub.base_url)
+            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?;
+        client
+            .page_dictations(hub.hub_id, query, from, to, cursor, limit)
+            .await
+            .map_err(classify_client_error)
+    }
+}
+
+fn classify_client_error(error: super::client::HubClientError) -> HubTransferError {
+    use super::client::HubClientError;
+    match &error {
+        HubClientError::Transport(_) => HubTransferError::Retryable(error.to_string()),
+        HubClientError::Http { status, .. } if *status >= 500 => {
+            HubTransferError::Retryable(error.to_string())
+        }
+        _ => HubTransferError::NeedsAttention(error.to_string()),
     }
 }
 
@@ -133,6 +209,16 @@ struct HubRuntime {
     task: JoinHandle<Result<(), super::server::HubServerError>>,
 }
 
+struct OutboxRuntime {
+    shutdown: oneshot::Sender<()>,
+    task: JoinHandle<()>,
+}
+
+struct PreparedOutboxRuntime {
+    start: oneshot::Sender<()>,
+    runtime: OutboxRuntime,
+}
+
 /// Single owner of durable sync settings and all role-dependent runtime tasks.
 ///
 /// The transition mutex covers preview/verify/apply/commit/rollback as one
@@ -145,6 +231,7 @@ pub struct SyncService {
     hub_bind_address: SocketAddr,
     transition: Mutex<()>,
     hub_runtime: Mutex<Option<HubRuntime>>,
+    outbox_runtime: Mutex<Option<OutboxRuntime>>,
     hub_reachable: RwLock<bool>,
     shut_down: AtomicBool,
 }
@@ -174,6 +261,7 @@ impl SyncService {
             hub_bind_address,
             transition: Mutex::new(()),
             hub_runtime: Mutex::new(None),
+            outbox_runtime: Mutex::new(None),
             hub_reachable: RwLock::new(false),
             shut_down: AtomicBool::new(false),
         }
@@ -196,12 +284,71 @@ impl SyncService {
             settings.last_contact_at = Some(now());
         }
         self.save_settings(&settings)?;
+        if settings.role != SyncRole::Standalone {
+            self.activate_dictation_transfer(&settings).await?;
+        }
         self.status_unlocked().await
     }
 
     pub async fn status(&self) -> Result<SyncStatus, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.status_unlocked().await
+    }
+
+    pub async fn history(
+        &self,
+        params: &crate::history::SearchParams,
+    ) -> Result<Vec<crate::history::HistoryEntry>, SyncServiceError> {
+        let _transition = self.transition.lock().await;
+        let (_, settings) = self.load()?;
+        let result =
+            super::library_reader::LibraryReader::new(self.db_path.clone(), Arc::clone(&self.hubs))
+                .read(&settings, params)
+                .await
+                .map_err(SyncServiceError::Persistence)?;
+        *self.hub_reachable.write().await = result.hub_reachable;
+        if settings.role != SyncRole::Standalone {
+            let mut contact = settings;
+            if result.hub_reachable {
+                contact.last_contact_at = Some(now());
+                contact.last_error = None;
+            } else if let Some(error) = result.error {
+                contact.last_error = Some(error);
+            }
+            self.save_settings(&contact)?;
+        }
+        Ok(result.entries)
+    }
+
+    pub async fn history_entry(
+        &self,
+        id: RecordId,
+    ) -> Result<Option<crate::history::HistoryEntry>, SyncServiceError> {
+        let mut offset = 0usize;
+        loop {
+            let mut params = crate::history::SearchParams::new().with_limit(100);
+            params.offset = offset;
+            let page = self.history(&params).await?;
+            if let Some(entry) = page.iter().find(|entry| entry.id == id) {
+                return Ok(Some(entry.clone()));
+            }
+            if page.len() < 100 {
+                break;
+            }
+            offset = offset.saturating_add(page.len());
+        }
+        Ok(None)
+    }
+
+    pub async fn retry(&self) -> Result<u64, SyncServiceError> {
+        let _transition = self.transition.lock().await;
+        self.ensure_running()?;
+        let connection = crate::db::open_db_at(&self.db_path)
+            .context("opening sync database")
+            .map_err(SyncServiceError::Persistence)?;
+        crate::db::sync_outbox::SyncOutboxRepository::retry_all(&connection)
+            .map(|count| count as u64)
+            .map_err(SyncServiceError::Persistence)
     }
 
     pub async fn discover(&self) -> Result<SyncSetupResult, SyncServiceError> {
@@ -304,6 +451,7 @@ impl SyncService {
             return Ok(());
         }
         *self.hub_reachable.write().await = false;
+        self.stop_outbox_runtime().await;
         self.stop_hub_runtime().await
     }
 
@@ -347,6 +495,7 @@ impl SyncService {
         if current.role == SyncRole::HomeHub {
             self.stop_hub_runtime().await?;
         }
+        self.stop_outbox_runtime().await;
         *self.hub_reachable.write().await = false;
         Ok(())
     }
@@ -375,43 +524,66 @@ impl SyncService {
         }
 
         let runtime_was_running = self.hub_runtime_running().await;
+        let was_reachable = *self.hub_reachable.read().await;
         self.start_hub_runtime(hub_id, &owner_login, request.device_name.as_deref())
             .await?;
-        let activation = self
-            .activate_home_hub(&request, &tailscale_status, hub_id, &owner_login)
-            .await;
-        if let Err((error, mapping_created)) = activation {
-            let rollback = if mapping_created {
-                self.tailscale_remove()
-                    .await
-                    .map(|_| ())
-                    .map_err(|rollback| rollback.to_string())
-            } else {
-                Ok(())
-            };
-            if !runtime_was_running {
-                let _ = self.stop_hub_runtime().await;
+        let mapping_created = match self
+            .verify_home_hub_network(&tailscale_status, hub_id, &owner_login)
+            .await
+        {
+            Ok(mapping_created) => mapping_created,
+            Err((error, mapping_created)) => {
+                return Err(self
+                    .rollback_home_hub_activation(
+                        None,
+                        runtime_was_running,
+                        was_reachable,
+                        mapping_created,
+                        error,
+                    )
+                    .await)
             }
-            *self.hub_reachable.write().await = false;
-            return match rollback {
-                Ok(()) => Err(error),
-                Err(rollback_error) => Err(SyncServiceError::Rollback {
-                    source_error: error.to_string(),
-                    rollback_error,
-                }),
-            };
+        };
+
+        let mut settings = settings_from_request(request, None);
+        settings.shared_config_enabled = true;
+        settings.last_contact_at = Some(now());
+        let prepared = match self.prepare_dictation_transfer(&settings).await {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return Err(self
+                    .rollback_home_hub_activation(
+                        None,
+                        runtime_was_running,
+                        was_reachable,
+                        mapping_created,
+                        error,
+                    )
+                    .await)
+            }
+        };
+        if let Err(error) = self.commit_home_hub(&settings, hub_id, &owner_login) {
+            return Err(self
+                .rollback_home_hub_activation(
+                    Some(prepared),
+                    runtime_was_running,
+                    was_reachable,
+                    mapping_created,
+                    error,
+                )
+                .await);
         }
+        self.activate_prepared_outbox(prepared).await;
         *self.hub_reachable.write().await = true;
         Ok(())
     }
 
-    async fn activate_home_hub(
+    async fn verify_home_hub_network(
         &self,
-        request: &SyncSetupRequest,
         tailscale_status: &TailscaleStatus,
         hub_id: audetic_core::sync::HubId,
         owner_login: &str,
-    ) -> Result<(), (SyncServiceError, bool)> {
+    ) -> Result<bool, (SyncServiceError, bool)> {
         let mapping_created = self
             .tailscale_apply()
             .await
@@ -447,13 +619,7 @@ impl SyncService {
             .handshake(&connection)
             .await
             .map_err(|error| (SyncServiceError::HubVerification(error), mapping_created))?;
-
-        let mut settings = settings_from_request(request.clone(), None);
-        settings.shared_config_enabled = true;
-        settings.last_contact_at = Some(now());
-        self.commit_home_hub(&settings, hub_id, owner_login)
-            .map_err(|error| (error, mapping_created))?;
-        Ok(())
+        Ok(mapping_created)
     }
 
     async fn configure_connected_device(
@@ -491,7 +657,14 @@ impl SyncService {
         let mut settings = settings_from_request(request, Some(candidate.connection));
         settings.last_contact_at = Some(now());
         settings.last_error = None;
-        self.save_settings(&settings)?;
+        let was_reachable = *self.hub_reachable.read().await;
+        let prepared = self.prepare_dictation_transfer(&settings).await?;
+        if let Err(error) = self.commit_connected_device(&settings) {
+            self.cancel_prepared_outbox(prepared).await;
+            *self.hub_reachable.write().await = was_reachable;
+            return Err(error);
+        }
+        self.activate_prepared_outbox(prepared).await;
         *self.hub_reachable.write().await = true;
         Ok(())
     }
@@ -582,6 +755,12 @@ impl SyncService {
             SyncRole::HomeHub => runtime_running && *self.hub_reachable.read().await,
             SyncRole::ConnectedDevice => *self.hub_reachable.read().await,
         };
+        let connection = crate::db::open_db_at(&self.db_path)
+            .context("opening sync database")
+            .map_err(SyncServiceError::Persistence)?;
+        let (pending_items, outbox_error) =
+            crate::db::sync_outbox::SyncOutboxRepository::counts(&connection)
+                .map_err(SyncServiceError::Persistence)?;
         Ok(SyncStatus {
             device_id: identity.device_id,
             role: settings.role,
@@ -590,9 +769,9 @@ impl SyncService {
             hub: settings.hub,
             hub_reachable: reachable,
             last_contact_at: settings.last_contact_at,
-            pending_items: 0,
+            pending_items,
             pending_bytes: 0,
-            last_error: settings.last_error,
+            last_error: outbox_error.or(settings.last_error),
             upload_recording_payloads: settings.upload_recording_payloads,
             cache_level: settings.cache_level,
             shared_config_enabled: settings.shared_config_enabled,
@@ -687,7 +866,8 @@ impl SyncService {
             .await
             .map_err(|error| SyncServiceError::Listener(error.to_string()))?;
         let mut config = HubServerConfig::new(hub_id, owner_login)
-            .map_err(|error| SyncServiceError::Listener(error.to_string()))?;
+            .map_err(|error| SyncServiceError::Listener(error.to_string()))?
+            .with_library(HubLibrary::new(self.db_path.clone()));
         if let Some(device_name) = device_name {
             config = config.with_device_name(device_name);
         }
@@ -722,6 +902,98 @@ impl SyncService {
             .await
             .as_ref()
             .is_some_and(|runtime| !runtime.task.is_finished())
+    }
+
+    async fn activate_dictation_transfer(
+        &self,
+        settings: &SyncSettings,
+    ) -> Result<(), SyncServiceError> {
+        let connection = crate::db::open_db_at(&self.db_path)
+            .context("opening sync database")
+            .map_err(SyncServiceError::Persistence)?;
+        crate::db::backfill_visible_dictations(&connection, settings.role)
+            .map_err(SyncServiceError::Persistence)?;
+        let prepared = self.prepare_dictation_transfer(settings).await?;
+        self.activate_prepared_outbox(prepared).await;
+        Ok(())
+    }
+
+    async fn prepare_dictation_transfer(
+        &self,
+        settings: &SyncSettings,
+    ) -> Result<PreparedOutboxRuntime, SyncServiceError> {
+        let worker = OutboxWorker::new(
+            self.db_path.clone(),
+            settings.role,
+            settings.hub.clone(),
+            Arc::clone(&self.hubs),
+        );
+        let (start, start_receiver) = oneshot::channel();
+        let (shutdown, receiver) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            if start_receiver.await.is_ok() {
+                worker.run(receiver).await;
+            }
+        });
+        Ok(PreparedOutboxRuntime {
+            start,
+            runtime: OutboxRuntime { shutdown, task },
+        })
+    }
+
+    async fn activate_prepared_outbox(&self, prepared: PreparedOutboxRuntime) {
+        self.stop_outbox_runtime().await;
+        let PreparedOutboxRuntime { start, runtime } = prepared;
+        let _ = start.send(());
+        *self.outbox_runtime.lock().await = Some(runtime);
+    }
+
+    async fn cancel_prepared_outbox(&self, prepared: PreparedOutboxRuntime) {
+        let PreparedOutboxRuntime { start, runtime } = prepared;
+        drop(start);
+        let _ = runtime.shutdown.send(());
+        let _ = runtime.task.await;
+    }
+
+    async fn rollback_home_hub_activation(
+        &self,
+        prepared: Option<PreparedOutboxRuntime>,
+        runtime_was_running: bool,
+        was_reachable: bool,
+        mapping_created: bool,
+        source_error: SyncServiceError,
+    ) -> SyncServiceError {
+        if let Some(prepared) = prepared {
+            self.cancel_prepared_outbox(prepared).await;
+        }
+        let mut rollback_errors = Vec::new();
+        if mapping_created {
+            if let Err(error) = self.tailscale_remove().await {
+                rollback_errors.push(error.to_string());
+            }
+        }
+        if !runtime_was_running {
+            if let Err(error) = self.stop_hub_runtime().await {
+                rollback_errors.push(error.to_string());
+            }
+        }
+        *self.hub_reachable.write().await = was_reachable;
+        if rollback_errors.is_empty() {
+            source_error
+        } else {
+            SyncServiceError::Rollback {
+                source_error: source_error.to_string(),
+                rollback_error: rollback_errors.join("; "),
+            }
+        }
+    }
+
+    async fn stop_outbox_runtime(&self) {
+        let Some(runtime) = self.outbox_runtime.lock().await.take() else {
+            return;
+        };
+        let _ = runtime.shutdown.send(());
+        let _ = runtime.task.await;
     }
 
     fn load(&self) -> Result<(SyncIdentity, SyncSettings), SyncServiceError> {
@@ -767,9 +1039,29 @@ impl SyncService {
             .map_err(SyncServiceError::Persistence)?;
         SyncServeRepository::save(&transaction, &expected_ownership())
             .map_err(SyncServiceError::Persistence)?;
+        crate::db::backfill_visible_dictations_in_transaction(&transaction, settings.role)
+            .map_err(SyncServiceError::Persistence)?;
         transaction
             .commit()
             .context("committing Home Hub settings transaction")
+            .map_err(SyncServiceError::Persistence)
+    }
+
+    fn commit_connected_device(&self, settings: &SyncSettings) -> Result<(), SyncServiceError> {
+        let mut conn = crate::db::open_db_at(&self.db_path)
+            .context("opening sync database")
+            .map_err(SyncServiceError::Persistence)?;
+        let transaction = conn
+            .transaction()
+            .context("starting Connected Device settings transaction")
+            .map_err(SyncServiceError::Persistence)?;
+        SyncSettingsRepository::save(&transaction, settings)
+            .map_err(SyncServiceError::Persistence)?;
+        crate::db::backfill_visible_dictations_in_transaction(&transaction, settings.role)
+            .map_err(SyncServiceError::Persistence)?;
+        transaction
+            .commit()
+            .context("committing Connected Device settings transaction")
             .map_err(SyncServiceError::Persistence)
     }
 
@@ -1106,6 +1398,129 @@ mod tests {
             SyncRole::Standalone
         );
         assert!(SyncServeRepository::get(&conn).unwrap().is_none());
+    }
+
+    fn insert_dictation_with_invalid_backfill_timestamp(path: &std::path::Path) {
+        let conn = crate::db::open_db_at(path).unwrap();
+        crate::db::insert_workflow_record(
+            &conn,
+            &crate::db::Workflow::new(
+                crate::db::WorkflowType::VoiceToText,
+                crate::db::WorkflowData::VoiceToText(crate::db::VoiceToTextData {
+                    text: "valid before rollback".into(),
+                    audio_path: "/missing".into(),
+                }),
+            ),
+        )
+        .unwrap();
+        let (_, record_id) = crate::db::insert_workflow_record(
+            &conn,
+            &crate::db::Workflow::new(
+                crate::db::WorkflowType::VoiceToText,
+                crate::db::WorkflowData::VoiceToText(crate::db::VoiceToTextData {
+                    text: "cannot backfill".into(),
+                    audio_path: "/missing".into(),
+                }),
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE workflows SET created_at = 'not-a-timestamp' WHERE sync_id = ?1",
+            [record_id.to_string()],
+        )
+        .unwrap();
+    }
+
+    fn outbox_count(conn: &rusqlite::Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM sync_outbox_items", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn home_hub_backfill_failure_rolls_back_role_listener_mapping_and_worker() {
+        let fixture = fixture();
+        insert_dictation_with_invalid_backfill_timestamp(&fixture.path);
+
+        let error = fixture
+            .service
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SyncServiceError::Persistence(_)));
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        assert_eq!(
+            SyncSettingsRepository::get(&conn).unwrap().role,
+            SyncRole::Standalone
+        );
+        assert!(SyncServeRepository::get(&conn).unwrap().is_none());
+        assert_eq!(outbox_count(&conn), 0);
+        assert_eq!(
+            *fixture.tailscale.mapping.lock().unwrap(),
+            MappingState::Vacant
+        );
+        assert!(!fixture.service.hub_runtime_running().await);
+        assert!(fixture.service.outbox_runtime.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn home_hub_commit_failure_cancels_prepared_worker_and_rolls_back_runtime() {
+        let fixture = fixture();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_home_hub_role
+             BEFORE UPDATE OF role ON sync_settings
+             WHEN NEW.role = 'home_hub'
+             BEGIN SELECT RAISE(ABORT, 'simulated settings commit failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = fixture
+            .service
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SyncServiceError::Persistence(_)));
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        assert_eq!(
+            SyncSettingsRepository::get(&conn).unwrap().role,
+            SyncRole::Standalone
+        );
+        assert_eq!(outbox_count(&conn), 0);
+        assert!(SyncServeRepository::get(&conn).unwrap().is_none());
+        assert_eq!(
+            *fixture.tailscale.mapping.lock().unwrap(),
+            MappingState::Vacant
+        );
+        assert!(!fixture.service.hub_runtime_running().await);
+        assert!(fixture.service.outbox_runtime.lock().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn connected_device_backfill_failure_leaves_standalone_without_a_worker() {
+        let fixture = fixture();
+        insert_dictation_with_invalid_backfill_timestamp(&fixture.path);
+
+        let error = fixture
+            .service
+            .configure(connected_request(HubId::new()))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SyncServiceError::Persistence(_)));
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        assert_eq!(
+            SyncSettingsRepository::get(&conn).unwrap().role,
+            SyncRole::Standalone
+        );
+        assert_eq!(outbox_count(&conn), 0);
+        assert!(fixture.service.outbox_runtime.lock().await.is_none());
+        assert!(!*fixture.service.hub_reachable.read().await);
     }
 
     #[tokio::test]

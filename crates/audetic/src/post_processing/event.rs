@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use utoipa::ToSchema;
 
+use audetic_core::sync::RecordId;
+
 /// JSON-payload format version. Bump on breaking shape changes.
 pub const PAYLOAD_VERSION: u32 = 1;
 
@@ -50,11 +52,12 @@ pub const ALL_EVENT_KINDS: &[EventKind] =
     &[EventKind::DictationCompleted, EventKind::MeetingCompleted];
 
 /// Payload for `dictation.completed`. Mirrors the fields the user is
-/// likely to want — the `dictation_id` is enough to call
-/// `GET /api/history/:id` for the full record.
+/// likely to want. `dictation_id` remains the local integer identifier for
+/// existing scripts; `record_id` is the stable UUID used by public history APIs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DictationCompletedPayload {
     pub dictation_id: i64,
+    pub record_id: RecordId,
     pub workflow_type: String,
     pub audio_path: PathBuf,
     pub text: String,
@@ -114,6 +117,7 @@ impl Event {
         match kind {
             EventKind::DictationCompleted => Self::DictationCompleted(DictationCompletedPayload {
                 dictation_id: 0,
+                record_id: RecordId::from_uuid(uuid::Uuid::nil()),
                 workflow_type: "VoiceToText".to_string(),
                 audio_path: PathBuf::from("/tmp/audetic/test-dictation.wav"),
                 text: "This is a synthetic test transcript.".to_string(),
@@ -150,6 +154,7 @@ mod tests {
     fn envelope_carries_event_version_and_data() {
         let payload = DictationCompletedPayload {
             dictation_id: 42,
+            record_id: RecordId::from_uuid(uuid::Uuid::from_u128(42)),
             workflow_type: "VoiceToText".to_string(),
             audio_path: PathBuf::from("/tmp/a.wav"),
             text: "hi".to_string(),
@@ -159,6 +164,10 @@ mod tests {
         assert_eq!(env["event"], "dictation.completed");
         assert_eq!(env["version"], PAYLOAD_VERSION);
         assert_eq!(env["data"]["dictation_id"], 42);
+        assert_eq!(
+            env["data"]["record_id"],
+            "00000000-0000-0000-0000-00000000002a"
+        );
         assert_eq!(env["data"]["text"], "hi");
     }
 
