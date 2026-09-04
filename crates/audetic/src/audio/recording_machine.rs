@@ -526,7 +526,7 @@ impl RecordingMachine {
 
 /// Save transcription to database and return the history ID.
 fn save_to_database(text: &str, audio_path: &Path) -> Result<i64> {
-    let conn = db::init_db()?;
+    let conn = db::open_db()?;
 
     let workflow_data = WorkflowData::VoiceToText(VoiceToTextData {
         text: text.to_string(),

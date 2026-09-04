@@ -37,6 +37,42 @@ fn test_migrate_creates_table() {
 }
 
 #[test]
+fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE workflows (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_type TEXT NOT NULL,
+            text TEXT NOT NULL,
+            audio_path TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO workflows (workflow_type, text, audio_path)
+        VALUES ('VoiceToText', 'legacy text', '/tmp/legacy.wav');",
+    )
+    .unwrap();
+
+    migrate(&conn).unwrap();
+    migrate(&conn).unwrap();
+
+    let applied: i64 = conn
+        .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(applied, 3);
+
+    let legacy: (String, String) = conn
+        .query_row(
+            "SELECT text, audio_path FROM workflows WHERE id = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(legacy, ("legacy text".into(), "/tmp/legacy.wav".into()));
+}
+
+#[test]
 fn test_insert_workflow() {
     let conn = setup_test_db().unwrap();
     let workflow = create_test_workflow("Test transcription");

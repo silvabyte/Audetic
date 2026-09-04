@@ -764,6 +764,54 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sync/configure": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["configure_sync_role"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/discover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["discover_home_hubs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_sync_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/system/deps": {
         parameters: {
             query?: never;
@@ -940,8 +988,14 @@ export interface components {
         AgentProfilesResponse: {
             profiles: components["schemas"]["AgentProfile"][];
         };
+        ApiErrorBody: {
+            error: boolean;
+            message: string;
+        };
         /** @enum {string} */
         ArtifactStatus: "pending" | "running" | "completed" | "error";
+        /** @enum {string} */
+        CacheLevel: "live_only" | "text_for_offline_use" | "text_and_available_audio";
         /** @description The `last_completed_job` nested block inside `RecordingStatusResponse`. */
         CompletedJobSummary: {
             created_at: string;
@@ -960,6 +1014,8 @@ export interface components {
             id: number;
             success: boolean;
         };
+        /** Format: uuid */
+        DeviceId: string;
         /** @description Progress of a model download. */
         DownloadProgress: {
             /** Format: int64 */
@@ -1015,6 +1071,20 @@ export interface components {
             id: number;
             text: string;
         };
+        HubCandidate: {
+            connection: components["schemas"]["HubConnection"];
+            device_name?: string | null;
+            /** Format: int32 */
+            protocol_version: number;
+        };
+        HubConnection: {
+            /** @description Canonical base URL ending in `/audetic/`. */
+            base_url: string;
+            hub_id: components["schemas"]["HubId"];
+            owner_login: string;
+        };
+        /** Format: uuid */
+        HubId: string;
         /**
          * @description Phase string for the install status endpoint. Renderer uses this to drive
          *     progress UI and decide when to stop polling.
@@ -1462,6 +1532,8 @@ export interface components {
             start: number;
             text: string;
         };
+        /** @enum {string} */
+        ServeMappingState: "vacant" | "audetic" | "collision";
         /** @description Response for GET / — service identity and basic status. */
         ServiceInfo: {
             service: string;
@@ -1514,6 +1586,60 @@ export interface components {
         };
         SummaryTemplatesResponse: {
             templates: components["schemas"]["SummaryTemplate"][];
+        };
+        SyncDiscoveryFailure: {
+            candidate: string;
+            reason: string;
+        };
+        /** @description Current Tailscale and Serve readiness as observed by the daemon. */
+        SyncNetworkAssessment: {
+            backend_state?: string | null;
+            dns_name?: string | null;
+            error?: string | null;
+            funnel_enabled?: boolean | null;
+            owner_login?: string | null;
+            ready: boolean;
+            serve_mapping?: null | components["schemas"]["ServeMappingState"];
+            serve_preview: string;
+        };
+        /** @enum {string} */
+        SyncRole: "standalone" | "home_hub" | "connected_device";
+        SyncSetupRequest: {
+            cache_level: components["schemas"]["CacheLevel"];
+            /** @description Home Hub activation changes Tailscale Serve only when explicitly true. */
+            confirm_serve_change?: boolean;
+            device_name?: string | null;
+            hub?: null | components["schemas"]["HubConnection"];
+            role: components["schemas"]["SyncRole"];
+            shared_config_enabled: boolean;
+            upload_recording_payloads: boolean;
+        };
+        SyncSetupResult: {
+            discovered_hubs: components["schemas"]["HubCandidate"][];
+            discovery_failures: components["schemas"]["SyncDiscoveryFailure"][];
+            serve_preview?: string | null;
+            setup_command?: string | null;
+            status: components["schemas"]["SyncStatus"];
+        };
+        SyncStatus: {
+            /** Format: int64 */
+            applied_shared_config_version?: number | null;
+            cache_level: components["schemas"]["CacheLevel"];
+            device_id: components["schemas"]["DeviceId"];
+            device_name?: string | null;
+            hub?: null | components["schemas"]["HubConnection"];
+            hub_reachable: boolean;
+            last_contact_at?: string | null;
+            last_error?: string | null;
+            local_hub_id?: null | components["schemas"]["HubId"];
+            network: components["schemas"]["SyncNetworkAssessment"];
+            /** Format: int64 */
+            pending_bytes: number;
+            /** Format: int64 */
+            pending_items: number;
+            role: components["schemas"]["SyncRole"];
+            shared_config_enabled: boolean;
+            upload_recording_payloads: boolean;
         };
         /** @description Availability of external tools the daemon depends on. */
         SystemDeps: {
@@ -2961,6 +3087,133 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SummaryTemplatesResponse"];
+                };
+            };
+        };
+    };
+    configure_sync_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SyncSetupRequest"];
+            };
+        };
+        responses: {
+            /** @description Preview or committed role transition */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncSetupResult"];
+                };
+            };
+            /** @description Invalid settings or disallowed role transition */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description Tailscale Serve or Funnel collision */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The transition could not be persisted */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The requested role could not be verified or started */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    discover_home_hubs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Compatible Home Hubs visible on the tailnet */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncSetupResult"];
+                };
+            };
+            /** @description Tailscale is not authenticated or suitable for discovery */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description Tailscale or discovery transport is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    get_sync_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Persisted role and current sync readiness */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncStatus"];
+                };
+            };
+            /** @description Persisted sync state could not be read */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
                 };
             };
         };

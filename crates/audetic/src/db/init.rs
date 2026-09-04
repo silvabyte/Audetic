@@ -1,56 +1,182 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use rusqlite::Connection;
+
 use std::path::Path;
 use std::time::Duration;
 
-pub fn init_db() -> Result<Connection> {
-    let db_path = crate::global::db_file()?;
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const LATEST_SCHEMA_VERSION: i64 = 3;
 
-    init_db_at(&db_path)
+/// Open the application database and run pending migrations.
+///
+/// This remains the compatibility entry point for callers that historically
+/// expected `init_db` to initialize an empty database. New runtime callers
+/// should run [`migrate_db`] once during startup and use [`open_db`] afterward.
+pub fn init_db() -> Result<Connection> {
+    migrate_db()
 }
 
+/// Open a database at `db_path` and run pending migrations.
+///
+/// Prefer [`migrate_db_at`] in startup code and [`open_db_at`] in code that
+/// only needs a connection to an already-migrated database.
 pub fn init_db_at(db_path: &Path) -> Result<Connection> {
-    // Ensure parent directory exists
+    migrate_db_at(db_path)
+}
+
+/// Open the application database without running data migrations.
+pub fn open_db() -> Result<Connection> {
+    let db_path = crate::global::db_file()?;
+    open_db_at(&db_path)
+}
+
+/// Open an already-migrated database and apply connection-local settings.
+pub fn open_db_at(db_path: &Path) -> Result<Connection> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).context("Failed to create database directory")?;
     }
 
     let conn = Connection::open(db_path).context("Failed to open database connection")?;
-
-    // The daemon opens a fresh connection per request, so recording-history
-    // writes, meeting writes, and API reads overlap. Wait for the write lock
-    // instead of failing immediately with SQLITE_BUSY.
-    conn.busy_timeout(Duration::from_secs(5))
-        .context("Failed to set SQLite busy timeout")?;
-
-    migrate(&conn)?;
-
+    configure_connection(&conn)?;
     Ok(conn)
 }
 
+/// Open the application database and apply all pending migrations.
+///
+/// The daemon should call this exactly once while constructing startup state.
+pub fn migrate_db() -> Result<Connection> {
+    let db_path = crate::global::db_file()?;
+    migrate_db_at(&db_path)
+}
+
+/// Open `db_path` and apply all pending migrations under one exclusive
+/// transaction.
+pub fn migrate_db_at(db_path: &Path) -> Result<Connection> {
+    let conn = open_db_at(db_path)?;
+    migrate(&conn)?;
+    Ok(conn)
+}
+
+/// Apply settings that SQLite scopes to an individual connection.
+pub fn configure_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(BUSY_TIMEOUT)
+        .context("Failed to set SQLite busy timeout")?;
+    conn.pragma_update(None, "foreign_keys", "ON")
+        .context("Failed to enable SQLite foreign keys")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .context("Failed to configure SQLite synchronous mode")?;
+    Ok(())
+}
+
+/// Apply numbered schema migrations.
+///
+/// Migrations are serialized by an exclusive transaction and recorded only
+/// after their complete schema/data change succeeds. Keeping this function
+/// public preserves the existing in-memory test setup API; production code
+/// should invoke it only through the startup migration entry points above.
 pub fn migrate(conn: &Connection) -> Result<()> {
+    configure_connection(conn)?;
+
+    // WAL is database-persistent rather than connection-local, so set it only
+    // on the startup migration path. In-memory databases retain their `memory`
+    // journal mode, which is expected.
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .context("Failed to configure SQLite journal mode")?;
+
+    conn.execute_batch("BEGIN EXCLUSIVE TRANSACTION")
+        .context("Failed to begin exclusive database migration")?;
+
+    let result = apply_pending_migrations(conn);
+    match result {
+        Ok(()) => conn
+            .execute_batch("COMMIT")
+            .context("Failed to commit database migrations"),
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
+fn apply_pending_migrations(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )",
+    )
+    .context("Failed to create schema_migrations table")?;
+
+    let newest: Option<i64> = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .context("Failed to read current schema version")?;
+    if let Some(version) = newest {
+        if version > LATEST_SCHEMA_VERSION {
+            bail!(
+                "Database schema version {version} is newer than supported version \
+                 {LATEST_SCHEMA_VERSION}"
+            );
+        }
+    }
+
+    apply_migration(conn, 1, "baseline", migrate_baseline)?;
+    apply_migration(
+        conn,
+        2,
+        "sync_identity_and_settings",
+        migrate_sync_foundation,
+    )?;
+    apply_migration(
+        conn,
+        3,
+        "sync_serve_ownership",
+        migrate_sync_serve_ownership,
+    )?;
+    Ok(())
+}
+
+fn apply_migration(
+    conn: &Connection,
+    version: i64,
+    name: &str,
+    migration: fn(&Connection) -> Result<()>,
+) -> Result<()> {
+    let already_applied: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+            [version],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("Failed to inspect database migration {version}"))?;
+    if already_applied {
+        return Ok(());
+    }
+
+    migration(conn).with_context(|| format!("Failed to apply database migration {version}"))?;
     conn.execute(
+        "INSERT INTO schema_migrations (version, name) VALUES (?1, ?2)",
+        rusqlite::params![version, name],
+    )
+    .with_context(|| format!("Failed to record database migration {version}"))?;
+    Ok(())
+}
+
+fn migrate_baseline(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS workflows (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             workflow_type TEXT NOT NULL,
             text TEXT NOT NULL,
             audio_path TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )",
-        [],
-    )
-    .context("Failed to create workflows table")?;
+        );
+        CREATE INDEX IF NOT EXISTS idx_workflows_created_at
+            ON workflows(created_at DESC);
 
-    // Create index for faster text searches
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_workflows_created_at ON workflows(created_at DESC)",
-        [],
-    )
-    .context("Failed to create index on created_at")?;
-
-    // Meetings table
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS meetings (
+        CREATE TABLE IF NOT EXISTS meetings (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title TEXT,
             title_source TEXT,
@@ -68,71 +194,9 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             error TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             deleted_at TIMESTAMP
-        )",
-        [],
-    )
-    .context("Failed to create meetings table")?;
+        );
 
-    // Soft-delete column for meetings created before `deleted_at` existed.
-    // `CREATE TABLE IF NOT EXISTS` above is a no-op on those DBs, so backfill
-    // the column here. Idempotent — skips the ALTER if it's already present.
-    add_column_if_missing(conn, "meetings", "deleted_at", "TIMESTAMP")?;
-
-    // Per-segment timestamps (JSON array of {start,end,text}) for clickable
-    // transcript lines. Backfilled for meetings created before this column —
-    // older rows just have NULL and the UI falls back to plain text.
-    add_column_if_missing(conn, "meetings", "transcript_segments", "TEXT")?;
-
-    // Meeting Titles gained persisted provenance after the initial meetings
-    // schema shipped. Existing non-empty titles are user-owned Manual Titles;
-    // whitespace-only legacy values are absence, not titles.
-    add_column_if_missing(conn, "meetings", "title_source", "TEXT")?;
-    add_column_if_missing(conn, "meetings", "title_updated_at", "TIMESTAMP")?;
-    add_column_if_missing(
-        conn,
-        "meetings",
-        "title_version",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(conn, "meetings", "source_filename", "TEXT")?;
-    conn.execute(
-        "UPDATE meetings SET title = NULL, title_source = NULL \
-         WHERE (title IS NOT NULL AND trim(title) = '') \
-            OR (title IS NULL AND title_source IS NOT NULL)",
-        [],
-    )
-    .context("Failed to normalize absent meeting titles")?;
-    conn.execute(
-        "UPDATE meetings SET title = trim(title), title_source = 'manual' \
-         WHERE title IS NOT NULL AND title_source IS NULL",
-        [],
-    )
-    .context("Failed to migrate legacy meeting titles to manual provenance")?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_meetings_started_at ON meetings(started_at DESC)",
-        [],
-    )
-    .context("Failed to create meetings started_at index")?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status)",
-        [],
-    )
-    .context("Failed to create meetings status index")?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_meetings_deleted_at ON meetings(deleted_at)",
-        [],
-    )
-    .context("Failed to create meetings deleted_at index")?;
-
-    // Post-processing jobs: user-defined commands fired on daemon events
-    // (e.g. dictation.completed, meeting.completed). `action_config` is a
-    // serialized JSON blob whose shape depends on `action_type`; future
-    // action types (webhook, etc.) reuse the same row.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS post_processing_jobs (
+        CREATE TABLE IF NOT EXISTS post_processing_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             event TEXT NOT NULL,
@@ -141,24 +205,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             enabled INTEGER NOT NULL DEFAULT 1,
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-        )",
-        [],
-    )
-    .context("Failed to create post_processing_jobs table")?;
+        );
+        CREATE INDEX IF NOT EXISTS idx_pp_jobs_event_enabled
+            ON post_processing_jobs(event) WHERE enabled = 1;
 
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_pp_jobs_event_enabled \
-         ON post_processing_jobs(event) WHERE enabled = 1",
-        [],
-    )
-    .context("Failed to create post_processing_jobs event index")?;
-
-    // Agent profiles describe local coding-agent CLIs (Claude Code, Codex,
-    // OpenCode, Cursor Agent, etc.) that can turn a meeting transcript into a
-    // persisted artifact. The args are stored as JSON argv tokens — not a shell
-    // command — so execution can avoid `sh -c` quoting/injection hazards.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS agent_profiles (
+        CREATE TABLE IF NOT EXISTS agent_profiles (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
             kind TEXT NOT NULL,
@@ -170,23 +221,11 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(kind, executable)
-        )",
-        [],
-    )
-    .context("Failed to create agent_profiles table")?;
+        );
+        CREATE INDEX IF NOT EXISTS idx_agent_profiles_enabled
+            ON agent_profiles(enabled);
 
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_agent_profiles_enabled \
-         ON agent_profiles(enabled)",
-        [],
-    )
-    .context("Failed to create agent_profiles enabled index")?;
-
-    // Durable outputs generated from meetings (summaries, action-item reports,
-    // notes). Agent runs move pending → running → completed/error so the UI can
-    // show useful failures and preserve stdout/stderr for debugging.
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS meeting_artifacts (
+        CREATE TABLE IF NOT EXISTS meeting_artifacts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             meeting_id INTEGER NOT NULL,
             kind TEXT NOT NULL,
@@ -203,32 +242,106 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             completed_at TIMESTAMP,
             FOREIGN KEY(meeting_id) REFERENCES meetings(id),
             FOREIGN KEY(agent_profile_id) REFERENCES agent_profiles(id)
-        )",
-        [],
+        );
+        CREATE INDEX IF NOT EXISTS idx_meeting_artifacts_meeting_created
+            ON meeting_artifacts(meeting_id, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_meeting_artifacts_status
+            ON meeting_artifacts(status);",
     )
-    .context("Failed to create meeting_artifacts table")?;
+    .context("Failed to create baseline database schema")?;
 
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_meeting_artifacts_meeting_created \
-         ON meeting_artifacts(meeting_id, created_at DESC)",
-        [],
+    // These checks absorb every known pre-numbered schema vintage. Once
+    // migration 1 is recorded, normal startups never repeat them.
+    add_column_if_missing(conn, "meetings", "deleted_at", "TIMESTAMP")?;
+    add_column_if_missing(conn, "meetings", "transcript_segments", "TEXT")?;
+    add_column_if_missing(conn, "meetings", "title_source", "TEXT")?;
+    add_column_if_missing(conn, "meetings", "title_updated_at", "TIMESTAMP")?;
+    add_column_if_missing(
+        conn,
+        "meetings",
+        "title_version",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(conn, "meetings", "source_filename", "TEXT")?;
+
+    conn.execute_batch(
+        "UPDATE meetings SET title = NULL, title_source = NULL
+         WHERE (title IS NOT NULL AND trim(title) = '')
+            OR (title IS NULL AND title_source IS NOT NULL);
+         UPDATE meetings SET title = trim(title), title_source = 'manual'
+         WHERE title IS NOT NULL AND title_source IS NULL;
+
+         CREATE INDEX IF NOT EXISTS idx_meetings_started_at
+            ON meetings(started_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_meetings_status ON meetings(status);
+         CREATE INDEX IF NOT EXISTS idx_meetings_deleted_at ON meetings(deleted_at);",
     )
-    .context("Failed to create meeting_artifacts meeting index")?;
-
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_meeting_artifacts_status \
-         ON meeting_artifacts(status)",
-        [],
-    )
-    .context("Failed to create meeting_artifacts status index")?;
-
+    .context("Failed to migrate legacy meeting data")?;
     Ok(())
 }
 
-/// Add `column` to `table` only if it isn't already there. SQLite has no
-/// `ADD COLUMN IF NOT EXISTS`, and there's no versioned-migration system here,
-/// so we inspect `PRAGMA table_info` first and `ALTER` only when missing —
-/// keeping `migrate()` safe to run on every startup against any DB vintage.
+fn migrate_sync_foundation(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_identity (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            device_id TEXT NOT NULL UNIQUE,
+            hub_id TEXT UNIQUE,
+            owner_login TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK ((hub_id IS NULL) = (owner_login IS NULL))
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_settings (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            role TEXT NOT NULL DEFAULT 'standalone'
+                CHECK (role IN ('standalone', 'home_hub', 'connected_device')),
+            device_name TEXT,
+            hub_url TEXT,
+            hub_id TEXT,
+            hub_owner_login TEXT,
+            upload_recording_payloads INTEGER NOT NULL DEFAULT 0
+                CHECK (upload_recording_payloads IN (0, 1)),
+            cache_level TEXT NOT NULL DEFAULT 'live_only'
+                CHECK (cache_level IN (
+                    'live_only',
+                    'text_for_offline_use',
+                    'text_and_available_audio'
+                )),
+            shared_config_enabled INTEGER NOT NULL DEFAULT 0
+                CHECK (shared_config_enabled IN (0, 1)),
+            change_cursor INTEGER NOT NULL DEFAULT 0 CHECK (change_cursor >= 0),
+            shared_config_version INTEGER CHECK (shared_config_version >= 0),
+            last_contact_at TEXT,
+            last_error TEXT,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            CHECK (
+                (role = 'connected_device' AND hub_url IS NOT NULL
+                    AND hub_id IS NOT NULL AND hub_owner_login IS NOT NULL)
+                OR (role != 'connected_device' AND hub_url IS NULL
+                    AND hub_id IS NULL AND hub_owner_login IS NULL)
+            )
+        );",
+    )
+    .context("Failed to create sync identity and settings tables")?;
+    Ok(())
+}
+
+fn migrate_sync_serve_ownership(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS sync_serve_ownership (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            https_port INTEGER NOT NULL CHECK (https_port BETWEEN 1 AND 65535),
+            mount_path TEXT NOT NULL,
+            proxy_url TEXT NOT NULL,
+            configured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );",
+    )
+    .context("Failed to create sync Serve ownership table")?;
+    Ok(())
+}
+
+/// Add `column` to `table` only when a pre-numbered database lacks it.
 fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &str) -> Result<()> {
     let mut stmt = conn
         .prepare(&format!("PRAGMA table_info({table})"))
@@ -236,36 +349,19 @@ fn add_column_if_missing(conn: &Connection, table: &str, column: &str, decl: &st
     let exists = stmt
         .query_map([], |row| row.get::<_, String>(1))
         .with_context(|| format!("Failed to read columns of {table}"))?
-        .filter_map(|c| c.ok())
-        .any(|c| c == column);
+        .filter_map(|column| column.ok())
+        .any(|existing| existing == column);
 
     if exists {
         return Ok(());
     }
 
-    match conn.execute(
+    conn.execute(
         &format!("ALTER TABLE {table} ADD COLUMN {column} {decl}"),
         [],
-    ) {
-        Ok(_) => Ok(()),
-        // SQLite has no `ADD COLUMN IF NOT EXISTS`, so the check above and the
-        // ALTER below can't be one atomic step: another connection opening the
-        // same database (a second daemon, the CLI, concurrent tests) can land
-        // its migration in between. Losing that race means the column is now
-        // there, which is all we wanted — so treat it as success rather than
-        // failing startup.
-        Err(err) if is_duplicate_column(&err) => Ok(()),
-        Err(err) => Err(err).with_context(|| format!("Failed to add column {column} to {table}")),
-    }
-}
-
-/// Whether a rusqlite error is SQLite's "duplicate column name" — i.e. the
-/// column we were about to add already exists.
-fn is_duplicate_column(err: &rusqlite::Error) -> bool {
-    matches!(
-        err,
-        rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("duplicate column name")
     )
+    .with_context(|| format!("Failed to add column {column} to {table}"))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -306,5 +402,17 @@ mod tests {
             .unwrap();
         assert_eq!(blank.title, None);
         assert_eq!(blank.title_source, None);
+    }
+
+    #[test]
+    fn every_opened_connection_enforces_foreign_keys() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("audetic.db");
+        let conn = open_db_at(&path).unwrap();
+
+        let enabled: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .unwrap();
+        assert!(enabled);
     }
 }

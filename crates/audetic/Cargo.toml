@@ -50,6 +50,7 @@ toml = "0.8"
 
 # Encoding
 base64 = "0.22.1"
+rfc2047-decoder = "1.1"
 
 # Logging and errors
 anyhow = "1.0"
@@ -73,6 +74,7 @@ regex = "1.10"
 # HTTP server. `multipart` enables the file-upload extractor used by
 # `POST /api/meetings/import`.
 axum = { version = "0.7", features = ["multipart"] }
+http = "1"
 # `util` provides `ServiceExt::oneshot`, used to drive `ServeFile` from the
 # meeting-audio handler. 0.5 unifies with the tower that tower-http pulls in.
 tower = { version = "0.5", features = ["util"] }

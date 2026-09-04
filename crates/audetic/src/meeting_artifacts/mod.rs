@@ -32,7 +32,7 @@ pub async fn generate_meeting_artifact(
     meeting_id: i64,
     request: GenerateArtifactRequest,
 ) -> Result<MeetingArtifact> {
-    let conn = crate::db::init_db().context("Failed to open audetic database")?;
+    let conn = crate::db::open_db().context("Failed to open audetic database")?;
     AgentProfileRepository::ensure_builtin_profiles(&conn)?;
 
     let meeting = MeetingRepository::get(&conn, meeting_id)?

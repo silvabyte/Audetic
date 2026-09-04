@@ -154,6 +154,7 @@ fn build_test_machine(
         .expect("create test meetings dir")
         .keep();
     let db_path = meetings_dir.join("audetic.db");
+    audetic::db::migrate_db_at(&db_path).expect("initialize test database");
     let post_processing = Arc::new(PostProcessingService::new(db_path.clone()));
     let machine = MeetingMachine::new(
         mic,

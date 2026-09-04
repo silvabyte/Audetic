@@ -42,7 +42,7 @@ pub struct AgentProfileTestResponse {
 )]
 pub async fn list_agent_profiles() -> ApiResult<Json<AgentProfilesResponse>> {
     let profiles = tokio::task::spawn_blocking(|| -> anyhow::Result<Vec<AgentProfile>> {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         AgentProfileRepository::ensure_builtin_profiles(&conn)?;
         AgentProfileRepository::list(&conn)
     })
@@ -64,7 +64,7 @@ pub async fn list_agent_profiles() -> ApiResult<Json<AgentProfilesResponse>> {
 )]
 pub async fn test_agent_profile(Path(id): Path<i64>) -> ApiResult<Json<AgentProfileTestResponse>> {
     let profile = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<AgentProfile>> {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         AgentProfileRepository::ensure_builtin_profiles(&conn)?;
         AgentProfileRepository::get(&conn, id)
     })

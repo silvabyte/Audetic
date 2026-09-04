@@ -593,7 +593,7 @@ pub async fn list_meetings(
     let limit = params.limit.unwrap_or(20);
 
     let meetings = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         crate::db::meetings::MeetingRepository::list(&conn, limit)
     })
     .await
@@ -633,7 +633,7 @@ pub async fn recent_meeting_titles(
 ) -> ApiResult<Json<RecentMeetingTitlesResponse>> {
     let limit = params.limit.unwrap_or(10).min(50);
     let titles = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         crate::db::meetings::MeetingRepository::recent_manual_titles(&conn, limit)
     })
     .await
@@ -664,7 +664,7 @@ pub async fn update_meeting_title(
         return Err(ApiError::bad_request("Meeting Title cannot be blank"));
     }
     let meeting = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         if !crate::db::meetings::MeetingRepository::set_manual_title(&conn, id, &title)? {
             return Ok(None);
         }
@@ -741,7 +741,7 @@ pub async fn get_meeting(
     State(_state): State<MeetingState>,
 ) -> Result<Json<MeetingDetailResponse>, Response> {
     let meeting = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         crate::db::meetings::MeetingRepository::get(&conn, id)
     })
     .await
@@ -812,7 +812,7 @@ pub async fn meeting_audio(
     request: axum::extract::Request,
 ) -> Response {
     let lookup = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         crate::db::meetings::MeetingRepository::get(&conn, id)
     })
     .await;
@@ -901,7 +901,7 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
     info!("Meeting {} retry requested", id);
 
     let join = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         crate::db::meetings::MeetingRepository::get(&conn, id)
     })
     .await;
@@ -975,7 +975,7 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
             // Heal the row so future calls don't pay this lookup again.
             let mp3_str = mp3_sibling.to_string_lossy().into_owned();
             let _ = tokio::task::spawn_blocking(move || {
-                let conn = crate::db::init_db()?;
+                let conn = crate::db::open_db()?;
                 crate::db::meetings::MeetingRepository::update_audio_path(&conn, id, &mp3_str)
             })
             .await;
@@ -1003,7 +1003,7 @@ pub async fn retry_meeting(Path(id): Path<i64>, State(state): State<MeetingState
     // strand the row in `transcribing`) and reject if the row is no longer the
     // failed meeting we loaded — e.g. a concurrent retry or delete won.
     let marked = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         crate::db::meetings::MeetingRepository::begin_retry(&conn, id)
     })
     .await;
@@ -1090,7 +1090,7 @@ pub async fn delete_meeting(Path(id): Path<i64>, State(state): State<MeetingStat
     info!("Meeting {} delete requested", id);
 
     let outcome = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         crate::db::meetings::MeetingRepository::soft_delete(&conn, id)
     })
     .await;

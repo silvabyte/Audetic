@@ -19,6 +19,7 @@ pub mod normalizer;
 pub mod post_processing;
 pub mod setup;
 pub mod summary_templates;
+pub mod sync;
 pub mod system;
 pub mod text_io;
 pub mod transcription;

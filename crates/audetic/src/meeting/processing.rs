@@ -48,7 +48,7 @@ impl ProcessingServices {
     }
 
     fn open_db(&self) -> anyhow::Result<rusqlite::Connection> {
-        db::init_db_at(&self.db_path)
+        db::open_db_at(&self.db_path)
     }
 }
 

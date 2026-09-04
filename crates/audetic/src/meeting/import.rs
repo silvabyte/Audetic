@@ -183,7 +183,7 @@ fn insert_meeting_row(
     title: Option<&str>,
     source_filename: Option<&str>,
 ) -> Result<i64> {
-    let conn = db::init_db().context("Failed to open audetic database")?;
+    let conn = db::open_db().context("Failed to open audetic database")?;
     let id = MeetingRepository::insert_import(
         &conn,
         title,

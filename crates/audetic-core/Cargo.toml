@@ -34,7 +34,7 @@ tokio-util = { version = "0.7", features = ["io"] }
 which = "6.0"
 
 # Temp-file naming for compression output
-uuid = { version = "1.18.1", features = ["v4"] }
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
 
 # Bundled FFmpeg installer / resolver
 ffmpeg-sidecar = "2.5"

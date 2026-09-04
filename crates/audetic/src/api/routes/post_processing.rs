@@ -151,7 +151,7 @@ pub async fn list_jobs(
     };
 
     let jobs = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         JobRepository::list(&conn, event_filter)
     })
     .await
@@ -182,7 +182,7 @@ pub async fn create_job(
     validate_action(&new.action)?;
 
     let job = tokio::task::spawn_blocking(move || -> anyhow::Result<Job> {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         let id = JobRepository::insert(&conn, &new)?;
         JobRepository::get(&conn, id)?
             .ok_or_else(|| anyhow::anyhow!("inserted job {id} disappeared"))
@@ -209,7 +209,7 @@ pub async fn get_job(
     State(_state): State<PostProcessingApiState>,
 ) -> ApiResult<Json<Job>> {
     let job = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         JobRepository::get(&conn, id)
     })
     .await
@@ -247,7 +247,7 @@ pub async fn update_job(
     }
 
     let job = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<Job>> {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         let updated = JobRepository::update(&conn, id, &patch)?;
         if !updated {
             return Ok(None);
@@ -277,7 +277,7 @@ pub async fn delete_job(
     State(_state): State<PostProcessingApiState>,
 ) -> ApiResult<Json<DeleteResponse>> {
     let deleted = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         JobRepository::delete(&conn, id)
     })
     .await
@@ -307,7 +307,7 @@ pub async fn test_job(
     State(state): State<PostProcessingApiState>,
 ) -> ApiResult<Json<TestJobResponse>> {
     let job = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         JobRepository::get(&conn, id)
     })
     .await

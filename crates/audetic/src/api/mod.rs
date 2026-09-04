@@ -33,6 +33,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use utoipa::{OpenApi, ToSchema};
 
+use std::future::Future;
+
 use crate::config::Config;
 use crate::post_processing::PostProcessingService;
 
@@ -66,6 +68,7 @@ pub struct ApiServer {
     post_processing_state: routes::post_processing::PostProcessingApiState,
     runtime_provider: crate::config::WhisperConfig,
     instance_id: ProcessInstanceId,
+    sync_state: Option<routes::sync::SyncApiState>,
 }
 
 impl ApiServer {
@@ -88,6 +91,7 @@ impl ApiServer {
             },
             runtime_provider: config.whisper.clone(),
             instance_id: ProcessInstanceId(uuid::Uuid::new_v4().to_string()),
+            sync_state: None,
         }
     }
 
@@ -118,7 +122,19 @@ impl ApiServer {
         self
     }
 
+    pub fn with_sync_service(mut self, service: std::sync::Arc<crate::sync::SyncService>) -> Self {
+        self.sync_state = Some(routes::sync::SyncApiState::new(service));
+        self
+    }
+
     pub async fn start(self) -> Result<()> {
+        self.start_with_shutdown(std::future::pending::<()>()).await
+    }
+
+    pub async fn start_with_shutdown(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
         // Build the API surface. All routes nest under `/api` so the daemon
         // can serve the bundled web-ui at `/` without colliding with API
         // paths (e.g. /meetings is also a SPA route).
@@ -152,6 +168,9 @@ impl ApiServer {
         if let Some(meeting_state) = self.meeting_state {
             api = api.merge(routes::meetings::router(meeting_state));
         }
+        if let Some(sync_state) = self.sync_state {
+            api = api.merge(routes::sync::router(sync_state));
+        }
 
         let app = Router::new()
             .nest(url::API_PREFIX, api)
@@ -169,7 +188,9 @@ impl ApiServer {
             if has_meeting { "enabled" } else { "disabled" }
         );
 
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
 
         Ok(())
     }

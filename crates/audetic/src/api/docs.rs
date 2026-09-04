@@ -8,7 +8,7 @@ use utoipa::OpenApi;
 
 use super::routes::{
     agents, history, keybind, logs, meeting_artifacts, meetings, models, post_processing, provider,
-    recording, setup, summary_templates, system, transcribe,
+    recording, setup, summary_templates, sync, system, transcribe,
 };
 
 #[derive(OpenApi)]
@@ -90,6 +90,10 @@ use super::routes::{
         post_processing::update_job,
         post_processing::delete_job,
         post_processing::test_job,
+        // Library Sync
+        sync::get_status,
+        sync::discover,
+        sync::configure,
     ),
     components(schemas(
         // Service
@@ -180,6 +184,20 @@ use super::routes::{
         post_processing::JobsListResponse,
         post_processing::DeleteResponse,
         post_processing::TestJobResponse,
+        // Library Sync
+        audetic_core::sync::SyncRole,
+        audetic_core::sync::CacheLevel,
+        audetic_core::sync::DeviceId,
+        audetic_core::sync::HubId,
+        audetic_core::sync::HubConnection,
+        audetic_core::sync::HubCandidate,
+        audetic_core::sync::SyncDiscoveryFailure,
+        audetic_core::sync::ServeMappingState,
+        audetic_core::sync::SyncNetworkAssessment,
+        audetic_core::sync::SyncSetupRequest,
+        audetic_core::sync::SyncSetupResult,
+        audetic_core::sync::SyncStatus,
+        super::error::ApiErrorBody,
     )),
     tags(
         (name = "service", description = "Service identity and liveness"),
@@ -198,6 +216,7 @@ use super::routes::{
         (name = "update", description = "Daemon self-update"),
         (name = "logs", description = "Application and transcription logs"),
         (name = "post_processing", description = "User-defined commands fired on daemon events"),
+        (name = "sync", description = "Local Shared Library role setup and status"),
     ),
 )]
 pub struct ApiDoc;
@@ -259,6 +278,9 @@ mod tests {
             paths::MODELS,
             paths::TRANSCRIBE,
             paths::SETUP,
+            paths::SYNC_STATUS,
+            paths::SYNC_DISCOVER,
+            paths::SYNC_CONFIGURE,
             paths::SYSTEM_RESTART,
             paths::KEYBIND_STATUS,
             paths::KEYBIND_INSTALL,
@@ -322,6 +344,37 @@ mod tests {
         );
         assert!(spec["components"]["schemas"]["RestartAccepted"].is_object());
         assert!(spec["components"]["schemas"]["ProviderRuntimeStatus"].is_object());
+    }
+
+    #[test]
+    fn sync_slice_one_operations_and_schemas_are_registered() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert_eq!(
+            spec["paths"][paths::SYNC_STATUS]["get"]["operationId"],
+            "get_sync_status"
+        );
+        assert_eq!(
+            spec["paths"][paths::SYNC_DISCOVER]["post"]["operationId"],
+            "discover_home_hubs"
+        );
+        assert_eq!(
+            spec["paths"][paths::SYNC_CONFIGURE]["post"]["operationId"],
+            "configure_sync_role"
+        );
+        for schema in [
+            "SyncStatus",
+            "SyncSetupRequest",
+            "SyncSetupResult",
+            "SyncNetworkAssessment",
+            "HubConnection",
+            "ApiErrorBody",
+        ] {
+            assert!(
+                spec["components"]["schemas"][schema].is_object(),
+                "missing schema {schema}"
+            );
+        }
     }
 
     #[test]

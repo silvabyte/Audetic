@@ -46,7 +46,7 @@ pub async fn list_meeting_artifacts(
     Path(id): Path<i64>,
 ) -> ApiResult<Json<MeetingArtifactsResponse>> {
     let artifacts = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         MeetingArtifactRepository::list_for_live_meeting(&conn, id)
     })
     .await
@@ -94,7 +94,7 @@ pub async fn get_meeting_artifact(
 ) -> ApiResult<Json<MeetingArtifact>> {
     let artifact =
         tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MeetingArtifact>> {
-            let conn = crate::db::init_db()?;
+            let conn = crate::db::open_db()?;
             MeetingArtifactRepository::get_for_live_meeting(&conn, id, artifact_id)
         })
         .await
@@ -121,7 +121,7 @@ pub async fn delete_meeting_artifact(
     Path((id, artifact_id)): Path<(i64, i64)>,
 ) -> ApiResult<Json<DeleteArtifactResponse>> {
     let deleted = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::init_db()?;
+        let conn = crate::db::open_db()?;
         MeetingArtifactRepository::delete_for_live_meeting(&conn, id, artifact_id)
     })
     .await
