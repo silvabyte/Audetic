@@ -1227,6 +1227,26 @@ fn import_error(status: StatusCode, message: String) -> Response {
 mod tests {
     use super::*;
 
+    #[test]
+    fn title_workflow_statuses_preserve_conflict_and_unavailable_semantics() {
+        assert_eq!(
+            ApiError::from(crate::sync::shared_library::LibraryError::Conflict(
+                "Meeting has no transcript".into(),
+            ))
+            .into_response()
+            .status(),
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            ApiError::from(crate::sync::shared_library::LibraryError::Unavailable(
+                "Home Hub unavailable".into(),
+            ))
+            .into_response()
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
     #[tokio::test]
     async fn default_status_json_exposes_capture_health() {
         let status = MeetingStatusHandle::default();

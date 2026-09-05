@@ -234,7 +234,7 @@ impl MeetingRepository {
                 "SELECT title FROM meetings \
                  WHERE deleted_at IS NULL AND title_source = 'manual' AND title IS NOT NULL \
                  GROUP BY title \
-                 ORDER BY MAX(COALESCE(title_updated_at, started_at)) DESC, MAX(id) DESC \
+                 ORDER BY MAX(julianday(COALESCE(title_updated_at, started_at))) DESC, MAX(id) DESC \
                  LIMIT ?1",
             )
             .context("Failed to prepare recent Manual Titles query")?;
@@ -279,6 +279,43 @@ impl MeetingRepository {
         )
         .optional()
         .context("mirroring authoritative Meeting Title")
+    }
+
+    /// Best-effort enrichment for a committed Connected Device title receipt.
+    ///
+    /// The local row and its pre-request title version are both fenced. A
+    /// concurrent local edit therefore wins instead of being overwritten by a
+    /// delayed response. This intentionally does not publish origin work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mirror_authoritative_title_if_version(
+        conn: &Connection,
+        local_id: i64,
+        record_id: RecordId,
+        expected_title_version: u64,
+        title: Option<&str>,
+        title_source: Option<&str>,
+        title_version: u64,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let expected_title_version = i64::try_from(expected_title_version)
+            .context("expected Meeting Title version exceeds local storage")?;
+        let title_version = i64::try_from(title_version)
+            .context("authoritative Meeting Title version exceeds local storage")?;
+        conn.execute(
+            "UPDATE meetings SET title=?4,title_source=?5,title_version=?6,title_updated_at=?7
+             WHERE id=?1 AND sync_id=?2 AND deleted_at IS NULL AND title_version=?3",
+            params![
+                local_id,
+                record_id.to_string(),
+                expected_title_version,
+                title,
+                title_source,
+                title_version,
+                updated_at
+            ],
+        )
+        .map(|changed| changed == 1)
+        .context("mirroring fenced authoritative Meeting Title")
     }
 
     /// Mark meeting as completed with transcript and duration. Clears any
@@ -774,7 +811,7 @@ impl MeetingRepository {
                  transcript_path, transcript_text, duration_seconds, started_at, completed_at, \
                  error, created_at, deleted_at, transcript_segments, sync_id, origin_device_id, sync_version \
                  FROM meetings WHERE deleted_at IS NULL \
-                 ORDER BY started_at DESC, id DESC LIMIT ?1",
+                 ORDER BY started_at DESC, sync_id DESC LIMIT ?1",
             )
             .context("Failed to prepare meetings list query")?;
 
@@ -1264,9 +1301,20 @@ mod tests {
     fn test_list_meetings() {
         let conn = setup_db();
 
-        MeetingRepository::insert(&conn, Some("Meeting 1"), "/tmp/m1.wav").unwrap();
-        MeetingRepository::insert(&conn, Some("Meeting 2"), "/tmp/m2.wav").unwrap();
-        MeetingRepository::insert(&conn, Some("Meeting 3"), "/tmp/m3.wav").unwrap();
+        let first = MeetingRepository::insert(&conn, Some("Meeting 1"), "/tmp/m1.wav").unwrap();
+        let second = MeetingRepository::insert(&conn, Some("Meeting 2"), "/tmp/m2.wav").unwrap();
+        let third = MeetingRepository::insert(&conn, Some("Meeting 3"), "/tmp/m3.wav").unwrap();
+        for (id, started_at) in [
+            (first, "2026-09-05 10:00:00"),
+            (second, "2026-09-05 11:00:00"),
+            (third, "2026-09-05 12:00:00"),
+        ] {
+            conn.execute(
+                "UPDATE meetings SET started_at=?1 WHERE id=?2",
+                params![started_at, id],
+            )
+            .unwrap();
+        }
 
         let meetings = MeetingRepository::list(&conn, 2).unwrap();
         assert_eq!(meetings.len(), 2);
@@ -1430,6 +1478,58 @@ mod tests {
         assert_eq!(
             MeetingRepository::recent_manual_titles(&conn, 10).unwrap(),
             vec!["Weekly Planning", "Design Review"]
+        );
+    }
+
+    #[test]
+    fn recent_manual_titles_orders_sqlite_and_rfc3339_timestamps_chronologically() {
+        let conn = setup_db();
+        let newer = MeetingRepository::insert(&conn, Some("Newer SQLite"), "/tmp/new.wav").unwrap();
+        let older =
+            MeetingRepository::insert(&conn, Some("Older RFC3339"), "/tmp/old.wav").unwrap();
+        conn.execute(
+            "UPDATE meetings SET title_updated_at='2026-09-05 12:30:00' WHERE id=?1",
+            [newer],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE meetings SET title_updated_at='2026-09-05T11:45:00Z' WHERE id=?1",
+            [older],
+        )
+        .unwrap();
+
+        assert_eq!(
+            MeetingRepository::recent_manual_titles(&conn, 10).unwrap(),
+            vec!["Newer SQLite", "Older RFC3339"]
+        );
+    }
+
+    #[test]
+    fn list_uses_sync_id_as_the_canonical_equal_timestamp_tiebreaker() {
+        let conn = setup_db();
+        let mut expected = Vec::new();
+        for index in 0..120 {
+            let local_id = MeetingRepository::insert(&conn, None, "/tmp/missing.wav").unwrap();
+            let suffix = 120 - index;
+            let sync_id: RecordId = format!("00000000-0000-0000-0000-{suffix:012}")
+                .parse()
+                .unwrap();
+            conn.execute(
+                "UPDATE meetings SET started_at='2026-09-05 12:00:00', sync_id=?1 WHERE id=?2",
+                params![sync_id.to_string(), local_id],
+            )
+            .unwrap();
+            expected.push(sync_id);
+        }
+        expected.sort_by(|left, right| right.cmp(left));
+
+        let page = MeetingRepository::list(&conn, 100).unwrap();
+
+        assert_eq!(
+            page.into_iter()
+                .map(|meeting| meeting.sync_id)
+                .collect::<Vec<_>>(),
+            expected[..100]
         );
     }
 

@@ -157,7 +157,7 @@ impl HubLibrary {
         record_id: RecordId,
         patch: &MeetingTitlePatch,
     ) -> std::result::Result<
-        Option<SharedMeeting>,
+        Option<crate::db::shared_library::MeetingTitleUpdateReceipt>,
         crate::db::shared_library::MeetingTitleUpdateError,
     > {
         let mut connection = crate::db::open_db_at(&self.db_path)

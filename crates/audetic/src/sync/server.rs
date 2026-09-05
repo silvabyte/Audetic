@@ -551,7 +551,7 @@ async fn update_meeting_title(
             .into_response();
     };
     match library.update_meeting_title(id, &patch) {
-        Ok(Some(value)) => Json(value).into_response(),
+        Ok(Some(value)) => Json(value.meeting).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(HubApiError::new("not_found", "meeting not found")),

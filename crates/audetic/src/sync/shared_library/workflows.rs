@@ -92,20 +92,34 @@ impl SharedLibrary {
                 "Home Hub is unavailable; generated titles are not queued offline".into(),
             ));
         }
+        if meeting.status != crate::meeting::MeetingPhase::Completed.as_str() {
+            return Err(LibraryError::Conflict(format!(
+                "Meeting {id} is in state '{}'; only completed meetings can regenerate titles",
+                meeting.status
+            )));
+        }
+        let transcript = meeting
+            .transcript_text
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| LibraryError::Conflict("Meeting has no transcript".into()))?;
+        let context = self.context()?;
+        require_available_title_profile(&context.db_path)?;
         if meeting.access == LibraryItemAccess::Shared {
-            let transcript = meeting
-                .transcript_text
-                .as_deref()
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| LibraryError::Conflict("Meeting has no transcript".into()))?;
-            let context = self.context()?;
             let generated = crate::meeting::title::generate_shared_meeting_title(
                 id,
                 transcript,
                 &context.db_path,
             )
             .await
-            .map_err(|error| LibraryError::internal("generating Meeting Title", error))?;
+            .map_err(|error| match error {
+                crate::meeting::title::SharedTitleWorkflowError::Conflict(message) => {
+                    LibraryError::Conflict(message)
+                }
+                crate::meeting::title::SharedTitleWorkflowError::Infrastructure(error) => {
+                    LibraryError::internal("generating Meeting Title", error)
+                }
+            })?;
             self.update_authoritative_title(
                 id,
                 generated,
@@ -121,10 +135,17 @@ impl SharedLibrary {
                 anyhow::anyhow!("local meeting has no row identity"),
             )
         })?;
-        let db_path = self.context()?.db_path;
-        crate::meeting::title::prepare_title_regeneration_at(&db_path, local_id).map_err(
-            |error| LibraryError::internal("preparing Meeting Title regeneration", error),
-        )?;
+        let db_path = context.db_path;
+        let connection = crate::db::open_db_at(&db_path)
+            .map_err(|error| LibraryError::internal("opening meeting title library", error))?;
+        if !MeetingRepository::release_title_for_regeneration(&connection, local_id).map_err(
+            |error| LibraryError::internal("releasing Meeting Title for regeneration", error),
+        )? {
+            return Err(LibraryError::Conflict(format!(
+                "Meeting {id} is no longer eligible for title regeneration"
+            )));
+        }
+        drop(connection);
         crate::meeting::title::spawn_title_generation_at(local_id, db_path);
         Ok(Some(local_id))
     }
@@ -194,12 +215,20 @@ impl SharedLibrary {
                 "Home Hub is unavailable; shared artifacts are not queued offline".into(),
             ));
         }
+        if meeting.status != crate::meeting::MeetingPhase::Completed.as_str() {
+            return Err(LibraryError::Invalid(format!(
+                "Meeting {meeting_id} is in state '{}'; only completed meetings can generate artifacts",
+                meeting.status
+            )));
+        }
+        let transcript = meeting
+            .transcript_text
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| LibraryError::Invalid("Meeting has no transcript".into()))?;
         let context = self.context()?;
+        validate_artifact_request(&context.db_path, &request)?;
         if meeting.access == LibraryItemAccess::Shared {
-            let transcript = meeting
-                .transcript_text
-                .as_deref()
-                .ok_or_else(|| LibraryError::Conflict("Meeting has no transcript".into()))?;
             return crate::meeting_artifacts::generate_shared_meeting_artifact(
                 &context.db_path,
                 meeting_id,
@@ -208,7 +237,14 @@ impl SharedLibrary {
                 request,
             )
             .await
-            .map_err(|error| LibraryError::internal("generating shared meeting artifact", error));
+            .map_err(|error| match error {
+                crate::meeting_artifacts::ArtifactWorkflowError::Invalid(message) => {
+                    LibraryError::Invalid(message)
+                }
+                crate::meeting_artifacts::ArtifactWorkflowError::Infrastructure(error) => {
+                    LibraryError::internal("generating shared meeting artifact", error)
+                }
+            });
         }
         let local_id = meeting.local_id.ok_or_else(|| {
             LibraryError::internal(
@@ -218,6 +254,69 @@ impl SharedLibrary {
         })?;
         crate::meeting_artifacts::generate_meeting_artifact_at(&context.db_path, local_id, request)
             .await
-            .map_err(|error| LibraryError::internal("generating meeting artifact", error))
+            .map_err(|error| match error {
+                crate::meeting_artifacts::ArtifactWorkflowError::Invalid(message) => {
+                    LibraryError::Invalid(message)
+                }
+                crate::meeting_artifacts::ArtifactWorkflowError::Infrastructure(error) => {
+                    LibraryError::internal("generating meeting artifact", error)
+                }
+            })
     }
+}
+
+fn require_available_title_profile(db_path: &std::path::Path) -> LibraryResult<()> {
+    let connection = crate::db::open_db_at(db_path)
+        .map_err(|error| LibraryError::internal("opening title profile library", error))?;
+    crate::db::agent_profiles::AgentProfileRepository::ensure_builtin_profiles(&connection)
+        .map_err(|error| LibraryError::internal("preparing title profiles", error))?;
+    if crate::db::agent_profiles::AgentProfileRepository::first_available(&connection)
+        .map_err(|error| LibraryError::internal("resolving title profile", error))?
+        .is_none()
+    {
+        return Err(LibraryError::Conflict(
+            "No available enabled agent profiles are configured".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_artifact_request(
+    db_path: &std::path::Path,
+    request: &GenerateArtifactRequest,
+) -> LibraryResult<()> {
+    crate::summary_templates::get_template(&request.template_id)
+        .and_then(|template| template.validate())
+        .map_err(|error| LibraryError::Invalid(error.to_string()))?;
+    let connection = crate::db::open_db_at(db_path)
+        .map_err(|error| LibraryError::internal("opening artifact profile library", error))?;
+    crate::db::agent_profiles::AgentProfileRepository::ensure_builtin_profiles(&connection)
+        .map_err(|error| LibraryError::internal("preparing artifact profiles", error))?;
+    let profile = match request.agent_profile_id {
+        Some(profile_id) => {
+            crate::db::agent_profiles::AgentProfileRepository::get(&connection, profile_id)
+                .map_err(|error| LibraryError::internal("resolving artifact profile", error))?
+                .ok_or_else(|| {
+                    LibraryError::Invalid(format!("Agent profile {profile_id} was not found"))
+                })?
+        }
+        None => crate::db::agent_profiles::AgentProfileRepository::first_available(&connection)
+            .map_err(|error| LibraryError::internal("resolving artifact profile", error))?
+            .ok_or_else(|| {
+                LibraryError::Invalid("No available enabled agent profiles are configured".into())
+            })?,
+    };
+    if !profile.enabled {
+        return Err(LibraryError::Invalid(format!(
+            "Agent profile {} is disabled",
+            profile.id
+        )));
+    }
+    if !profile.available {
+        return Err(LibraryError::Invalid(format!(
+            "Agent profile {} is unavailable",
+            profile.id
+        )));
+    }
+    Ok(())
 }

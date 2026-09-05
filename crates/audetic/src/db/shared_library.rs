@@ -57,6 +57,16 @@ pub struct LibraryBlobRecord {
     pub media_type: String,
 }
 
+/// Durable receipt for one committed authoritative Meeting Title update.
+///
+/// The optional local row identity is resolved and mirrored inside the same
+/// transaction, so callers never need a fallible enrichment read after commit.
+#[derive(Clone, Debug)]
+pub struct MeetingTitleUpdateReceipt {
+    pub meeting: SharedMeeting,
+    pub local_id: Option<i64>,
+}
+
 pub struct SharedLibraryRepository;
 
 impl SharedLibraryRepository {
@@ -619,7 +629,7 @@ impl SharedLibraryRepository {
         conn: &mut Connection,
         record_id: RecordId,
         patch: &MeetingTitlePatch,
-    ) -> std::result::Result<Option<SharedMeeting>, MeetingTitleUpdateError> {
+    ) -> std::result::Result<Option<MeetingTitleUpdateReceipt>, MeetingTitleUpdateError> {
         let title = patch.title.trim();
         if title.is_empty() {
             return Err(MeetingTitleUpdateError::InvalidTitle);
@@ -644,7 +654,7 @@ impl SharedLibraryRepository {
         tx.execute("UPDATE shared_record_index SET authoritative_revision=?2,updated_at=CURRENT_TIMESTAMP WHERE record_id=?1",params![record_id.to_string(),revision])?;
         let updated =
             get_meeting_from(&tx, record_id)?.context("meeting disappeared after title update")?;
-        crate::db::meetings::MeetingRepository::mirror_authoritative_title(
+        let local_id = crate::db::meetings::MeetingRepository::mirror_authoritative_title(
             &tx,
             record_id,
             updated.title.as_deref(),
@@ -665,7 +675,10 @@ impl SharedLibraryRepository {
             },
         )?;
         tx.commit()?;
-        Ok(Some(updated))
+        Ok(Some(MeetingTitleUpdateReceipt {
+            meeting: updated,
+            local_id,
+        }))
     }
 
     pub fn apply_delete(
@@ -1499,7 +1512,7 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(edited.title.as_deref(), Some("Hub-owned title"));
+        assert_eq!(edited.meeting.title.as_deref(), Some("Hub-owned title"));
 
         let duplicate = SharedLibraryRepository::apply_meeting_snapshot(&mut conn, &first).unwrap();
         assert!(!duplicate.changed);

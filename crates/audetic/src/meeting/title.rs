@@ -13,6 +13,16 @@ use super::MeetingPhase;
 
 const TITLE_AGENT_TIMEOUT_SECONDS: u64 = 120;
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SharedTitleWorkflowError {
+    #[error("{0}")]
+    Conflict(String),
+    #[error(transparent)]
+    Infrastructure(#[from] anyhow::Error),
+}
+
+type SharedTitleWorkflowResult<T> = std::result::Result<T, SharedTitleWorkflowError>;
+
 /// Generate and persist a title when the meeting still has no title owner.
 /// A concurrent Manual Title causes the final guarded write to be discarded.
 pub async fn generate_meeting_title(meeting_id: i64) -> Result<Option<String>> {
@@ -81,18 +91,21 @@ async fn generate_meeting_title_at(meeting_id: i64, db_path: &Path) -> Result<Op
     }
 }
 
-pub async fn generate_shared_meeting_title(
+pub(crate) async fn generate_shared_meeting_title(
     meeting_id: RecordId,
     transcript: &str,
     db_path: &Path,
-) -> Result<String> {
+) -> SharedTitleWorkflowResult<String> {
     if transcript.trim().is_empty() {
-        anyhow::bail!("meeting {meeting_id} has no transcript text");
+        return Err(SharedTitleWorkflowError::Conflict(format!(
+            "meeting {meeting_id} has no transcript text"
+        )));
     }
     let conn = crate::db::open_db_at(db_path).context("Failed to open audetic database")?;
     AgentProfileRepository::ensure_builtin_profiles(&conn)?;
-    let profile = AgentProfileRepository::first_available(&conn)?
-        .ok_or_else(|| anyhow::anyhow!("no available enabled agent profiles configured"))?;
+    let profile = AgentProfileRepository::first_available(&conn)?.ok_or_else(|| {
+        SharedTitleWorkflowError::Conflict("no available enabled agent profiles configured".into())
+    })?;
     let data_dir = db_path
         .parent()
         .context("Audetic database path has no parent directory")?;
@@ -110,17 +123,18 @@ pub async fn generate_shared_meeting_title(
     let _ = std::fs::remove_dir_all(run_dir);
     let output = output?;
     if !output.success {
-        anyhow::bail!(
+        return Err(SharedTitleWorkflowError::Infrastructure(anyhow::anyhow!(
             "title agent failed{}: {}",
             output
                 .exit_code
                 .map(|code| format!(" with exit code {code}"))
                 .unwrap_or_default(),
             output.stderr.trim()
-        );
+        )));
     }
-    normalize_generated_title(&output.stdout)
-        .ok_or_else(|| anyhow::anyhow!("title agent returned an invalid Generated Title"))
+    normalize_generated_title(&output.stdout).ok_or_else(|| {
+        SharedTitleWorkflowError::Conflict("title agent returned an invalid Generated Title".into())
+    })
 }
 
 /// Start title generation without joining it to meeting completion.

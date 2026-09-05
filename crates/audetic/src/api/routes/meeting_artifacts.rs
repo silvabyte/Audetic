@@ -157,3 +157,31 @@ pub async fn delete_meeting_artifact(
         id: artifact_record_id,
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+
+    use super::*;
+
+    #[test]
+    fn artifact_workflow_statuses_preserve_invalid_and_unavailable_semantics() {
+        assert_eq!(
+            ApiError::from(crate::sync::shared_library::LibraryError::Invalid(
+                "Unknown template".into(),
+            ))
+            .into_response()
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            ApiError::from(crate::sync::shared_library::LibraryError::Unavailable(
+                "Home Hub unavailable".into(),
+            ))
+            .into_response()
+            .status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+}

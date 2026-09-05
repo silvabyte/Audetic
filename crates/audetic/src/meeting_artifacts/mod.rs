@@ -14,6 +14,16 @@ use crate::summary_templates::{get_template, SummaryTemplate};
 
 const DEFAULT_AGENT_TIMEOUT_SECONDS: u64 = 600;
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ArtifactWorkflowError {
+    #[error("{0}")]
+    Invalid(String),
+    #[error(transparent)]
+    Infrastructure(#[from] anyhow::Error),
+}
+
+type ArtifactWorkflowResult<T> = std::result::Result<T, ArtifactWorkflowError>;
+
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct GenerateArtifactRequest {
     #[serde(default = "default_artifact_kind")]
@@ -33,33 +43,40 @@ pub async fn generate_meeting_artifact(
     meeting_id: i64,
     request: GenerateArtifactRequest,
 ) -> Result<MeetingArtifact> {
-    generate_meeting_artifact_at(&crate::global::db_file()?, meeting_id, request).await
+    generate_meeting_artifact_at(&crate::global::db_file()?, meeting_id, request)
+        .await
+        .map_err(anyhow::Error::new)
 }
 
 pub(crate) async fn generate_meeting_artifact_at(
     db_path: &Path,
     meeting_id: i64,
     request: GenerateArtifactRequest,
-) -> Result<MeetingArtifact> {
+) -> ArtifactWorkflowResult<MeetingArtifact> {
     let conn = crate::db::open_db_at(db_path).context("Failed to open audetic database")?;
     AgentProfileRepository::ensure_builtin_profiles(&conn)?;
 
     let meeting = MeetingRepository::get(&conn, meeting_id)?
-        .ok_or_else(|| anyhow::anyhow!("meeting {meeting_id} not found"))?;
+        .ok_or_else(|| ArtifactWorkflowError::Invalid(format!("meeting {meeting_id} not found")))?;
     if meeting.status != crate::meeting::MeetingPhase::Completed.as_str() {
-        anyhow::bail!(
+        return Err(ArtifactWorkflowError::Invalid(format!(
             "meeting {meeting_id} is in state `{}`; only completed meetings can generate artifacts",
             meeting.status
-        );
+        )));
     }
     let transcript = meeting
         .transcript_text
         .clone()
         .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("meeting {meeting_id} has no transcript text"))?;
+        .ok_or_else(|| {
+            ArtifactWorkflowError::Invalid(format!("meeting {meeting_id} has no transcript text"))
+        })?;
 
-    let template = get_template(&request.template_id)?;
-    template.validate()?;
+    let template = get_template(&request.template_id)
+        .map_err(|error| ArtifactWorkflowError::Invalid(error.to_string()))?;
+    template
+        .validate()
+        .map_err(|error| ArtifactWorkflowError::Invalid(error.to_string()))?;
     let profile = resolve_profile(&conn, request.agent_profile_id)?;
     let title = format!("{} — {}", template.name, profile.name);
 
@@ -129,22 +146,28 @@ pub(crate) async fn generate_meeting_artifact_at(
 
     MeetingArtifactRepository::get(&conn, artifact_id)?
         .ok_or_else(|| anyhow::anyhow!("artifact {artifact_id} disappeared after generation"))
+        .map_err(ArtifactWorkflowError::Infrastructure)
 }
 
-pub async fn generate_shared_meeting_artifact(
+pub(crate) async fn generate_shared_meeting_artifact(
     db_path: &Path,
     meeting_id: RecordId,
     meeting_title: Option<&str>,
     transcript: &str,
     request: GenerateArtifactRequest,
-) -> Result<MeetingArtifact> {
+) -> ArtifactWorkflowResult<MeetingArtifact> {
     if transcript.trim().is_empty() {
-        anyhow::bail!("meeting {meeting_id} has no transcript text");
+        return Err(ArtifactWorkflowError::Invalid(format!(
+            "meeting {meeting_id} has no transcript text"
+        )));
     }
     let conn = crate::db::open_db_at(db_path).context("Failed to open audetic database")?;
     AgentProfileRepository::ensure_builtin_profiles(&conn)?;
-    let template = get_template(&request.template_id)?;
-    template.validate()?;
+    let template = get_template(&request.template_id)
+        .map_err(|error| ArtifactWorkflowError::Invalid(error.to_string()))?;
+    template
+        .validate()
+        .map_err(|error| ArtifactWorkflowError::Invalid(error.to_string()))?;
     let profile = resolve_profile(&conn, request.agent_profile_id)?;
     let title = format!("{} — {}", template.name, profile.name);
     let run = MeetingArtifactRepository::insert_shared_run(
@@ -266,12 +289,30 @@ pub async fn generate_shared_meeting_artifact(
     })
 }
 
-fn resolve_profile(conn: &rusqlite::Connection, id: Option<i64>) -> Result<AgentProfile> {
+fn resolve_profile(
+    conn: &rusqlite::Connection,
+    id: Option<i64>,
+) -> ArtifactWorkflowResult<AgentProfile> {
     match id {
-        Some(id) => AgentProfileRepository::get(conn, id)?
-            .ok_or_else(|| anyhow::anyhow!("agent profile {id} not found")),
-        None => AgentProfileRepository::first_enabled(conn)?
-            .ok_or_else(|| anyhow::anyhow!("no enabled agent profiles configured")),
+        Some(id) => {
+            let profile = AgentProfileRepository::get(conn, id)?.ok_or_else(|| {
+                ArtifactWorkflowError::Invalid(format!("agent profile {id} not found"))
+            })?;
+            if !profile.enabled {
+                return Err(ArtifactWorkflowError::Invalid(format!(
+                    "agent profile {id} is disabled"
+                )));
+            }
+            if !profile.available {
+                return Err(ArtifactWorkflowError::Invalid(format!(
+                    "agent profile {id} is unavailable"
+                )));
+            }
+            Ok(profile)
+        }
+        None => AgentProfileRepository::first_available(conn)?.ok_or_else(|| {
+            ArtifactWorkflowError::Invalid("no available enabled agent profiles configured".into())
+        }),
     }
 }
 

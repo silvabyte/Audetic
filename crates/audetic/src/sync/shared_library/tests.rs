@@ -124,7 +124,10 @@ impl RemoteLibraryMutations for PagedHub {
     }
 }
 
-fn connected_library(path: std::path::PathBuf, remote: Arc<PagedHub>) -> SharedLibrary {
+fn connected_library<T>(path: std::path::PathBuf, remote: Arc<T>) -> SharedLibrary
+where
+    T: RemoteDictationLibrary + RemoteMeetingLibrary + RemoteLibraryMutations + 'static,
+{
     let network = Arc::new(crate::sync::client::NetworkHubAdapter::default());
     let capabilities = HubCapabilities::for_test(
         network.clone(),
@@ -143,6 +146,147 @@ fn connected_library(path: std::path::PathBuf, remote: Arc<PagedHub>) -> SharedL
         "127.0.0.1:0".parse().unwrap(),
     )
     .library()
+}
+
+struct ScriptedPagingHub {
+    dictation_pages: Vec<DictationPage>,
+    meeting_pages: Vec<MeetingPage>,
+}
+
+struct PausedTitleHub {
+    meeting: SharedMeeting,
+    mutation_started: Arc<tokio::sync::Notify>,
+    mutation_release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl RemoteDictationLibrary for PausedTitleHub {
+    async fn page_dictations(
+        &self,
+        _hub: &HubConnection,
+        _query: Option<&str>,
+        _from: Option<&str>,
+        _to: Option<&str>,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<DictationPage, HubTransferError> {
+        Ok(DictationPage {
+            items: vec![],
+            next_cursor: None,
+        })
+    }
+}
+
+#[async_trait]
+impl RemoteMeetingLibrary for PausedTitleHub {
+    async fn page_meetings(
+        &self,
+        _hub: &HubConnection,
+        _query: Option<&str>,
+        _cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<MeetingPage, HubTransferError> {
+        Ok(MeetingPage {
+            items: vec![self.meeting.clone()],
+            next_cursor: None,
+        })
+    }
+
+    async fn meeting(
+        &self,
+        _hub: &HubConnection,
+        id: RecordId,
+    ) -> Result<Option<SharedMeeting>, HubTransferError> {
+        Ok((self.meeting.record_id == id).then(|| self.meeting.clone()))
+    }
+}
+
+#[async_trait]
+impl RemoteLibraryMutations for PausedTitleHub {
+    async fn update_meeting_title(
+        &self,
+        _hub: &HubConnection,
+        id: RecordId,
+        patch: crate::sync::protocol::MeetingTitlePatch,
+    ) -> Result<SharedMeeting, HubTransferError> {
+        self.mutation_started.notify_one();
+        self.mutation_release.notified().await;
+        let mut meeting = self.meeting.clone();
+        meeting.record_id = id;
+        meeting.title = Some(patch.title);
+        meeting.title_source = Some(patch.title_source.unwrap_or_else(|| "manual".into()));
+        meeting.title_version = patch.expected_title_version + 1;
+        meeting.updated_at = "2026-09-05T12:30:00Z".into();
+        Ok(meeting)
+    }
+
+    async fn delete_record(
+        &self,
+        _hub: &HubConnection,
+        _id: RecordId,
+        _kind: RecordKind,
+    ) -> Result<(), HubTransferError> {
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl RemoteDictationLibrary for ScriptedPagingHub {
+    async fn page_dictations(
+        &self,
+        _hub: &HubConnection,
+        _query: Option<&str>,
+        _from: Option<&str>,
+        _to: Option<&str>,
+        cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<DictationPage, HubTransferError> {
+        let index = page_start(cursor);
+        Ok(self.dictation_pages[index].clone())
+    }
+}
+
+#[async_trait]
+impl RemoteMeetingLibrary for ScriptedPagingHub {
+    async fn page_meetings(
+        &self,
+        _hub: &HubConnection,
+        _query: Option<&str>,
+        cursor: Option<&str>,
+        _limit: usize,
+    ) -> Result<MeetingPage, HubTransferError> {
+        let index = page_start(cursor);
+        Ok(self.meeting_pages[index].clone())
+    }
+
+    async fn meeting(
+        &self,
+        _hub: &HubConnection,
+        _id: RecordId,
+    ) -> Result<Option<SharedMeeting>, HubTransferError> {
+        Ok(None)
+    }
+}
+
+#[async_trait]
+impl RemoteLibraryMutations for ScriptedPagingHub {
+    async fn update_meeting_title(
+        &self,
+        _hub: &HubConnection,
+        _id: RecordId,
+        _patch: crate::sync::protocol::MeetingTitlePatch,
+    ) -> Result<SharedMeeting, HubTransferError> {
+        Err(HubTransferError::Transport("not implemented".into()))
+    }
+
+    async fn delete_record(
+        &self,
+        _hub: &HubConnection,
+        _id: RecordId,
+        _kind: RecordKind,
+    ) -> Result<(), HubTransferError> {
+        Err(HubTransferError::Transport("not implemented".into()))
+    }
 }
 
 fn set_connected(conn: &rusqlite::Connection) {
@@ -338,6 +482,184 @@ async fn direct_history_uuid_lookup_walks_beyond_masked_remote_pages() {
 }
 
 #[tokio::test]
+async fn filtered_dictation_paging_counts_distinct_records_across_overlapping_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("overlapping-dictations.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    set_connected(&conn);
+    drop(conn);
+    let items = (0..100).map(shared_dictation).collect::<Vec<_>>();
+    let library = connected_library(
+        path,
+        Arc::new(ScriptedPagingHub {
+            dictation_pages: vec![
+                DictationPage {
+                    items: items[..60].to_vec(),
+                    next_cursor: Some("1".into()),
+                },
+                DictationPage {
+                    items: items[..60].to_vec(),
+                    next_cursor: Some("2".into()),
+                },
+                DictationPage {
+                    items: items[60..].to_vec(),
+                    next_cursor: None,
+                },
+            ],
+            meeting_pages: vec![],
+        }),
+    );
+
+    let page = library
+        .dictations(&crate::history::SearchParams::new().with_limit(100))
+        .await
+        .unwrap();
+
+    assert_eq!(page.len(), 100);
+}
+
+#[tokio::test]
+async fn filtered_meeting_paging_counts_distinct_records_across_overlapping_pages() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("overlapping-meetings.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    set_connected(&conn);
+    drop(conn);
+    let items = (0..100).map(shared_meeting).collect::<Vec<_>>();
+    let library = connected_library(
+        path,
+        Arc::new(ScriptedPagingHub {
+            dictation_pages: vec![],
+            meeting_pages: vec![
+                MeetingPage {
+                    items: items[..60].to_vec(),
+                    next_cursor: Some("1".into()),
+                },
+                MeetingPage {
+                    items: items[..60].to_vec(),
+                    next_cursor: Some("2".into()),
+                },
+                MeetingPage {
+                    items: items[60..].to_vec(),
+                    next_cursor: None,
+                },
+            ],
+        }),
+    );
+
+    let page = library
+        .meetings(MeetingPageRequest {
+            query: Some("transcript".into()),
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(page.len(), 100);
+}
+
+#[tokio::test]
+async fn filtered_remote_paging_rejects_repeated_cursors() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repeated-cursor.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    set_connected(&conn);
+    drop(conn);
+    let item = shared_dictation(0);
+    let library = connected_library(
+        path,
+        Arc::new(ScriptedPagingHub {
+            dictation_pages: vec![
+                DictationPage {
+                    items: vec![item.clone()],
+                    next_cursor: Some("1".into()),
+                },
+                DictationPage {
+                    items: vec![item],
+                    next_cursor: Some("1".into()),
+                },
+            ],
+            meeting_pages: vec![],
+        }),
+    );
+
+    let error = library
+        .dictations(&crate::history::SearchParams::new().with_limit(100))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LibraryError::Unavailable(_)));
+}
+
+#[tokio::test]
+async fn filtered_meeting_paging_rejects_repeated_cursors() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("repeated-meeting-cursor.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    set_connected(&conn);
+    drop(conn);
+    let item = shared_meeting(0);
+    let library = connected_library(
+        path,
+        Arc::new(ScriptedPagingHub {
+            dictation_pages: vec![],
+            meeting_pages: vec![
+                MeetingPage {
+                    items: vec![item.clone()],
+                    next_cursor: Some("1".into()),
+                },
+                MeetingPage {
+                    items: vec![item],
+                    next_cursor: Some("1".into()),
+                },
+            ],
+        }),
+    );
+
+    let error = library
+        .meetings(MeetingPageRequest {
+            query: Some("transcript".into()),
+            offset: 0,
+            limit: 100,
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LibraryError::Unavailable(_)));
+}
+
+#[tokio::test]
+async fn direct_history_lookup_rejects_cyclic_cursors() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("direct-cursor.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    set_connected(&conn);
+    drop(conn);
+    let item = shared_dictation(0);
+    let library = connected_library(
+        path,
+        Arc::new(ScriptedPagingHub {
+            dictation_pages: vec![
+                DictationPage {
+                    items: vec![item.clone()],
+                    next_cursor: Some("1".into()),
+                },
+                DictationPage {
+                    items: vec![item],
+                    next_cursor: Some("1".into()),
+                },
+            ],
+            meeting_pages: vec![],
+        }),
+    );
+
+    let error = library.dictation(RecordId::new()).await.unwrap_err();
+
+    assert!(matches!(error, LibraryError::Unavailable(_)));
+}
+
+#[tokio::test]
 async fn authoritative_title_is_mirrored_without_origin_publication() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("title.sqlite");
@@ -500,6 +822,11 @@ async fn connected_authoritative_title_response_updates_the_local_mirror() {
     let original = crate::db::meetings::MeetingRepository::get(&conn, local_id)
         .unwrap()
         .unwrap();
+    conn.execute(
+        "UPDATE meetings SET title_version=5 WHERE id=?1",
+        [local_id],
+    )
+    .unwrap();
     set_connected(&conn);
     drop(conn);
     let mut authoritative = shared_meeting(0);
@@ -537,6 +864,287 @@ async fn connected_authoritative_title_response_updates_the_local_mirror() {
         )
         .unwrap();
     assert_eq!(outbox_count, 0);
+}
+
+#[tokio::test]
+async fn connected_title_commit_survives_local_mirror_failure_and_records_repair_health() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("connected-title-mirror-failure.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    let local_id = crate::db::meetings::MeetingRepository::insert(
+        &conn,
+        Some("Old local title"),
+        "/missing.wav",
+    )
+    .unwrap();
+    let original = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+        .unwrap()
+        .unwrap();
+    conn.execute(
+        "UPDATE meetings SET title_version=5 WHERE id=?1",
+        [local_id],
+    )
+    .unwrap();
+    set_connected(&conn);
+    drop(conn);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut authoritative = shared_meeting(0);
+    authoritative.record_id = original.sync_id;
+    authoritative.title_version = 5;
+    let library = connected_library(
+        path.clone(),
+        Arc::new(PausedTitleHub {
+            meeting: authoritative,
+            mutation_started: started.clone(),
+            mutation_release: release.clone(),
+        }),
+    );
+    let task = tokio::spawn(async move {
+        library
+            .update_meeting_title(original.sync_id, "Committed remotely".into())
+            .await
+    });
+    started.notified().await;
+    let conn = crate::db::open_db_at(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER reject_connected_title_mirror
+         BEFORE UPDATE OF title ON meetings
+         BEGIN SELECT RAISE(FAIL, 'mirror unavailable'); END;",
+    )
+    .unwrap();
+    drop(conn);
+    release.notify_one();
+
+    let result = task.await.unwrap().unwrap();
+
+    assert_eq!(result.title.as_deref(), Some("Committed remotely"));
+    assert_eq!(result.local_id, None);
+    let conn = crate::db::open_db_at(&path).unwrap();
+    let local = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(local.title.as_deref(), Some("Old local title"));
+    let health = crate::db::sync_settings::SyncSettingsRepository::get(&conn)
+        .unwrap()
+        .last_error
+        .unwrap();
+    assert!(health.contains("local mirror repair is required"));
+}
+
+#[tokio::test]
+async fn old_hub_title_response_cannot_overwrite_newer_local_state() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("stale-connected-title.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    let local_id = crate::db::meetings::MeetingRepository::insert(
+        &conn,
+        Some("Old local title"),
+        "/missing.wav",
+    )
+    .unwrap();
+    let original = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+        .unwrap()
+        .unwrap();
+    conn.execute(
+        "UPDATE meetings SET title_version=5 WHERE id=?1",
+        [local_id],
+    )
+    .unwrap();
+    set_connected(&conn);
+    drop(conn);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let mut authoritative = shared_meeting(0);
+    authoritative.record_id = original.sync_id;
+    authoritative.title_version = 5;
+    let library = connected_library(
+        path.clone(),
+        Arc::new(PausedTitleHub {
+            meeting: authoritative,
+            mutation_started: started.clone(),
+            mutation_release: release.clone(),
+        }),
+    );
+    let task = tokio::spawn(async move {
+        library
+            .update_meeting_title(original.sync_id, "Old hub receipt".into())
+            .await
+    });
+    started.notified().await;
+    let conn = crate::db::open_db_at(&path).unwrap();
+    conn.execute(
+        "UPDATE meetings SET title='Newer local title',title_version=6 WHERE id=?1",
+        [local_id],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sync_settings SET hub_id=?1 WHERE singleton=1",
+        [audetic_core::sync::HubId::new().to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    release.notify_one();
+
+    let result = task.await.unwrap().unwrap();
+
+    assert_eq!(result.title.as_deref(), Some("Old hub receipt"));
+    assert_eq!(result.local_id, None);
+    let conn = crate::db::open_db_at(&path).unwrap();
+    let local = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(local.title.as_deref(), Some("Newer local title"));
+    assert_eq!(local.title_version, 6);
+}
+
+#[tokio::test]
+async fn title_regeneration_validation_is_typed_as_conflict() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("title-validation.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    let local_id =
+        crate::db::meetings::MeetingRepository::insert(&conn, None, "/missing.wav").unwrap();
+    let record_id = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+        .unwrap()
+        .unwrap()
+        .sync_id;
+    drop(conn);
+    let library = crate::sync::SyncService::local_library(path).library();
+
+    let error = library
+        .regenerate_meeting_title(record_id)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LibraryError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn unavailable_title_profile_is_typed_as_conflict() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("title-profile-validation.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    let local_id =
+        crate::db::meetings::MeetingRepository::insert(&conn, None, "/missing.wav").unwrap();
+    crate::db::meetings::MeetingRepository::complete(
+        &conn,
+        local_id,
+        "/missing.txt",
+        "transcript",
+        None,
+        1,
+    )
+    .unwrap();
+    crate::db::agent_profiles::AgentProfileRepository::ensure_builtin_profiles(&conn).unwrap();
+    conn.execute("UPDATE agent_profiles SET enabled=0", [])
+        .unwrap();
+    conn.execute(
+        "INSERT INTO agent_profiles
+         (name,kind,executable,args_json,prompt_mode,default_profile,enabled)
+         VALUES('Missing','missing','definitely-not-an-audetic-agent','[]','stdin',1,1)",
+        [],
+    )
+    .unwrap();
+    let record_id = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+        .unwrap()
+        .unwrap()
+        .sync_id;
+    drop(conn);
+    let library = crate::sync::SyncService::local_library(path).library();
+
+    let error = library
+        .regenerate_meeting_title(record_id)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LibraryError::Conflict(_)));
+}
+
+#[tokio::test]
+async fn artifact_workflow_validation_is_typed_as_invalid() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("artifact-validation.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    let local_id =
+        crate::db::meetings::MeetingRepository::insert(&conn, None, "/missing.wav").unwrap();
+    crate::db::meetings::MeetingRepository::complete(
+        &conn,
+        local_id,
+        "/missing.txt",
+        "transcript",
+        None,
+        1,
+    )
+    .unwrap();
+    let record_id = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+        .unwrap()
+        .unwrap()
+        .sync_id;
+    drop(conn);
+    let library = crate::sync::SyncService::local_library(path).library();
+
+    let error = library
+        .generate_artifact(
+            record_id,
+            crate::meeting_artifacts::GenerateArtifactRequest {
+                kind: "summary".into(),
+                template_id: "unknown-template".into(),
+                agent_profile_id: None,
+                custom_context: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LibraryError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn unavailable_artifact_profile_is_typed_as_invalid() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("artifact-profile-validation.sqlite");
+    let conn = crate::db::migrate_db_at(&path).unwrap();
+    let local_id =
+        crate::db::meetings::MeetingRepository::insert(&conn, None, "/missing.wav").unwrap();
+    crate::db::meetings::MeetingRepository::complete(
+        &conn,
+        local_id,
+        "/missing.txt",
+        "transcript",
+        None,
+        1,
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO agent_profiles
+         (name,kind,executable,args_json,prompt_mode,default_profile,enabled)
+         VALUES('Missing','missing','definitely-not-an-audetic-agent','[]','stdin',0,1)",
+        [],
+    )
+    .unwrap();
+    let profile_id = conn.last_insert_rowid();
+    let record_id = crate::db::meetings::MeetingRepository::get(&conn, local_id)
+        .unwrap()
+        .unwrap()
+        .sync_id;
+    drop(conn);
+    let library = crate::sync::SyncService::local_library(path).library();
+
+    let error = library
+        .generate_artifact(
+            record_id,
+            crate::meeting_artifacts::GenerateArtifactRequest {
+                kind: "summary".into(),
+                template_id: "standard_meeting".into(),
+                agent_profile_id: Some(profile_id),
+                custom_context: None,
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, LibraryError::Invalid(_)));
 }
 
 #[tokio::test]

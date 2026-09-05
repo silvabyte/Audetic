@@ -78,45 +78,66 @@ impl SharedLibrary {
             expected_title_version,
             title_source,
         };
-        let (updated, mirrored_by_authority) = match &context.role {
+        let local_target = if matches!(context.role, LibraryRole::ConnectedDevice { .. }) {
+            let connection = crate::db::open_db_at(&context.db_path)
+                .map_err(|error| LibraryError::internal("opening local title mirror", error))?;
+            MeetingRepository::internal_id(&connection, id)
+                .map_err(|error| LibraryError::internal("resolving local title mirror", error))?
+        } else {
+            None
+        };
+        let (updated, local_id) = match &context.role {
             LibraryRole::Standalone => {
                 return Err(LibraryError::Conflict("Meeting is not shared".into()));
             }
-            LibraryRole::HomeHub => (
-                crate::sync::library::HubLibrary::new(context.db_path.clone())
+            LibraryRole::HomeHub => {
+                let receipt = crate::sync::library::HubLibrary::new(context.db_path.clone())
                     .update_meeting_title(id, &patch)
                     .map_err(map_authoritative_title_error)?
-                    .ok_or_else(|| LibraryError::NotFound(format!("Meeting {id} not found")))?,
-                true,
-            ),
-            LibraryRole::ConnectedDevice { hub } => (
-                context
+                    .ok_or_else(|| LibraryError::NotFound(format!("Meeting {id} not found")))?;
+                (receipt.meeting, receipt.local_id)
+            }
+            LibraryRole::ConnectedDevice { hub } => {
+                let updated = context
                     .capabilities
                     .mutations()
-                    .update_meeting_title(hub, id, patch)
+                    .update_meeting_title(hub, id, patch.clone())
                     .await
-                    .map_err(map_remote_error)?,
-                false,
-            ),
-        };
-        let connection = crate::db::open_db_at(&context.db_path)
-            .map_err(|error| LibraryError::internal("opening local title mirror", error))?;
-        let local_id = if mirrored_by_authority {
-            MeetingRepository::internal_id(&connection, id).map_err(|error| {
-                LibraryError::internal("reading authoritative title mirror", error)
-            })?
-        } else {
-            MeetingRepository::mirror_authoritative_title(
-                &connection,
-                id,
-                updated.title.as_deref(),
-                updated.title_source.as_deref(),
-                updated.title_version,
-                &updated.updated_at,
-            )
-            .map_err(|error| {
-                LibraryError::internal("mirroring authoritative Meeting Title", error)
-            })?
+                    .map_err(map_remote_error)?;
+                let local_id = if let Some(local_id) = local_target {
+                    let title = updated.title.clone();
+                    let title_source = updated.title_source.clone();
+                    let updated_at = updated.updated_at.clone();
+                    let updated_version = updated.title_version;
+                    self.coordinator
+                        .enrich_connected_library_receipt(
+                            &context,
+                            "authoritative Meeting Title update",
+                            move |connection| {
+                                let mirrored =
+                                    MeetingRepository::mirror_authoritative_title_if_version(
+                                    connection,
+                                    local_id,
+                                    id,
+                                    expected_title_version,
+                                    title.as_deref(),
+                                    title_source.as_deref(),
+                                    updated_version,
+                                    &updated_at,
+                                )?;
+                                anyhow::ensure!(
+                                    mirrored,
+                                    "local Meeting Title changed while the authoritative update was in flight"
+                                );
+                                Ok(local_id)
+                            },
+                        )
+                        .await
+                } else {
+                    None
+                };
+                (updated, local_id)
+            }
         };
         Ok(AuthoritativeTitle {
             title: updated.title,

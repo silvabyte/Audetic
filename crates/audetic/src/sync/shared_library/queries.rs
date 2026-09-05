@@ -2,7 +2,7 @@
 
 use audetic_core::sync::{PayloadAvailability, RecordId, UploadState};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use crate::db::shared_library::SharedLibraryRepository;
 use crate::db::sync_outbox::SyncOutboxRepository;
@@ -81,6 +81,8 @@ impl SharedLibrary {
             LibraryRole::ConnectedDevice { hub } => {
                 let mut cursor = None;
                 let mut unmasked = 0usize;
+                let mut seen_cursors = HashSet::new();
+                let mut seen_ids = HashSet::new();
                 let mut failure = None;
                 while unmasked < target {
                     let page_limit = target.saturating_sub(unmasked).clamp(1, 100);
@@ -98,11 +100,13 @@ impl SharedLibrary {
                         .await
                     {
                         Ok(page) => {
-                            let raw_len = page.items.len();
                             let visible = page
                                 .items
                                 .into_iter()
                                 .filter_map(|shared| {
+                                    if !seen_ids.insert(shared.record_id) {
+                                        return None;
+                                    }
                                     let masked = SyncOutboxRepository::deletion_masks(
                                         &connection,
                                         shared.record_id,
@@ -123,9 +127,18 @@ impl SharedLibrary {
                                 .collect::<LibraryResult<Vec<_>>>()?;
                             unmasked = unmasked.saturating_add(visible.len());
                             merge_dictations(&mut entries, visible);
-                            cursor = page.next_cursor;
-                            if cursor.is_none() || raw_len == 0 {
-                                break;
+                            match advance_remote_cursor(
+                                page.next_cursor,
+                                &mut seen_cursors,
+                                "dictation",
+                            ) {
+                                Ok(Some(next)) => cursor = Some(next),
+                                Ok(None) => break,
+                                Err(error) => {
+                                    self.observe(&context, false, Some(&error.to_string()))
+                                        .await?;
+                                    return Err(error);
+                                }
                             }
                         }
                         Err(error) => {
@@ -203,6 +216,8 @@ impl SharedLibrary {
             }
             LibraryRole::ConnectedDevice { hub } => {
                 let mut cursor = None;
+                let mut seen_cursors = HashSet::new();
+                let mut seen_ids = HashSet::new();
                 loop {
                     match context
                         .capabilities
@@ -211,9 +226,11 @@ impl SharedLibrary {
                         .await
                     {
                         Ok(page) => {
-                            let page_was_empty = page.items.is_empty();
-                            if let Some(shared) =
-                                page.items.into_iter().find(|item| item.record_id == id)
+                            if let Some(shared) = page
+                                .items
+                                .into_iter()
+                                .filter(|item| seen_ids.insert(item.record_id))
+                                .find(|item| item.record_id == id)
                             {
                                 self.observe(&context, true, None).await?;
                                 return overlay_dictation_payload(
@@ -229,12 +246,25 @@ impl SharedLibrary {
                                     )
                                 });
                             }
-                            cursor = page.next_cursor;
-                            if cursor.is_none() || page_was_empty {
-                                self.observe(&context, true, None).await?;
-                                return local.ok_or_else(|| {
-                                    LibraryError::NotFound(format!("Transcription {id} not found"))
-                                });
+                            match advance_remote_cursor(
+                                page.next_cursor,
+                                &mut seen_cursors,
+                                "dictation",
+                            ) {
+                                Ok(Some(next)) => cursor = Some(next),
+                                Ok(None) => {
+                                    self.observe(&context, true, None).await?;
+                                    return local.ok_or_else(|| {
+                                        LibraryError::NotFound(format!(
+                                            "Transcription {id} not found"
+                                        ))
+                                    });
+                                }
+                                Err(error) => {
+                                    self.observe(&context, false, Some(&error.to_string()))
+                                        .await?;
+                                    return Err(error);
+                                }
                             }
                         }
                         Err(error) => {
@@ -322,6 +352,8 @@ impl SharedLibrary {
             LibraryRole::ConnectedDevice { hub } => {
                 let mut cursor = None;
                 let mut unmasked = 0usize;
+                let mut seen_cursors = HashSet::new();
+                let mut seen_ids = HashSet::new();
                 let mut failure = None;
                 while unmasked < target {
                     let page_limit = target
@@ -334,11 +366,13 @@ impl SharedLibrary {
                         .await
                     {
                         Ok(page) => {
-                            let raw_len = page.items.len();
                             let visible = page
                                 .items
                                 .into_iter()
                                 .filter_map(|shared| {
+                                    if !seen_ids.insert(shared.record_id) {
+                                        return None;
+                                    }
                                     let masked = SyncOutboxRepository::deletion_masks(
                                         &connection,
                                         shared.record_id,
@@ -359,9 +393,18 @@ impl SharedLibrary {
                                 .collect::<LibraryResult<Vec<_>>>()?;
                             unmasked = unmasked.saturating_add(visible.len());
                             merge_meetings(&mut entries, visible);
-                            cursor = page.next_cursor;
-                            if cursor.is_none() || raw_len == 0 {
-                                break;
+                            match advance_remote_cursor(
+                                page.next_cursor,
+                                &mut seen_cursors,
+                                "meeting",
+                            ) {
+                                Ok(Some(next)) => cursor = Some(next),
+                                Ok(None) => break,
+                                Err(error) => {
+                                    self.observe(&context, false, Some(&error.to_string()))
+                                        .await?;
+                                    return Err(error);
+                                }
                             }
                         }
                         Err(error) => {
@@ -689,4 +732,20 @@ fn shared_entry(
 
 fn contains_case_insensitive(value: &str, query: &str) -> bool {
     value.to_lowercase().contains(&query.to_lowercase())
+}
+
+fn advance_remote_cursor(
+    next: Option<String>,
+    seen: &mut HashSet<String>,
+    resource: &str,
+) -> LibraryResult<Option<String>> {
+    let Some(next) = next else {
+        return Ok(None);
+    };
+    if !seen.insert(next.clone()) {
+        return Err(LibraryError::Unavailable(format!(
+            "Home Hub returned a repeated {resource} page cursor"
+        )));
+    }
+    Ok(Some(next))
 }

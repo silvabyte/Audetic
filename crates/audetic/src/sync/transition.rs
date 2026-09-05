@@ -5,6 +5,7 @@ use audetic_core::sync::{
     HubConnection, ServeMappingState, SyncDiscoveryFailure, SyncNetworkAssessment, SyncRole,
     SyncSetupRequest, SyncSetupResult, SyncStatus,
 };
+use rusqlite::Connection;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -491,6 +492,82 @@ impl RoleCoordinator {
                 .await;
         }
         Ok(())
+    }
+
+    /// Enrich a committed Connected Device receipt only while its captured
+    /// role generation and Home Hub identity are still current.
+    ///
+    /// Enrichment can never turn the already-committed remote mutation into an
+    /// API failure. Infrastructure failures are logged and, when the current
+    /// sync row remains writable, persisted as an actionable health signal.
+    pub(super) async fn enrich_connected_library_receipt<T, F>(
+        &self,
+        context: &LibraryContext,
+        operation: &'static str,
+        enrich: F,
+    ) -> Option<T>
+    where
+        T: Send,
+        F: FnOnce(&Connection) -> anyhow::Result<T> + Send,
+    {
+        let expected_hub_id = match &context.role {
+            LibraryRole::ConnectedDevice { hub } => hub.hub_id,
+            _ => return None,
+        };
+        let expected_role_version = context.observation.0;
+        let _transition = self.transition.lock().await;
+        let installation = match self.load() {
+            Ok(installation) => installation,
+            Err(error) => {
+                tracing::error!(%operation, %error, "failed to fence committed library receipt");
+                return None;
+            }
+        };
+        let current_hub_matches = matches!(
+            installation.settings.hub.as_ref(),
+            Some(hub)
+                if installation.settings.role == SyncRole::ConnectedDevice
+                    && hub.hub_id == expected_hub_id
+        );
+        if installation.role_epoch != expected_role_version.value() || !current_hub_matches {
+            tracing::warn!(
+                %operation,
+                expected_role_epoch = expected_role_version.value(),
+                current_role_epoch = installation.role_epoch,
+                %expected_hub_id,
+                "discarded stale committed library receipt enrichment"
+            );
+            return None;
+        }
+        let connection = match crate::db::open_db_at(self.state.db_path()) {
+            Ok(connection) => connection,
+            Err(error) => {
+                tracing::error!(%operation, %error, "committed library receipt requires local repair");
+                return None;
+            }
+        };
+        match enrich(&connection) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                let health =
+                    format!("{operation} committed but local mirror repair is required: {error:#}");
+                tracing::error!(%operation, %error, "committed library receipt requires local repair");
+                if let Err(signal_error) =
+                    crate::db::sync_settings::SyncSettingsRepository::record_error(
+                        &connection,
+                        expected_role_version.value(),
+                        Some(&health),
+                    )
+                {
+                    tracing::error!(
+                        %operation,
+                        error = %signal_error,
+                        "failed to persist committed receipt repair signal"
+                    );
+                }
+                None
+            }
+        }
     }
 
     pub(super) async fn discover(&self) -> Result<SyncSetupResult, SyncServiceError> {
