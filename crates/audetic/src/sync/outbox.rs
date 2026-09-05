@@ -29,6 +29,7 @@ pub struct OutboxWorker {
     retry_jitter: RetryJitter,
     scheduling_clock: SchedulingClock,
     upload_recording_payloads: bool,
+    role_epoch: u64,
 }
 
 pub enum OutboxDestination {
@@ -57,11 +58,17 @@ impl OutboxWorker {
             retry_jitter: record_retry_jitter,
             scheduling_clock: chrono::Utc::now,
             upload_recording_payloads: true,
+            role_epoch: 0,
         }
     }
 
     pub fn with_payload_uploads(mut self, enabled: bool) -> Self {
         self.upload_recording_payloads = enabled;
+        self
+    }
+
+    pub(crate) fn with_role_epoch(mut self, role_epoch: u64) -> Self {
+        self.role_epoch = role_epoch;
         self
     }
 
@@ -85,15 +92,17 @@ impl OutboxWorker {
             }
             let db_path = self.db_path.clone();
             let role = self.destination.role();
+            let role_epoch = self.role_epoch;
             let upload_recording_payloads = self.upload_recording_payloads;
             let cancel_backfill = cancellation.clone();
             let mut cursor_for_batch = backfill_cursor.clone();
             let backfill = tokio::task::spawn_blocking(move || {
                 let result = crate::db::open_db_at(&db_path).and_then(|connection| {
-                    crate::db::backfill_visible_records_batch_cancellable(
+                    crate::db::backfill_visible_records_batch_for_epoch(
                         &connection,
                         role,
                         upload_recording_payloads,
+                        role_epoch,
                         OUTBOX_BATCH_SIZE,
                         &mut cursor_for_batch,
                         &cancel_backfill,
@@ -120,9 +129,11 @@ impl OutboxWorker {
         }
         match crate::db::open_db_at(&self.db_path) {
             Ok(connection) => {
-                if let Err(error) =
-                    SyncOutboxRepository::release_worker_leases(&connection, &self.worker_id)
-                {
+                if let Err(error) = SyncOutboxRepository::release_worker_leases(
+                    &connection,
+                    self.role_epoch,
+                    &self.worker_id,
+                ) {
                     tracing::warn!(%error, "failed to release cancelled outbox leases");
                 }
             }
@@ -149,6 +160,7 @@ impl OutboxWorker {
         let mut connection = crate::db::open_db_at(&self.db_path)?;
         let items = SyncOutboxRepository::claim_items(
             &mut connection,
+            self.role_epoch,
             &self.worker_id,
             &now.to_rfc3339(),
             &lease_expiry.to_rfc3339(),
@@ -187,12 +199,14 @@ impl OutboxWorker {
                             Some(result) if result.disposition == SnapshotDisposition::Accepted => {
                                 SyncOutboxRepository::mark_snapshot_accepted(
                                     &connection,
+                                    self.role_epoch,
                                     item,
                                     result.authoritative_revision.unwrap_or(0),
                                 )?;
                             }
                             Some(result) => SyncOutboxRepository::mark_needs_attention(
                                 &connection,
+                                self.role_epoch,
                                 item,
                                 result.message.as_deref().unwrap_or("snapshot rejected"),
                             )?,
@@ -200,6 +214,7 @@ impl OutboxWorker {
                                 let scheduling_now = (self.scheduling_clock)();
                                 mark_retry(
                                     &connection,
+                                    self.role_epoch,
                                     item,
                                     "Home Hub omitted the snapshot result",
                                     (self.retry_jitter)(item),
@@ -220,6 +235,7 @@ impl OutboxWorker {
                         }
                         mark_retry(
                             &connection,
+                            self.role_epoch,
                             item,
                             &message,
                             (self.retry_jitter)(item),
@@ -234,7 +250,12 @@ impl OutboxWorker {
                         if cancellation.is_cancelled() {
                             return Ok(None);
                         }
-                        SyncOutboxRepository::mark_needs_attention(&connection, item, &error)?;
+                        SyncOutboxRepository::mark_needs_attention(
+                            &connection,
+                            self.role_epoch,
+                            item,
+                            &error,
+                        )?;
                     }
                 }
             }
@@ -243,6 +264,7 @@ impl OutboxWorker {
         let blobs = if self.upload_recording_payloads {
             SyncOutboxRepository::claim_blobs(
                 &mut connection,
+                self.role_epoch,
                 &self.worker_id,
                 &now.to_rfc3339(),
                 &lease_expiry.to_rfc3339(),
@@ -267,6 +289,7 @@ impl OutboxWorker {
             if staged_size != Some(blob.byte_size) {
                 SyncOutboxRepository::mark_blob_needs_attention(
                     &connection,
+                    self.role_epoch,
                     blob,
                     &format!(
                         "staged Recording Payload is missing or has the wrong size; restore it or disable payload upload (expected {}, found {:?})",
@@ -312,12 +335,13 @@ impl OutboxWorker {
             };
             match uploaded {
                 Ok(()) => {
-                    SyncOutboxRepository::mark_blob_accepted(&connection, blob)?;
+                    SyncOutboxRepository::mark_blob_accepted(&connection, self.role_epoch, blob)?;
                 }
                 Err(error) if error.is_retryable() => {
                     let scheduling_now = (self.scheduling_clock)();
                     mark_blob_retry(
                         &connection,
+                        self.role_epoch,
                         blob,
                         &error.to_string(),
                         blob_retry_jitter(blob),
@@ -328,6 +352,7 @@ impl OutboxWorker {
                 Err(error) => {
                     SyncOutboxRepository::mark_blob_needs_attention(
                         &connection,
+                        self.role_epoch,
                         blob,
                         &error.to_string(),
                     )?;
@@ -340,6 +365,7 @@ impl OutboxWorker {
 
 fn mark_retry(
     connection: &rusqlite::Connection,
+    role_epoch: u64,
     item: &OutboxItem,
     error: &str,
     jitter: u64,
@@ -347,7 +373,7 @@ fn mark_retry(
     retry_after: Option<&str>,
 ) -> Result<()> {
     let next = metadata_retry_at(now, item, jitter, retry_after);
-    SyncOutboxRepository::mark_retry(connection, item, &next.to_rfc3339(), error)
+    SyncOutboxRepository::mark_retry(connection, role_epoch, item, &next.to_rfc3339(), error)
 }
 
 fn retry_delay_seconds(attempts: u32, jitter: u64) -> i64 {
@@ -366,6 +392,7 @@ fn record_retry_jitter(item: &OutboxItem) -> u64 {
 
 fn mark_blob_retry(
     connection: &rusqlite::Connection,
+    role_epoch: u64,
     blob: &OutboxBlob,
     error: &str,
     jitter: u64,
@@ -373,7 +400,7 @@ fn mark_blob_retry(
     retry_after: Option<&str>,
 ) -> Result<()> {
     let next = blob_retry_at(now, blob, jitter, retry_after);
-    SyncOutboxRepository::mark_blob_retry(connection, blob, &next.to_rfc3339(), error)
+    SyncOutboxRepository::mark_blob_retry(connection, role_epoch, blob, &next.to_rfc3339(), error)
 }
 
 fn metadata_retry_at(

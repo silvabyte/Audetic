@@ -474,6 +474,46 @@ pub(crate) fn backfill_visible_records_batch_cancellable(
     cursor: &mut BackfillCursor,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<usize> {
+    backfill_visible_records_batch_guarded(
+        conn,
+        target_role,
+        upload_recording_payloads,
+        None,
+        limit,
+        cursor,
+        cancellation,
+    )
+}
+
+pub(crate) fn backfill_visible_records_batch_for_epoch(
+    conn: &Connection,
+    target_role: SyncRole,
+    upload_recording_payloads: bool,
+    role_epoch: u64,
+    limit: usize,
+    cursor: &mut BackfillCursor,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<usize> {
+    backfill_visible_records_batch_guarded(
+        conn,
+        target_role,
+        upload_recording_payloads,
+        Some(role_epoch),
+        limit,
+        cursor,
+        cancellation,
+    )
+}
+
+fn backfill_visible_records_batch_guarded(
+    conn: &Connection,
+    target_role: SyncRole,
+    upload_recording_payloads: bool,
+    role_epoch: Option<u64>,
+    limit: usize,
+    cursor: &mut BackfillCursor,
+    cancellation: &tokio_util::sync::CancellationToken,
+) -> Result<usize> {
     if limit == 0 || !sync_active(target_role) || cursor.is_complete() {
         return Ok(0);
     }
@@ -520,6 +560,7 @@ pub(crate) fn backfill_visible_records_batch_cancellable(
                     id,
                     target_role,
                     upload_recording_payloads,
+                    role_epoch,
                     cancellation,
                 ),
                 BackfillPhase::Meetings => backfill_meeting(
@@ -527,9 +568,10 @@ pub(crate) fn backfill_visible_records_batch_cancellable(
                     id,
                     target_role,
                     upload_recording_payloads,
+                    role_epoch,
                     cancellation,
                 ),
-                BackfillPhase::Artifacts => backfill_artifact(conn, id, target_role),
+                BackfillPhase::Artifacts => backfill_artifact(conn, id, target_role, role_epoch),
                 BackfillPhase::Complete => Ok(()),
             };
             if let Err(error) = result {
@@ -643,6 +685,7 @@ fn backfill_dictation(
     workflow_id: i64,
     target_role: SyncRole,
     upload_recording_payloads: bool,
+    role_epoch: Option<u64>,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let row = conn.query_row(
@@ -676,7 +719,12 @@ fn backfill_dictation(
     let staged_path = staging.staged.as_ref().map(|value| value.path.clone());
     let result = (|| -> Result<bool> {
         let transaction = conn.unchecked_transaction()?;
-        if !backfill_policy_matches(&transaction, target_role, upload_recording_payloads)? {
+        if !backfill_policy_matches(
+            &transaction,
+            target_role,
+            upload_recording_payloads,
+            role_epoch,
+        )? {
             transaction.commit()?;
             return Ok(false);
         }
@@ -753,6 +801,7 @@ fn backfill_meeting(
     meeting_id: i64,
     target_role: SyncRole,
     upload_recording_payloads: bool,
+    role_epoch: Option<u64>,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<()> {
     let meeting = crate::db::meetings::MeetingRepository::get(conn, meeting_id)?
@@ -776,7 +825,12 @@ fn backfill_meeting(
     let staged_path = staging.staged.as_ref().map(|value| value.path.clone());
     let result = (|| -> Result<bool> {
         let transaction = conn.unchecked_transaction()?;
-        if !backfill_policy_matches(&transaction, target_role, upload_recording_payloads)? {
+        if !backfill_policy_matches(
+            &transaction,
+            target_role,
+            upload_recording_payloads,
+            role_epoch,
+        )? {
             transaction.commit()?;
             return Ok(false);
         }
@@ -828,10 +882,15 @@ fn backfill_meeting(
     result.map(|_| ())
 }
 
-fn backfill_artifact(conn: &Connection, artifact_id: i64, target_role: SyncRole) -> Result<()> {
+fn backfill_artifact(
+    conn: &Connection,
+    artifact_id: i64,
+    target_role: SyncRole,
+    role_epoch: Option<u64>,
+) -> Result<()> {
     let transaction = conn.unchecked_transaction()?;
     let settings = SyncSettingsRepository::get(&transaction)?;
-    if settings.role != target_role {
+    if settings.role != target_role || !role_epoch_matches(&transaction, role_epoch)? {
         transaction.commit()?;
         return Ok(());
     }
@@ -875,10 +934,25 @@ fn backfill_policy_matches(
     conn: &Connection,
     target_role: SyncRole,
     upload_recording_payloads: bool,
+    role_epoch: Option<u64>,
 ) -> Result<bool> {
     let settings = SyncSettingsRepository::get(conn)?;
-    Ok(settings.role == target_role
+    Ok(role_epoch_matches(conn, role_epoch)?
+        && settings.role == target_role
         && settings.upload_recording_payloads == upload_recording_payloads)
+}
+
+fn role_epoch_matches(conn: &Connection, role_epoch: Option<u64>) -> Result<bool> {
+    match role_epoch {
+        Some(expected) => conn
+            .query_row(
+                "SELECT role_epoch = ?1 FROM sync_settings WHERE singleton=1",
+                [expected],
+                |row| row.get(0),
+            )
+            .context("checking historical backfill role epoch"),
+        None => Ok(true),
+    }
 }
 
 fn sql_limit(limit: usize) -> i64 {

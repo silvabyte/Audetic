@@ -624,6 +624,7 @@ mod tests {
         MeetingArtifactRepository::complete(&conn, artifact_id, "# Summary", "", "")?;
         crate::db::sync_outbox::SyncOutboxRepository::claim_items(
             &mut conn,
+            0,
             "worker",
             "2026-09-04T10:00:00Z",
             "2026-09-04T10:00:30Z",

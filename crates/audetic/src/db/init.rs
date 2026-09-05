@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_SCHEMA_VERSION: i64 = 7;
+const LATEST_SCHEMA_VERSION: i64 = 8;
 
 /// Open the application database and run pending migrations.
 ///
@@ -159,6 +159,7 @@ fn apply_pending_migrations(conn: &Connection) -> Result<()> {
         "payload_staging_failures",
         migrate_payload_staging_failures,
     )?;
+    apply_migration(conn, 8, "sync_role_epoch", migrate_sync_role_epoch)?;
     Ok(())
 }
 
@@ -923,6 +924,15 @@ fn migrate_payload_staging_failures(conn: &Connection) -> Result<()> {
              ON sync_outbox_blobs(checksum,state);",
     )
     .context("Failed to allow payload staging failures without fabricated blob metadata")?;
+    Ok(())
+}
+
+fn migrate_sync_role_epoch(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE sync_settings
+             ADD COLUMN role_epoch INTEGER NOT NULL DEFAULT 0 CHECK(role_epoch >= 0);",
+    )
+    .context("Failed to add the sync role epoch")?;
     Ok(())
 }
 

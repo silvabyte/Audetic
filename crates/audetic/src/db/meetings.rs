@@ -1540,6 +1540,7 @@ mod tests {
         MeetingRepository::complete(&conn, id, "/tmp/claimed.txt", "claimed", None, 10).unwrap();
         crate::db::sync_outbox::SyncOutboxRepository::claim_items(
             &mut conn,
+            0,
             "worker",
             "2026-09-04T10:00:00Z",
             "2026-09-04T10:00:30Z",

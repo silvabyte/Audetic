@@ -4,27 +4,26 @@ use audetic_core::sync::{
     SyncRole, SyncSetupRequest, SyncSetupResult, SyncStatus,
 };
 use thiserror::Error;
-use tokio::sync::{oneshot, Mutex, RwLock};
-use tokio::task::JoinHandle;
+use tokio::sync::Mutex;
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use crate::db::sync_identity::{SyncIdentity, SyncIdentityRepository};
-use crate::db::sync_serve::{SyncServeOwnership, SyncServeRepository};
-use crate::db::sync_settings::{SyncSettings, SyncSettingsRepository};
+use crate::db::sync_serve::SyncServeOwnership;
+use crate::db::sync_settings::SyncSettings;
 use crate::sync::is_exact_audetic_serve_ownership;
 
 use super::client::{canonicalize_base_url, NetworkHubAdapter};
 use super::library::HubLibrary;
-use super::outbox::{OutboxDestination, OutboxWorker};
 use super::protocol::{MeetingTitlePatch, RecordKind, SharedMeeting};
 use super::protocol::{
     HUB_API_MOUNT_PATH, HUB_LISTENER_ADDRESS, HUB_LOOPBACK_BASE_URL, TAILSCALE_HTTPS_PORT,
 };
-use super::server::{HubServer, HubServerConfig};
+use super::runtime::{PreparedRuntime, QuiescedWorker, RuntimeError, RuntimeSet, RuntimeSpec};
+use super::state::HomeHubCommit;
+use super::state::{CommitEffects, EpochMismatch, InstallationSnapshot, InstallationState};
 use super::tailscale::{
     MappingState, ServeAssessment, SystemCommandRunner, Tailscale, TailscaleControl,
     TailscaleError, TailscaleStatus,
@@ -87,41 +86,23 @@ impl SyncServiceError {
     }
 }
 
-struct HubRuntime {
-    shutdown: oneshot::Sender<()>,
-    task: JoinHandle<Result<(), super::server::HubServerError>>,
-}
-
-struct OutboxRuntime {
-    cancellation: tokio_util::sync::CancellationToken,
-    task: JoinHandle<()>,
-}
-
-struct PreparedOutboxRuntime {
-    start: oneshot::Sender<()>,
-    runtime: OutboxRuntime,
-}
-
 /// Single owner of durable sync settings and all role-dependent runtime tasks.
 ///
 /// The transition mutex covers preview/verify/apply/commit/rollback as one
 /// serialized operation. SQLite transactions are kept short and never cross an
 /// await point.
 pub struct SyncService {
-    db_path: PathBuf,
+    state: InstallationState,
+    runtime: RuntimeSet,
     tailscale: Arc<dyn TailscaleControl>,
     hub_capabilities: HubCapabilities,
-    hub_bind_address: SocketAddr,
     transition: Mutex<()>,
-    hub_runtime: Mutex<Option<HubRuntime>>,
-    outbox_runtime: Mutex<Option<OutboxRuntime>>,
-    hub_reachable: RwLock<bool>,
     shut_down: AtomicBool,
 }
 
 impl SyncService {
     pub(crate) fn db_path(&self) -> &std::path::Path {
-        &self.db_path
+        self.state.db_path()
     }
 
     pub fn production(db_path: PathBuf) -> Self {
@@ -141,15 +122,14 @@ impl SyncService {
         hub_capabilities: HubCapabilities,
         hub_bind_address: SocketAddr,
     ) -> Self {
+        let state = InstallationState::new(db_path.clone());
+        let runtime = RuntimeSet::new(db_path, hub_capabilities.clone(), hub_bind_address);
         Self {
-            db_path,
+            state,
+            runtime,
             tailscale,
             hub_capabilities,
-            hub_bind_address,
             transition: Mutex::new(()),
-            hub_runtime: Mutex::new(None),
-            outbox_runtime: Mutex::new(None),
-            hub_reachable: RwLock::new(false),
             shut_down: AtomicBool::new(false),
         }
     }
@@ -159,26 +139,41 @@ impl SyncService {
     pub async fn initialize(&self) -> Result<SyncStatus, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
-        let (identity, mut settings) = self.load()?;
-        let startup_error = match settings.role {
+        let installation = self.load()?;
+        let spec = runtime_spec(&installation, installation.role_epoch)?;
+        let prepared = self.prepare_runtime(spec).await?;
+        let startup_error = match installation.settings.role {
             SyncRole::Standalone => None,
-            SyncRole::HomeHub => self.reconstruct_home_hub(&identity, &settings).await.err(),
-            SyncRole::ConnectedDevice => self.verify_connected_device(&settings).await.err(),
+            SyncRole::HomeHub => self.reconstruct_home_hub(&installation).await.err(),
+            SyncRole::ConnectedDevice => self
+                .verify_connected_device(&installation.settings)
+                .await
+                .err(),
         };
-
-        settings.last_error = startup_error.as_ref().map(ToString::to_string);
-        if startup_error.is_none() && settings.role != SyncRole::Standalone {
-            settings.last_contact_at = Some(now());
+        if let Some(error) = startup_error.as_ref() {
+            self.state
+                .record_error(installation.role_epoch, Some(&error.to_string()))
+                .map_err(SyncServiceError::Persistence)?;
+        } else if installation.settings.role != SyncRole::Standalone {
+            self.state
+                .record_contact(installation.role_epoch)
+                .map_err(SyncServiceError::Persistence)?;
+        } else {
+            self.state
+                .record_error(installation.role_epoch, None)
+                .map_err(SyncServiceError::Persistence)?;
         }
-        self.save_settings(&settings)?;
-        if settings.role != SyncRole::Standalone {
-            self.activate_dictation_transfer(&settings).await?;
-        }
+        self.activate_runtime(prepared).await?;
+        self.runtime
+            .observe_reachability(
+                installation.role_epoch,
+                installation.settings.role != SyncRole::Standalone && startup_error.is_none(),
+            )
+            .await;
         self.status_unlocked().await
     }
 
     pub async fn status(&self) -> Result<SyncStatus, SyncServiceError> {
-        let _transition = self.transition.lock().await;
         self.status_unlocked().await
     }
 
@@ -186,25 +181,22 @@ impl SyncService {
         &self,
         params: &crate::history::SearchParams,
     ) -> Result<Vec<crate::history::HistoryEntry>, SyncServiceError> {
-        let _transition = self.transition.lock().await;
-        let (_, settings) = self.load()?;
+        let installation = self.load()?;
+        let settings = installation.settings;
         let result = super::library_reader::LibraryReader::new(
-            self.db_path.clone(),
+            self.state.db_path().to_path_buf(),
             self.hub_capabilities.dictations(),
         )
         .read(&settings, params)
         .await
         .map_err(SyncServiceError::Persistence)?;
-        *self.hub_reachable.write().await = result.hub_reachable;
         if settings.role != SyncRole::Standalone {
-            let mut contact = settings;
-            if result.hub_reachable {
-                contact.last_contact_at = Some(now());
-                contact.last_error = None;
-            } else if let Some(error) = result.error {
-                contact.last_error = Some(error);
-            }
-            self.save_settings(&contact)?;
+            self.observe_contact(
+                installation.role_epoch,
+                result.hub_reachable,
+                result.error.as_deref(),
+            )
+            .await?;
         }
         Ok(result.entries)
     }
@@ -235,25 +227,22 @@ impl SyncService {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<super::library_reader::LibraryMeeting>, SyncServiceError> {
-        let _transition = self.transition.lock().await;
-        let (_, settings) = self.load()?;
+        let installation = self.load()?;
+        let settings = installation.settings;
         let result = super::library_reader::MeetingLibraryReader::new(
-            self.db_path.clone(),
+            self.state.db_path().to_path_buf(),
             self.hub_capabilities.meetings(),
         )
         .read(&settings, query, offset, limit)
         .await
         .map_err(SyncServiceError::Persistence)?;
-        *self.hub_reachable.write().await = result.hub_reachable;
         if settings.role != SyncRole::Standalone {
-            let mut contact = settings;
-            if result.hub_reachable {
-                contact.last_contact_at = Some(now());
-                contact.last_error = None;
-            } else if let Some(error) = result.error {
-                contact.last_error = Some(error);
-            }
-            self.save_settings(&contact)?;
+            self.observe_contact(
+                installation.role_epoch,
+                result.hub_reachable,
+                result.error.as_deref(),
+            )
+            .await?;
         }
         Ok(result.meetings)
     }
@@ -282,8 +271,8 @@ impl SyncService {
         expected_title_version: u64,
         title_source: Option<String>,
     ) -> Result<SharedMeeting, SyncServiceError> {
-        let _transition = self.transition.lock().await;
-        let (_, settings) = self.load()?;
+        let installation = self.load()?;
+        let settings = installation.settings;
         let patch = MeetingTitlePatch {
             title,
             expected_title_version,
@@ -293,7 +282,7 @@ impl SyncService {
             SyncRole::Standalone => Err(SyncServiceError::InvalidRequest(
                 "meeting is not shared".into(),
             )),
-            SyncRole::HomeHub => HubLibrary::new(self.db_path.clone())
+            SyncRole::HomeHub => HubLibrary::new(self.state.db_path().to_path_buf())
                 .update_meeting_title(id, &patch)
                 .map_err(SyncServiceError::Persistence)?
                 .ok_or_else(|| SyncServiceError::InvalidRequest("meeting not found".into())),
@@ -311,13 +300,13 @@ impl SyncService {
         id: RecordId,
         kind: RecordKind,
     ) -> Result<(), SyncServiceError> {
-        let _transition = self.transition.lock().await;
-        let (_, settings) = self.load()?;
+        let installation = self.load()?;
+        let settings = installation.settings;
         match settings.role {
             SyncRole::Standalone => Err(SyncServiceError::InvalidRequest(
                 "record is not shared".into(),
             )),
-            SyncRole::HomeHub => HubLibrary::new(self.db_path.clone())
+            SyncRole::HomeHub => HubLibrary::new(self.state.db_path().to_path_buf())
                 .delete(id, kind)
                 .map(|_| ())
                 .map_err(|error| SyncServiceError::Persistence(anyhow::anyhow!(error))),
@@ -336,11 +325,11 @@ impl SyncService {
         kind: RecordKind,
         range: Option<&str>,
     ) -> Result<Option<PayloadSource>, SyncServiceError> {
-        let _transition = self.transition.lock().await;
-        let (_, settings) = self.load()?;
+        let installation = self.load()?;
+        let settings = installation.settings;
         match settings.role {
             SyncRole::Standalone => Ok(None),
-            SyncRole::HomeHub => HubLibrary::new(self.db_path.clone())
+            SyncRole::HomeHub => HubLibrary::new(self.state.db_path().to_path_buf())
                 .payload(id, kind)
                 .map(|value| value.map(PayloadSource::Local))
                 .map_err(SyncServiceError::Persistence),
@@ -362,16 +351,21 @@ impl SyncService {
     pub async fn retry(&self) -> Result<u64, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
-        let (_, settings) = self.load()?;
-        let prepared = if settings.role == SyncRole::Standalone {
+        let installation = self.load()?;
+        let prepared = if installation.settings.role == SyncRole::Standalone {
             None
         } else {
-            Some(self.prepare_dictation_transfer(&settings).await?)
+            Some(
+                self.prepare_runtime(runtime_spec(&installation, installation.role_epoch)?)
+                    .await?,
+            )
         };
-        if prepared.is_some() {
-            self.stop_outbox_runtime().await;
-        }
-        let result = crate::db::open_db_at(&self.db_path)
+        let quiesced = if prepared.is_some() {
+            Some(self.quiesce_worker().await?)
+        } else {
+            None
+        };
+        let result = crate::db::open_db_at(self.state.db_path())
             .context("opening sync database")
             .and_then(|connection| {
                 crate::db::sync_outbox::SyncOutboxRepository::retry_all(&connection)
@@ -379,7 +373,12 @@ impl SyncService {
             })
             .map_err(SyncServiceError::Persistence);
         if let Some(prepared) = prepared {
-            self.activate_prepared_outbox(prepared).await;
+            if let Err(error) = self.activate_runtime(prepared).await {
+                if let Some(quiesced) = quiesced {
+                    let _ = self.restore_worker(quiesced).await;
+                }
+                return Err(error);
+            }
         }
         result
     }
@@ -390,7 +389,8 @@ impl SyncService {
     ) -> Result<bool, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
-        let (_, mut settings) = self.load()?;
+        let installation = self.load()?;
+        let mut settings = installation.settings.clone();
         if settings.role == SyncRole::Standalone {
             return Err(SyncServiceError::InvalidRequest(
                 "Recording Payload upload policy requires an active Shared Library role".into(),
@@ -400,57 +400,38 @@ impl SyncService {
             return Ok(enabled);
         }
 
-        let previous_settings = settings.clone();
-        let prepared = self
-            .prepare_dictation_transfer(&SyncSettings {
-                upload_recording_payloads: enabled,
-                ..settings.clone()
-            })
-            .await?;
-        self.stop_outbox_runtime().await;
         settings.upload_recording_payloads = enabled;
-        let persistence = (|| -> Result<(), SyncServiceError> {
-            let mut connection = crate::db::open_db_at(&self.db_path)
-                .context("opening sync database")
-                .map_err(SyncServiceError::Persistence)?;
-            let transaction = connection
-                .transaction()
-                .context("starting Recording Payload policy transaction")
-                .map_err(SyncServiceError::Persistence)?;
-            SyncSettingsRepository::save(&transaction, &settings)
-                .map_err(SyncServiceError::Persistence)?;
-            if !enabled {
-                crate::db::sync_outbox::SyncOutboxRepository::pause_blob_uploads(&transaction)
-                    .map_err(SyncServiceError::Persistence)?;
-            } else {
-                crate::db::sync_outbox::SyncOutboxRepository::reset_restageable_for_backfill(
-                    &transaction,
-                )
-                .map_err(SyncServiceError::Persistence)?;
-            }
-            transaction
-                .commit()
-                .context("committing Recording Payload policy")
-                .map_err(SyncServiceError::Persistence)
-        })();
-        if let Err(error) = persistence {
-            self.cancel_prepared_outbox(prepared).await;
-            return Err(
-                match self.restore_outbox_runtime(&previous_settings).await {
-                    Ok(()) => error,
-                    Err(rollback) => SyncServiceError::Rollback {
-                        source_error: error.to_string(),
-                        rollback_error: rollback.to_string(),
-                    },
+        let next_epoch = installation.role_epoch.checked_add(1).ok_or_else(|| {
+            SyncServiceError::Persistence(anyhow::anyhow!("role epoch exhausted"))
+        })?;
+        let target = InstallationSnapshot {
+            settings,
+            role_epoch: next_epoch,
+            ..installation.clone()
+        };
+        let prepared = self
+            .prepare_runtime(runtime_spec(&target, next_epoch)?)
+            .await?;
+        let quiesced = self.quiesce_worker().await?;
+        let committed = self
+            .state
+            .commit_payload_policy(installation.role_epoch, enabled)
+            .map_err(map_state_error);
+        if let Err(error) = committed {
+            prepared.abort().await;
+            return Err(match self.restore_worker(quiesced).await {
+                Ok(()) => error,
+                Err(rollback) => SyncServiceError::Rollback {
+                    source_error: error.to_string(),
+                    rollback_error: rollback.to_string(),
                 },
-            );
+            });
         }
-        self.activate_prepared_outbox(prepared).await;
+        self.activate_runtime(prepared).await?;
         Ok(enabled)
     }
 
     pub async fn discover(&self) -> Result<SyncSetupResult, SyncServiceError> {
-        let _transition = self.transition.lock().await;
         self.ensure_running()?;
         let status = self.tailscale_status().await?;
         require_running(&status)?;
@@ -493,7 +474,8 @@ impl SyncService {
     ) -> Result<SyncSetupResult, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
-        let (identity, current) = self.load()?;
+        let installation = self.load()?;
+        let current = installation.settings.clone();
         if current.role != SyncRole::Standalone
             && request.role != SyncRole::Standalone
             && request.upload_recording_payloads != current.upload_recording_payloads
@@ -506,7 +488,7 @@ impl SyncService {
             (request.role == SyncRole::HomeHub).then(|| self.tailscale.serve_preview());
 
         match request.role {
-            SyncRole::Standalone => self.configure_standalone(request, current).await?,
+            SyncRole::Standalone => self.configure_standalone(request, &installation).await?,
             SyncRole::HomeHub => {
                 if current.role == SyncRole::ConnectedDevice {
                     return Err(SyncServiceError::InvalidTransition(
@@ -523,8 +505,7 @@ impl SyncService {
                         serve_preview,
                     });
                 }
-                self.configure_home_hub(request, current, identity.device_id)
-                    .await?;
+                self.configure_home_hub(request, &installation).await?;
             }
             SyncRole::ConnectedDevice => {
                 if current.role == SyncRole::HomeHub {
@@ -532,7 +513,7 @@ impl SyncService {
                         "demote the Home Hub to Standalone before connecting to another hub".into(),
                     ));
                 }
-                self.configure_connected_device(request, current, identity.device_id)
+                self.configure_connected_device(request, &installation)
                     .await?;
             }
         }
@@ -562,15 +543,13 @@ impl SyncService {
         if self.shut_down.swap(true, Ordering::SeqCst) {
             return Ok(());
         }
-        *self.hub_reachable.write().await = false;
-        self.stop_outbox_runtime().await;
-        self.stop_hub_runtime().await
+        self.runtime.shutdown().await.map_err(map_runtime_error)
     }
 
     async fn configure_standalone(
         &self,
         request: SyncSetupRequest,
-        current: SyncSettings,
+        installation: &InstallationSnapshot,
     ) -> Result<(), SyncServiceError> {
         if request.hub.is_some() {
             return Err(SyncServiceError::InvalidRequest(
@@ -578,19 +557,23 @@ impl SyncService {
             ));
         }
 
-        let ownership = self.load_ownership()?;
-        if current.role != SyncRole::Standalone {
-            self.stop_outbox_runtime().await;
-        }
+        let current = &installation.settings;
+        let ownership = installation.serve_ownership.as_ref();
+        let prepared = self
+            .prepare_runtime(RuntimeSpec::Standalone {
+                role_epoch: installation.role_epoch.checked_add(1).ok_or_else(|| {
+                    SyncServiceError::Persistence(anyhow::anyhow!("role epoch exhausted"))
+                })?,
+            })
+            .await?;
+        let quiesced = self.quiesce_worker_if_running().await?;
         let removed_mapping = if current.role == SyncRole::HomeHub {
-            if ownership
-                .as_ref()
-                .is_some_and(is_exact_audetic_serve_ownership)
-            {
+            if ownership.is_some_and(is_exact_audetic_serve_ownership) {
                 match self.tailscale_remove().await {
                     Ok(removed) => removed,
                     Err(error) => {
-                        return Err(match self.restore_outbox_runtime(&current).await {
+                        prepared.abort().await;
+                        return Err(match self.restore_optional_worker(quiesced).await {
                             Ok(()) => error,
                             Err(rollback) => SyncServiceError::Rollback {
                                 source_error: error.to_string(),
@@ -607,14 +590,19 @@ impl SyncService {
         };
 
         let settings = settings_from_request(request, None);
-        if let Err(error) = self.commit_settings_and_ownership(&settings, None, true) {
+        if let Err(error) = self
+            .state
+            .commit_standalone(installation.role_epoch, &settings)
+            .map_err(map_state_error)
+        {
+            prepared.abort().await;
             let mut rollback_errors = Vec::new();
             if removed_mapping {
                 if let Err(rollback) = self.tailscale_apply().await {
                     rollback_errors.push(rollback.to_string());
                 }
             }
-            if let Err(rollback) = self.restore_outbox_runtime(&current).await {
+            if let Err(rollback) = self.restore_optional_worker(quiesced).await {
                 rollback_errors.push(rollback.to_string());
             }
             return Err(if rollback_errors.is_empty() {
@@ -626,18 +614,14 @@ impl SyncService {
                 }
             });
         }
-        if current.role == SyncRole::HomeHub {
-            self.stop_hub_runtime().await?;
-        }
-        *self.hub_reachable.write().await = false;
+        self.activate_runtime(prepared).await?;
         Ok(())
     }
 
     async fn configure_home_hub(
         &self,
         request: SyncSetupRequest,
-        current: SyncSettings,
-        local_device_id: audetic_core::sync::DeviceId,
+        installation: &InstallationSnapshot,
     ) -> Result<(), SyncServiceError> {
         if request.hub.is_some() {
             return Err(SyncServiceError::InvalidRequest(
@@ -645,7 +629,8 @@ impl SyncService {
             ));
         }
         let tailscale_status = self.assess_home_hub_ready().await?;
-        let identity = self.load()?.0;
+        let identity = &installation.identity;
+        let current = &installation.settings;
         let hub_id = identity.hub_id.unwrap_or_default();
         let owner_login = tailscale_status.owner_login.clone();
 
@@ -657,68 +642,75 @@ impl SyncService {
             ));
         }
 
-        let runtime_was_running = self.hub_runtime_running().await;
-        let was_reachable = *self.hub_reachable.read().await;
-        self.start_hub_runtime(hub_id, &owner_login, request.device_name.as_deref())
+        let mut settings = settings_from_request(request, None);
+        settings.shared_config_enabled = true;
+        settings.last_contact_at = Some(now());
+        let next_epoch = installation.role_epoch.checked_add(1).ok_or_else(|| {
+            SyncServiceError::Persistence(anyhow::anyhow!("role epoch exhausted"))
+        })?;
+        let target = InstallationSnapshot {
+            identity: installation.identity.clone(),
+            settings: settings.clone(),
+            serve_ownership: Some(expected_ownership()),
+            role_epoch: next_epoch,
+        };
+        let prepared = self
+            .prepare_runtime(runtime_spec_with_home_identity(
+                &target,
+                hub_id,
+                &owner_login,
+            )?)
             .await?;
+        let quiesced = self.quiesce_worker_if_running().await?;
         let mapping_created = match self
             .verify_home_hub_network(&tailscale_status, hub_id, &owner_login)
             .await
         {
             Ok(mapping_created) => mapping_created,
             Err((error, mapping_created)) => {
-                return Err(self
-                    .rollback_home_hub_activation(
-                        None,
-                        runtime_was_running,
-                        was_reachable,
-                        mapping_created,
-                        error,
-                    )
-                    .await)
+                prepared.abort().await;
+                let error = self.rollback_created_mapping(mapping_created, error).await;
+                return Err(match self.restore_optional_worker(quiesced).await {
+                    Ok(()) => error,
+                    Err(rollback) => SyncServiceError::Rollback {
+                        source_error: error.to_string(),
+                        rollback_error: rollback.to_string(),
+                    },
+                });
             }
         };
-
-        let mut settings = settings_from_request(request, None);
-        settings.shared_config_enabled = true;
-        settings.last_contact_at = Some(now());
-        let prepared = match self.prepare_dictation_transfer(&settings).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                return Err(self
-                    .rollback_home_hub_activation(
-                        None,
-                        runtime_was_running,
-                        was_reachable,
-                        mapping_created,
-                        error,
-                    )
-                    .await)
-            }
-        };
-        let obsolete_staged_paths = match self.commit_home_hub(
-            &settings,
-            hub_id,
-            &owner_login,
-            local_device_id,
-            current.role == SyncRole::Standalone,
+        let ownership = expected_ownership();
+        let effects = match self.state.commit_home_hub(
+            installation.role_epoch,
+            HomeHubCommit {
+                settings: &settings,
+                hub_id,
+                owner_login: &owner_login,
+                local_device_id: identity.device_id,
+                reset_destination: current.role == SyncRole::Standalone,
+                ownership: &ownership,
+            },
         ) {
-            Ok(paths) => paths,
+            Ok(effects) => effects,
             Err(error) => {
-                return Err(self
-                    .rollback_home_hub_activation(
-                        Some(prepared),
-                        runtime_was_running,
-                        was_reachable,
-                        mapping_created,
-                        error,
-                    )
-                    .await)
+                prepared.abort().await;
+                let error = self
+                    .rollback_created_mapping(mapping_created, map_state_error(error))
+                    .await;
+                return Err(match self.restore_optional_worker(quiesced).await {
+                    Ok(()) => error,
+                    Err(rollback) => SyncServiceError::Rollback {
+                        source_error: error.to_string(),
+                        rollback_error: rollback.to_string(),
+                    },
+                });
             }
         };
-        self.reclaim_obsolete_staged_paths(&obsolete_staged_paths, "Home Hub activation");
-        self.activate_prepared_outbox(prepared).await;
-        *self.hub_reachable.write().await = true;
+        self.cleanup_after_commit(&effects, "Home Hub activation");
+        self.activate_runtime(prepared).await?;
+        self.runtime
+            .observe_reachability(effects.role_epoch, true)
+            .await;
         Ok(())
     }
 
@@ -775,8 +767,7 @@ impl SyncService {
     async fn configure_connected_device(
         &self,
         request: SyncSetupRequest,
-        current: SyncSettings,
-        local_device_id: audetic_core::sync::DeviceId,
+        installation: &InstallationSnapshot,
     ) -> Result<(), SyncServiceError> {
         let mut requested_hub = request.hub.clone().ok_or_else(|| {
             SyncServiceError::InvalidRequest(
@@ -810,82 +801,55 @@ impl SyncService {
         let mut settings = settings_from_request(request, Some(candidate.connection));
         settings.last_contact_at = Some(now());
         settings.last_error = None;
+        let current = &installation.settings;
         let destination_changed = current.role == SyncRole::Standalone
             || (current.role == SyncRole::ConnectedDevice
                 && current.hub.as_ref().map(|hub| hub.hub_id)
                     != settings.hub.as_ref().map(|hub| hub.hub_id));
-        let was_reachable = *self.hub_reachable.read().await;
-        let runtime_was_running = self
-            .outbox_runtime
-            .lock()
-            .await
-            .as_ref()
-            .is_some_and(|runtime| !runtime.task.is_finished());
-        let prepared = self.prepare_dictation_transfer(&settings).await?;
-        if current.role != SyncRole::Standalone {
-            self.stop_outbox_runtime().await;
-        }
-        let obsolete_staged_paths =
-            match self.commit_connected_device(&settings, local_device_id, destination_changed) {
-                Ok(paths) => paths,
-                Err(error) => {
-                    self.cancel_prepared_outbox(prepared).await;
-                    *self.hub_reachable.write().await = was_reachable;
-                    return Err(if runtime_was_running {
-                        match self.restore_outbox_runtime(&current).await {
-                            Ok(()) => error,
-                            Err(rollback) => SyncServiceError::Rollback {
-                                source_error: error.to_string(),
-                                rollback_error: rollback.to_string(),
-                            },
-                        }
-                    } else {
-                        error
-                    });
-                }
-            };
-        self.reclaim_obsolete_staged_paths(&obsolete_staged_paths, "Connected Device activation");
-        self.activate_prepared_outbox(prepared).await;
-        *self.hub_reachable.write().await = true;
-        Ok(())
-    }
-
-    fn commit_connected_device(
-        &self,
-        settings: &SyncSettings,
-        local_device_id: audetic_core::sync::DeviceId,
-        destination_changed: bool,
-    ) -> Result<Vec<std::path::PathBuf>, SyncServiceError> {
-        let mut conn = crate::db::open_db_at(&self.db_path)
-            .context("opening sync database")
-            .map_err(SyncServiceError::Persistence)?;
-        let transaction = conn
-            .transaction()
-            .context("starting Connected Device settings transaction")
-            .map_err(SyncServiceError::Persistence)?;
-        SyncSettingsRepository::save(&transaction, settings)
-            .map_err(SyncServiceError::Persistence)?;
-        let obsolete_staged_paths = if destination_changed {
-            crate::db::sync_outbox::SyncOutboxRepository::reset_for_new_destination(
-                &transaction,
-                local_device_id,
-            )
-            .map_err(SyncServiceError::Persistence)?
-        } else {
-            Vec::new()
+        let next_epoch = installation.role_epoch.checked_add(1).ok_or_else(|| {
+            SyncServiceError::Persistence(anyhow::anyhow!("role epoch exhausted"))
+        })?;
+        let target = InstallationSnapshot {
+            settings: settings.clone(),
+            role_epoch: next_epoch,
+            ..installation.clone()
         };
-        transaction
-            .commit()
-            .context("committing Connected Device settings transaction")
-            .map_err(SyncServiceError::Persistence)?;
-        Ok(obsolete_staged_paths)
+        let prepared = self
+            .prepare_runtime(runtime_spec(&target, next_epoch)?)
+            .await?;
+        let quiesced = self.quiesce_worker_if_running().await?;
+        let effects = match self.state.commit_connected_device(
+            installation.role_epoch,
+            &settings,
+            installation.identity.device_id,
+            destination_changed,
+        ) {
+            Ok(effects) => effects,
+            Err(error) => {
+                prepared.abort().await;
+                let error = map_state_error(error);
+                return Err(match self.restore_optional_worker(quiesced).await {
+                    Ok(()) => error,
+                    Err(rollback) => SyncServiceError::Rollback {
+                        source_error: error.to_string(),
+                        rollback_error: rollback.to_string(),
+                    },
+                });
+            }
+        };
+        self.cleanup_after_commit(&effects, "Connected Device activation");
+        self.activate_runtime(prepared).await?;
+        self.runtime
+            .observe_reachability(effects.role_epoch, true)
+            .await;
+        Ok(())
     }
 
     async fn reconstruct_home_hub(
         &self,
-        identity: &SyncIdentity,
-        settings: &SyncSettings,
+        installation: &InstallationSnapshot,
     ) -> Result<(), SyncServiceError> {
+        let identity = &installation.identity;
         let hub_id = identity.hub_id.ok_or_else(|| {
             SyncServiceError::Persistence(anyhow::anyhow!("persisted Home Hub role has no Hub ID"))
         })?;
@@ -894,9 +858,6 @@ impl SyncService {
                 "persisted Home Hub role has no owner login"
             ))
         })?;
-        self.start_hub_runtime(hub_id, owner_login, settings.device_name.as_deref())
-            .await?;
-
         let status = self.assess_home_hub_ready().await?;
         let assessment = self.tailscale_serve_assessment().await?;
         if assessment.mapping != MappingState::OwnedByAudetic || assessment.funnel_enabled {
@@ -904,8 +865,8 @@ impl SyncService {
                 "persisted Home Hub Serve mapping is missing, changed, or exposed by Funnel".into(),
             ));
         }
-        if !self
-            .load_ownership()?
+        if !installation
+            .serve_ownership
             .as_ref()
             .is_some_and(is_exact_audetic_serve_ownership)
         {
@@ -926,7 +887,6 @@ impl SyncService {
             .handshake(&connection)
             .await
             .map_err(|error| SyncServiceError::HubVerification(error.to_string()))?;
-        *self.hub_reachable.write().await = true;
         Ok(())
     }
 
@@ -944,7 +904,6 @@ impl SyncService {
             .handshake(hub)
             .await
             .map_err(|error| SyncServiceError::HubVerification(error.to_string()))?;
-        *self.hub_reachable.write().await = true;
         Ok(())
     }
 
@@ -962,14 +921,19 @@ impl SyncService {
     }
 
     async fn status_unlocked(&self) -> Result<SyncStatus, SyncServiceError> {
-        let (identity, settings) = self.load()?;
-        let runtime_running = self.hub_runtime_running().await;
+        let installation = self.load()?;
+        let identity = installation.identity;
+        let settings = installation.settings;
+        let runtime = self.runtime.snapshot().await;
+        let runtime_is_current = runtime.role_epoch == Some(installation.role_epoch);
         let reachable = match settings.role {
             SyncRole::Standalone => false,
-            SyncRole::HomeHub => runtime_running && *self.hub_reachable.read().await,
-            SyncRole::ConnectedDevice => *self.hub_reachable.read().await,
+            SyncRole::HomeHub => {
+                runtime_is_current && runtime.hub_listener_running && runtime.hub_reachable
+            }
+            SyncRole::ConnectedDevice => runtime_is_current && runtime.hub_reachable,
         };
-        let connection = crate::db::open_db_at(&self.db_path)
+        let connection = crate::db::open_db_at(self.state.db_path())
             .context("opening sync database")
             .map_err(SyncServiceError::Persistence)?;
         let (pending_items, outbox_error) =
@@ -1064,282 +1028,103 @@ impl SyncService {
             .map_err(SyncServiceError::Tailscale)
     }
 
-    async fn start_hub_runtime(
-        &self,
-        hub_id: audetic_core::sync::HubId,
-        owner_login: &str,
-        device_name: Option<&str>,
-    ) -> Result<(), SyncServiceError> {
-        if self.hub_runtime_running().await {
-            return Ok(());
-        }
-        if !self.hub_bind_address.ip().is_loopback() {
-            return Err(SyncServiceError::Listener(format!(
-                "non-loopback bind address {}",
-                self.hub_bind_address
-            )));
-        }
-        let listener = tokio::net::TcpListener::bind(self.hub_bind_address)
-            .await
-            .map_err(|error| SyncServiceError::Listener(error.to_string()))?;
-        let mut config = HubServerConfig::new(hub_id, owner_login)
-            .map_err(|error| SyncServiceError::Listener(error.to_string()))?
-            .with_library(HubLibrary::new(self.db_path.clone()));
-        if let Some(device_name) = device_name {
-            config = config.with_device_name(device_name);
-        }
-        let server = HubServer::new(config);
-        let (shutdown, receiver) = oneshot::channel();
-        let task = tokio::spawn(async move {
-            server
-                .serve_with_shutdown(listener, async move {
-                    let _ = receiver.await;
-                })
-                .await
-        });
-        *self.hub_runtime.lock().await = Some(HubRuntime { shutdown, task });
-        Ok(())
-    }
-
-    async fn stop_hub_runtime(&self) -> Result<(), SyncServiceError> {
-        let Some(runtime) = self.hub_runtime.lock().await.take() else {
-            return Ok(());
-        };
-        let _ = runtime.shutdown.send(());
-        runtime
-            .task
-            .await
-            .map_err(|error| SyncServiceError::Listener(error.to_string()))?
-            .map_err(|error| SyncServiceError::Listener(error.to_string()))
-    }
-
+    #[cfg(test)]
     async fn hub_runtime_running(&self) -> bool {
-        self.hub_runtime
-            .lock()
+        self.runtime.snapshot().await.hub_listener_running
+    }
+
+    async fn prepare_runtime(
+        &self,
+        spec: RuntimeSpec,
+    ) -> Result<PreparedRuntime, SyncServiceError> {
+        self.runtime.prepare(spec).await.map_err(map_runtime_error)
+    }
+
+    async fn activate_runtime(&self, prepared: PreparedRuntime) -> Result<(), SyncServiceError> {
+        self.runtime
+            .activate(prepared)
             .await
-            .as_ref()
-            .is_some_and(|runtime| !runtime.task.is_finished())
+            .map_err(map_runtime_error)
     }
 
-    async fn activate_dictation_transfer(
-        &self,
-        settings: &SyncSettings,
-    ) -> Result<(), SyncServiceError> {
-        let prepared = self.prepare_dictation_transfer(settings).await?;
-        self.activate_prepared_outbox(prepared).await;
-        Ok(())
+    async fn quiesce_worker(&self) -> Result<QuiescedWorker, SyncServiceError> {
+        self.runtime
+            .quiesce_worker()
+            .await
+            .map_err(map_runtime_error)
     }
 
-    async fn prepare_dictation_transfer(
-        &self,
-        settings: &SyncSettings,
-    ) -> Result<PreparedOutboxRuntime, SyncServiceError> {
-        let destination = match settings.role {
-            SyncRole::HomeHub => OutboxDestination::Local(HubLibrary::new(self.db_path.clone())),
-            SyncRole::ConnectedDevice => OutboxDestination::Remote {
-                hub: settings.hub.clone().ok_or_else(|| {
-                    SyncServiceError::Persistence(anyhow::anyhow!(
-                        "Connected Device outbox has no Home Hub"
-                    ))
-                })?,
-                replication: self.hub_capabilities.replication(),
-            },
-            SyncRole::Standalone => {
-                return Err(SyncServiceError::InvalidRequest(
-                    "Standalone has no outbox destination".to_owned(),
-                ))
-            }
-        };
-        let worker = OutboxWorker::new(self.db_path.clone(), destination)
-            .with_payload_uploads(settings.upload_recording_payloads);
-        let (start, start_receiver) = oneshot::channel();
-        let cancellation = tokio_util::sync::CancellationToken::new();
-        let worker_cancellation = cancellation.clone();
-        let task = tokio::spawn(async move {
-            if start_receiver.await.is_ok() {
-                worker.run(worker_cancellation).await;
-            }
-        });
-        Ok(PreparedOutboxRuntime {
-            start,
-            runtime: OutboxRuntime { cancellation, task },
-        })
-    }
-
-    async fn activate_prepared_outbox(&self, prepared: PreparedOutboxRuntime) {
-        self.stop_outbox_runtime().await;
-        let PreparedOutboxRuntime { start, runtime } = prepared;
-        let _ = start.send(());
-        *self.outbox_runtime.lock().await = Some(runtime);
-    }
-
-    async fn cancel_prepared_outbox(&self, prepared: PreparedOutboxRuntime) {
-        let PreparedOutboxRuntime { start, runtime } = prepared;
-        drop(start);
-        runtime.cancellation.cancel();
-        let _ = runtime.task.await;
-    }
-
-    async fn restore_outbox_runtime(
-        &self,
-        settings: &SyncSettings,
-    ) -> Result<(), SyncServiceError> {
-        if settings.role == SyncRole::Standalone {
-            return Ok(());
+    async fn quiesce_worker_if_running(&self) -> Result<Option<QuiescedWorker>, SyncServiceError> {
+        if self.runtime.snapshot().await.outbox_worker_running {
+            self.quiesce_worker().await.map(Some)
+        } else {
+            Ok(None)
         }
-        let prepared = self.prepare_dictation_transfer(settings).await?;
-        self.activate_prepared_outbox(prepared).await;
+    }
+
+    async fn restore_worker(&self, quiesced: QuiescedWorker) -> Result<(), SyncServiceError> {
+        self.runtime
+            .restore_worker(quiesced)
+            .await
+            .map_err(map_runtime_error)
+    }
+
+    async fn restore_optional_worker(
+        &self,
+        quiesced: Option<QuiescedWorker>,
+    ) -> Result<(), SyncServiceError> {
+        if let Some(quiesced) = quiesced {
+            self.restore_worker(quiesced).await?;
+        }
         Ok(())
     }
 
-    async fn rollback_home_hub_activation(
+    async fn rollback_created_mapping(
         &self,
-        prepared: Option<PreparedOutboxRuntime>,
-        runtime_was_running: bool,
-        was_reachable: bool,
         mapping_created: bool,
         source_error: SyncServiceError,
     ) -> SyncServiceError {
-        if let Some(prepared) = prepared {
-            self.cancel_prepared_outbox(prepared).await;
-        }
-        let mut rollback_errors = Vec::new();
         if mapping_created {
-            if let Err(error) = self.tailscale_remove().await {
-                rollback_errors.push(error.to_string());
+            if let Err(rollback) = self.tailscale_remove().await {
+                return SyncServiceError::Rollback {
+                    source_error: source_error.to_string(),
+                    rollback_error: rollback.to_string(),
+                };
             }
         }
-        if !runtime_was_running {
-            if let Err(error) = self.stop_hub_runtime().await {
-                rollback_errors.push(error.to_string());
-            }
-        }
-        *self.hub_reachable.write().await = was_reachable;
-        if rollback_errors.is_empty() {
-            source_error
-        } else {
-            SyncServiceError::Rollback {
-                source_error: source_error.to_string(),
-                rollback_error: rollback_errors.join("; "),
-            }
-        }
+        source_error
     }
 
-    async fn stop_outbox_runtime(&self) {
-        let Some(runtime) = self.outbox_runtime.lock().await.take() else {
-            return;
-        };
-        runtime.cancellation.cancel();
-        let _ = runtime.task.await;
-    }
-
-    fn load(&self) -> Result<(SyncIdentity, SyncSettings), SyncServiceError> {
-        let conn = crate::db::open_db_at(&self.db_path)
-            .context("opening sync database")
-            .map_err(SyncServiceError::Persistence)?;
-        let identity = SyncIdentityRepository::get_or_create_device(&conn)
-            .map_err(SyncServiceError::Persistence)?;
-        let settings = SyncSettingsRepository::get(&conn).map_err(SyncServiceError::Persistence)?;
-        Ok((identity, settings))
-    }
-
-    fn load_ownership(&self) -> Result<Option<SyncServeOwnership>, SyncServiceError> {
-        let conn = crate::db::open_db_at(&self.db_path)
-            .context("opening sync database")
-            .map_err(SyncServiceError::Persistence)?;
-        SyncServeRepository::get(&conn).map_err(SyncServiceError::Persistence)
-    }
-
-    fn save_settings(&self, settings: &SyncSettings) -> Result<(), SyncServiceError> {
-        let conn = crate::db::open_db_at(&self.db_path)
-            .context("opening sync database")
-            .map_err(SyncServiceError::Persistence)?;
-        SyncSettingsRepository::save(&conn, settings).map_err(SyncServiceError::Persistence)
-    }
-
-    fn commit_home_hub(
+    async fn observe_contact(
         &self,
-        settings: &SyncSettings,
-        hub_id: audetic_core::sync::HubId,
-        owner_login: &str,
-        local_device_id: audetic_core::sync::DeviceId,
-        reset_destination: bool,
-    ) -> Result<Vec<std::path::PathBuf>, SyncServiceError> {
-        let mut conn = crate::db::open_db_at(&self.db_path)
-            .context("opening sync database")
-            .map_err(SyncServiceError::Persistence)?;
-        let transaction = conn
-            .transaction()
-            .context("starting Home Hub settings transaction")
-            .map_err(SyncServiceError::Persistence)?;
-        SyncIdentityRepository::save_hub(&transaction, hub_id, owner_login)
-            .map_err(SyncServiceError::Persistence)?;
-        SyncSettingsRepository::save(&transaction, settings)
-            .map_err(SyncServiceError::Persistence)?;
-        SyncServeRepository::save(&transaction, &expected_ownership())
-            .map_err(SyncServiceError::Persistence)?;
-        let obsolete_staged_paths = if reset_destination {
-            crate::db::sync_outbox::SyncOutboxRepository::reset_for_new_destination(
-                &transaction,
-                local_device_id,
-            )
-            .map_err(SyncServiceError::Persistence)?
-        } else {
-            Vec::new()
-        };
-        transaction
-            .commit()
-            .context("committing Home Hub settings transaction")
-            .map_err(SyncServiceError::Persistence)?;
-        Ok(obsolete_staged_paths)
-    }
-
-    fn reclaim_obsolete_staged_paths(&self, paths: &[std::path::PathBuf], activation: &str) {
-        if paths.is_empty() {
-            return;
-        }
-        match crate::db::open_db_at(&self.db_path).context("opening sync database") {
-            Ok(connection) => {
-                if let Err(error) =
-                    crate::db::sync_outbox::SyncOutboxRepository::reclaim_staged_paths(
-                        &connection,
-                        paths,
-                    )
-                {
-                    tracing::warn!(%error, %activation, "failed to reclaim obsolete Recording Payload staging after activation");
-                }
-            }
-            Err(error) => {
-                tracing::warn!(%error, %activation, "failed to open database for staging cleanup after activation");
-            }
-        }
-    }
-
-    fn commit_settings_and_ownership(
-        &self,
-        settings: &SyncSettings,
-        ownership: Option<&SyncServeOwnership>,
-        clear_ownership: bool,
+        role_epoch: u64,
+        reachable: bool,
+        error: Option<&str>,
     ) -> Result<(), SyncServiceError> {
-        let mut conn = crate::db::open_db_at(&self.db_path)
-            .context("opening sync database")
+        self.state
+            .observe_contact(role_epoch, reachable, error)
             .map_err(SyncServiceError::Persistence)?;
-        let transaction = conn
-            .transaction()
-            .context("starting sync settings transaction")
-            .map_err(SyncServiceError::Persistence)?;
-        SyncSettingsRepository::save(&transaction, settings)
-            .map_err(SyncServiceError::Persistence)?;
-        if clear_ownership {
-            SyncServeRepository::clear(&transaction).map_err(SyncServiceError::Persistence)?;
-        } else if let Some(ownership) = ownership {
-            SyncServeRepository::save(&transaction, ownership)
-                .map_err(SyncServiceError::Persistence)?;
-        }
-        transaction
-            .commit()
-            .context("committing sync settings transaction")
-            .map_err(SyncServiceError::Persistence)
+        self.runtime
+            .observe_reachability(role_epoch, reachable)
+            .await;
+        Ok(())
+    }
+
+    fn cleanup_after_commit(&self, effects: &CommitEffects, activation: &str) {
+        let cleanup = self
+            .state
+            .reclaim_obsolete_staged_paths(effects.role_epoch, &effects.obsolete_staged_paths);
+        let health = match cleanup {
+            Ok(true) => return,
+            Ok(false) => format!("{activation} cleanup skipped after a newer role activation"),
+            Err(error) => format!("{activation} cleanup failed: {error}"),
+        };
+        let _ = self.state.record_error(effects.role_epoch, Some(&health));
+        tracing::warn!(%health, %activation, "post-commit sync cleanup was incomplete");
+    }
+
+    fn load(&self) -> Result<InstallationSnapshot, SyncServiceError> {
+        self.state.load().map_err(SyncServiceError::Persistence)
     }
 
     fn ensure_running(&self) -> Result<(), SyncServiceError> {
@@ -1348,6 +1133,72 @@ impl SyncService {
         } else {
             Ok(())
         }
+    }
+}
+
+fn runtime_spec(
+    installation: &InstallationSnapshot,
+    role_epoch: u64,
+) -> Result<RuntimeSpec, SyncServiceError> {
+    match installation.settings.role {
+        SyncRole::Standalone => Ok(RuntimeSpec::Standalone { role_epoch }),
+        SyncRole::HomeHub => {
+            let hub_id = installation.identity.hub_id.ok_or_else(|| {
+                SyncServiceError::Persistence(anyhow::anyhow!(
+                    "persisted Home Hub role has no Hub ID"
+                ))
+            })?;
+            let owner_login = installation.identity.owner_login.clone().ok_or_else(|| {
+                SyncServiceError::Persistence(anyhow::anyhow!(
+                    "persisted Home Hub role has no owner login"
+                ))
+            })?;
+            runtime_spec_with_home_identity(installation, hub_id, &owner_login)
+        }
+        SyncRole::ConnectedDevice => Ok(RuntimeSpec::ConnectedDevice {
+            role_epoch,
+            hub: installation.settings.hub.clone().ok_or_else(|| {
+                SyncServiceError::Persistence(anyhow::anyhow!(
+                    "Connected Device runtime has no Home Hub"
+                ))
+            })?,
+            upload_recording_payloads: installation.settings.upload_recording_payloads,
+        }),
+    }
+}
+
+fn runtime_spec_with_home_identity(
+    installation: &InstallationSnapshot,
+    hub_id: audetic_core::sync::HubId,
+    owner_login: &str,
+) -> Result<RuntimeSpec, SyncServiceError> {
+    if installation.settings.role != SyncRole::HomeHub {
+        return Err(SyncServiceError::InvalidTransition(
+            "Home Hub runtime requires Home Hub settings".into(),
+        ));
+    }
+    Ok(RuntimeSpec::HomeHub {
+        role_epoch: installation.role_epoch,
+        hub_id,
+        owner_login: owner_login.to_owned(),
+        device_name: installation.settings.device_name.clone(),
+        upload_recording_payloads: installation.settings.upload_recording_payloads,
+    })
+}
+
+fn map_runtime_error(error: RuntimeError) -> SyncServiceError {
+    match error {
+        RuntimeError::Listener(error) => SyncServiceError::Listener(error),
+        RuntimeError::Invariant(error) => SyncServiceError::RuntimeTask(error),
+        RuntimeError::Shutdown => SyncServiceError::Shutdown,
+    }
+}
+
+fn map_state_error(error: anyhow::Error) -> SyncServiceError {
+    if let Some(error) = error.downcast_ref::<EpochMismatch>() {
+        SyncServiceError::InvalidTransition(error.to_string())
+    } else {
+        SyncServiceError::Persistence(error)
     }
 }
 
@@ -1421,6 +1272,9 @@ mod tests {
     use semver::Version;
     use std::sync::Mutex as StdMutex;
 
+    use crate::db::sync_identity::SyncIdentityRepository;
+    use crate::db::sync_serve::SyncServeRepository;
+    use crate::db::sync_settings::SyncSettingsRepository;
     use crate::sync::protocol::{
         DictationPage, MeetingPage, MeetingTitlePatch, SharedMeeting, Snapshot, SnapshotBatch,
         SnapshotBatchResponse, SnapshotDisposition, SnapshotResult,
@@ -1939,7 +1793,14 @@ mod tests {
             MappingState::OwnedByAudetic
         );
         assert!(fixture.service.hub_runtime_running().await);
-        assert!(fixture.service.outbox_runtime.lock().await.is_some());
+        assert!(
+            fixture
+                .service
+                .runtime
+                .snapshot()
+                .await
+                .outbox_worker_running
+        );
         fixture.service.shutdown().await.unwrap();
     }
 
@@ -1976,7 +1837,14 @@ mod tests {
             MappingState::Vacant
         );
         assert!(!fixture.service.hub_runtime_running().await);
-        assert!(fixture.service.outbox_runtime.lock().await.is_none());
+        assert!(
+            !fixture
+                .service
+                .runtime
+                .snapshot()
+                .await
+                .outbox_worker_running
+        );
     }
 
     #[tokio::test]
@@ -1996,8 +1864,9 @@ mod tests {
             SyncSettingsRepository::get(&conn).unwrap().role,
             SyncRole::ConnectedDevice
         );
-        assert!(fixture.service.outbox_runtime.lock().await.is_some());
-        assert!(*fixture.service.hub_reachable.read().await);
+        let runtime = fixture.service.runtime.snapshot().await;
+        assert!(runtime.outbox_worker_running);
+        assert!(runtime.hub_reachable);
         fixture.service.shutdown().await.unwrap();
     }
 
@@ -2271,7 +2140,14 @@ mod tests {
             .unwrap(),
             "synced:9"
         );
-        assert!(fixture.service.outbox_runtime.lock().await.is_some());
+        assert!(
+            fixture
+                .service
+                .runtime
+                .snapshot()
+                .await
+                .outbox_worker_running
+        );
         fixture.service.shutdown().await.unwrap();
     }
 
@@ -2508,7 +2384,14 @@ mod tests {
             SyncSettingsRepository::get(&conn).unwrap().role,
             SyncRole::ConnectedDevice
         );
-        assert!(fixture.service.outbox_runtime.lock().await.is_some());
+        assert!(
+            fixture
+                .service
+                .runtime
+                .snapshot()
+                .await
+                .outbox_worker_running
+        );
         fixture.service.shutdown().await.unwrap();
     }
 
@@ -2547,7 +2430,14 @@ mod tests {
             MappingState::OwnedByAudetic
         );
         assert!(fixture.service.hub_runtime_running().await);
-        assert!(fixture.service.outbox_runtime.lock().await.is_some());
+        assert!(
+            fixture
+                .service
+                .runtime
+                .snapshot()
+                .await
+                .outbox_worker_running
+        );
         fixture.service.shutdown().await.unwrap();
     }
 
@@ -2577,6 +2467,121 @@ mod tests {
             *fixture.tailscale.mapping.lock().unwrap(),
             MappingState::OwnedByAudetic
         );
+    }
+
+    #[tokio::test]
+    async fn runtime_shape_tracks_exactly_one_current_role() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        assert_eq!(
+            fixture.service.runtime.snapshot().await,
+            super::super::runtime::RuntimeSnapshot {
+                role: Some(SyncRole::Standalone),
+                role_epoch: Some(0),
+                ..Default::default()
+            }
+        );
+
+        fixture
+            .service
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap();
+        let home = fixture.service.runtime.snapshot().await;
+        assert_eq!(home.role, Some(SyncRole::HomeHub));
+        assert!(home.hub_listener_running);
+        assert!(home.outbox_worker_running);
+
+        fixture
+            .service
+            .configure(request(SyncRole::Standalone))
+            .await
+            .unwrap();
+        let standalone = fixture.service.runtime.snapshot().await;
+        assert_eq!(standalone.role, Some(SyncRole::Standalone));
+        assert!(!standalone.hub_listener_running);
+        assert!(!standalone.outbox_worker_running);
+
+        fixture
+            .service
+            .configure(connected_request(HubId::new()))
+            .await
+            .unwrap();
+        let connected = fixture.service.runtime.snapshot().await;
+        assert_eq!(connected.role, Some(SyncRole::ConnectedDevice));
+        assert!(!connected.hub_listener_running);
+        assert!(connected.outbox_worker_running);
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prepared_home_runtime_abort_releases_listener_without_activation() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("audetic.db");
+        crate::db::migrate_db_at(&path).unwrap();
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let tailscale = Arc::new(FakeTailscale::default());
+        let hubs = Arc::new(FakeHubs::default());
+        let service =
+            SyncService::with_dependencies(path, tailscale, test_capabilities(hubs), address);
+        let prepared = service
+            .runtime
+            .prepare(RuntimeSpec::HomeHub {
+                role_epoch: 1,
+                hub_id: HubId::new(),
+                owner_login: "owner@example.com".into(),
+                device_name: Some("Hub".into()),
+                upload_recording_payloads: false,
+            })
+            .await
+            .unwrap();
+        tokio::net::TcpStream::connect(address).await.unwrap();
+
+        prepared.abort().await;
+
+        assert_eq!(service.runtime.snapshot().await.role, None);
+        tokio::net::TcpListener::bind(address).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn status_does_not_wait_for_the_transition_mutex() {
+        let fixture = fixture();
+        let _transition = fixture.service.transition.lock().await;
+
+        let status =
+            tokio::time::timeout(std::time::Duration::from_secs(1), fixture.service.status())
+                .await
+                .expect("status should use only the short runtime inspection lock")
+                .unwrap();
+
+        assert_eq!(status.role, SyncRole::Standalone);
+    }
+
+    #[tokio::test]
+    async fn restart_reconstructs_the_current_home_hub_runtime() {
+        let fixture = fixture();
+        fixture
+            .service
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap();
+        let restarted = SyncService::with_dependencies(
+            fixture.path.clone(),
+            fixture.tailscale.clone(),
+            test_capabilities(fixture.hubs.clone()),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+
+        let status = restarted.initialize().await.unwrap();
+        let runtime = restarted.runtime.snapshot().await;
+
+        assert_eq!(status.role, SyncRole::HomeHub);
+        assert!(runtime.hub_listener_running);
+        assert!(runtime.outbox_worker_running);
+        restarted.shutdown().await.unwrap();
+        fixture.service.shutdown().await.unwrap();
     }
 
     #[test]

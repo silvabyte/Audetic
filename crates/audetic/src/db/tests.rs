@@ -103,7 +103,7 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(applied, 7);
+    assert_eq!(applied, 8);
 
     let legacy: (String, String) = conn
         .query_row(

@@ -484,16 +484,30 @@ pub async fn run_service() -> Result<()> {
     }
 
     let _ = shutdown_tx.send(true);
-    if let Err(error) = sync_service.shutdown().await {
-        warn!("Library Sync shutdown was incomplete: {error}");
-    }
-    match api_task.await {
+    let (api_result, sync_result) =
+        drain_api_before_runtime_shutdown(api_task, sync_service.shutdown()).await;
+    match api_result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!("API server stopped with an error: {error}"),
         Err(error) => warn!("API server task failed: {error}"),
     }
+    if let Err(error) = sync_result {
+        warn!("Library Sync shutdown was incomplete: {error}");
+    }
 
     Ok(())
+}
+
+async fn drain_api_before_runtime_shutdown<F, T>(
+    api_task: tokio::task::JoinHandle<Result<()>>,
+    runtime_shutdown: F,
+) -> (Result<Result<()>, tokio::task::JoinError>, T)
+where
+    F: std::future::Future<Output = T>,
+{
+    let api_result = api_task.await;
+    let runtime_result = runtime_shutdown.await;
+    (api_result, runtime_result)
 }
 
 #[cfg(unix)]
@@ -624,6 +638,32 @@ mod tests {
     use crate::audio::stream_event::{CaptureSource, StreamGeneration};
 
     use super::*;
+
+    #[tokio::test]
+    async fn runtime_shutdown_waits_for_in_flight_api_work_to_drain() {
+        let request_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release_request = Arc::new(tokio::sync::Notify::new());
+        let api_finished = Arc::clone(&request_finished);
+        let api_release = Arc::clone(&release_request);
+        let api_task = tokio::spawn(async move {
+            api_release.notified().await;
+            api_finished.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let teardown_saw_drained_api = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let teardown_observation = Arc::clone(&teardown_saw_drained_api);
+        let request_observation = Arc::clone(&request_finished);
+        let teardown = async move {
+            teardown_observation
+                .store(request_observation.load(Ordering::SeqCst), Ordering::SeqCst);
+        };
+        release_request.notify_one();
+
+        let (api_result, ()) = drain_api_before_runtime_shutdown(api_task, teardown).await;
+
+        assert!(api_result.unwrap().is_ok());
+        assert!(teardown_saw_drained_api.load(Ordering::SeqCst));
+    }
 
     struct FakeDefaultInput {
         sample_rate: u32,

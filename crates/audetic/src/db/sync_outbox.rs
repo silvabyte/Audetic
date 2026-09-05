@@ -297,12 +297,17 @@ impl SyncOutboxRepository {
 
     pub fn claim_items(
         conn: &mut Connection,
+        role_epoch: u64,
         lease_owner: &str,
         now: &str,
         lease_expires_at: &str,
         limit: usize,
     ) -> Result<Vec<OutboxItem>> {
         let tx = conn.transaction().context("starting outbox claim")?;
+        if !epoch_is_current(&tx, role_epoch)? {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
         tx.execute(
             "UPDATE sync_outbox_items
              SET state = 'pending', lease_owner = NULL, lease_expires_at = NULL,
@@ -366,12 +371,17 @@ impl SyncOutboxRepository {
 
     pub fn claim_blobs(
         conn: &mut Connection,
+        role_epoch: u64,
         lease_owner: &str,
         now: &str,
         lease_expires_at: &str,
         limit: usize,
     ) -> Result<Vec<OutboxBlob>> {
         let tx = conn.transaction().context("starting blob outbox claim")?;
+        if !epoch_is_current(&tx, role_epoch)? {
+            tx.commit()?;
+            return Ok(Vec::new());
+        }
         tx.execute(
             "UPDATE sync_outbox_blobs SET state='pending',lease_owner=NULL,lease_expires_at=NULL,
                  last_error=COALESCE(last_error,'upload interrupted; retrying'),updated_at=CURRENT_TIMESTAMP
@@ -433,6 +443,7 @@ impl SyncOutboxRepository {
 
     pub fn mark_snapshot_accepted(
         conn: &Connection,
+        role_epoch: u64,
         item: &OutboxItem,
         revision: u64,
     ) -> Result<()> {
@@ -441,73 +452,96 @@ impl SyncOutboxRepository {
                 lease_owner = NULL, lease_expires_at = NULL, next_attempt_at = NULL,
                 last_error = NULL, updated_at = CURRENT_TIMESTAMP
              WHERE record_id = ?1 AND kind = ?5 AND local_version = ?2
-                AND lease_owner = ?4",
+                 AND lease_owner = ?4
+                 AND EXISTS(SELECT 1 FROM sync_settings WHERE singleton=1 AND role_epoch=?6)",
             params![
                 item.record_id.to_string(),
                 item.local_version,
                 revision,
                 item.lease_owner,
-                kind_name(item.kind)
+                kind_name(item.kind),
+                role_epoch,
             ],
         )?;
         Ok(())
     }
 
-    pub fn mark_retry(conn: &Connection, item: &OutboxItem, next: &str, error: &str) -> Result<()> {
+    pub fn mark_retry(
+        conn: &Connection,
+        role_epoch: u64,
+        item: &OutboxItem,
+        next: &str,
+        error: &str,
+    ) -> Result<()> {
         conn.execute(
             "UPDATE sync_outbox_items SET state = 'pending', lease_owner = NULL,
                 lease_expires_at = NULL, next_attempt_at = ?4, last_error = ?5,
                 updated_at = CURRENT_TIMESTAMP
              WHERE record_id = ?1 AND kind = ?6 AND local_version = ?2
-                AND lease_owner = ?3",
+                 AND lease_owner = ?3
+                 AND EXISTS(SELECT 1 FROM sync_settings WHERE singleton=1 AND role_epoch=?7)",
             params![
                 item.record_id.to_string(),
                 item.local_version,
                 item.lease_owner,
                 next,
                 error,
-                kind_name(item.kind)
+                kind_name(item.kind),
+                role_epoch,
             ],
         )?;
         Ok(())
     }
 
-    pub fn mark_needs_attention(conn: &Connection, item: &OutboxItem, error: &str) -> Result<()> {
+    pub fn mark_needs_attention(
+        conn: &Connection,
+        role_epoch: u64,
+        item: &OutboxItem,
+        error: &str,
+    ) -> Result<()> {
         conn.execute(
             "UPDATE sync_outbox_items SET state = 'needs_attention', lease_owner = NULL,
                  lease_expires_at = NULL, next_attempt_at = NULL, last_error = ?4,
                  updated_at = CURRENT_TIMESTAMP
              WHERE record_id = ?1 AND kind = ?5 AND local_version = ?2
-                AND lease_owner = ?3",
+                 AND lease_owner = ?3
+                 AND EXISTS(SELECT 1 FROM sync_settings WHERE singleton=1 AND role_epoch=?6)",
             params![
                 item.record_id.to_string(),
                 item.local_version,
                 item.lease_owner,
                 error,
-                kind_name(item.kind)
+                kind_name(item.kind),
+                role_epoch,
             ],
         )?;
         Ok(())
     }
 
-    pub fn mark_blob_accepted(conn: &Connection, blob: &OutboxBlob) -> Result<()> {
-        conn.execute(
+    pub fn mark_blob_accepted(conn: &Connection, role_epoch: u64, blob: &OutboxBlob) -> Result<()> {
+        let changed = conn.execute(
             "UPDATE sync_outbox_blobs SET state='synced',availability='available',lease_owner=NULL,
                  lease_expires_at=NULL,next_attempt_at=NULL,last_error=NULL,staged_path=NULL,
                  updated_at=CURRENT_TIMESTAMP
-             WHERE record_id=?1 AND kind=?2 AND checksum=?3 AND lease_owner=?4",
+              WHERE record_id=?1 AND kind=?2 AND checksum=?3 AND lease_owner=?4
+                AND EXISTS(SELECT 1 FROM sync_settings WHERE singleton=1 AND role_epoch=?5)",
             params![
                 blob.record_id.to_string(),
                 kind_name(blob.kind),
                 blob.checksum,
-                blob.lease_owner
+                blob.lease_owner,
+                role_epoch,
             ],
         )?;
-        Self::reclaim_staged_paths(conn, std::slice::from_ref(&blob.staged_path))
+        if changed == 1 {
+            Self::reclaim_staged_paths(conn, std::slice::from_ref(&blob.staged_path))?;
+        }
+        Ok(())
     }
 
     pub fn mark_blob_retry(
         conn: &Connection,
+        role_epoch: u64,
         blob: &OutboxBlob,
         next: &str,
         error: &str,
@@ -515,14 +549,16 @@ impl SyncOutboxRepository {
         conn.execute(
             "UPDATE sync_outbox_blobs SET state='pending',lease_owner=NULL,lease_expires_at=NULL,
                  next_attempt_at=?5,last_error=?6,updated_at=CURRENT_TIMESTAMP
-             WHERE record_id=?1 AND kind=?2 AND checksum=?3 AND lease_owner=?4",
+              WHERE record_id=?1 AND kind=?2 AND checksum=?3 AND lease_owner=?4
+                AND EXISTS(SELECT 1 FROM sync_settings WHERE singleton=1 AND role_epoch=?7)",
             params![
                 blob.record_id.to_string(),
                 kind_name(blob.kind),
                 blob.checksum,
                 blob.lease_owner,
                 next,
-                error
+                error,
+                role_epoch,
             ],
         )?;
         Ok(())
@@ -530,6 +566,7 @@ impl SyncOutboxRepository {
 
     pub fn mark_blob_needs_attention(
         conn: &Connection,
+        role_epoch: u64,
         blob: &OutboxBlob,
         error: &str,
     ) -> Result<()> {
@@ -537,13 +574,15 @@ impl SyncOutboxRepository {
             "UPDATE sync_outbox_blobs SET state='needs_attention',availability='needs_attention',
                  lease_owner=NULL,lease_expires_at=NULL,next_attempt_at=NULL,last_error=?5,
                  updated_at=CURRENT_TIMESTAMP
-             WHERE record_id=?1 AND kind=?2 AND checksum=?3 AND lease_owner=?4",
+              WHERE record_id=?1 AND kind=?2 AND checksum=?3 AND lease_owner=?4
+                AND EXISTS(SELECT 1 FROM sync_settings WHERE singleton=1 AND role_epoch=?6)",
             params![
                 blob.record_id.to_string(),
                 kind_name(blob.kind),
                 blob.checksum,
                 blob.lease_owner,
-                error
+                error,
+                role_epoch,
             ],
         )?;
         Ok(())
@@ -615,6 +654,30 @@ impl SyncOutboxRepository {
         }
         let db_path = crate::db::operations::database_path(conn)?;
         let _staging_lock = crate::sync::payload::lock_staging_for_db(&db_path)?;
+        Self::reclaim_staged_paths_locked(conn, paths)
+    }
+
+    pub(crate) fn reclaim_staged_paths_for_epoch(
+        conn: &Connection,
+        role_epoch: u64,
+        paths: &[std::path::PathBuf],
+    ) -> Result<bool> {
+        if paths.is_empty() {
+            return Ok(true);
+        }
+        let db_path = crate::db::operations::database_path(conn)?;
+        let _staging_lock = crate::sync::payload::lock_staging_for_db(&db_path)?;
+        let transaction = conn.unchecked_transaction()?;
+        if !epoch_is_current(&transaction, role_epoch)? {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        Self::reclaim_staged_paths_locked(&transaction, paths)?;
+        transaction.commit()?;
+        Ok(true)
+    }
+
+    fn reclaim_staged_paths_locked(conn: &Connection, paths: &[std::path::PathBuf]) -> Result<()> {
         let mut unique = std::collections::BTreeSet::new();
         for path in paths {
             if !unique.insert(path) {
@@ -639,19 +702,25 @@ impl SyncOutboxRepository {
         Ok(())
     }
 
-    pub fn release_worker_leases(conn: &Connection, worker_id: &str) -> Result<()> {
+    pub fn release_worker_leases(
+        conn: &Connection,
+        role_epoch: u64,
+        worker_id: &str,
+    ) -> Result<()> {
         let transaction = conn.unchecked_transaction()?;
         transaction.execute(
             "UPDATE sync_outbox_items SET state='pending',lease_owner=NULL,lease_expires_at=NULL,
                  next_attempt_at=NULL,last_error=COALESCE(last_error,'upload cancelled'),
-                 updated_at=CURRENT_TIMESTAMP WHERE state='uploading' AND lease_owner=?1",
-            [worker_id],
+                  updated_at=CURRENT_TIMESTAMP WHERE state='uploading' AND lease_owner=?1
+                  AND EXISTS(SELECT 1 FROM sync_settings WHERE singleton=1 AND role_epoch=?2)",
+            rusqlite::params![worker_id, role_epoch],
         )?;
         transaction.execute(
             "UPDATE sync_outbox_blobs SET state='pending',lease_owner=NULL,lease_expires_at=NULL,
                  next_attempt_at=NULL,last_error=COALESCE(last_error,'upload cancelled'),
-                 updated_at=CURRENT_TIMESTAMP WHERE state='uploading' AND lease_owner=?1",
-            [worker_id],
+                  updated_at=CURRENT_TIMESTAMP WHERE state='uploading' AND lease_owner=?1
+                  AND EXISTS(SELECT 1 FROM sync_settings WHERE singleton=1 AND role_epoch=?2)",
+            rusqlite::params![worker_id, role_epoch],
         )?;
         transaction.commit()?;
         Ok(())
@@ -793,6 +862,20 @@ impl SyncOutboxRepository {
     }
 }
 
+fn epoch_is_current(conn: &Connection, role_epoch: u64) -> Result<bool> {
+    conn.execute(
+        "INSERT OR IGNORE INTO sync_settings(singleton) VALUES(1)",
+        [],
+    )
+    .context("materializing sync state for outbox epoch check")?;
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sync_settings WHERE singleton=1 AND role_epoch=?1)",
+        [role_epoch],
+        |row| row.get(0),
+    )
+    .context("checking outbox worker role epoch")
+}
+
 fn same_snapshot_except_recording_payload(left: &Snapshot, right: &Snapshot) -> Result<bool> {
     let mut left = left.clone();
     let mut right = right.clone();
@@ -877,6 +960,7 @@ mod tests {
         tx.commit().unwrap();
         let first = SyncOutboxRepository::claim_items(
             &mut conn,
+            0,
             "worker-one",
             "2026-09-04T10:00:00Z",
             "2026-09-04T10:00:01Z",
@@ -886,6 +970,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         let recovered = SyncOutboxRepository::claim_items(
             &mut conn,
+            0,
             "worker-two",
             "2026-09-04T10:00:02Z",
             "2026-09-04T10:00:32Z",
@@ -966,6 +1051,7 @@ mod tests {
         tx.commit().unwrap();
         let claimed = SyncOutboxRepository::claim_items(
             &mut conn,
+            0,
             "old-worker",
             "2026-09-04T10:00:00Z",
             "2026-09-04T10:00:30Z",
@@ -978,10 +1064,10 @@ mod tests {
         let tx = conn.transaction().unwrap();
         SyncOutboxRepository::enqueue_snapshot(&tx, &second.into()).unwrap();
         tx.commit().unwrap();
-        SyncOutboxRepository::mark_snapshot_accepted(&conn, &claimed, 1).unwrap();
-        SyncOutboxRepository::mark_retry(&conn, &claimed, "2026-09-04T11:00:00Z", "stale retry")
+        SyncOutboxRepository::mark_snapshot_accepted(&conn, 0, &claimed, 1).unwrap();
+        SyncOutboxRepository::mark_retry(&conn, 0, &claimed, "2026-09-04T11:00:00Z", "stale retry")
             .unwrap();
-        SyncOutboxRepository::mark_needs_attention(&conn, &claimed, "stale rejection").unwrap();
+        SyncOutboxRepository::mark_needs_attention(&conn, 0, &claimed, "stale rejection").unwrap();
 
         let stored: (u64, String, Option<String>, Option<String>) = conn
             .query_row(
@@ -994,6 +1080,50 @@ mod tests {
     }
 
     #[test]
+    fn stale_role_epoch_cannot_claim_or_commit_worker_progress() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let item = snapshot(RecordId::new(), 1, "old authority");
+        SyncOutboxRepository::enqueue_snapshot(&conn, &item.into()).unwrap();
+        let claimed = SyncOutboxRepository::claim_items(
+            &mut conn,
+            0,
+            "old-worker",
+            "2026-09-04T10:00:00Z",
+            "2026-09-04T10:00:30Z",
+            1,
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+        conn.execute("UPDATE sync_settings SET role_epoch=1", [])
+            .unwrap();
+
+        SyncOutboxRepository::mark_snapshot_accepted(&conn, 0, &claimed, 99).unwrap();
+        assert!(SyncOutboxRepository::claim_items(
+            &mut conn,
+            0,
+            "another-old-worker",
+            "2026-09-04T11:00:00Z",
+            "2026-09-04T11:00:30Z",
+            1,
+        )
+        .unwrap()
+        .is_empty());
+        let stored: (String, Option<u64>, Option<String>) = conn
+            .query_row(
+                "SELECT state,accepted_hub_revision,lease_owner FROM sync_outbox_items",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            stored,
+            ("uploading".into(), None, Some("old-worker".into()))
+        );
+    }
+
+    #[test]
     fn identical_same_version_enqueue_preserves_an_active_lease() {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::db::migrate(&conn).unwrap();
@@ -1003,6 +1133,7 @@ mod tests {
         tx.commit().unwrap();
         SyncOutboxRepository::claim_items(
             &mut conn,
+            0,
             "worker",
             "2026-09-04T10:00:00Z",
             "2026-09-04T10:00:30Z",
@@ -1038,6 +1169,7 @@ mod tests {
 
         let claimed = SyncOutboxRepository::claim_items(
             &mut conn,
+            0,
             "worker",
             "2026-09-04T10:00:00Z",
             "2026-09-04T10:00:30Z",
@@ -1053,8 +1185,14 @@ mod tests {
         )
         .unwrap());
 
-        SyncOutboxRepository::mark_retry(&conn, &claimed, "2026-09-04T11:00:00Z", "response lost")
-            .unwrap();
+        SyncOutboxRepository::mark_retry(
+            &conn,
+            0,
+            &claimed,
+            "2026-09-04T11:00:00Z",
+            "response lost",
+        )
+        .unwrap();
         assert!(SyncOutboxRepository::may_have_reached_hub(
             &conn,
             item.record_id,
@@ -1090,6 +1228,7 @@ mod tests {
 
         let first = SyncOutboxRepository::claim_blobs(
             &mut conn,
+            0,
             "one",
             "2026-09-04T10:00:00Z",
             "2026-09-04T10:00:01Z",
@@ -1099,6 +1238,7 @@ mod tests {
         assert_eq!(first.len(), 1);
         let recovered = SyncOutboxRepository::claim_blobs(
             &mut conn,
+            0,
             "two",
             "2026-09-04T10:00:02Z",
             "2026-09-04T10:00:32Z",
@@ -1139,6 +1279,7 @@ mod tests {
             .unwrap();
         let claimed = SyncOutboxRepository::claim_blobs(
             &mut conn,
+            0,
             "worker",
             "2026-09-04T10:00:00Z",
             "2026-09-04T10:00:30Z",
@@ -1146,9 +1287,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(claimed.len(), 2);
-        SyncOutboxRepository::mark_blob_accepted(&conn, &claimed[0]).unwrap();
+        SyncOutboxRepository::mark_blob_accepted(&conn, 0, &claimed[0]).unwrap();
         assert!(path.exists());
-        SyncOutboxRepository::mark_blob_accepted(&conn, &claimed[1]).unwrap();
+        SyncOutboxRepository::mark_blob_accepted(&conn, 0, &claimed[1]).unwrap();
         assert!(!path.exists());
     }
 

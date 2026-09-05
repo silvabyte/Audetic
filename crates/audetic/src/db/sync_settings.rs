@@ -162,6 +162,84 @@ impl SyncSettingsRepository {
         .context("Failed to persist sync settings")?;
         Ok(())
     }
+
+    pub(crate) fn role_epoch(conn: &Connection) -> Result<u64> {
+        Self::get(conn)?;
+        let epoch = conn
+            .query_row(
+                "SELECT role_epoch FROM sync_settings WHERE singleton = 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("Failed to read sync role epoch")?;
+        to_u64(epoch, "role_epoch")
+    }
+
+    pub(crate) fn compare_and_increment_role_epoch(
+        conn: &Connection,
+        expected_epoch: u64,
+    ) -> Result<Option<u64>> {
+        let expected = i64::try_from(expected_epoch)
+            .context("Expected sync role epoch exceeds SQLite integer range")?;
+        let next = expected
+            .checked_add(1)
+            .context("Sync role epoch is exhausted")?;
+        let changed = conn
+            .execute(
+                "UPDATE sync_settings
+                 SET role_epoch = ?2, updated_at = CURRENT_TIMESTAMP
+                 WHERE singleton = 1 AND role_epoch = ?1",
+                rusqlite::params![expected, next],
+            )
+            .context("Failed to compare and increment sync role epoch")?;
+        Ok((changed == 1).then_some(next as u64))
+    }
+
+    pub(crate) fn record_contact(
+        conn: &Connection,
+        expected_epoch: u64,
+        contacted_at: &str,
+    ) -> Result<bool> {
+        let epoch = i64::try_from(expected_epoch)
+            .context("Expected sync role epoch exceeds SQLite integer range")?;
+        conn.execute(
+            "UPDATE sync_settings
+             SET last_contact_at = ?2, last_error = NULL,
+                 updated_at = CURRENT_TIMESTAMP
+             WHERE singleton = 1 AND role_epoch = ?1",
+            rusqlite::params![epoch, contacted_at],
+        )
+        .map(|changed| changed == 1)
+        .context("Failed to record sync contact")
+    }
+
+    pub(crate) fn record_error(
+        conn: &Connection,
+        expected_epoch: u64,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let epoch = i64::try_from(expected_epoch)
+            .context("Expected sync role epoch exceeds SQLite integer range")?;
+        conn.execute(
+            "UPDATE sync_settings
+             SET last_error = ?2, updated_at = CURRENT_TIMESTAMP
+             WHERE singleton = 1 AND role_epoch = ?1",
+            rusqlite::params![epoch, error],
+        )
+        .map(|changed| changed == 1)
+        .context("Failed to record sync error")
+    }
+
+    pub(crate) fn update_payload_policy(conn: &Connection, enabled: bool) -> Result<()> {
+        conn.execute(
+            "UPDATE sync_settings
+             SET upload_recording_payloads = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE singleton = 1",
+            [enabled],
+        )
+        .context("Failed to update Recording Payload policy")?;
+        Ok(())
+    }
 }
 
 fn validate(settings: &SyncSettings) -> Result<()> {
