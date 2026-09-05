@@ -5,7 +5,7 @@ use std::io;
 use std::process::Command;
 
 use super::identity::{parse_stored_tailscale_login, LoginParseError};
-use super::protocol::{HUB_API_MOUNT_PATH, HUB_LOOPBACK_BASE_URL, TAILSCALE_HTTPS_PORT};
+use super::protocol::ServeSpec;
 
 pub const MINIMUM_TAILSCALE_VERSION: &str = "1.52.0";
 
@@ -43,10 +43,7 @@ pub struct TailscalePeer {
 
 impl TailscalePeer {
     pub fn audetic_base_url(&self) -> String {
-        format!(
-            "https://{}:{TAILSCALE_HTTPS_PORT}{HUB_API_MOUNT_PATH}",
-            self.dns_name.trim_end_matches('.')
-        )
+        ServeSpec::audetic().base_url(&self.dns_name)
     }
 }
 
@@ -106,9 +103,9 @@ pub enum TailscaleError {
     TaggedDevice,
     #[error("invalid Tailscale owner login: {0}")]
     InvalidOwnerLogin(#[from] LoginParseError),
-    #[error("Tailscale port {TAILSCALE_HTTPS_PORT} already has a non-Audetic Serve mapping")]
+    #[error("the Audetic Tailscale Serve port already has a non-Audetic Serve mapping")]
     ServeCollision,
-    #[error("Tailscale Funnel is enabled on port {TAILSCALE_HTTPS_PORT}")]
+    #[error("Tailscale Funnel is enabled on the Audetic Serve port")]
     FunnelEnabled,
 }
 
@@ -127,11 +124,12 @@ impl<R: CommandRunner> Tailscale<R> {
     }
 
     pub fn serve_assessment(&self) -> Result<ServeAssessment, TailscaleError> {
+        let spec = ServeSpec::audetic();
         let serve = self.run_json(&["serve", "status", "--json"])?;
         let funnel = self.run_json(&["funnel", "status", "--json"])?;
         Ok(ServeAssessment {
-            mapping: mapping_state(&serve),
-            funnel_enabled: funnel_enabled_on_port(&funnel, TAILSCALE_HTTPS_PORT),
+            mapping: mapping_state(&serve, spec),
+            funnel_enabled: funnel_enabled_on_port(&funnel, spec.https_port()),
         })
     }
 
@@ -147,7 +145,7 @@ impl<R: CommandRunner> Tailscale<R> {
             return Err(TailscaleError::FunnelEnabled);
         }
 
-        self.run_checked(&serve_apply_arguments())?;
+        self.run_checked_owned(&ServeSpec::audetic().apply_arguments())?;
         Ok(true)
     }
 
@@ -156,12 +154,15 @@ impl<R: CommandRunner> Tailscale<R> {
         if assessment.mapping != MappingState::OwnedByAudetic {
             return Ok(false);
         }
-        self.run_checked(&serve_remove_arguments())?;
+        self.run_checked_owned(&ServeSpec::audetic().remove_arguments())?;
         Ok(true)
     }
 
     pub fn serve_preview(&self) -> String {
-        format!("tailscale {}", serve_apply_arguments().join(" "))
+        format!(
+            "tailscale {}",
+            ServeSpec::audetic().apply_arguments().join(" ")
+        )
     }
 
     fn run_json(&self, arguments: &[&str]) -> Result<Value, TailscaleError> {
@@ -184,6 +185,11 @@ impl<R: CommandRunner> Tailscale<R> {
             });
         }
         Ok(output.stdout)
+    }
+
+    fn run_checked_owned(&self, arguments: &[String]) -> Result<Vec<u8>, TailscaleError> {
+        let arguments = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+        self.run_checked(&arguments)
     }
 }
 
@@ -218,25 +224,14 @@ impl<R: CommandRunner> TailscaleControl for Tailscale<R> {
     }
 }
 
-fn serve_apply_arguments() -> [&'static str; 5] {
-    [
-        "serve",
-        "--bg",
-        "--https=8443",
-        "--set-path=/audetic",
-        HUB_LOOPBACK_BASE_URL,
-    ]
-}
-
-fn serve_remove_arguments() -> [&'static str; 4] {
-    ["serve", "--https=8443", "--set-path=/audetic", "off"]
-}
-
 /// Exact, path-scoped recovery command printed when uninstall cannot execute
 /// Tailscale. This deliberately never suggests `tailscale serve reset`, which
 /// would destroy mappings owned by other applications.
 pub(crate) fn audetic_serve_cleanup_command() -> String {
-    format!("tailscale {}", serve_remove_arguments().join(" "))
+    format!(
+        "tailscale {}",
+        ServeSpec::audetic().remove_arguments().join(" ")
+    )
 }
 
 fn parse_status(value: &Value) -> Result<TailscaleStatus, TailscaleError> {
@@ -319,9 +314,9 @@ fn has_tags(tags: Option<&Value>) -> bool {
         .is_some_and(|tags| !tags.is_empty())
 }
 
-fn mapping_state(config: &Value) -> MappingState {
+fn mapping_state(config: &Value, spec: ServeSpec) -> MappingState {
     let Some(web) = config.get("Web").and_then(Value::as_object) else {
-        return if port_has_mapping(config, TAILSCALE_HTTPS_PORT) {
+        return if port_has_mapping(config, spec.https_port()) {
             MappingState::Collision
         } else {
             MappingState::Vacant
@@ -330,24 +325,24 @@ fn mapping_state(config: &Value) -> MappingState {
 
     let on_port: Vec<_> = web
         .iter()
-        .filter(|(endpoint, _)| endpoint_uses_port(endpoint, TAILSCALE_HTTPS_PORT))
+        .filter(|(endpoint, _)| endpoint_uses_port(endpoint, spec.https_port()))
         .collect();
     if on_port.is_empty() {
-        return if tcp_has_port(config, TAILSCALE_HTTPS_PORT) {
+        return if tcp_has_port(config, spec.https_port()) {
             MappingState::Collision
         } else {
             MappingState::Vacant
         };
     }
 
-    if on_port.len() == 1 && is_exact_audetic_mapping(on_port[0].1) {
+    if on_port.len() == 1 && is_exact_audetic_mapping(on_port[0].1, spec) {
         MappingState::OwnedByAudetic
     } else {
         MappingState::Collision
     }
 }
 
-fn is_exact_audetic_mapping(server: &Value) -> bool {
+fn is_exact_audetic_mapping(server: &Value, spec: ServeSpec) -> bool {
     let Some(handlers) = server.get("Handlers").and_then(Value::as_object) else {
         return false;
     };
@@ -355,11 +350,11 @@ fn is_exact_audetic_mapping(server: &Value) -> bool {
         return false;
     }
     handlers
-        .get("/audetic")
-        .or_else(|| handlers.get("/audetic/"))
+        .get(spec.mount_path())
+        .or_else(|| handlers.get(&format!("{}/", spec.mount_path())))
         .and_then(|handler| handler.get("Proxy"))
         .and_then(Value::as_str)
-        == Some(HUB_LOOPBACK_BASE_URL)
+        == Some(spec.proxy_url())
 }
 
 fn port_has_mapping(config: &Value, port: u16) -> bool {

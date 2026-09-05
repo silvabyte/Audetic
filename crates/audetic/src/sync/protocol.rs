@@ -4,9 +4,9 @@ use utoipa::ToSchema;
 
 pub const HUB_LISTENER_PORT: u16 = 3738;
 pub const HUB_LISTENER_ADDRESS: &str = "127.0.0.1:3738";
-pub const HUB_LOOPBACK_BASE_URL: &str = "http://127.0.0.1:3738";
-pub const TAILSCALE_HTTPS_PORT: u16 = 8443;
-pub const HUB_API_MOUNT_PATH: &str = "/audetic/";
+pub const HUB_LOOPBACK_BASE_URL: &str = ServeSpec::AUDETIC.proxy_url;
+pub const TAILSCALE_HTTPS_PORT: u16 = ServeSpec::AUDETIC.https_port;
+pub const HUB_API_MOUNT_PATH: &str = ServeSpec::AUDETIC.api_mount_path;
 pub const HUB_INFO_ROUTE: &str = "/v1/info";
 pub const HUB_INFO_PATH: &str = "v1/info";
 pub const HUB_SNAPSHOTS_ROUTE: &str = "/v1/snapshots";
@@ -29,6 +29,68 @@ pub const MIN_PROTOCOL_VERSION: u16 = 1;
 pub const HUB_ID_HEADER: &str = "x-audetic-hub-id";
 pub const PROTOCOL_VERSION_HEADER: &str = "x-audetic-protocol-version";
 pub const TAILSCALE_FUNNEL_REQUEST_HEADER: &str = "tailscale-funnel-request";
+
+/// Audetic's exact path-scoped Tailscale Serve contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ServeSpec {
+    https_port: u16,
+    mount_path: &'static str,
+    api_mount_path: &'static str,
+    proxy_url: &'static str,
+}
+
+impl ServeSpec {
+    const AUDETIC: Self = Self {
+        https_port: 8443,
+        mount_path: "/audetic",
+        api_mount_path: "/audetic/",
+        proxy_url: "http://127.0.0.1:3738",
+    };
+
+    pub(super) const fn audetic() -> Self {
+        Self::AUDETIC
+    }
+
+    pub(super) const fn https_port(self) -> u16 {
+        self.https_port
+    }
+
+    pub(super) const fn mount_path(self) -> &'static str {
+        self.mount_path
+    }
+
+    pub(super) const fn proxy_url(self) -> &'static str {
+        self.proxy_url
+    }
+
+    pub(super) fn base_url(self, dns_name: &str) -> String {
+        format!(
+            "https://{}:{}{}",
+            dns_name.trim_end_matches('.'),
+            self.https_port,
+            self.api_mount_path
+        )
+    }
+
+    pub(super) fn apply_arguments(self) -> Vec<String> {
+        vec![
+            "serve".into(),
+            "--bg".into(),
+            format!("--https={}", self.https_port),
+            format!("--set-path={}", self.mount_path),
+            self.proxy_url.into(),
+        ]
+    }
+
+    pub(super) fn remove_arguments(self) -> Vec<String> {
+        vec![
+            "serve".into(),
+            format!("--https={}", self.https_port),
+            format!("--set-path={}", self.mount_path),
+            "off".into(),
+        ]
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]

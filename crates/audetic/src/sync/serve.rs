@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use crate::db::sync_serve::SyncServeOwnership;
 
-use super::protocol::{HUB_API_MOUNT_PATH, HUB_LOOPBACK_BASE_URL, TAILSCALE_HTTPS_PORT};
+use super::protocol::ServeSpec;
 use super::tailscale::{MappingState, TailscaleControl, TailscaleError, TailscaleStatus};
 
 #[derive(Debug, Error)]
@@ -54,6 +54,7 @@ pub struct NetworkDiscovery {
 pub struct HomeHubNetwork {
     dns_name: String,
     owner_login: String,
+    serve: ServeSpec,
 }
 
 impl HomeHubNetwork {
@@ -63,10 +64,7 @@ impl HomeHubNetwork {
 
     pub fn connection(&self, hub_id: HubId) -> HubConnection {
         HubConnection {
-            base_url: format!(
-                "https://{}:{TAILSCALE_HTTPS_PORT}{HUB_API_MOUNT_PATH}",
-                self.dns_name
-            ),
+            base_url: self.serve.base_url(&self.dns_name),
             hub_id,
             owner_login: self.owner_login.clone(),
         }
@@ -86,11 +84,15 @@ pub struct RemovedServe {
 #[derive(Clone)]
 pub struct ServeManager {
     tailscale: Arc<dyn TailscaleControl>,
+    spec: ServeSpec,
 }
 
 impl ServeManager {
     pub fn new(tailscale: Arc<dyn TailscaleControl>) -> Self {
-        Self { tailscale }
+        Self {
+            tailscale,
+            spec: ServeSpec::audetic(),
+        }
     }
 
     pub fn preview(&self) -> String {
@@ -111,7 +113,7 @@ impl ServeManager {
         require_running(&status)?;
         let candidate_base_urls = status
             .discoverable_peers()
-            .map(|peer| peer.audetic_base_url())
+            .map(|peer| self.spec.base_url(&peer.dns_name))
             .collect();
         Ok(NetworkDiscovery {
             owner_login: status.owner_login,
@@ -132,6 +134,7 @@ impl ServeManager {
         Ok(HomeHubNetwork {
             dns_name: status.self_dns_name.trim_end_matches('.').to_owned(),
             owner_login: status.owner_login,
+            serve: self.spec,
         })
     }
 
@@ -279,10 +282,11 @@ impl ServeManager {
 }
 
 pub fn expected_ownership() -> SyncServeOwnership {
+    let spec = ServeSpec::audetic();
     SyncServeOwnership {
-        https_port: TAILSCALE_HTTPS_PORT,
-        mount_path: HUB_API_MOUNT_PATH.trim_end_matches('/').to_owned(),
-        proxy_url: HUB_LOOPBACK_BASE_URL.to_owned(),
+        https_port: spec.https_port(),
+        mount_path: spec.mount_path().into(),
+        proxy_url: spec.proxy_url().into(),
     }
 }
 
