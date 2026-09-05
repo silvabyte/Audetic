@@ -16,9 +16,12 @@ pub const HUB_MEETINGS_PATH: &str = "v1/meetings";
 pub const HUB_ARTIFACTS_ROUTE: &str = "/v1/artifacts";
 pub const HUB_BLOBS_ROUTE: &str = "/v1/blobs/:sha256";
 pub const HUB_BLOBS_PATH: &str = "v1/blobs";
+pub const HUB_CHANGES_ROUTE: &str = "/v1/changes";
+pub const HUB_CHANGES_PATH: &str = "v1/changes";
 pub const MAX_SNAPSHOT_BATCH: usize = 25;
 pub const MAX_DICTATION_PAGE: usize = 100;
 pub const MAX_MEETING_PAGE: usize = 100;
+pub const MAX_CHANGE_PAGE: usize = 250;
 pub const MAX_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub const PROTOCOL_VERSION: u16 = 1;
@@ -421,6 +424,51 @@ pub enum ChangeOperation {
     PayloadAvailability,
 }
 
+/// An exact committed position in the authoritative change feed.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize, ToSchema,
+)]
+#[serde(transparent)]
+#[schema(value_type = u64)]
+pub struct ChangeCursor(u64);
+
+impl ChangeCursor {
+    pub const ZERO: Self = Self(0);
+
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn value(self) -> u64 {
+        self.0
+    }
+
+    pub const fn checked_next(self) -> Option<Self> {
+        match self.0.checked_add(1) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+}
+
+/// Immutable upper bound advertised for one feed traversal.
+#[derive(
+    Clone, Copy, Debug, Default, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize, ToSchema,
+)]
+#[serde(transparent)]
+#[schema(value_type = u64)]
+pub struct ChangeTarget(ChangeCursor);
+
+impl ChangeTarget {
+    pub const fn new(cursor: ChangeCursor) -> Self {
+        Self(cursor)
+    }
+
+    pub const fn cursor(self) -> ChangeCursor {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
 pub struct ChangeEnvelope {
     pub cursor: Option<u64>,
@@ -431,6 +479,34 @@ pub struct ChangeEnvelope {
     pub authoritative_revision: u64,
     pub snapshot: Option<Snapshot>,
     pub changed_at: String,
+}
+
+/// One self-contained authoritative revision at an exact feed cursor.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct ChangeRecord {
+    pub cursor: ChangeCursor,
+    pub operation: ChangeOperation,
+    pub kind: RecordKind,
+    pub record_id: RecordId,
+    pub origin_device_id: Option<DeviceId>,
+    pub authoritative_revision: u64,
+    pub snapshot: Option<Snapshot>,
+    pub changed_at: String,
+}
+
+/// A stable page bounded by the immutable target advertised on the first page.
+///
+/// Every record satisfies `after_cursor < cursor <= target_cursor`. A traversal
+/// is complete only when `through_cursor == target_cursor` and no eligible
+/// records remain. An empty feed is represented by all three cursors being
+/// zero, `complete = true`, and no changes.
+#[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
+pub struct ChangePage {
+    pub target_cursor: ChangeTarget,
+    pub after_cursor: ChangeCursor,
+    pub through_cursor: ChangeCursor,
+    pub complete: bool,
+    pub changes: Vec<ChangeRecord>,
 }
 
 impl ChangeEnvelope {

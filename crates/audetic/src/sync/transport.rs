@@ -10,8 +10,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::protocol::{
-    DictationPage, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting, SnapshotBatch,
-    SnapshotBatchResponse,
+    ChangeCursor, ChangePage, ChangeTarget, DictationPage, MeetingPage, MeetingTitlePatch,
+    RecordKind, SharedMeeting, SnapshotBatch, SnapshotBatchResponse,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -205,6 +205,18 @@ pub trait RemotePayloadSource: Send + Sync {
         kind: RecordKind,
         range: Option<&str>,
     ) -> Result<StreamingPayloadResponse, HubTransferError>;
+}
+
+/// Narrow capability for traversing one immutable authoritative change target.
+#[async_trait]
+pub trait HubChangeSource: Send + Sync {
+    async fn page_changes(
+        &self,
+        hub: &HubConnection,
+        after: ChangeCursor,
+        target: Option<ChangeTarget>,
+        limit: usize,
+    ) -> Result<ChangePage, HubTransferError>;
 }
 
 /// Capabilities derived from one adapter instance.

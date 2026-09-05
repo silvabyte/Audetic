@@ -103,7 +103,17 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
             row.get(0)
         })
         .unwrap();
-    assert_eq!(applied, 8);
+    assert_eq!(applied, 9);
+    let seeded_changes: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_library_change_feed_v1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Operational legacy rows are not authoritative Shared Library rows until
+    // the later Home Hub activation backfill publishes them.
+    assert_eq!(seeded_changes, 0);
 
     let legacy: (String, String) = conn
         .query_row(
@@ -172,8 +182,21 @@ fn populated_v7_database_migrates_to_zero_role_epoch_without_data_loss() {
         ),
     )
     .unwrap();
-    conn.execute("DELETE FROM schema_migrations WHERE version=8", [])
+    conn.execute("DELETE FROM schema_migrations WHERE version>=8", [])
         .unwrap();
+    conn.execute_batch(
+        "DROP TABLE library_cache_live_pages;
+         DROP TABLE library_cache_live_overlay;
+         DROP TABLE library_cache_blob_refs;
+         DROP TABLE library_cache_blobs;
+         DROP TABLE library_cache_applied_pages;
+         DROP TABLE library_cache_tombstones;
+         DROP TABLE library_cache_items;
+         DROP TABLE library_cache_generations;
+         DROP TABLE library_cache_sources;
+         DROP TABLE shared_library_change_feed_v1;",
+    )
+    .unwrap();
     conn.execute("ALTER TABLE sync_settings DROP COLUMN role_epoch", [])
         .unwrap();
     let version: i64 = conn

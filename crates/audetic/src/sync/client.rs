@@ -14,15 +14,17 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use super::protocol::{
-    hub_blob_path, hub_payload_path, DictationPage, HubApiError, HubInfo, MeetingPage,
-    MeetingTitlePatch, RecordKind, ServeSpec, SharedMeeting, SnapshotBatch, SnapshotBatchResponse,
-    HUB_DICTATIONS_PATH, HUB_ID_HEADER, HUB_INFO_PATH, HUB_MEETINGS_PATH, HUB_SNAPSHOTS_PATH,
-    MAX_BLOB_BYTES, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    hub_blob_path, hub_payload_path, ChangeCursor, ChangePage, ChangeTarget, DictationPage,
+    HubApiError, HubInfo, MeetingPage, MeetingTitlePatch, RecordKind, ServeSpec, SharedMeeting,
+    SnapshotBatch, SnapshotBatchResponse, HUB_CHANGES_PATH, HUB_DICTATIONS_PATH, HUB_ID_HEADER,
+    HUB_INFO_PATH, HUB_MEETINGS_PATH, HUB_SNAPSHOTS_PATH, MAX_BLOB_BYTES, PROTOCOL_VERSION,
+    PROTOCOL_VERSION_HEADER,
 };
 use super::transport::{
-    BlobUpload, DiscoveryFailure, DiscoveryOutcome, HubProbe, HubTransferError, PayloadBody,
-    PayloadContentRange, PayloadMetadata, RemoteDictationLibrary, RemoteLibraryMutations,
-    RemoteMeetingLibrary, RemotePayloadSource, ReplicationTransport, StreamingPayloadResponse,
+    BlobUpload, DiscoveryFailure, DiscoveryOutcome, HubChangeSource, HubProbe, HubTransferError,
+    PayloadBody, PayloadContentRange, PayloadMetadata, RemoteDictationLibrary,
+    RemoteLibraryMutations, RemoteMeetingLibrary, RemotePayloadSource, ReplicationTransport,
+    StreamingPayloadResponse,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -549,6 +551,37 @@ impl<T: HubTransport> HubClient<T> {
         serde_json::from_slice(&response.body).map_err(HubClientError::InvalidInfo)
     }
 
+    pub async fn page_changes(
+        &self,
+        hub_id: HubId,
+        after: ChangeCursor,
+        target: Option<ChangeTarget>,
+        limit: usize,
+    ) -> Result<ChangePage, HubClientError> {
+        let mut url = self
+            .base_url
+            .join(HUB_CHANGES_PATH)
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            pairs.append_pair("after", &after.value().to_string());
+            pairs.append_pair("limit", &limit.to_string());
+            if let Some(target) = target {
+                pairs.append_pair("target", &target.cursor().value().to_string());
+            }
+        }
+        let response = self
+            .transport
+            .get(url, protocol_headers(hub_id))
+            .await
+            .map_err(HubClientError::Transport)?;
+        verify_hub_response(&response, hub_id)?;
+        if !(200..300).contains(&response.status) {
+            return Err(http_error(response));
+        }
+        serde_json::from_slice(&response.body).map_err(HubClientError::InvalidInfo)
+    }
+
     pub async fn page_meetings(
         &self,
         hub_id: HubId,
@@ -845,6 +878,22 @@ impl<T: HubTransport> RemotePayloadSource for HubClient<T> {
     }
 }
 
+#[async_trait]
+impl<T: HubTransport> HubChangeSource for HubClient<T> {
+    async fn page_changes(
+        &self,
+        hub: &HubConnection,
+        after: ChangeCursor,
+        target: Option<ChangeTarget>,
+        limit: usize,
+    ) -> Result<ChangePage, HubTransferError> {
+        self.verify_target(hub)?;
+        HubClient::page_changes(self, hub.hub_id, after, target, limit)
+            .await
+            .map_err(HubTransferError::from)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct NetworkHubAdapter<T = ReqwestHubTransport> {
     transport: Result<T, String>,
@@ -997,6 +1046,19 @@ impl<T: HubTransport> RemotePayloadSource for NetworkHubAdapter<T> {
         range: Option<&str>,
     ) -> Result<StreamingPayloadResponse, HubTransferError> {
         RemotePayloadSource::stream_payload(&self.client(hub)?, hub, id, kind, range).await
+    }
+}
+
+#[async_trait]
+impl<T: HubTransport> HubChangeSource for NetworkHubAdapter<T> {
+    async fn page_changes(
+        &self,
+        hub: &HubConnection,
+        after: ChangeCursor,
+        target: Option<ChangeTarget>,
+        limit: usize,
+    ) -> Result<ChangePage, HubTransferError> {
+        HubChangeSource::page_changes(&self.client(hub)?, hub, after, target, limit).await
     }
 }
 
@@ -2010,6 +2072,44 @@ mod tests {
         assert!(requests[0].url.as_str().contains("cursor=cursor"));
         assert_eq!(requests[1].method, "DELETE");
         assert!(requests[1].url.path().contains("/v1/meetings/"));
+    }
+
+    #[tokio::test]
+    async fn change_source_preserves_mount_path_and_immutable_target_query() {
+        let hub_id = hub_id();
+        let response_page = ChangePage {
+            target_cursor: ChangeTarget::new(ChangeCursor::ZERO),
+            after_cursor: ChangeCursor::ZERO,
+            through_cursor: ChangeCursor::ZERO,
+            complete: true,
+            changes: Vec::new(),
+        };
+        let transport = FakeTransport::with_responses(vec![hub_response(
+            hub_id,
+            200,
+            serde_json::to_vec(&response_page).unwrap(),
+        )]);
+        let hub = connection(hub_id);
+        let client = HubClient::with_transport(&hub.base_url, transport.clone()).unwrap();
+
+        HubChangeSource::page_changes(
+            &client,
+            &hub,
+            ChangeCursor::new(4),
+            Some(ChangeTarget::new(ChangeCursor::new(9))),
+            25,
+        )
+        .await
+        .unwrap();
+
+        let requests = transport.requests();
+        assert_eq!(requests[0].method, "GET");
+        assert_eq!(requests[0].url.path(), "/audetic/v1/changes");
+        let query = requests[0].url.query().unwrap();
+        assert!(query.contains("after=4"));
+        assert!(query.contains("target=9"));
+        assert!(query.contains("limit=25"));
+        assert_eq!(requests[0].headers[HUB_ID_HEADER], hub_id.to_string());
     }
 
     #[tokio::test]

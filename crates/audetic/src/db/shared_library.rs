@@ -4,9 +4,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
 use crate::sync::protocol::{
-    ChangeEnvelope, ChangeOperation, CompletedArtifactSnapshot, DictationSnapshot, MeetingSnapshot,
-    MeetingTitlePatch, RecordKind, RecordingPayloadDescriptor, SharedArtifact, SharedDictation,
-    SharedMeeting, Snapshot,
+    ChangeCursor, ChangeEnvelope, ChangeOperation, ChangeRecord, CompletedArtifactPayload,
+    CompletedArtifactSnapshot, DictationPayload, DictationSnapshot, MeetingPayload,
+    MeetingSnapshot, MeetingTitlePatch, RecordKind, RecordingPayloadDescriptor, SharedArtifact,
+    SharedDictation, SharedMeeting, Snapshot,
 };
 
 #[derive(Debug, Error)]
@@ -188,15 +189,19 @@ impl SharedLibraryRepository {
         let mut accepted_snapshot = snapshot.clone();
         accepted_snapshot.payload.recording_payload =
             payload_descriptor_from(&tx, snapshot.record_id)?;
-        let change = ChangeEnvelope::upsert(accepted_snapshot, revision);
-        let change_json = serde_json::to_string(&change).context("serializing library change")?;
-        tx.execute(
-            "INSERT INTO shared_library_changes
-                (operation, kind, record_id, authoritative_revision, change_json)
-             VALUES ('upsert', 'dictation', ?1, ?2, ?3)",
-            params![snapshot.record_id.to_string(), revision, change_json],
-        )
-        .context("appending library change")?;
+        let changed_at = chrono::Utc::now().to_rfc3339();
+        append_change(
+            &tx,
+            PendingChange {
+                kind: RecordKind::Dictation,
+                record_id: snapshot.record_id,
+                origin: Some(snapshot.origin_device_id),
+                revision,
+                snapshot: Some(Snapshot::Dictation(accepted_snapshot)),
+                operation: ChangeOperation::Upsert,
+                changed_at: &changed_at,
+            },
+        )?;
         tx.commit().context("committing authoritative dictation")?;
         Ok(ApplyResult {
             revision,
@@ -245,25 +250,17 @@ impl SharedLibraryRepository {
              ON CONFLICT(record_id) DO NOTHING",
             params![record_id.to_string(), revision, deleted_at],
         )?;
-        let change = ChangeEnvelope {
-            cursor: None,
-            operation: ChangeOperation::Delete,
-            kind: RecordKind::Dictation,
-            record_id,
-            origin_device_id: origin,
-            authoritative_revision: revision,
-            snapshot: None,
-            changed_at: deleted_at.to_owned(),
-        };
-        tx.execute(
-            "INSERT INTO shared_library_changes
-                (operation, kind, record_id, authoritative_revision, change_json)
-             VALUES ('delete', 'dictation', ?1, ?2, ?3)",
-            params![
-                record_id.to_string(),
+        append_change(
+            &tx,
+            PendingChange {
+                kind: RecordKind::Dictation,
+                record_id,
+                origin,
                 revision,
-                serde_json::to_string(&change)?
-            ],
+                snapshot: None,
+                operation: ChangeOperation::Delete,
+                changed_at: deleted_at,
+            },
         )?;
         tx.commit()?;
         Ok(ApplyResult {
@@ -721,13 +718,15 @@ impl SharedLibraryRepository {
             RecordKind::Meeting => {
                 tx.execute("UPDATE shared_meetings SET deleted_at=?2,authoritative_revision=?3 WHERE record_id=?1",params![record_id.to_string(),deleted_at,revision])?;
                 let children = {
-                    let mut statement = tx.prepare("SELECT record_id FROM shared_artifacts WHERE parent_record_id=?1 AND deleted_at IS NULL")?;
+                    let mut statement = tx.prepare("SELECT record_id,origin_device_id FROM shared_artifacts WHERE parent_record_id=?1 AND deleted_at IS NULL ORDER BY record_id")?;
                     let rows = statement
-                        .query_map([record_id.to_string()], |row| row.get::<_, String>(0))?
+                        .query_map([record_id.to_string()], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
                         .collect::<std::result::Result<Vec<_>, _>>()?;
                     rows
                 };
-                for child in children {
+                for (child, child_origin) in children {
                     let child_id: RecordId = child.parse().map_err(anyhow::Error::msg)?;
                     let child_revision: u64 = tx.query_row("SELECT authoritative_revision+1 FROM shared_record_index WHERE record_id=?1",[&child],|row| row.get(0))?;
                     tx.execute("UPDATE shared_record_index SET deleted_at=?2,authoritative_revision=?3,updated_at=CURRENT_TIMESTAMP WHERE record_id=?1",params![child,deleted_at,child_revision])?;
@@ -738,7 +737,7 @@ impl SharedLibraryRepository {
                         PendingChange {
                             kind: RecordKind::Artifact,
                             record_id: child_id,
-                            origin: None,
+                            origin: Some(child_origin.parse().map_err(anyhow::Error::msg)?),
                             revision: child_revision,
                             snapshot: None,
                             operation: ChangeOperation::Delete,
@@ -936,6 +935,12 @@ struct PendingChange<'a> {
 }
 
 fn append_change(conn: &Connection, pending: PendingChange<'_>) -> Result<()> {
+    let replay_snapshot =
+        if pending.snapshot.is_none() && pending.operation != ChangeOperation::Delete {
+            authoritative_snapshot(conn, pending.kind, pending.record_id)?
+        } else {
+            pending.snapshot.clone()
+        };
     let change = ChangeEnvelope {
         cursor: None,
         operation: pending.operation,
@@ -947,7 +952,95 @@ fn append_change(conn: &Connection, pending: PendingChange<'_>) -> Result<()> {
         changed_at: pending.changed_at.to_owned(),
     };
     conn.execute("INSERT INTO shared_library_changes(operation,kind,record_id,authoritative_revision,change_json) VALUES(?1,?2,?3,?4,?5)",params![match pending.operation { ChangeOperation::Upsert=>"upsert",ChangeOperation::Delete=>"delete",ChangeOperation::PayloadAvailability=>"payload_availability"},crate::db::sync_outbox::kind_name(pending.kind),pending.record_id.to_string(),pending.revision,serde_json::to_string(&change)?])?;
+    super::library_change_feed::LibraryChangeFeedRepository::append(
+        conn,
+        &ChangeRecord {
+            cursor: ChangeCursor::ZERO,
+            operation: pending.operation,
+            kind: pending.kind,
+            record_id: pending.record_id,
+            origin_device_id: pending
+                .origin
+                .or_else(|| replay_snapshot.as_ref().map(Snapshot::origin_device_id)),
+            authoritative_revision: pending.revision,
+            snapshot: replay_snapshot,
+            changed_at: pending.changed_at.to_owned(),
+        },
+    )?;
     Ok(())
+}
+
+pub(crate) fn authoritative_snapshot(
+    conn: &Connection,
+    kind: RecordKind,
+    record_id: RecordId,
+) -> Result<Option<Snapshot>> {
+    match kind {
+        RecordKind::Dictation => SharedLibraryRepository::get_from(conn, record_id).map(|value| {
+            value.map(|value| {
+                Snapshot::Dictation(DictationSnapshot {
+                    kind,
+                    schema_version: 1,
+                    record_id: value.record_id,
+                    origin_device_id: value.origin_device_id,
+                    local_version: value.local_version,
+                    created_at: value.created_at,
+                    updated_at: value.updated_at,
+                    payload: DictationPayload {
+                        text: value.text,
+                        recording_payload: value.recording_payload,
+                    },
+                })
+            })
+        }),
+        RecordKind::Meeting => get_meeting_from(conn, record_id).map(|value| {
+            value.map(|value| {
+                Snapshot::Meeting(MeetingSnapshot {
+                    kind,
+                    schema_version: 1,
+                    record_id: value.record_id,
+                    origin_device_id: value.origin_device_id,
+                    local_version: value.local_version,
+                    created_at: value.created_at,
+                    updated_at: value.updated_at,
+                    payload: MeetingPayload {
+                        title: value.title,
+                        title_source: value.title_source,
+                        title_version: value.title_version,
+                        source_filename: value.source_filename,
+                        transcript_text: value.transcript_text,
+                        transcript_segments: value.transcript_segments,
+                        duration_seconds: value.duration_seconds,
+                        status: value.status,
+                        completed_at: value.completed_at,
+                        recording_payload: value.recording_payload,
+                    },
+                })
+            })
+        }),
+        RecordKind::Artifact => get_artifact_from(conn, record_id).map(|value| {
+            value.map(|value| {
+                Snapshot::Artifact(CompletedArtifactSnapshot {
+                    kind,
+                    schema_version: 1,
+                    record_id: value.record_id,
+                    parent_record_id: value.parent_record_id,
+                    origin_device_id: value.origin_device_id,
+                    local_version: value.local_version,
+                    created_at: value.created_at,
+                    updated_at: value.updated_at,
+                    payload: CompletedArtifactPayload {
+                        artifact_kind: value.artifact_kind,
+                        title: value.title,
+                        template_id: value.template_id,
+                        agent_profile_name: value.agent_profile_name,
+                        content_markdown: value.content_markdown,
+                        completed_at: value.completed_at,
+                    },
+                })
+            })
+        }),
+    }
 }
 
 struct StoredMeetingRow {
@@ -1321,6 +1414,15 @@ mod tests {
                 .unwrap(),
             1
         );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM shared_library_change_feed_v1",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
 
         let changed_origin = snapshot(record_id, DeviceId::new());
         assert!(matches!(
@@ -1342,6 +1444,38 @@ mod tests {
             SharedLibraryRepository::apply_snapshot(&mut conn, &changed_creation),
             Err(ApplySnapshotError::VersionConflict)
         ));
+    }
+
+    #[test]
+    fn replay_feed_failure_rolls_back_the_authoritative_mutation() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_replay_feed
+             BEFORE INSERT ON shared_library_change_feed_v1
+             BEGIN SELECT RAISE(ABORT, 'injected replay feed failure'); END;",
+        )
+        .unwrap();
+
+        let record_id = RecordId::new();
+        assert!(SharedLibraryRepository::apply_snapshot(
+            &mut conn,
+            &snapshot(record_id, DeviceId::new())
+        )
+        .is_err());
+        for table in [
+            "shared_record_index",
+            "shared_dictations",
+            "shared_library_changes",
+            "shared_library_change_feed_v1",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "{table} was not rolled back");
+        }
     }
 
     #[test]
@@ -1405,6 +1539,28 @@ mod tests {
                 .unwrap(),
             3
         );
+        let legacy_json: String = conn
+            .query_row(
+                "SELECT change_json FROM shared_library_changes ORDER BY cursor DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy: ChangeEnvelope = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(legacy.operation, ChangeOperation::PayloadAvailability);
+        assert!(legacy.snapshot.is_none());
+        let replay = crate::db::library_change_feed::LibraryChangeFeedRepository::page(
+            &conn,
+            crate::sync::protocol::ChangeCursor::new(2),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            replay.changes[0].operation,
+            ChangeOperation::PayloadAvailability
+        );
+        assert!(replay.changes[0].snapshot.is_some());
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_SCHEMA_VERSION: i64 = 8;
+const LATEST_SCHEMA_VERSION: i64 = 9;
 
 /// Open the application database and run pending migrations.
 ///
@@ -160,6 +160,12 @@ fn apply_pending_migrations(conn: &Connection) -> Result<()> {
         migrate_payload_staging_failures,
     )?;
     apply_migration(conn, 8, "sync_role_epoch", migrate_sync_role_epoch)?;
+    apply_migration(
+        conn,
+        9,
+        "replay_safe_library_cache",
+        migrate_replay_safe_library_cache,
+    )?;
     Ok(())
 }
 
@@ -933,6 +939,161 @@ fn migrate_sync_role_epoch(conn: &Connection) -> Result<()> {
              ADD COLUMN role_epoch INTEGER NOT NULL DEFAULT 0 CHECK(role_epoch >= 0);",
     )
     .context("Failed to add the sync role epoch")?;
+    Ok(())
+}
+
+fn migrate_replay_safe_library_cache(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE shared_library_change_feed_v1 (
+            cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+            codec_version INTEGER NOT NULL CHECK(codec_version = 1),
+            operation TEXT NOT NULL
+                CHECK(operation IN ('upsert','delete','payload_availability')),
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting','artifact')),
+            record_id TEXT NOT NULL,
+            authoritative_revision INTEGER NOT NULL CHECK(authoritative_revision >= 1),
+            body_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         CREATE INDEX idx_shared_library_change_feed_v1_record
+            ON shared_library_change_feed_v1(record_id,cursor);
+
+         CREATE TABLE library_cache_sources (
+            source_hub_id TEXT PRIMARY KEY,
+            change_cursor INTEGER NOT NULL DEFAULT 0 CHECK(change_cursor >= 0),
+            live_target_cursor INTEGER CHECK(live_target_cursor > change_cursor),
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+
+         CREATE TABLE library_cache_generations (
+            generation_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_hub_id TEXT NOT NULL,
+            cache_level TEXT NOT NULL CHECK(cache_level IN
+                ('text_for_offline_use','text_and_available_audio')),
+            start_cursor INTEGER NOT NULL CHECK(start_cursor >= 0),
+            target_cursor INTEGER NOT NULL CHECK(target_cursor >= start_cursor),
+            applied_cursor INTEGER NOT NULL CHECK(applied_cursor >= start_cursor),
+            complete INTEGER NOT NULL DEFAULT 0 CHECK(complete IN (0,1)),
+            active INTEGER NOT NULL DEFAULT 0 CHECK(active IN (0,1)),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT,
+            activated_at TEXT,
+            UNIQUE(source_hub_id,generation_id),
+            FOREIGN KEY(source_hub_id) REFERENCES library_cache_sources(source_hub_id),
+            CHECK(applied_cursor <= target_cursor),
+            CHECK((complete = 0 AND completed_at IS NULL)
+               OR (complete = 1 AND applied_cursor = target_cursor AND completed_at IS NOT NULL)),
+            CHECK(active = 0 OR complete = 1)
+         );
+         CREATE UNIQUE INDEX idx_library_cache_one_active_per_source
+            ON library_cache_generations(source_hub_id) WHERE active = 1;
+         CREATE INDEX idx_library_cache_incomplete
+            ON library_cache_generations(source_hub_id,complete,created_at);
+
+         CREATE TABLE library_cache_items (
+            source_hub_id TEXT NOT NULL,
+            generation_id INTEGER NOT NULL,
+            record_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting','artifact')),
+            authoritative_revision INTEGER NOT NULL CHECK(authoritative_revision >= 1),
+            codec_version INTEGER NOT NULL CHECK(codec_version = 1),
+            item_json TEXT NOT NULL,
+            PRIMARY KEY(source_hub_id,generation_id,record_id),
+            FOREIGN KEY(source_hub_id,generation_id)
+                REFERENCES library_cache_generations(source_hub_id,generation_id)
+                ON DELETE CASCADE
+         );
+         CREATE INDEX idx_library_cache_items_kind
+            ON library_cache_items(source_hub_id,generation_id,kind,record_id);
+
+         CREATE TABLE library_cache_tombstones (
+            source_hub_id TEXT NOT NULL,
+            generation_id INTEGER NOT NULL,
+            record_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting','artifact')),
+            authoritative_revision INTEGER NOT NULL CHECK(authoritative_revision >= 1),
+            deleted_at TEXT NOT NULL,
+            PRIMARY KEY(source_hub_id,generation_id,record_id),
+            FOREIGN KEY(source_hub_id,generation_id)
+                REFERENCES library_cache_generations(source_hub_id,generation_id)
+                ON DELETE CASCADE
+         );
+
+         CREATE TABLE library_cache_applied_pages (
+            source_hub_id TEXT NOT NULL,
+            generation_id INTEGER NOT NULL,
+            after_cursor INTEGER NOT NULL CHECK(after_cursor >= 0),
+            through_cursor INTEGER NOT NULL CHECK(through_cursor >= after_cursor),
+            target_cursor INTEGER NOT NULL CHECK(target_cursor >= through_cursor),
+            page_hash TEXT NOT NULL,
+            PRIMARY KEY(source_hub_id,generation_id,after_cursor),
+            FOREIGN KEY(source_hub_id,generation_id)
+                REFERENCES library_cache_generations(source_hub_id,generation_id)
+                ON DELETE CASCADE
+         );
+
+         CREATE TABLE library_cache_blobs (
+            source_hub_id TEXT NOT NULL,
+            checksum TEXT NOT NULL,
+            local_path TEXT NOT NULL UNIQUE,
+            byte_size INTEGER NOT NULL CHECK(byte_size > 0),
+            media_type TEXT NOT NULL,
+            verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0,1)),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(source_hub_id,checksum),
+            FOREIGN KEY(source_hub_id) REFERENCES library_cache_sources(source_hub_id)
+         );
+
+         CREATE TABLE library_cache_blob_refs (
+            source_hub_id TEXT NOT NULL,
+            generation_id INTEGER NOT NULL,
+            record_id TEXT NOT NULL,
+            payload_role TEXT NOT NULL DEFAULT 'recording' CHECK(payload_role='recording'),
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting')),
+            checksum TEXT,
+            byte_size INTEGER,
+            media_type TEXT,
+            availability TEXT NOT NULL
+                CHECK(availability IN ('pending','available','unavailable','needs_attention')),
+            PRIMARY KEY(source_hub_id,generation_id,record_id,payload_role),
+            FOREIGN KEY(source_hub_id,generation_id,record_id)
+                REFERENCES library_cache_items(source_hub_id,generation_id,record_id)
+                ON DELETE CASCADE,
+            CHECK((availability IN ('unavailable','needs_attention')
+                    AND checksum IS NULL AND byte_size IS NULL AND media_type IS NULL)
+               OR (availability IN ('pending','available')
+                    AND checksum IS NOT NULL AND byte_size > 0 AND media_type IS NOT NULL))
+         );
+         CREATE INDEX idx_library_cache_blob_refs_checksum
+            ON library_cache_blob_refs(source_hub_id,checksum,generation_id);
+
+         CREATE TABLE library_cache_live_overlay (
+            source_hub_id TEXT NOT NULL,
+            record_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting','artifact')),
+            authoritative_revision INTEGER NOT NULL CHECK(authoritative_revision >= 1),
+            deleted_at TEXT NOT NULL,
+            change_cursor INTEGER NOT NULL CHECK(change_cursor >= 1),
+            PRIMARY KEY(source_hub_id,record_id),
+            FOREIGN KEY(source_hub_id) REFERENCES library_cache_sources(source_hub_id)
+                ON DELETE CASCADE
+         );
+
+         CREATE TABLE library_cache_live_pages (
+            source_hub_id TEXT NOT NULL,
+            after_cursor INTEGER NOT NULL CHECK(after_cursor >= 0),
+            through_cursor INTEGER NOT NULL CHECK(through_cursor >= after_cursor),
+            target_cursor INTEGER NOT NULL CHECK(target_cursor >= through_cursor),
+            page_hash TEXT NOT NULL,
+            PRIMARY KEY(source_hub_id,after_cursor),
+            FOREIGN KEY(source_hub_id) REFERENCES library_cache_sources(source_hub_id)
+                ON DELETE CASCADE
+         );",
+    )
+    .context("Failed to install replay-safe Library Cache schema")?;
+    super::library_change_feed::LibraryChangeFeedRepository::seed_current(conn)
+        .context("Failed to seed replay-safe Shared Library feed")?;
     Ok(())
 }
 

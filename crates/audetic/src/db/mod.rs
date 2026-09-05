@@ -1,5 +1,8 @@
 pub mod agent_profiles;
 mod init;
+pub mod library_cache;
+pub mod library_change_feed;
+mod library_codec;
 pub mod meeting_artifacts;
 pub mod meetings;
 mod operations;

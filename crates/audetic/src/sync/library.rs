@@ -10,10 +10,10 @@ use crate::db::shared_library::{ApplySnapshotError, LibraryBlobRecord, SharedLib
 use super::payload::{BlobStore, StoredBlob};
 
 use super::protocol::{
-    is_canonical_sha256, DictationPage, MeetingPage, MeetingTitlePatch, RecordKind,
-    RecordingPayloadDescriptor, SharedMeeting, Snapshot, SnapshotBatchResponse,
-    SnapshotDisposition, SnapshotResult, MAX_BLOB_BYTES, MAX_DICTATION_PAGE, MAX_MEETING_PAGE,
-    MAX_SNAPSHOT_BATCH,
+    is_canonical_sha256, ChangeCursor, ChangePage, ChangeTarget, DictationPage, MeetingPage,
+    MeetingTitlePatch, RecordKind, RecordingPayloadDescriptor, SharedMeeting, Snapshot,
+    SnapshotBatchResponse, SnapshotDisposition, SnapshotResult, MAX_BLOB_BYTES, MAX_DICTATION_PAGE,
+    MAX_MEETING_PAGE, MAX_SNAPSHOT_BATCH,
 };
 
 /// Authoritative validation/application boundary used by both the HTTP hub
@@ -113,6 +113,21 @@ impl HubLibrary {
             None
         };
         Ok(DictationPage { next_cursor, items })
+    }
+
+    pub fn page_changes(
+        &self,
+        after: ChangeCursor,
+        target: Option<ChangeTarget>,
+        limit: usize,
+    ) -> Result<ChangePage> {
+        let connection = crate::db::open_db_at(&self.db_path)?;
+        crate::db::library_change_feed::LibraryChangeFeedRepository::page(
+            &connection,
+            after,
+            target,
+            limit,
+        )
     }
 
     pub fn page_meetings(

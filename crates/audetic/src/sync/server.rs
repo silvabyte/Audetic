@@ -19,11 +19,12 @@ use tower_http::services::ServeFile;
 use super::identity::{parse_stored_tailscale_login, parse_tailscale_login, LoginParseError};
 use super::library::HubLibrary;
 use super::protocol::{
-    is_canonical_sha256, DictationPage, HubApiError, HubInfo, MeetingPage, MeetingTitlePatch,
-    ProtocolRange, RecordKind, SharedMeeting, SnapshotBatch, SnapshotBatchResponse,
-    HUB_BLOBS_ROUTE, HUB_DICTATIONS_ROUTE, HUB_ID_HEADER, HUB_INFO_ROUTE, HUB_MEETINGS_ROUTE,
-    HUB_SNAPSHOTS_ROUTE, MAX_BLOB_BYTES, MAX_DICTATION_PAGE, MAX_MEETING_PAGE, PROTOCOL_VERSION,
-    PROTOCOL_VERSION_HEADER, TAILSCALE_FUNNEL_REQUEST_HEADER,
+    is_canonical_sha256, ChangeCursor, ChangePage, ChangeTarget, DictationPage, HubApiError,
+    HubInfo, MeetingPage, MeetingTitlePatch, ProtocolRange, RecordKind, SharedMeeting,
+    SnapshotBatch, SnapshotBatchResponse, HUB_BLOBS_ROUTE, HUB_CHANGES_ROUTE, HUB_DICTATIONS_ROUTE,
+    HUB_ID_HEADER, HUB_INFO_ROUTE, HUB_MEETINGS_ROUTE, HUB_SNAPSHOTS_ROUTE, MAX_BLOB_BYTES,
+    MAX_DICTATION_PAGE, MAX_MEETING_PAGE, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    TAILSCALE_FUNNEL_REQUEST_HEADER,
 };
 
 #[derive(Clone, Debug)]
@@ -82,6 +83,7 @@ impl HubServer {
             .route(HUB_INFO_ROUTE, get(info))
             .route(HUB_SNAPSHOTS_ROUTE, post(apply_snapshots))
             .route(HUB_BLOBS_ROUTE, put(upload_blob).head(head_blob))
+            .route(HUB_CHANGES_ROUTE, get(page_changes))
             .route(HUB_DICTATIONS_ROUTE, get(page_dictations))
             .route(HUB_MEETINGS_ROUTE, get(page_meetings))
             .route(
@@ -123,6 +125,52 @@ impl HubServer {
             .with_graceful_shutdown(shutdown)
             .await?;
         Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+struct ChangePageQuery {
+    /// Last committed cursor already applied by the caller. Use zero to begin.
+    after: Option<ChangeCursor>,
+    /// Immutable target returned by the first page of this traversal.
+    target: Option<ChangeTarget>,
+    /// Maximum changes to return (default 100, maximum 250).
+    limit: Option<usize>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/changes",
+    tag = "hub_cache",
+    params(ChangePageQuery),
+    responses(
+        (status = 200, description = "Stable bounded page of self-contained authoritative changes", body = ChangePage),
+        (status = 400, description = "Missing, malformed, nonadvancing, or unbounded cursor request", body = HubApiError),
+        (status = 403, description = "Untrusted caller", body = HubApiError),
+        (status = 409, description = "Wrong expected Hub ID", body = HubApiError),
+    )
+)]
+async fn page_changes(
+    State(state): State<Arc<HubServerConfig>>,
+    Query(query): Query<ChangePageQuery>,
+) -> Response {
+    let Some(library) = &state.library else {
+        return library_unavailable();
+    };
+    let Some(after) = query.after else {
+        return hub_error(
+            StatusCode::BAD_REQUEST,
+            "change_cursor_required",
+            "the after cursor is required; use zero to begin",
+        );
+    };
+    match library.page_changes(after, query.target, query.limit.unwrap_or(100)) {
+        Ok(page) => Json(page).into_response(),
+        Err(error) => hub_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_change_page",
+            &error.to_string(),
+        ),
     }
 }
 
@@ -804,7 +852,7 @@ fn insert_hub_id(headers: &mut HeaderMap, hub_id: HubId) {
     servers(
         (url = "http://127.0.0.1:3738", description = "Loopback listener behind Tailscale Serve"),
     ),
-    paths(info, apply_snapshots, upload_blob, head_blob, page_dictations, page_meetings, get_meeting, update_meeting_title, delete_dictation, delete_meeting, delete_artifact, get_dictation_payload, get_meeting_payload),
+    paths(info, apply_snapshots, upload_blob, head_blob, page_changes, page_dictations, page_meetings, get_meeting, update_meeting_title, delete_dictation, delete_meeting, delete_artifact, get_dictation_payload, get_meeting_payload),
     components(schemas(
         HubInfo, ProtocolRange, HubApiError, audetic_core::sync::HubId,
         audetic_core::sync::RecordId, audetic_core::sync::DeviceId,
@@ -813,7 +861,9 @@ fn insert_hub_id(headers: &mut HeaderMap, hub_id: HubId) {
         super::protocol::SnapshotDisposition, super::protocol::SnapshotResult,
         super::protocol::SnapshotBatchResponse, super::protocol::SharedDictation,
         super::protocol::DictationPage, super::protocol::ChangeOperation,
-        super::protocol::ChangeEnvelope
+        super::protocol::ChangeEnvelope, super::protocol::ChangeCursor,
+        super::protocol::ChangeTarget, super::protocol::ChangeRecord,
+        super::protocol::ChangePage
         ,super::protocol::MeetingPayload, super::protocol::MeetingSnapshot,
         super::protocol::CompletedArtifactPayload, super::protocol::CompletedArtifactSnapshot,
         super::protocol::Snapshot, super::protocol::SharedMeeting, super::protocol::SharedArtifact,
@@ -824,6 +874,7 @@ fn insert_hub_id(headers: &mut HeaderMap, hub_id: HubId) {
         (name = "hub_discovery", description = "Home Hub discovery and compatibility"),
         (name = "hub_dictations", description = "Authoritative dictation text transfer and reads")
         ,(name = "hub_payloads", description = "Checksum-addressed Recording Payload transfer and associated playback")
+        ,(name = "hub_cache", description = "Replay-safe Shared Library cache change feed")
     ),
 )]
 pub struct HubApiDoc;
@@ -1102,6 +1153,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn changes_route_is_authenticated_and_returns_a_stable_typed_page() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("hub.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let library = HubLibrary::new(db_path);
+        let actual_hub_id = hub_id();
+        let record_id = audetic_core::sync::RecordId::new();
+        library
+            .apply_snapshots(vec![DictationSnapshot {
+                kind: RecordKind::Dictation,
+                schema_version: 1,
+                record_id,
+                origin_device_id: audetic_core::sync::DeviceId::new(),
+                local_version: 1,
+                created_at: "2026-09-05T10:00:00Z".into(),
+                updated_at: "2026-09-05T10:00:00Z".into(),
+                payload: DictationPayload {
+                    text: "cache me".into(),
+                    recording_payload: Default::default(),
+                },
+            }])
+            .unwrap();
+        let server = HubServer::new(
+            HubServerConfig::new(actual_hub_id, "Alice@Example.com")
+                .unwrap()
+                .with_library(library),
+        );
+
+        let response = server
+            .router()
+            .clone()
+            .oneshot(payload_request(
+                Method::GET,
+                "/v1/changes?after=0&limit=1",
+                actual_hub_id,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[HUB_ID_HEADER], actual_hub_id.to_string());
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let page: ChangePage = serde_json::from_slice(&body).unwrap();
+        assert!(page.complete);
+        assert_eq!(page.target_cursor.cursor().value(), 1);
+        assert_eq!(page.changes.len(), 1);
+        assert_eq!(page.changes[0].record_id, record_id);
+        assert!(page.changes[0].snapshot.is_some());
+
+        let missing_cursor = server
+            .router()
+            .clone()
+            .oneshot(payload_request(
+                Method::GET,
+                HUB_CHANGES_ROUTE,
+                actual_hub_id,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing_cursor.status(), StatusCode::BAD_REQUEST);
+
+        let unauthenticated = Request::get("/v1/changes?after=0")
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
+            .header(HUB_ID_HEADER, actual_hub_id.to_string())
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            server
+                .router()
+                .oneshot(unauthenticated)
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
     fn payload_request(method: Method, uri: &str, hub_id: HubId, body: Body) -> Request<Body> {
         Request::builder()
             .method(method)
@@ -1350,9 +1480,10 @@ mod tests {
             document.servers.as_ref().unwrap()[0].url,
             super::super::protocol::HUB_LOOPBACK_BASE_URL
         );
-        assert_eq!(document.paths.paths.len(), 10);
+        assert_eq!(document.paths.paths.len(), 11);
         assert!(document.paths.paths.contains_key("/v1/info"));
         assert!(document.paths.paths.contains_key("/v1/snapshots"));
+        assert!(document.paths.paths.contains_key("/v1/changes"));
         assert!(document.paths.paths.contains_key("/v1/dictations"));
         assert!(document
             .paths
