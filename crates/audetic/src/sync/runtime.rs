@@ -27,6 +27,11 @@ use super::transport::HubCapabilities;
 pub(crate) type HubListenerFuture =
     Pin<Box<dyn Future<Output = Result<(), super::server::HubServerError>> + Send + 'static>>;
 
+pub(crate) struct LaunchedHubListener {
+    pub(crate) bound_address: Option<SocketAddr>,
+    pub(crate) future: HubListenerFuture,
+}
+
 #[async_trait::async_trait]
 pub(crate) trait HubRuntimeLauncher: Send + Sync {
     async fn launch(
@@ -34,7 +39,7 @@ pub(crate) trait HubRuntimeLauncher: Send + Sync {
         server: HubServer,
         bind_address: SocketAddr,
         shutdown: oneshot::Receiver<()>,
-    ) -> Result<HubListenerFuture, RuntimeError>;
+    ) -> Result<LaunchedHubListener, RuntimeError>;
 }
 
 #[derive(Debug, Default)]
@@ -47,7 +52,7 @@ impl HubRuntimeLauncher for TcpHubRuntimeLauncher {
         server: HubServer,
         bind_address: SocketAddr,
         shutdown: oneshot::Receiver<()>,
-    ) -> Result<HubListenerFuture, RuntimeError> {
+    ) -> Result<LaunchedHubListener, RuntimeError> {
         if !bind_address.ip().is_loopback() {
             return Err(RuntimeError::Listener(format!(
                 "non-loopback bind address {bind_address}"
@@ -56,9 +61,15 @@ impl HubRuntimeLauncher for TcpHubRuntimeLauncher {
         let listener = tokio::net::TcpListener::bind(bind_address)
             .await
             .map_err(|error| RuntimeError::Listener(error.to_string()))?;
-        Ok(Box::pin(server.serve_with_shutdown(listener, async move {
-            let _ = shutdown.await;
-        })))
+        let bound_address = listener
+            .local_addr()
+            .map_err(|error| RuntimeError::Listener(error.to_string()))?;
+        Ok(LaunchedHubListener {
+            bound_address: Some(bound_address),
+            future: Box::pin(server.serve_with_shutdown(listener, async move {
+                let _ = shutdown.await;
+            })),
+        })
     }
 }
 
@@ -1228,6 +1239,8 @@ impl RuntimeSet {
             .launcher
             .launch(server, self.shared.hub_bind_address, receiver)
             .await?;
+        let bound_address = listener.bound_address;
+        let listener = listener.future;
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let failure = Arc::new(StdMutex::new(None));
@@ -1238,6 +1251,7 @@ impl RuntimeSet {
         let task = tokio::spawn(async move {
             observer.observe(WorkerEvent::ListenerStarted {
                 role_epoch: role_version.value(),
+                bound_address,
             });
             let result = listener.await;
             observer.observe(WorkerEvent::ListenerStopped {

@@ -845,7 +845,7 @@ impl<T: HubTransport> RemotePayloadSource for HubClient<T> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct NetworkHubAdapter<T = ReqwestHubTransport> {
     transport: Result<T, String>,
 }

@@ -74,30 +74,52 @@ impl TailscaleControl for ProcessTailscale {
     }
 }
 
-struct FileObserver(PathBuf);
+struct FileObserver {
+    path: PathBuf,
+    bound_address: Mutex<Option<tokio::sync::oneshot::Sender<SocketAddr>>>,
+}
 
 impl WorkerObserver for FileObserver {
     fn observe(&self, event: WorkerEvent) {
+        if let WorkerEvent::ListenerStarted {
+            bound_address: Some(address),
+            ..
+        } = &event
+        {
+            if let Some(sender) = self.bound_address.lock().unwrap().take() {
+                let _ = sender.send(*address);
+            }
+        }
         let mut output = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&self.0)
+            .open(&self.path)
             .unwrap();
         writeln!(output, "{event:?}").unwrap();
     }
 }
 
-fn process_service(db_path: &Path, address: SocketAddr, event_log: &Path) -> SyncService {
-    SyncService::with_runtime_dependencies(
-        db_path.to_path_buf(),
-        Arc::new(ProcessTailscale::new(MappingState::OwnedByAudetic)),
-        HubCapabilities::from_adapter(NetworkHubAdapter::default()),
-        address,
-        RuntimeDependencies {
-            launcher: Arc::new(TcpHubRuntimeLauncher),
-            clock: Arc::new(SystemSyncClock),
-            observer: Arc::new(FileObserver(event_log.to_path_buf())),
-        },
+fn process_service(
+    db_path: &Path,
+    event_log: &Path,
+) -> (SyncService, tokio::sync::oneshot::Receiver<SocketAddr>) {
+    let (bound_address, receiver) = tokio::sync::oneshot::channel();
+    (
+        SyncService::with_runtime_dependencies(
+            db_path.to_path_buf(),
+            Arc::new(ProcessTailscale::new(MappingState::OwnedByAudetic)),
+            HubCapabilities::from_adapter(NetworkHubAdapter::default()),
+            "127.0.0.1:0".parse().unwrap(),
+            RuntimeDependencies {
+                launcher: Arc::new(TcpHubRuntimeLauncher),
+                clock: Arc::new(SystemSyncClock),
+                observer: Arc::new(FileObserver {
+                    path: event_log.to_path_buf(),
+                    bound_address: Mutex::new(Some(bound_address)),
+                }),
+            },
+        ),
+        receiver,
     )
 }
 
@@ -107,15 +129,11 @@ fn process_lock_helper() {
     let Ok(db_path) = std::env::var("AUDETIC_PROCESS_HELPER_DB") else {
         return;
     };
-    let address = std::env::var("AUDETIC_PROCESS_HELPER_ADDRESS")
-        .unwrap()
-        .parse()
-        .unwrap();
     let event_log = PathBuf::from(std::env::var("AUDETIC_PROCESS_HELPER_EVENTS").unwrap());
     let expect_locked = std::env::var_os("AUDETIC_PROCESS_HELPER_EXPECT_LOCKED").is_some();
     let runtime = tokio::runtime::Runtime::new().unwrap();
     runtime.block_on(async move {
-        let service = process_service(Path::new(&db_path), address, &event_log);
+        let (service, bound_address) = process_service(Path::new(&db_path), &event_log);
         match service.initialize().await {
             Err(error) if expect_locked => {
                 let message = error.to_string();
@@ -128,7 +146,10 @@ fn process_lock_helper() {
             Ok(_) if expect_locked => panic!("second process unexpectedly acquired ownership"),
             Ok(_) => {}
         }
-        println!("PROCESS_READY");
+        let bound_address = watchdog("waiting for child listener bound address", bound_address)
+            .await
+            .unwrap();
+        println!("PROCESS_READY {bound_address}");
         std::io::stdout().flush().unwrap();
         let mut stop = String::new();
         std::io::stdin().read_line(&mut stop).unwrap();
@@ -141,7 +162,7 @@ struct RunningHelper {
     lines: std::sync::mpsc::Receiver<String>,
 }
 
-fn helper_command(db_path: &Path, address: SocketAddr, event_log: &Path) -> Command {
+fn helper_command(db_path: &Path, event_log: &Path) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .arg("--exact")
@@ -150,13 +171,12 @@ fn helper_command(db_path: &Path, address: SocketAddr, event_log: &Path) -> Comm
         .arg("--nocapture")
         .arg("--test-threads=1")
         .env("AUDETIC_PROCESS_HELPER_DB", db_path)
-        .env("AUDETIC_PROCESS_HELPER_ADDRESS", address.to_string())
         .env("AUDETIC_PROCESS_HELPER_EVENTS", event_log);
     command
 }
 
-fn spawn_running_helper(db_path: &Path, address: SocketAddr, event_log: &Path) -> RunningHelper {
-    let mut child = helper_command(db_path, address, event_log)
+fn spawn_running_helper(db_path: &Path, event_log: &Path) -> RunningHelper {
+    let mut child = helper_command(db_path, event_log)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -172,21 +192,25 @@ fn spawn_running_helper(db_path: &Path, address: SocketAddr, event_log: &Path) -
     RunningHelper { child, lines }
 }
 
-async fn wait_for_helper_ready(helper: &RunningHelper) {
+async fn wait_for_helper_ready(helper: &RunningHelper) -> SocketAddr {
     watchdog("waiting for child SyncService readiness", async {
         loop {
             match helper
                 .lines
                 .recv_timeout(std::time::Duration::from_millis(100))
             {
-                Ok(line) if line.contains("PROCESS_READY") => return,
-                Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Ok(line) => {
+                    if let Some((_, address)) = line.split_once("PROCESS_READY ") {
+                        return address.trim().parse().unwrap();
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(error) => panic!("process helper output closed before readiness: {error}"),
             }
             tokio::task::yield_now().await;
         }
     })
-    .await;
+    .await
 }
 
 async fn stop_helper(mut helper: RunningHelper) {
@@ -213,10 +237,6 @@ async fn process_lock_prevents_second_owner_and_fresh_process_reconstructs_runti
     let db_path = temp.path().join("shared.db");
     let event_log = temp.path().join("events.log");
     crate::db::migrate_db_at(&db_path).unwrap();
-    let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = reservation.local_addr().unwrap();
-    drop(reservation);
-
     let bootstrap_tailnet = FakeTailnet::default();
     bootstrap_tailnet.add_node("process-helper", "owner@example.com");
     let bootstrap = SyncService::with_runtime_dependencies(
@@ -225,7 +245,7 @@ async fn process_lock_prevents_second_owner_and_fresh_process_reconstructs_runti
         HubCapabilities::from_adapter(NetworkHubAdapter::from_transport(
             bootstrap_tailnet.transport("process-helper"),
         )),
-        address,
+        "127.0.0.1:0".parse().unwrap(),
         RuntimeDependencies {
             launcher: bootstrap_tailnet.launcher("process-helper"),
             clock: Arc::new(ManualClock::new()),
@@ -271,10 +291,12 @@ async fn process_lock_prevents_second_owner_and_fresh_process_reconstructs_runti
         .unwrap();
     drop(connection);
 
-    let first = spawn_running_helper(&db_path, address, &event_log);
-    wait_for_helper_ready(&first).await;
+    let first = spawn_running_helper(&db_path, &event_log);
+    let first_address = wait_for_helper_ready(&first).await;
+    assert!(first_address.ip().is_loopback());
+    assert_ne!(first_address.port(), 0);
 
-    let mut second_command = helper_command(&db_path, address, &event_log);
+    let mut second_command = helper_command(&db_path, &event_log);
     second_command.env("AUDETIC_PROCESS_HELPER_EXPECT_LOCKED", "1");
     let second = watchdog(
         "waiting for rejected second process",
@@ -302,8 +324,10 @@ async fn process_lock_prevents_second_owner_and_fresh_process_reconstructs_runti
     );
 
     stop_helper(first).await;
-    let fresh = spawn_running_helper(&db_path, address, &event_log);
-    wait_for_helper_ready(&fresh).await;
+    let fresh = spawn_running_helper(&db_path, &event_log);
+    let fresh_address = wait_for_helper_ready(&fresh).await;
+    assert!(fresh_address.ip().is_loopback());
+    assert_ne!(fresh_address.port(), 0);
     stop_helper(fresh).await;
 
     let events = std::fs::read_to_string(&event_log).unwrap();

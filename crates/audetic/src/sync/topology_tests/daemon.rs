@@ -231,6 +231,10 @@ impl TestDaemon {
     }
 
     async fn drive_cycle_with_result(&self, duration: Duration, success: bool) {
+        // Establish the baseline only after the worker is idle. In particular,
+        // a freshly reconstructed worker may still be finishing its initial
+        // cycle while this call is waiting for its first sleep.
+        self.clock.wait_for_sleepers(1).await;
         let role_epoch = self.role_epoch();
         let before = self.probe.successful_cycles(role_epoch);
         let failed_before = self
@@ -247,7 +251,6 @@ impl TestDaemon {
                 )
             })
             .count();
-        self.clock.wait_for_sleepers(1).await;
         self.clock.advance(duration);
         self.probe
             .wait_for(|events| {
@@ -332,7 +335,8 @@ impl TestDaemon {
                     .filter(|event| matches!(
                         event,
                         crate::sync::observer::WorkerEvent::ListenerStarted {
-                            role_epoch: event_epoch
+                            role_epoch: event_epoch,
+                            ..
                         } if *event_epoch == role_epoch
                     ))
                     .count(),

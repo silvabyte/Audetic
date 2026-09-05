@@ -3,8 +3,6 @@ use bytes::Bytes;
 use futures_util::{stream, StreamExt};
 use sha2::{Digest, Sha256};
 
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-
 use crate::sync::identity::TAILSCALE_USER_LOGIN_HEADER;
 use crate::sync::library::HubLibrary;
 use crate::sync::protocol::{
@@ -15,11 +13,6 @@ use crate::sync::runtime::{HubRuntimeLauncher, TcpHubRuntimeLauncher};
 use crate::sync::server::{HubServer, HubServerConfig};
 
 use super::watchdog;
-
-fn unused_loopback_address() -> SocketAddr {
-    let listener = std::net::TcpListener::bind((IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
-    listener.local_addr().unwrap()
-}
 
 fn temp_file_count(root: &std::path::Path) -> usize {
     std::fs::read_dir(root)
@@ -62,13 +55,17 @@ async fn real_tcp_reqwest_contract_covers_framing_disconnect_cleanup_and_shutdow
             .unwrap()
             .with_library(HubLibrary::new(db_path.clone())),
     );
-    let address = unused_loopback_address();
+    let requested_address = "127.0.0.1:0".parse().unwrap();
     let (shutdown, receiver) = tokio::sync::oneshot::channel();
     let listener = TcpHubRuntimeLauncher
-        .launch(server, address, receiver)
+        .launch(server, requested_address, receiver)
         .await
         .unwrap();
-    let server_task = tokio::spawn(listener);
+    let address = listener
+        .bound_address
+        .expect("TCP launcher reports its actual bound address");
+    assert_ne!(address.port(), 0);
+    let server_task = tokio::spawn(listener.future);
 
     let raw_client = reqwest::Client::new();
     // trusted_proxy_request directly models Tailscale reverse-proxy output.

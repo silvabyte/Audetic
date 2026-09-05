@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 use crate::sync::client::{HubTransport, StreamingTransportResponse, TransportResponse};
 use crate::sync::identity::TAILSCALE_USER_LOGIN_HEADER;
 use crate::sync::protocol::{ServeSpec, PROTOCOL_VERSION_HEADER, TAILSCALE_FUNNEL_REQUEST_HEADER};
-use crate::sync::runtime::{HubListenerFuture, HubRuntimeLauncher, RuntimeError};
+use crate::sync::runtime::{HubRuntimeLauncher, LaunchedHubListener, RuntimeError};
 use crate::sync::server::HubServer;
 use crate::sync::tailscale::{
     MappingState, ServeAssessment, TailscaleControl, TailscaleError, TailscalePeer, TailscaleStatus,
@@ -99,6 +99,7 @@ pub(super) enum OperationFault {
     FailBeforeDispatch(&'static str),
     LoseResponseAfterDispatch(&'static str),
     HoldBeforeDispatch(FaultGate),
+    HoldBeforeDispatchThenFail(FaultGate, &'static str),
     HoldRequestBodyAfterFirstChunk(FaultGate),
     HoldResponseBodyAfterFirstChunk(FaultGate),
     TruncateRequestBody(usize),
@@ -389,6 +390,11 @@ impl FakeTailnet {
             Some(OperationFault::HoldBeforeDispatch(gate)) => {
                 gate.enter();
                 gate.wait_released().await;
+            }
+            Some(OperationFault::HoldBeforeDispatchThenFail(gate, message)) => {
+                gate.enter();
+                gate.wait_released().await;
+                return Err((*message).into());
             }
             _ => {}
         }
@@ -727,7 +733,7 @@ impl HubRuntimeLauncher for TailnetHubLauncher {
         server: HubServer,
         _bind_address: SocketAddr,
         shutdown: tokio::sync::oneshot::Receiver<()>,
-    ) -> Result<HubListenerFuture, RuntimeError> {
+    ) -> Result<LaunchedHubListener, RuntimeError> {
         let router = server.router();
         self.tailnet.node_mut(&self.node, |state| {
             assert!(state.router.is_none(), "only one router may be published");
@@ -735,10 +741,13 @@ impl HubRuntimeLauncher for TailnetHubLauncher {
         });
         let tailnet = self.tailnet.clone();
         let node = self.node.clone();
-        Ok(Box::pin(async move {
-            let _ = shutdown.await;
-            tailnet.node_mut(&node, |state| state.router = None);
-            Ok(())
-        }))
+        Ok(LaunchedHubListener {
+            bound_address: None,
+            future: Box::pin(async move {
+                let _ = shutdown.await;
+                tailnet.node_mut(&node, |state| state.router = None);
+                Ok(())
+            }),
+        })
     }
 }

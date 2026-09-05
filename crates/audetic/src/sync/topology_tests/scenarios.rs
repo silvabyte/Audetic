@@ -760,3 +760,57 @@ async fn slice_3_uuid_identity_parent_mapping_cas_and_tombstones_win() {
         0
     );
 }
+
+#[tokio::test]
+async fn cycle_driver_ignores_a_restarts_initial_cycle_before_advancing_clock() {
+    let topology = HomeHubTopology::new();
+    let hub = topology.daemon("hub", "owner@example.com");
+    let mut device = topology.daemon("device", "owner@example.com");
+    hub.start().await;
+    device.start().await;
+    let hub_connection = hub.activate_hub(false).await;
+    device.connect(hub_connection, false).await;
+    device.wait_for_cycle().await;
+
+    let (_, record_id) = device.insert_dictation("restart ordering", None);
+    let initial_cycle = super::FaultGate::new();
+    let advanced_cycle = super::FaultGate::new();
+    for gate in [&initial_cycle, &advanced_cycle] {
+        topology.tailnet.fault(
+            "device",
+            "hub",
+            Method::POST,
+            "/audetic/v1/snapshots",
+            OperationFault::HoldBeforeDispatchThenFail(gate.clone(), "ordered failure"),
+        );
+    }
+
+    device.shutdown_for_restart().await;
+    device.reconstruct().await;
+    initial_cycle.wait_entered().await;
+
+    let mut driven_cycle = Box::pin(device.drive_failed_cycle_by(Duration::from_secs(301)));
+    tokio::select! {
+        () = &mut driven_cycle => panic!("cycle driver returned while the initial cycle was held"),
+        () = tokio::task::yield_now() => {}
+    }
+    initial_cycle.release();
+    tokio::select! {
+        () = advanced_cycle.wait_entered() => {}
+        () = &mut driven_cycle => panic!("restart's initial cycle satisfied the requested driven cycle"),
+    }
+    advanced_cycle.release();
+    super::watchdog("waiting for explicitly ordered driven cycle", driven_cycle).await;
+
+    assert_eq!(
+        device
+            .connection()
+            .query_row(
+                "SELECT state,lease_owner FROM sync_outbox_items WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap(),
+        ("pending".into(), None)
+    );
+}
