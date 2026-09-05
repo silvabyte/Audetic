@@ -75,6 +75,7 @@ regex = "1.10"
 # `POST /api/meetings/import`.
 axum = { version = "0.7", features = ["multipart"] }
 http = "1"
+httpdate = "1"
 http-body-util = "0.1"
 bytes = "1"
 futures-util = "0.3"

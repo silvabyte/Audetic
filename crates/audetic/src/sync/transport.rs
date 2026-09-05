@@ -114,6 +114,13 @@ impl HubTransferError {
                 }
         )
     }
+
+    pub fn retry_after(&self) -> Option<&str> {
+        match self {
+            Self::Http { retry_after, .. } => retry_after.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 #[async_trait]
