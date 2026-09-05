@@ -10,7 +10,7 @@ use tokio::sync::Mutex;
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::db::sync_settings::SyncSettings;
@@ -122,12 +122,16 @@ type SyncServiceError = TransitionError;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ConfigureReceipt {
     pub(super) role_version: RoleVersion,
+    operation_generation: OperationGeneration,
     pub(super) status: SyncStatus,
     pub(super) activation: ActivationHealth,
     pub(super) serve_preview: Option<String>,
     pub(super) verified_connection: Option<HubConnection>,
     pub(super) setup_command: Option<String>,
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OperationGeneration(u64);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum ActivationHealth {
@@ -140,13 +144,19 @@ impl ConfigureReceipt {
     pub(super) fn into_setup_result(self) -> SyncSetupResult {
         let Self {
             role_version,
+            operation_generation,
             status,
             activation,
             serve_preview,
             verified_connection,
             setup_command,
         } = self;
-        let _committed_transition = (role_version, activation, verified_connection);
+        let _committed_transition = (
+            role_version,
+            operation_generation,
+            activation,
+            verified_connection,
+        );
         SyncSetupResult {
             status,
             discovered_hubs: Vec::new(),
@@ -182,6 +192,7 @@ struct ConfiguredTransition {
     target: InstallationSnapshot,
     verified_connection: Option<HubConnection>,
     activation: ActivationHealth,
+    cleanup_error: Option<String>,
 }
 
 /// Owns every external side effect until the durable role commit succeeds.
@@ -263,6 +274,7 @@ pub(super) struct RoleCoordinator {
     serve: ServeManager,
     hub_capabilities: HubCapabilities,
     transition: Arc<Mutex<()>>,
+    operation_generation: Arc<AtomicU64>,
     shut_down: Arc<AtomicBool>,
     #[cfg(test)]
     transition_pause: Arc<std::sync::Mutex<Option<TransitionPause>>>,
@@ -286,6 +298,7 @@ impl RoleCoordinator {
             serve,
             hub_capabilities,
             transition: Arc::new(Mutex::new(())),
+            operation_generation: Arc::new(AtomicU64::new(0)),
             shut_down: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             transition_pause: Arc::new(std::sync::Mutex::new(None)),
@@ -336,7 +349,10 @@ impl RoleCoordinator {
         // before merging observations into its immutable committed fields.
         let _transition = self.transition.lock().await;
         let current_role_version = self.state.current_role_epoch().map(RoleVersion::new);
-        if !matches!(current_role_version, Ok(version) if version == receipt.role_version) {
+        let current_operation_generation = self.current_operation_generation();
+        if !matches!(current_role_version, Ok(version) if version == receipt.role_version)
+            || current_operation_generation != receipt.operation_generation
+        {
             return receipt.into_setup_result();
         }
 
@@ -484,6 +500,7 @@ impl RoleCoordinator {
 
     async fn initialize_owned(&self) -> Result<(), SyncServiceError> {
         let _transition = self.transition.lock().await;
+        self.begin_transition_attempt();
         self.check_available()?;
         self.runtime
             .acquire_ownership()
@@ -563,6 +580,7 @@ impl RoleCoordinator {
 
     async fn retry_owned(&self) -> Result<u64, SyncServiceError> {
         let _transition = self.transition.lock().await;
+        self.begin_transition_attempt();
         self.check_available()?;
         self.acquire_runtime_ownership().await?;
         let installation = self.load()?;
@@ -635,6 +653,7 @@ impl RoleCoordinator {
         enabled: bool,
     ) -> Result<bool, SyncServiceError> {
         let _transition = self.transition.lock().await;
+        self.begin_transition_attempt();
         self.check_available()?;
         self.acquire_runtime_ownership().await?;
         let installation = self.load()?;
@@ -700,6 +719,7 @@ impl RoleCoordinator {
         request: SyncSetupRequest,
     ) -> Result<ConfigureReceipt, SyncServiceError> {
         let _transition = self.transition.lock().await;
+        let operation_generation = self.begin_transition_attempt();
         self.check_available()?;
         self.acquire_runtime_ownership().await?;
         let installation = self.load()?;
@@ -721,8 +741,10 @@ impl RoleCoordinator {
                         .map_err(TransitionError::from)?;
                     return Ok(configure_receipt(
                         &installation,
+                        operation_generation,
                         None,
                         ActivationHealth::Inactive,
+                        None,
                         serve_preview,
                     ));
                 }
@@ -735,8 +757,10 @@ impl RoleCoordinator {
         };
         Ok(configure_receipt(
             &configured.target,
+            operation_generation,
             configured.verified_connection,
             configured.activation,
+            configured.cleanup_error,
             serve_preview,
         ))
     }
@@ -750,6 +774,7 @@ impl RoleCoordinator {
 
     async fn shutdown_owned(&self) -> Result<(), SyncServiceError> {
         let _transition = self.transition.lock().await;
+        self.begin_transition_attempt();
         self.shut_down.store(true, Ordering::SeqCst);
         self.runtime
             .shutdown()
@@ -811,7 +836,8 @@ impl RoleCoordinator {
         };
         self.transition_checkpoint(TransitionCheckpoint::Committed)
             .await;
-        self.activate_runtime(saga.committed()).await?;
+        let activation = self.activate_runtime(saga.committed()).await?;
+        self.record_committed_cleanup(effects.role_epoch, &activation);
         Ok(ConfiguredTransition {
             target: InstallationSnapshot {
                 settings,
@@ -821,6 +847,7 @@ impl RoleCoordinator {
             },
             verified_connection: None,
             activation: ActivationHealth::Inactive,
+            cleanup_error: activation_cleanup_error(&activation),
         })
     }
 
@@ -930,6 +957,7 @@ impl RoleCoordinator {
             target,
             verified_connection,
             activation: activation_health(&activation),
+            cleanup_error: activation_cleanup_error(&activation),
         })
     }
 
@@ -998,14 +1026,14 @@ impl RoleCoordinator {
         self.transition_checkpoint(TransitionCheckpoint::Committed)
             .await;
         let activation = self.activate_runtime(runtime_transition).await?;
-        self.runtime
-            .observe_reachability(RoleVersion::new(effects.role_epoch), true)
+        self.record_committed_activation(effects.role_epoch, &activation)
             .await;
         target.role_epoch = effects.role_epoch;
         Ok(ConfiguredTransition {
             target,
             verified_connection: verified.connection,
             activation: activation_health(&activation),
+            cleanup_error: activation_cleanup_error(&activation),
         })
     }
 
@@ -1259,19 +1287,30 @@ impl RoleCoordinator {
         role_epoch: u64,
         activation: &ActivationOutcome,
     ) -> Result<(), SyncServiceError> {
+        let cleanup_error = activation_cleanup_error(activation);
         match activation {
-            ActivationOutcome::Healthy { role_version } => {
-                self.state
-                    .record_contact(role_epoch)
-                    .map_err(SyncServiceError::State)?;
+            ActivationOutcome::Healthy { role_version, .. } => {
+                if let Some(error) = cleanup_error.as_deref() {
+                    self.state
+                        .record_error(role_epoch, Some(error))
+                        .map_err(SyncServiceError::State)?;
+                } else {
+                    self.state
+                        .record_contact(role_epoch)
+                        .map_err(SyncServiceError::State)?;
+                }
                 self.runtime.observe_reachability(*role_version, true).await;
             }
             ActivationOutcome::Degraded {
                 role_version,
                 listener_error,
+                ..
             } => {
+                let error = cleanup_error
+                    .map(|cleanup| format!("{listener_error}; {cleanup}"))
+                    .unwrap_or_else(|| listener_error.clone());
                 self.state
-                    .record_error(role_epoch, Some(listener_error))
+                    .record_error(role_epoch, Some(&error))
                     .map_err(SyncServiceError::State)?;
                 self.runtime
                     .observe_reachability(*role_version, false)
@@ -1290,6 +1329,20 @@ impl RoleCoordinator {
                 %error,
                 role_epoch,
                 "committed sync activation health could not be persisted"
+            );
+        }
+    }
+
+    fn record_committed_cleanup(&self, role_epoch: u64, activation: &ActivationOutcome) {
+        let Some(error) = activation_cleanup_error(activation) else {
+            return;
+        };
+        if let Err(persist_error) = self.state.record_error(role_epoch, Some(&error)) {
+            tracing::warn!(
+                %persist_error,
+                %error,
+                role_epoch,
+                "committed sync cleanup diagnostic could not be persisted"
             );
         }
     }
@@ -1317,6 +1370,18 @@ impl RoleCoordinator {
         } else {
             Ok(())
         }
+    }
+
+    fn begin_transition_attempt(&self) -> OperationGeneration {
+        OperationGeneration(
+            self.operation_generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1),
+        )
+    }
+
+    fn current_operation_generation(&self) -> OperationGeneration {
+        OperationGeneration(self.operation_generation.load(Ordering::SeqCst))
     }
 }
 
@@ -1384,10 +1449,23 @@ fn activation_health(outcome: &ActivationOutcome) -> ActivationHealth {
     }
 }
 
+fn activation_cleanup_error(outcome: &ActivationOutcome) -> Option<String> {
+    let diagnostics = outcome.cleanup_diagnostics();
+    (!diagnostics.is_empty()).then(|| {
+        diagnostics
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("; ")
+    })
+}
+
 fn configure_receipt(
     target: &InstallationSnapshot,
+    operation_generation: OperationGeneration,
     verified_connection: Option<HubConnection>,
     activation: ActivationHealth,
+    cleanup_error: Option<String>,
     serve_preview: Option<String>,
 ) -> ConfigureReceipt {
     let role_version = RoleVersion::new(target.role_epoch);
@@ -1429,6 +1507,7 @@ fn configure_receipt(
     };
     ConfigureReceipt {
         role_version,
+        operation_generation,
         status: SyncStatus {
             device_id: target.identity.device_id,
             role: target.settings.role,
@@ -1439,7 +1518,9 @@ fn configure_receipt(
             last_contact_at: target.settings.last_contact_at.clone(),
             pending_items: 0,
             pending_bytes: 0,
-            last_error: activation_error.or_else(|| target.settings.last_error.clone()),
+            last_error: activation_error
+                .or(cleanup_error)
+                .or_else(|| target.settings.last_error.clone()),
             upload_recording_payloads: target.settings.upload_recording_payloads,
             cache_level: target.settings.cache_level,
             shared_config_enabled: target.settings.shared_config_enabled,
@@ -3192,6 +3273,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_overlapping_promotion_discards_provisional_serve_enrichment() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        let receipt = fixture
+            .service
+            .coordinator
+            .configure(request(SyncRole::Standalone))
+            .await
+            .unwrap();
+        let committed_epoch = fixture
+            .service
+            .coordinator
+            .state
+            .current_role_epoch()
+            .unwrap();
+        let (entered, release) = pause_receipt_enrichment(&fixture.service);
+        let coordinator = fixture.service.coordinator.clone();
+        let enrichment =
+            tokio::spawn(async move { coordinator.enrich_configure_receipt(receipt).await });
+        entered.notified().await;
+
+        fixture.hubs.fail.store(true, Ordering::SeqCst);
+        let error = fixture
+            .service
+            .coordinator
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SyncServiceError::Hub(_)));
+        assert_eq!(fixture.tailscale.apply_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.tailscale.remove_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fixture
+                .service
+                .coordinator
+                .state
+                .current_role_epoch()
+                .unwrap(),
+            committed_epoch
+        );
+        let connection = crate::db::open_db_at(&fixture.path).unwrap();
+        connection
+            .execute("DROP TABLE sync_outbox_items", [])
+            .unwrap();
+        drop(connection);
+        release.notify_one();
+
+        let original = enrichment.await.unwrap();
+
+        assert_eq!(original.status.role, SyncRole::Standalone);
+        assert_eq!(original.status.pending_items, 0);
+        assert_eq!(original.status.network.serve_mapping, None);
+        assert!(original.status.last_error.is_none());
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn demotion_quiescence_failure_restores_runtime_and_serve_mapping() {
         let fixture = fixture();
         fixture
@@ -3218,6 +3356,52 @@ mod tests {
         assert!(runtime.hub_listener_running);
         assert!(runtime.outbox_worker_running);
         fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_obsolete_listener_cleanup_does_not_fail_committed_demotion() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("audetic.db");
+        crate::db::migrate_db_at(&path).unwrap();
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let tailscale = Arc::new(FakeTailscale::default());
+        let hubs = Arc::new(FakeHubs::default());
+        let service = SyncService::with_dependencies(
+            path,
+            tailscale.clone(),
+            test_capabilities(hubs),
+            address,
+        );
+        service.initialize().await.unwrap();
+        service.configure(request(SyncRole::HomeHub)).await.unwrap();
+        service
+            .coordinator
+            .runtime
+            .fail_active_listener_cleanup()
+            .await
+            .unwrap();
+
+        let result = service
+            .configure(request(SyncRole::Standalone))
+            .await
+            .unwrap();
+
+        assert_eq!(result.status.role, SyncRole::Standalone);
+        assert!(result
+            .status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("obsolete Home Hub listener cleanup failed")));
+        assert_eq!(*tailscale.mapping.lock().unwrap(), MappingState::Vacant);
+        let runtime = service.coordinator.runtime.snapshot().await;
+        assert_eq!(runtime.role, Some(SyncRole::Standalone));
+        assert!(!runtime.hub_listener_running);
+        assert!(!runtime.outbox_worker_running);
+        assert!(!runtime.transition_in_progress);
+        tokio::net::TcpListener::bind(address).await.unwrap();
+        service.shutdown().await.unwrap();
     }
 
     #[tokio::test]

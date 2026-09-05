@@ -100,10 +100,12 @@ pub(super) struct PersistedTransition {
 pub(super) enum ActivationOutcome {
     Healthy {
         role_version: RoleVersion,
+        cleanup_diagnostics: Vec<RuntimeCleanupDiagnostic>,
     },
     Degraded {
         role_version: RoleVersion,
         listener_error: String,
+        cleanup_diagnostics: Vec<RuntimeCleanupDiagnostic>,
     },
 }
 
@@ -118,9 +120,30 @@ impl ActivationOutcome {
             Self::Degraded { listener_error, .. } => Some(listener_error),
         }
     }
+
+    pub(super) fn cleanup_diagnostics(&self) -> &[RuntimeCleanupDiagnostic] {
+        match self {
+            Self::Healthy {
+                cleanup_diagnostics,
+                ..
+            }
+            | Self::Degraded {
+                cleanup_diagnostics,
+                ..
+            } => cleanup_diagnostics,
+        }
+    }
 }
 
-#[derive(Debug, Error)]
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub(super) enum RuntimeCleanupDiagnostic {
+    #[error("obsolete sync outbox worker cleanup failed: {0}")]
+    OutboxWorker(String),
+    #[error("obsolete Home Hub listener cleanup failed: {0}")]
+    HomeHubListener(String),
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum RuntimeError {
     #[error("Home Hub listener failed: {0}")]
     Listener(String),
@@ -183,6 +206,8 @@ struct HubRuntime {
     cancellation: CancellationToken,
     task: Option<JoinHandle<Result<(), super::server::HubServerError>>>,
     failure: Arc<StdMutex<Option<String>>>,
+    #[cfg(test)]
+    fail_cleanup: bool,
 }
 
 impl HubRuntime {
@@ -213,9 +238,17 @@ impl HubRuntime {
         let Some(task) = self.task.take() else {
             return Ok(());
         };
-        task.await
+        let result = task
+            .await
             .map_err(|error| RuntimeError::Listener(error.to_string()))?
-            .map_err(|error| RuntimeError::Listener(error.to_string()))
+            .map_err(|error| RuntimeError::Listener(error.to_string()));
+        #[cfg(test)]
+        if result.is_ok() && self.fail_cleanup {
+            return Err(RuntimeError::Listener(
+                "injected obsolete listener cleanup failure".into(),
+            ));
+        }
+        result
     }
 
     fn abort(&mut self) {
@@ -248,6 +281,14 @@ impl OutboxRuntime {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
+    }
+
+    async fn stop_with_diagnostic(mut self) -> Option<RuntimeCleanupDiagnostic> {
+        self.request_stop();
+        let task = self.task.take()?;
+        task.await.err().map(|error| {
+            RuntimeCleanupDiagnostic::OutboxWorker(format!("worker task join failed: {error}"))
+        })
     }
 
     fn abort(&mut self) {
@@ -328,6 +369,7 @@ impl ActiveRuntime {
     }
 
     async fn stop(mut self) -> Result<(), RuntimeError> {
+        self.request_stop();
         if let Some(outbox) = self.outbox.take() {
             outbox.stop().await;
         }
@@ -335,6 +377,24 @@ impl ActiveRuntime {
             hub.stop().await?;
         }
         Ok(())
+    }
+
+    async fn cleanup(mut self) -> Vec<RuntimeCleanupDiagnostic> {
+        // Request every cancellation before joining either resource. Cleanup
+        // diagnostics must never leave a later handle unconsumed.
+        self.request_stop();
+        let mut diagnostics = Vec::new();
+        if let Some(outbox) = self.outbox.take() {
+            if let Some(diagnostic) = outbox.stop_with_diagnostic().await {
+                diagnostics.push(diagnostic);
+            }
+        }
+        if let Some(hub) = self.hub.take() {
+            if let Err(error) = hub.stop().await {
+                diagnostics.push(RuntimeCleanupDiagnostic::HomeHubListener(error.to_string()));
+            }
+        }
+        diagnostics
     }
 }
 
@@ -737,15 +797,20 @@ impl RuntimeSet {
             }
             inner.active = Some(active);
         }
-        if let Some(previous) = previous {
-            previous.stop().await?;
-        }
+        let cleanup_diagnostics = match previous {
+            Some(previous) => previous.cleanup().await,
+            None => Vec::new(),
+        };
         Ok(match listener_error {
             Some(listener_error) => ActivationOutcome::Degraded {
                 role_version,
                 listener_error,
+                cleanup_diagnostics,
             },
-            None => ActivationOutcome::Healthy { role_version },
+            None => ActivationOutcome::Healthy {
+                role_version,
+                cleanup_diagnostics,
+            },
         })
     }
 
@@ -918,6 +983,18 @@ impl RuntimeSet {
             let _ = shutdown.send(());
         }
         self.wait_for_listener_exit(false).await;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) async fn fail_active_listener_cleanup(&self) -> Result<(), RuntimeError> {
+        let mut inner = self.shared.inner.lock().await;
+        inner
+            .active
+            .as_mut()
+            .and_then(|runtime| runtime.hub.as_mut())
+            .ok_or_else(|| RuntimeError::Invariant("active listener is missing".into()))?
+            .fail_cleanup = true;
         Ok(())
     }
 
@@ -1121,6 +1198,8 @@ impl RuntimeSet {
             cancellation,
             task: Some(task),
             failure,
+            #[cfg(test)]
+            fail_cleanup: false,
         };
         tokio::task::yield_now().await;
         if let Some(error) = runtime.liveness_error() {
