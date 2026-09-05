@@ -4,6 +4,8 @@ use rusqlite::{Connection, OptionalExtension};
 
 use std::str::FromStr;
 
+use crate::sync::protocol::ServeSpec;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncSettings {
     pub role: SyncRole,
@@ -253,8 +255,10 @@ fn validate(settings: &SyncSettings) -> Result<()> {
         (SyncRole::ConnectedDevice, None) => {
             bail!("Connected Device settings require a Home Hub connection")
         }
-        (SyncRole::ConnectedDevice, Some(hub)) if !hub.base_url.ends_with("/audetic/") => {
-            bail!("Home Hub base URL must end in /audetic/")
+        (SyncRole::ConnectedDevice, Some(hub))
+            if !ServeSpec::audetic().is_canonical_api_base_url(&hub.base_url) =>
+        {
+            bail!("Home Hub base URL must end in the Audetic Serve API mount path")
         }
         (SyncRole::Standalone | SyncRole::HomeHub, Some(_)) => {
             bail!("Only Connected Device settings may store a Home Hub connection")

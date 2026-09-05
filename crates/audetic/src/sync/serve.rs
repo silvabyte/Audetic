@@ -285,7 +285,7 @@ pub fn expected_ownership() -> SyncServeOwnership {
     let spec = ServeSpec::audetic();
     SyncServeOwnership {
         https_port: spec.https_port(),
-        mount_path: spec.mount_path().into(),
+        mount_path: spec.cli_mount_path().into(),
         proxy_url: spec.proxy_url().into(),
     }
 }

@@ -15,10 +15,9 @@ use std::time::Duration;
 
 use super::protocol::{
     hub_blob_path, hub_payload_path, DictationPage, HubApiError, HubInfo, MeetingPage,
-    MeetingTitlePatch, RecordKind, SharedMeeting, SnapshotBatch, SnapshotBatchResponse,
-    HUB_API_MOUNT_PATH, HUB_DICTATIONS_PATH, HUB_ID_HEADER, HUB_INFO_PATH, HUB_MEETINGS_PATH,
-    HUB_SNAPSHOTS_PATH, MAX_BLOB_BYTES, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-    TAILSCALE_HTTPS_PORT,
+    MeetingTitlePatch, RecordKind, ServeSpec, SharedMeeting, SnapshotBatch, SnapshotBatchResponse,
+    HUB_DICTATIONS_PATH, HUB_ID_HEADER, HUB_INFO_PATH, HUB_MEETINGS_PATH, HUB_SNAPSHOTS_PATH,
+    MAX_BLOB_BYTES, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
 use super::transport::{
     BlobUpload, DiscoveryFailure, DiscoveryOutcome, HubProbe, HubTransferError, PayloadBody,
@@ -287,9 +286,9 @@ pub enum HubClientError {
     InsecureBaseUrl,
     #[error("Home Hub URL must not contain credentials, query parameters, or a fragment")]
     UnsafeBaseUrl,
-    #[error("Home Hub URL path must be / or {HUB_API_MOUNT_PATH}")]
+    #[error("Home Hub URL path must be / or the Audetic Serve mount path")]
     UnexpectedBasePath,
-    #[error("Home Hub URL must use dedicated HTTPS port {TAILSCALE_HTTPS_PORT}")]
+    #[error("Home Hub URL must use the dedicated Audetic Serve HTTPS port")]
     UnexpectedPort,
     #[error("Home Hub transport failed: {0}")]
     Transport(String),
@@ -1383,6 +1382,7 @@ impl Stream for ValidatedPayloadBody {
 }
 
 pub fn canonicalize_base_url(input: &str) -> Result<Url, HubClientError> {
+    let serve = ServeSpec::audetic();
     let mut url =
         Url::parse(input).map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
     if url.scheme() != "https" {
@@ -1399,16 +1399,15 @@ pub fn canonicalize_base_url(input: &str) -> Result<Url, HubClientError> {
         return Err(HubClientError::InvalidBaseUrl("missing host".to_owned()));
     }
 
-    match url.path().trim_end_matches('/') {
-        "" | "/audetic" => {}
-        _ => return Err(HubClientError::UnexpectedBasePath),
+    if !serve.accepts_url_path(url.path()) {
+        return Err(HubClientError::UnexpectedBasePath);
     }
-    if explicit_port(input).is_some_and(|port| port != TAILSCALE_HTTPS_PORT) {
+    if explicit_port(input).is_some_and(|port| port != serve.https_port()) {
         return Err(HubClientError::UnexpectedPort);
     }
-    url.set_path(HUB_API_MOUNT_PATH);
+    url.set_path(&serve.api_mount_path());
     if url.port().is_none() {
-        url.set_port(Some(TAILSCALE_HTTPS_PORT))
+        url.set_port(Some(serve.https_port()))
             .map_err(|_| HubClientError::InvalidBaseUrl("URL cannot contain a port".to_owned()))?;
     }
     Ok(url)

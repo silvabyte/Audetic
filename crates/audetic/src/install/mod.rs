@@ -749,13 +749,7 @@ mod tests {
     }
 
     fn exact_ownership() -> SyncServeOwnership {
-        SyncServeOwnership {
-            https_port: crate::sync::protocol::TAILSCALE_HTTPS_PORT,
-            mount_path: crate::sync::protocol::HUB_API_MOUNT_PATH
-                .trim_end_matches('/')
-                .into(),
-            proxy_url: crate::sync::protocol::HUB_LOOPBACK_BASE_URL.into(),
-        }
+        crate::sync::serve::expected_ownership()
     }
 
     #[test]

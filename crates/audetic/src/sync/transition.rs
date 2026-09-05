@@ -43,6 +43,13 @@ struct TransitionPause {
     release: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct ReceiptEnrichmentPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
 #[derive(Debug, Error)]
 pub enum TransitionError {
     #[error("invalid sync request: {0}")]
@@ -259,6 +266,8 @@ pub(super) struct RoleCoordinator {
     shut_down: Arc<AtomicBool>,
     #[cfg(test)]
     transition_pause: Arc<std::sync::Mutex<Option<TransitionPause>>>,
+    #[cfg(test)]
+    receipt_enrichment_pause: Arc<std::sync::Mutex<Option<ReceiptEnrichmentPause>>>,
 }
 
 impl RoleCoordinator {
@@ -280,6 +289,8 @@ impl RoleCoordinator {
             shut_down: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             transition_pause: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            receipt_enrichment_pause: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -306,48 +317,49 @@ impl RoleCoordinator {
         &self,
         mut receipt: ConfigureReceipt,
     ) -> SyncSetupResult {
-        match self.state.load() {
-            Ok(current) if RoleVersion::new(current.role_epoch) == receipt.role_version => {
-                match crate::db::open_db_at(self.state.db_path())
-                    .context("opening sync database for configure receipt enrichment")
-                    .and_then(|connection| {
-                        let (items, error) =
-                            crate::db::sync_outbox::SyncOutboxRepository::counts(&connection)?;
-                        let bytes = crate::db::sync_outbox::SyncOutboxRepository::pending_bytes(
-                            &connection,
-                        )?;
-                        Ok((items, bytes, error))
-                    }) {
-                    Ok((items, bytes, error)) => {
-                        receipt.status.pending_items = items;
-                        receipt.status.pending_bytes = bytes;
-                        if let Some(error) = error {
-                            append_receipt_error(&mut receipt.status, error);
-                        }
-                    }
-                    Err(error) => append_receipt_error(
-                        &mut receipt.status,
-                        format!("configure receipt outbox enrichment failed: {error}"),
-                    ),
+        #[cfg(test)]
+        self.pause_receipt_enrichment().await;
+
+        let outbox = crate::db::open_db_at(self.state.db_path())
+            .context("opening sync database for configure receipt enrichment")
+            .and_then(|connection| {
+                let (items, error) =
+                    crate::db::sync_outbox::SyncOutboxRepository::counts(&connection)?;
+                let bytes =
+                    crate::db::sync_outbox::SyncOutboxRepository::pending_bytes(&connection)?;
+                Ok((items, bytes, error))
+            });
+        let network = self.serve.network_assessment().await;
+
+        // Collection may be slow, so it happens without transition ownership.
+        // Reacquire only to prove the receipt's generation is still current
+        // before merging observations into its immutable committed fields.
+        let _transition = self.transition.lock().await;
+        let current_role_version = self.state.current_role_epoch().map(RoleVersion::new);
+        if !matches!(current_role_version, Ok(version) if version == receipt.role_version) {
+            return receipt.into_setup_result();
+        }
+
+        match outbox {
+            Ok((items, bytes, error)) => {
+                receipt.status.pending_items = items;
+                receipt.status.pending_bytes = bytes;
+                if let Some(error) = error {
+                    append_receipt_error(&mut receipt.status, error);
                 }
-                let network = self.serve.network_assessment().await;
-                if let Some(error) = network.error.clone() {
-                    append_receipt_error(
-                        &mut receipt.status,
-                        format!("configure receipt network enrichment failed: {error}"),
-                    );
-                }
-                receipt.status.network = network;
             }
-            Ok(_) => append_receipt_error(
-                &mut receipt.status,
-                "configure receipt enrichment skipped after a newer role transition".into(),
-            ),
             Err(error) => append_receipt_error(
                 &mut receipt.status,
-                format!("configure receipt state enrichment failed: {error}"),
+                format!("configure receipt outbox enrichment failed: {error}"),
             ),
         }
+        if let Some(error) = network.error.clone() {
+            append_receipt_error(
+                &mut receipt.status,
+                format!("configure receipt network enrichment failed: {error}"),
+            );
+        }
+        receipt.status.network = network;
         receipt.into_setup_result()
     }
 
@@ -1205,6 +1217,19 @@ impl RoleCoordinator {
         let _ = checkpoint;
     }
 
+    #[cfg(test)]
+    async fn pause_receipt_enrichment(&self) {
+        let pause = self
+            .receipt_enrichment_pause
+            .lock()
+            .ok()
+            .and_then(|mut configured| configured.take());
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
     async fn compensate_saga(
         &self,
         mut saga: TransitionSaga,
@@ -1484,8 +1509,6 @@ mod tests {
         owner_login: StdMutex<String>,
         fail_apply: AtomicBool,
         fail_status: AtomicBool,
-        status_calls: std::sync::atomic::AtomicUsize,
-        status_delay_ms: std::sync::atomic::AtomicU64,
         apply_calls: std::sync::atomic::AtomicUsize,
         remove_calls: std::sync::atomic::AtomicUsize,
     }
@@ -1498,8 +1521,6 @@ mod tests {
                 owner_login: StdMutex::new("owner@example.com".into()),
                 fail_apply: AtomicBool::new(false),
                 fail_status: AtomicBool::new(false),
-                status_calls: std::sync::atomic::AtomicUsize::new(0),
-                status_delay_ms: std::sync::atomic::AtomicU64::new(0),
                 apply_calls: std::sync::atomic::AtomicUsize::new(0),
                 remove_calls: std::sync::atomic::AtomicUsize::new(0),
             }
@@ -1521,11 +1542,6 @@ mod tests {
 
     impl TailscaleControl for FakeTailscale {
         fn status(&self) -> Result<TailscaleStatus, TailscaleError> {
-            self.status_calls.fetch_add(1, Ordering::SeqCst);
-            let delay = self.status_delay_ms.load(Ordering::SeqCst);
-            if delay > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(delay));
-            }
             if self.fail_status.load(Ordering::SeqCst) {
                 Err(TailscaleError::MissingStatusField("Self"))
             } else {
@@ -1794,6 +1810,19 @@ mod tests {
             entered: entered.clone(),
             release: release.clone(),
         });
+        (entered, release)
+    }
+
+    fn pause_receipt_enrichment(
+        service: &SyncService,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *service.coordinator.receipt_enrichment_pause.lock().unwrap() =
+            Some(ReceiptEnrichmentPause {
+                entered: entered.clone(),
+                release: release.clone(),
+            });
         (entered, release)
     }
 
@@ -3094,7 +3123,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configure_receipt_enrichment_does_not_block_the_next_transition() {
+    async fn overlapping_transition_discards_new_role_receipt_enrichment() {
         let fixture = fixture();
         fixture.service.initialize().await.unwrap();
         let receipt = fixture
@@ -3103,20 +3132,24 @@ mod tests {
             .configure(request(SyncRole::HomeHub))
             .await
             .unwrap();
-        let prior_status_calls = fixture.tailscale.status_calls.load(Ordering::SeqCst);
-        fixture
-            .tailscale
-            .status_delay_ms
-            .store(2_000, Ordering::SeqCst);
+        let connection = crate::db::open_db_at(&fixture.path).unwrap();
+        let (_, record_id) = crate::db::insert_workflow_record(
+            &connection,
+            &crate::db::Workflow::new(
+                crate::db::WorkflowType::VoiceToText,
+                crate::db::WorkflowData::VoiceToText(crate::db::VoiceToTextData {
+                    text: "belongs to the next receipt generation".into(),
+                    audio_path: "/missing".into(),
+                }),
+            ),
+        )
+        .unwrap();
+        drop(connection);
+        let (entered, release) = pause_receipt_enrichment(&fixture.service);
         let coordinator = fixture.service.coordinator.clone();
         let enrichment =
             tokio::spawn(async move { coordinator.enrich_configure_receipt(receipt).await });
-        for _ in 0..100 {
-            if fixture.tailscale.status_calls.load(Ordering::SeqCst) > prior_status_calls {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        entered.notified().await;
 
         let next = tokio::time::timeout(
             std::time::Duration::from_millis(500),
@@ -3128,9 +3161,33 @@ mod tests {
         .await
         .expect("receipt enrichment must not retain the transition lock")
         .unwrap();
-
         assert_eq!(next.status.role, SyncRole::Standalone);
-        enrichment.await.unwrap();
+        let connection = crate::db::open_db_at(&fixture.path).unwrap();
+        connection
+            .execute(
+                "UPDATE sync_outbox_items SET state='pending' WHERE record_id=?1",
+                [record_id.to_string()],
+            )
+            .unwrap();
+        drop(connection);
+        release.notify_one();
+
+        let old = enrichment.await.unwrap();
+        let current = fixture.service.status().await.unwrap();
+
+        assert_eq!(old.status.role, SyncRole::HomeHub);
+        assert_eq!(old.status.pending_items, 0);
+        assert_eq!(
+            old.status.network.serve_mapping,
+            Some(ServeMappingState::Audetic)
+        );
+        assert!(old.status.network.ready);
+        assert_eq!(current.role, SyncRole::Standalone);
+        assert_eq!(current.pending_items, 1);
+        assert_eq!(
+            current.network.serve_mapping,
+            Some(ServeMappingState::Vacant)
+        );
         fixture.service.shutdown().await.unwrap();
     }
 

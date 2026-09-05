@@ -209,6 +209,11 @@ impl InstallationState {
         Ok(SyncSettingsRepository::role_epoch(&conn)? == expected_epoch)
     }
 
+    pub(super) fn current_role_epoch(&self) -> StateResult<u64> {
+        let conn = self.open()?;
+        Ok(SyncSettingsRepository::role_epoch(&conn)?)
+    }
+
     pub(super) fn reclaim_obsolete_staged_paths(
         &self,
         expected_epoch: u64,

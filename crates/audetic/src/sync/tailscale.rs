@@ -350,8 +350,8 @@ fn is_exact_audetic_mapping(server: &Value, spec: ServeSpec) -> bool {
         return false;
     }
     handlers
-        .get(spec.mount_path())
-        .or_else(|| handlers.get(&format!("{}/", spec.mount_path())))
+        .get(spec.cli_mount_path())
+        .or_else(|| handlers.get(&spec.api_mount_path()))
         .and_then(|handler| handler.get("Proxy"))
         .and_then(Value::as_str)
         == Some(spec.proxy_url())
