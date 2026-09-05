@@ -64,6 +64,13 @@ pub struct MeetingArtifact {
 
 pub struct MeetingArtifactRepository;
 
+#[derive(Debug, Clone, Copy)]
+pub struct SharedArtifactRunIdentity {
+    pub run_id: RecordId,
+    pub artifact_id: RecordId,
+    pub origin_device_id: DeviceId,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactDeleteOutcome {
     Deleted,
@@ -73,6 +80,92 @@ pub enum ArtifactDeleteOutcome {
 }
 
 impl MeetingArtifactRepository {
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_shared_run(
+        conn: &Connection,
+        parent_record_id: RecordId,
+        kind: &str,
+        title: &str,
+        template_id: &str,
+        agent_profile_name: &str,
+        agent_profile_id: i64,
+    ) -> Result<SharedArtifactRunIdentity> {
+        let identity =
+            crate::db::sync_identity::SyncIdentityRepository::get_or_create_device(conn)?;
+        let run = SharedArtifactRunIdentity {
+            run_id: RecordId::new(),
+            artifact_id: RecordId::new(),
+            origin_device_id: identity.device_id,
+        };
+        conn.execute(
+            "INSERT INTO sync_artifact_runs \
+             (run_id, artifact_record_id, parent_record_id, origin_device_id, kind, title, \
+              template_id, agent_profile_name, agent_profile_id, status) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')",
+            params![
+                run.run_id.to_string(),
+                run.artifact_id.to_string(),
+                parent_record_id.to_string(),
+                run.origin_device_id.to_string(),
+                kind,
+                title,
+                template_id,
+                agent_profile_name,
+                agent_profile_id,
+            ],
+        )?;
+        Ok(run)
+    }
+
+    pub fn set_shared_run_running(conn: &Connection, run_id: RecordId) -> Result<()> {
+        conn.execute(
+            "UPDATE sync_artifact_runs SET status='running', updated_at=CURRENT_TIMESTAMP \
+             WHERE run_id=?1",
+            [run_id.to_string()],
+        )?;
+        Ok(())
+    }
+
+    pub fn finish_shared_run(
+        conn: &Connection,
+        run_id: RecordId,
+        status: ArtifactStatus,
+        content: Option<&str>,
+        error: Option<&str>,
+        completed_at: &str,
+        snapshot: Option<&crate::sync::protocol::CompletedArtifactSnapshot>,
+    ) -> Result<()> {
+        let transaction = conn.unchecked_transaction()?;
+        let affected = transaction.execute(
+            "UPDATE sync_artifact_runs SET status=?1, content_markdown=?2, error=?3, \
+             updated_at=?4, completed_at=?4 WHERE run_id=?5 AND NOT EXISTS ( \
+                 SELECT 1 FROM sync_tombstones t \
+                 WHERE t.record_id=sync_artifact_runs.parent_record_id AND t.kind='meeting' \
+             )",
+            params![
+                status.as_str(),
+                content,
+                error,
+                completed_at,
+                run_id.to_string()
+            ],
+        )?;
+        if affected == 0 {
+            anyhow::bail!("shared artifact run was cancelled because its meeting was deleted");
+        }
+        let role = crate::db::sync_settings::SyncSettingsRepository::get(&transaction)?.role;
+        if matches!(role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
+            if let Some(snapshot) = snapshot {
+                crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
+                    &transaction,
+                    &snapshot.clone().into(),
+                )?;
+            }
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
     pub fn insert_pending(
         conn: &Connection,
         meeting_id: i64,
@@ -276,48 +369,24 @@ impl MeetingArtifactRepository {
         conn: &Connection,
         meeting_id: i64,
         id: i64,
-        guard_possible_upload: bool,
+        _guard_possible_upload: bool,
     ) -> Result<ArtifactDeleteOutcome> {
         let transaction = conn.unchecked_transaction()?;
-        let artifact: Option<(String, String)> = transaction
+        let artifact: Option<(String, String, String, u64)> = transaction
             .query_row(
-                "SELECT sync_id, status FROM meeting_artifacts WHERE id = ?1 AND meeting_id = ?2",
+                "SELECT sync_id, status, origin_device_id, sync_version \
+                 FROM meeting_artifacts WHERE id = ?1 AND meeting_id = ?2",
                 params![id, meeting_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((sync_id, status)) = artifact else {
+        let Some((sync_id, status, origin_device_id, sync_version)) = artifact else {
             transaction.commit()?;
             return Ok(ArtifactDeleteOutcome::NotFound);
         };
         if matches!(status.as_str(), "pending" | "running") {
             transaction.commit()?;
             return Ok(ArtifactDeleteOutcome::InFlight);
-        }
-        if guard_possible_upload {
-            let active_sync = transaction
-                .query_row(
-                    "SELECT role != 'standalone' FROM sync_settings WHERE singleton = 1",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()?
-                .unwrap_or(false);
-            let may_have_uploaded =
-                sync_id
-                    .parse()
-                    .map_err(anyhow::Error::msg)
-                    .and_then(|record_id| {
-                        crate::db::sync_outbox::SyncOutboxRepository::may_have_reached_hub(
-                            &transaction,
-                            record_id,
-                            crate::sync::protocol::RecordKind::Artifact,
-                        )
-                    })?;
-            if active_sync && may_have_uploaded {
-                transaction.commit()?;
-                return Ok(ArtifactDeleteOutcome::RequiresHub);
-            }
         }
         let n = transaction
             .execute(
@@ -330,8 +399,23 @@ impl MeetingArtifactRepository {
         if n > 0 {
             transaction.execute(
                 "DELETE FROM sync_outbox_items WHERE record_id = ?1 AND kind = 'artifact'",
-                params![sync_id],
+                params![&sync_id],
             )?;
+            let settings = crate::db::sync_settings::SyncSettingsRepository::get(&transaction)?;
+            if matches!(settings.role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
+                crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
+                    &transaction,
+                    &crate::sync::protocol::DeleteSnapshot {
+                        kind: crate::sync::protocol::RecordKind::Artifact,
+                        schema_version: 1,
+                        record_id: sync_id.parse().map_err(anyhow::Error::msg)?,
+                        origin_device_id: origin_device_id.parse().map_err(anyhow::Error::msg)?,
+                        local_version: sync_version + 1,
+                        deleted_at: chrono::Utc::now().to_rfc3339(),
+                    }
+                    .into(),
+                )?;
+            }
         }
         transaction.commit()?;
         Ok(if n > 0 {
@@ -553,6 +637,127 @@ mod tests {
         Ok(conn)
     }
 
+    fn reject_outbox_inserts(conn: &Connection) -> Result<()> {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_outbox_insert BEFORE INSERT ON sync_outbox_items \
+             BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_completion_rolls_back_when_publication_fails() -> Result<()> {
+        let conn = setup_db()?;
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn)?;
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub' WHERE singleton=1",
+            [],
+        )?;
+        let meeting = MeetingRepository::insert(&conn, None, "/tmp/meeting.wav")?;
+        MeetingRepository::complete(&conn, meeting, "/tmp/meeting.txt", "transcript", None, 1)?;
+        let artifact = MeetingArtifactRepository::insert_pending(
+            &conn, meeting, "summary", "Summary", None, None,
+        )?;
+        MeetingArtifactRepository::set_running(&conn, artifact)?;
+        reject_outbox_inserts(&conn)?;
+
+        assert!(MeetingArtifactRepository::complete(&conn, artifact, "# Done", "", "").is_err());
+        let stored = MeetingArtifactRepository::get(&conn, artifact)?.unwrap();
+        assert_eq!(stored.status, super::ArtifactStatus::Running);
+        assert!(stored.content_markdown.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_deletion_rolls_back_when_tombstone_publication_fails() -> Result<()> {
+        let conn = setup_db()?;
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn)?;
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub' WHERE singleton=1",
+            [],
+        )?;
+        let meeting = MeetingRepository::insert(&conn, None, "/tmp/meeting.wav")?;
+        MeetingRepository::complete(&conn, meeting, "/tmp/meeting.txt", "transcript", None, 1)?;
+        let artifact = MeetingArtifactRepository::insert_pending(
+            &conn, meeting, "summary", "Summary", None, None,
+        )?;
+        MeetingArtifactRepository::complete(&conn, artifact, "# Done", "", "")?;
+        conn.execute("DELETE FROM sync_outbox_items WHERE kind='artifact'", [])?;
+        reject_outbox_inserts(&conn)?;
+
+        assert!(MeetingArtifactRepository::delete_for_live_meeting_guarded(
+            &conn, meeting, artifact,
+        )
+        .is_err());
+        assert!(MeetingArtifactRepository::get(&conn, artifact)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn shared_run_completion_rolls_back_when_publication_fails() -> Result<()> {
+        let conn = setup_db()?;
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn)?;
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub' WHERE singleton=1",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO agent_profiles (name, kind, executable, args_json) \
+             VALUES ('Agent', 'cli', 'agent', '[]')",
+            [],
+        )?;
+        let profile_id = conn.last_insert_rowid();
+        let parent = audetic_core::sync::RecordId::new();
+        let run = MeetingArtifactRepository::insert_shared_run(
+            &conn,
+            parent,
+            "summary",
+            "Summary",
+            "standard_meeting",
+            "Agent",
+            profile_id,
+        )?;
+        MeetingArtifactRepository::set_shared_run_running(&conn, run.run_id)?;
+        reject_outbox_inserts(&conn)?;
+        let completed_at = chrono::Utc::now().to_rfc3339();
+        let snapshot = crate::sync::protocol::CompletedArtifactSnapshot {
+            kind: crate::sync::protocol::RecordKind::Artifact,
+            schema_version: 1,
+            record_id: run.artifact_id,
+            parent_record_id: parent,
+            origin_device_id: run.origin_device_id,
+            local_version: 1,
+            created_at: completed_at.clone(),
+            updated_at: completed_at.clone(),
+            payload: crate::sync::protocol::CompletedArtifactPayload {
+                artifact_kind: "summary".into(),
+                title: "Summary".into(),
+                template_id: Some("standard_meeting".into()),
+                agent_profile_name: Some("Agent".into()),
+                content_markdown: "# Done".into(),
+                completed_at: completed_at.clone(),
+            },
+        };
+
+        assert!(MeetingArtifactRepository::finish_shared_run(
+            &conn,
+            run.run_id,
+            super::ArtifactStatus::Completed,
+            Some("# Done"),
+            None,
+            &completed_at,
+            Some(&snapshot),
+        )
+        .is_err());
+        let status: String = conn.query_row(
+            "SELECT status FROM sync_artifact_runs WHERE run_id=?1",
+            [run.run_id.to_string()],
+            |row| row.get(0),
+        )?;
+        assert_eq!(status, "running");
+        Ok(())
+    }
+
     #[test]
     fn live_meeting_queries_hide_artifacts_after_soft_delete() -> Result<()> {
         let conn = setup_db()?;
@@ -602,7 +807,7 @@ mod tests {
     }
 
     #[test]
-    fn guarded_artifact_delete_requires_hub_after_upload_claim() -> Result<()> {
+    fn guarded_artifact_delete_replaces_claimed_upload_with_tombstone() -> Result<()> {
         let mut conn = setup_db()?;
         crate::db::sync_settings::SyncSettingsRepository::get(&conn)?;
         conn.execute(
@@ -637,14 +842,18 @@ mod tests {
                 meeting_id,
                 artifact_id,
             )?,
-            ArtifactDeleteOutcome::RequiresHub
+            ArtifactDeleteOutcome::Deleted
         );
-        assert!(MeetingArtifactRepository::get(&conn, artifact_id)?.is_some());
-        assert!(MeetingArtifactRepository::delete_for_live_meeting(
-            &conn,
-            meeting_id,
-            artifact_id,
-        )?);
+        assert!(MeetingArtifactRepository::get(&conn, artifact_id)?.is_none());
+        let snapshot: String = conn.query_row(
+            "SELECT snapshot_json FROM sync_outbox_items WHERE kind='artifact'",
+            [],
+            |row| row.get(0),
+        )?;
+        assert!(matches!(
+            serde_json::from_str::<crate::sync::protocol::Snapshot>(&snapshot)?,
+            crate::sync::protocol::Snapshot::Delete(_)
+        ));
         Ok(())
     }
 

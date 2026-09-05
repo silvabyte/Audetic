@@ -16,8 +16,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
-use tower::util::ServiceExt;
-use tower_http::services::ServeFile;
 use tracing::{error, info, warn};
 use utoipa::{IntoParams, ToSchema};
 
@@ -224,7 +222,10 @@ pub struct MeetingTitleRegenerationResponse {
     pub message: String,
 }
 
-pub fn router(state: MeetingState) -> Router {
+pub fn router(mut state: MeetingState) -> Router {
+    if state.sync.is_none() {
+        state.sync = Some(Arc::new(state.services.local_library_service()));
+    }
     Router::new()
         .route("/meetings/start", post(start_meeting))
         .route("/meetings/stop", post(stop_meeting))
@@ -309,23 +310,11 @@ fn parse_record_id(value: &str) -> Result<RecordId, ApiError> {
     value.parse().map_err(ApiError::bad_request)
 }
 
-fn resolve_local_meeting(
-    db_path: &std::path::Path,
-    value: &str,
-) -> Result<(i64, RecordId), ApiError> {
-    let record_id = parse_record_id(value)?;
-    let conn = crate::db::open_db_at(db_path).map_err(ApiError::from)?;
-    let local_id = crate::db::meetings::MeetingRepository::internal_id(&conn, record_id)
-        .map_err(ApiError::from)?
-        .ok_or_else(|| ApiError::not_found(format!("Meeting {record_id} not found")))?;
-    Ok((local_id, record_id))
-}
-
-fn sync_id_for_local(db_path: &std::path::Path, local_id: i64) -> anyhow::Result<RecordId> {
-    let conn = crate::db::open_db_at(db_path)?;
-    crate::db::meetings::MeetingRepository::get(&conn, local_id)?
-        .map(|meeting| meeting.sync_id)
-        .ok_or_else(|| anyhow::anyhow!("meeting {local_id} not found"))
+fn sync_id_for_local(state: &MeetingState, local_id: i64) -> anyhow::Result<RecordId> {
+    match state.sync.as_ref() {
+        Some(sync) => sync.public_meeting_id(local_id).map_err(anyhow::Error::new),
+        None => state.services.public_meeting_id(local_id),
+    }
 }
 
 /// Helper: send a daemon command and await the machine's reply.
@@ -381,7 +370,7 @@ pub async fn start_meeting(
 
     match dispatch(&state.tx, reply_rx, command, "start meeting").await {
         Ok(result) => {
-            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+            let meeting_id = match sync_id_for_local(&state, result.meeting_id) {
                 Ok(id) => id,
                 Err(error) => return error_response(error, "resolve meeting UUID"),
             };
@@ -417,7 +406,7 @@ pub async fn stop_meeting(State(state): State<MeetingState>) -> Response {
 
     match dispatch(&state.tx, reply_rx, command, "stop meeting").await {
         Ok(result) => {
-            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+            let meeting_id = match sync_id_for_local(&state, result.meeting_id) {
                 Ok(id) => id,
                 Err(error) => return error_response(error, "resolve meeting UUID"),
             };
@@ -473,7 +462,7 @@ pub async fn confirm_meeting(
 
     match dispatch(&state.tx, reply_rx, command, "confirm meeting").await {
         Ok(result) => {
-            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+            let meeting_id = match sync_id_for_local(&state, result.meeting_id) {
                 Ok(id) => id,
                 Err(error) => return error_response(error, "resolve meeting UUID"),
             };
@@ -506,7 +495,7 @@ pub async fn cancel_meeting(State(state): State<MeetingState>) -> Response {
 
     match dispatch(&state.tx, reply_rx, command, "cancel meeting").await {
         Ok(result) => {
-            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+            let meeting_id = match sync_id_for_local(&state, result.meeting_id) {
                 Ok(id) => id,
                 Err(error) => return error_response(error, "resolve meeting UUID"),
             };
@@ -547,7 +536,7 @@ pub async fn toggle_meeting(
     match dispatch(&state.tx, reply_rx, command, "toggle meeting").await {
         Ok(outcome) => match outcome {
             crate::meeting::ToggleOutcome::Started(r) => {
-                let meeting_id = match sync_id_for_local(&state.services.db_path, r.meeting_id) {
+                let meeting_id = match sync_id_for_local(&state, r.meeting_id) {
                     Ok(id) => id,
                     Err(error) => return error_response(error, "resolve meeting UUID"),
                 };
@@ -562,7 +551,7 @@ pub async fn toggle_meeting(
                 .into_response()
             }
             crate::meeting::ToggleOutcome::Stopped(r) => {
-                let meeting_id = match sync_id_for_local(&state.services.db_path, r.meeting_id) {
+                let meeting_id = match sync_id_for_local(&state, r.meeting_id) {
                     Ok(id) => id,
                     Err(error) => return error_response(error, "resolve meeting UUID"),
                 };
@@ -628,7 +617,7 @@ pub async fn meeting_status(
 
     let public_id = status
         .meeting_id
-        .and_then(|id| sync_id_for_local(&state.services.db_path, id).ok());
+        .and_then(|id| sync_id_for_local(&state, id).ok());
     Json(default_meeting_status_json(&status, public_id))
 }
 
@@ -665,65 +654,20 @@ pub async fn list_meetings(
         .unwrap_or(20)
         .clamp(1, crate::sync::protocol::MAX_MEETING_PAGE);
     let offset = params.offset.unwrap_or(0);
-    if let Some(sync) = &state.sync {
-        let meetings = sync
-            .meetings(params.q.as_deref(), offset, limit)
-            .await
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-        return Ok(Json(MeetingsListResponse {
-            meetings: meetings.into_iter().map(summary_from_library).collect(),
-        }));
-    }
-    let db_path = state.services.db_path.clone();
-
-    let meetings = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db_at(&db_path)?;
-        let meetings =
-            crate::db::meetings::MeetingRepository::list(&conn, offset.saturating_add(limit))?;
-        meetings
-            .into_iter()
-            .skip(offset)
-            .map(|meeting| {
-                let upload = crate::db::sync_outbox::SyncOutboxRepository::state_for_kind(
-                    &conn,
-                    meeting.sync_id,
-                    crate::sync::protocol::RecordKind::Meeting,
-                )?;
-                Ok((meeting, upload))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let entries: Vec<MeetingSummary> = meetings
-        .into_iter()
-        .map(|(m, upload_state)| MeetingSummary {
-            id: m.sync_id,
-            origin_device_id: m.origin_device_id,
-            title: m.title,
-            title_source: MeetingTitleSource::from_stored(m.title_source.as_deref()),
-            source_filename: m.source_filename,
-            status: m.status,
-            duration_seconds: m.duration_seconds,
-            started_at: m.started_at,
-            upload_state,
-            payload_availability: if std::path::Path::new(&m.audio_path).exists() {
-                PayloadAvailability::Available
-            } else {
-                PayloadAvailability::Unavailable
-            },
-            source: "local".into(),
-            offline: false,
-            read_only: false,
-        })
-        .collect();
-
-    Ok(Json(MeetingsListResponse { meetings: entries }))
+    let sync = state
+        .sync
+        .as_ref()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    let meetings = sync
+        .meetings(params.q.as_deref(), offset, limit)
+        .await
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(MeetingsListResponse {
+        meetings: meetings.into_iter().map(summary_from_library).collect(),
+    }))
 }
 
-fn summary_from_library(m: crate::sync::library_reader::LibraryMeeting) -> MeetingSummary {
+fn summary_from_library(m: crate::sync::shared_library::LibraryMeeting) -> MeetingSummary {
     MeetingSummary {
         id: m.id,
         origin_device_id: m.origin_device_id,
@@ -735,13 +679,13 @@ fn summary_from_library(m: crate::sync::library_reader::LibraryMeeting) -> Meeti
         started_at: m.started_at,
         upload_state: m.upload_state,
         payload_availability: m.payload_availability,
-        source: m.source.into(),
-        offline: m.offline,
-        read_only: m.read_only,
+        source: m.access.source().into(),
+        offline: m.access.offline(),
+        read_only: m.access.read_only(),
     }
 }
 
-fn detail_from_library(m: crate::sync::library_reader::LibraryMeeting) -> MeetingDetailResponse {
+fn detail_from_library(m: crate::sync::shared_library::LibraryMeeting) -> MeetingDetailResponse {
     MeetingDetailResponse {
         id: m.id,
         origin_device_id: m.origin_device_id,
@@ -758,9 +702,9 @@ fn detail_from_library(m: crate::sync::library_reader::LibraryMeeting) -> Meetin
         created_at: m.created_at,
         upload_state: m.upload_state,
         payload_availability: m.payload_availability,
-        source: m.source.into(),
-        offline: m.offline,
-        read_only: m.read_only,
+        source: m.access.source().into(),
+        offline: m.access.offline(),
+        read_only: m.access.read_only(),
     }
 }
 
@@ -775,16 +719,15 @@ fn detail_from_library(m: crate::sync::library_reader::LibraryMeeting) -> Meetin
 )]
 pub async fn recent_meeting_titles(
     Query(params): Query<RecentMeetingTitlesQuery>,
-    State(_state): State<MeetingState>,
+    State(state): State<MeetingState>,
 ) -> ApiResult<Json<RecentMeetingTitlesResponse>> {
     let limit = params.limit.unwrap_or(10).min(50);
-    let titles = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db()?;
-        crate::db::meetings::MeetingRepository::recent_manual_titles(&conn, limit)
-    })
-    .await
-    .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
-    .map_err(ApiError::from)?;
+    let titles = state
+        .sync
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?
+        .recent_meeting_titles(limit)
+        .map_err(|error| ApiError::internal(error.to_string()))?;
     Ok(Json(RecentMeetingTitlesResponse { titles }))
 }
 
@@ -810,58 +753,33 @@ pub async fn update_meeting_title(
     if title.is_empty() {
         return Err(ApiError::bad_request("Meeting Title cannot be blank"));
     }
-    if let Some(sync) = &state.sync {
-        if let Some(current) = sync
-            .meeting(record_id)
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?
-        {
-            if current.source == "shared" {
-                let updated = sync
-                    .update_shared_meeting_title(record_id, title, current.title_version, None)
-                    .await
-                    .map_err(|error| {
-                        if error.to_string().contains("conflict")
-                            || error.to_string().contains("HTTP 409")
-                        {
-                            ApiError::new(StatusCode::CONFLICT, error.to_string())
-                        } else {
-                            ApiError::internal(error.to_string())
-                        }
-                    })?;
-                return Ok(Json(MeetingTitleResponse {
-                    meeting_id: record_id,
-                    title: updated.title,
-                    title_source: MeetingTitleSource::from_stored(updated.title_source.as_deref()),
-                }));
+    let sync = state
+        .sync
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?;
+    let meeting = sync
+        .update_meeting_title(record_id, title)
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("conflict") || message.contains("HTTP 409") {
+                ApiError::new(StatusCode::CONFLICT, message)
+            } else if message.contains("not found") {
+                ApiError::not_found(message)
+            } else if message.contains("unavailable") {
+                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, message)
+            } else {
+                ApiError::internal(message)
             }
-            if current.offline && current.read_only {
-                return Err(ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Home Hub is unavailable; shared title edits are not queued offline",
-                ));
-            }
-        }
+        })?;
+    if let Some(local_id) = meeting.local_id {
+        state
+            .status
+            .set_title_if_current(local_id, meeting.title.clone())
+            .await;
     }
-    let (local_id, record_id) = resolve_local_meeting(&state.services.db_path, &id)?;
-    let meeting = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-        let conn = crate::db::open_db()?;
-        if !crate::db::meetings::MeetingRepository::set_manual_title(&conn, local_id, &title)? {
-            return Ok(None);
-        }
-        crate::db::meetings::MeetingRepository::get(&conn, local_id)
-    })
-    .await
-    .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
-    .map_err(ApiError::from)?
-    .ok_or_else(|| ApiError::not_found(format!("Meeting {record_id} not found")))?;
-
-    state
-        .status
-        .set_title_if_current(local_id, meeting.title.clone())
-        .await;
     Ok(Json(MeetingTitleResponse {
-        meeting_id: record_id,
+        meeting_id: meeting.meeting_id,
         title: meeting.title,
         title_source: MeetingTitleSource::from_stored(meeting.title_source.as_deref()),
     }))
@@ -883,82 +801,34 @@ pub async fn regenerate_meeting_title(
     State(state): State<MeetingState>,
 ) -> ApiResult<(StatusCode, Json<MeetingTitleRegenerationResponse>)> {
     let record_id = parse_record_id(&id)?;
-    if let Some(sync) = &state.sync {
-        if let Some(meeting) = sync
-            .meeting(record_id)
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))?
-        {
-            if meeting.offline && meeting.read_only {
-                return Err(ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Home Hub is unavailable; generated titles are not queued offline",
-                ));
+    let sync = state
+        .sync
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?;
+    let local_id = sync
+        .regenerate_meeting_title(record_id)
+        .await
+        .map_err(|error| {
+            let message = error.to_string();
+            if message.contains("not found") {
+                ApiError::not_found(message)
+            } else {
+                ApiError::new(StatusCode::CONFLICT, message)
             }
-            if meeting.source == "shared" {
-                let transcript = meeting
-                    .transcript_text
-                    .as_deref()
-                    .filter(|value| !value.trim().is_empty())
-                    .ok_or_else(|| {
-                        ApiError::new(StatusCode::CONFLICT, "meeting has no transcript")
-                    })?;
-                let generated = crate::meeting::title::generate_shared_meeting_title(
-                    record_id,
-                    transcript,
-                    sync.db_path(),
-                )
-                .await
-                .map_err(|error| ApiError::new(StatusCode::CONFLICT, error.to_string()))?;
-                sync.update_shared_meeting_title(
-                    record_id,
-                    generated,
-                    meeting.title_version,
-                    Some("generated".into()),
-                )
-                .await
-                .map_err(|error| {
-                    if error.to_string().contains("conflict")
-                        || error.to_string().contains("HTTP 409")
-                    {
-                        ApiError::new(StatusCode::CONFLICT, error.to_string())
-                    } else {
-                        ApiError::new(StatusCode::SERVICE_UNAVAILABLE, error.to_string())
-                    }
-                })?;
-                return Ok((
-                    StatusCode::ACCEPTED,
-                    Json(MeetingTitleRegenerationResponse {
-                        success: true,
-                        meeting_id: record_id,
-                        message: "Generated title committed to Home Hub".into(),
-                    }),
-                ));
-            }
-        }
+        })?;
+    if let Some(local_id) = local_id {
+        state.status.set_title_if_current(local_id, None).await;
     }
-    let (local_id, record_id) = resolve_local_meeting(&state.services.db_path, &id)?;
-    tokio::task::spawn_blocking(move || {
-        crate::meeting::title::prepare_title_regeneration(local_id)
-    })
-    .await
-    .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
-    .map_err(|error| {
-        let message = error.to_string();
-        if message.contains("not found") {
-            ApiError::not_found(message)
-        } else {
-            ApiError::new(StatusCode::CONFLICT, message)
-        }
-    })?;
-    state.status.set_title_if_current(local_id, None).await;
-    crate::meeting::title::spawn_title_generation(local_id);
     Ok((
         StatusCode::ACCEPTED,
         Json(MeetingTitleRegenerationResponse {
             success: true,
             meeting_id: record_id,
-            message: "Title regeneration started".to_string(),
+            message: if local_id.is_some() {
+                "Title regeneration started".to_string()
+            } else {
+                "Generated title committed to Home Hub".to_string()
+            },
         }),
     ))
 }
@@ -980,82 +850,24 @@ pub async fn get_meeting(
     State(state): State<MeetingState>,
 ) -> Result<Json<MeetingDetailResponse>, Response> {
     let record_id = parse_record_id(&id).map_err(IntoResponse::into_response)?;
-    if let Some(sync) = &state.sync {
-        return sync
-            .meeting(record_id)
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()).into_response())?
-            .map(detail_from_library)
-            .map(Json)
-            .ok_or_else(|| {
-                ApiError::not_found(format!("Meeting {record_id} not found")).into_response()
-            });
-    }
-    let (_, record_id) =
-        resolve_local_meeting(&state.services.db_path, &id).map_err(IntoResponse::into_response)?;
-    let db_path = state.services.db_path.clone();
-    let meeting = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db_at(&db_path)?;
-        crate::db::meetings::MeetingRepository::get_by_sync_id(&conn, record_id)
-    })
-    .await
-    .map_err(|_| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": "db task panicked" })),
-        )
-            .into_response()
-    })?
-    .map_err(|e| {
-        error!("failed to read meeting {}: {}", id, e);
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "success": false, "message": e.to_string() })),
-        )
-            .into_response()
-    })?;
-
-    match meeting {
-        Some(m) => Ok(Json(MeetingDetailResponse {
-            id: m.sync_id,
-            origin_device_id: m.origin_device_id,
-            title: m.title,
-            title_source: MeetingTitleSource::from_stored(m.title_source.as_deref()),
-            source_filename: m.source_filename,
-            status: m.status,
-            transcript_text: m.transcript_text,
-            transcript_segments: m.transcript_segments,
-            duration_seconds: m.duration_seconds,
-            started_at: m.started_at,
-            completed_at: m.completed_at,
-            error: m.error,
-            created_at: m.created_at,
-            upload_state: None,
-            payload_availability: if std::path::Path::new(&m.audio_path).exists() {
-                PayloadAvailability::Available
-            } else {
-                PayloadAvailability::Unavailable
-            },
-            source: "local".into(),
-            offline: false,
-            read_only: false,
-        })),
-        None => Err((
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "success": false,
-                "message": format!("Meeting {} not found", id),
-            })),
-        )
-            .into_response()),
-    }
+    state
+        .sync
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("Shared Library service unavailable").into_response())?
+        .meeting(record_id)
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()).into_response())?
+        .map(detail_from_library)
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::not_found(format!("Meeting {record_id} not found")).into_response()
+        })
 }
 
 /// Stream a meeting's audio file for in-browser playback. Used by the review
 /// UI so the user can listen back before choosing trim points. Resolves the
-/// file actually on disk — the row points at the `.wav` while review is
-/// pending and the `.mp3` after processing. Served via `ServeFile`, which
-/// honours HTTP Range requests so the `<audio>` element can seek.
+/// file actually on disk and honours HTTP Range requests so the `<audio>`
+/// element can seek.
 #[utoipa::path(
     get,
     path = "/meetings/{id}/audio",
@@ -1077,107 +889,24 @@ pub async fn meeting_audio(
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    let db_path = state.services.db_path.clone();
-    let lookup = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db_at(&db_path)?;
-        crate::db::meetings::MeetingRepository::get_by_sync_id(&conn, record_id)
-    })
-    .await;
-
-    let meeting = match lookup {
-        Ok(Ok(Some(m))) => m,
-        Ok(Ok(None)) => {
-            let Some(sync) = &state.sync else {
-                return audio_not_found(record_id);
-            };
-            let range = request
-                .headers()
-                .get(axum::http::header::RANGE)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            return match sync
-                .payload(
-                    record_id,
-                    crate::sync::protocol::RecordKind::Meeting,
-                    range.as_deref(),
-                )
-                .await
-            {
-                Ok(Some(source)) => super::payload::serve(source, request).await,
-                Ok(None) => audio_not_found(record_id),
-                Err(error) => (
-                    StatusCode::BAD_GATEWAY,
-                    Json(json!({"success":false,"message":error.to_string()})),
-                )
-                    .into_response(),
-            };
-        }
-        Ok(Err(e)) => {
-            error!("Failed to load meeting {} for audio: {}", id, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": e.to_string() })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            error!("DB task panicked loading meeting {} audio: {}", id, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": "db task panicked" })),
-            )
-                .into_response();
-        }
+    let Some(sync) = &state.sync else {
+        return audio_not_found(record_id);
     };
-
-    // Resolve the file on disk: pending-review rows point at the .wav, while
-    // processed rows point at the .mp3 (and older rows may have a stale .wav
-    // path whose .mp3 sibling is the real file).
-    let stored = std::path::PathBuf::from(&meeting.audio_path);
-    let resolved = if stored.exists() {
-        stored
-    } else {
-        let mp3 = stored.with_extension("mp3");
-        if mp3.exists() {
-            mp3
-        } else {
-            if let Some(sync) = &state.sync {
-                let range = request
-                    .headers()
-                    .get(axum::http::header::RANGE)
-                    .and_then(|value| value.to_str().ok())
-                    .map(str::to_owned);
-                return match sync
-                    .payload(
-                        record_id,
-                        crate::sync::protocol::RecordKind::Meeting,
-                        range.as_deref(),
-                    )
-                    .await
-                {
-                    Ok(Some(source)) => super::payload::serve(source, request).await,
-                    Ok(None) => audio_not_found(record_id),
-                    Err(error) => (
-                        StatusCode::BAD_GATEWAY,
-                        Json(json!({"success":false,"message":error.to_string()})),
-                    )
-                        .into_response(),
-                };
-            }
-            return audio_not_found(record_id);
-        }
-    };
-
-    match ServeFile::new(resolved).oneshot(request).await {
-        Ok(res) => res.into_response(),
-        Err(e) => {
-            error!("Failed to serve meeting {} audio: {}", id, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": "failed to read audio file" })),
-            )
-                .into_response()
-        }
+    let range = request
+        .headers()
+        .get(axum::http::header::RANGE)
+        .and_then(|value| value.to_str().ok());
+    match sync
+        .payload(record_id, crate::sync::protocol::RecordKind::Meeting, range)
+        .await
+    {
+        Ok(Some(source)) => super::payload::serve(source),
+        Ok(None) => audio_not_found(record_id),
+        Err(error) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"success":false,"message":error.to_string()})),
+        )
+            .into_response(),
     }
 }
 
@@ -1214,21 +943,28 @@ fn audio_not_found(id: RecordId) -> Response {
 )]
 pub async fn retry_meeting(Path(id): Path<String>, State(state): State<MeetingState>) -> Response {
     info!("Meeting {} retry requested", id);
-    let (local_id, record_id) = match resolve_local_meeting(&state.services.db_path, &id) {
+    let record_id = match parse_record_id(&id) {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    let db_path = state.services.db_path.clone();
-
-    let join = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db_at(&db_path)?;
-        crate::db::meetings::MeetingRepository::get(&conn, local_id)
-    })
-    .await;
-
-    let meeting = match join {
-        Ok(Ok(Some(m))) => m,
-        Ok(Ok(None)) => {
+    let Some(sync) = state.sync.as_ref() else {
+        return ApiError::internal("Shared Library service unavailable").into_response();
+    };
+    let prepared = match sync.prepare_meeting_retry(record_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            error!("Failed to prepare meeting {} retry: {}", id, error);
+            return ApiError::internal(error.to_string()).into_response();
+        }
+    };
+    let (local_id, record_id, resolved_path, duration) = match prepared {
+        crate::sync::shared_library::RetryMeetingResult::Ready {
+            local_id,
+            record_id,
+            audio_path,
+            duration_seconds,
+        } => (local_id, record_id, audio_path, duration_seconds),
+        crate::sync::shared_library::RetryMeetingResult::NotFound => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(json!({
@@ -1238,101 +974,30 @@ pub async fn retry_meeting(Path(id): Path<String>, State(state): State<MeetingSt
             )
                 .into_response();
         }
-        Ok(Err(e)) => {
-            error!("Failed to load meeting {}: {}", id, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "success": false,
-                    "message": e.to_string(),
-                })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            error!("DB task panicked while loading meeting {}: {}", id, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "success": false,
-                    "message": "db task panicked",
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    // Only retry from a terminal failure. Re-running a `completed` meeting is
-    // a no-op the user almost certainly didn't intend; re-running an in-flight
-    // one would race with the live machine.
-    if meeting.status != MeetingPhase::Error.as_str() {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "success": false,
-                "message": format!(
-                    "Meeting {} is in state '{}'; only failed meetings can be retried",
-                    id, meeting.status
-                ),
-            })),
-        )
-            .into_response();
-    }
-
-    // Resolve the file actually on disk. Older meetings (before we kept the
-    // DB row in sync with the WAV → MP3 compression swap) have a stale
-    // `.wav` path; the durable mp3 next to it is what we actually want.
-    let stored_path = std::path::PathBuf::from(&meeting.audio_path);
-    let resolved_path = if stored_path.exists() {
-        stored_path
-    } else {
-        let mp3_sibling = stored_path.with_extension("mp3");
-        if mp3_sibling.exists() {
-            info!(
-                "Meeting {} stored path missing; using mp3 sibling: {:?}",
-                id, mp3_sibling
-            );
-            // Heal the row so future calls don't pay this lookup again.
-            let mp3_str = mp3_sibling.to_string_lossy().into_owned();
-            let heal_db_path = state.services.db_path.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                let conn = crate::db::open_db_at(&heal_db_path)?;
-                crate::db::meetings::MeetingRepository::update_audio_path(&conn, local_id, &mp3_str)
-            })
-            .await;
-            mp3_sibling
-        } else {
+        crate::sync::shared_library::RetryMeetingResult::WrongState(status) => {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
                     "success": false,
                     "message": format!(
-                        "Audio file no longer on disk: {} (and no .mp3 sibling)",
-                        meeting.audio_path
+                        "Meeting {} is in state '{}'; only failed meetings can be retried",
+                        id, status
                     ),
                 })),
             )
                 .into_response();
         }
-    };
-
-    // Atomically flip error → transcribing *before* returning 202. The status
-    // check above and the spawned task's own transition leave a window where
-    // the row is still `error`; a DELETE arriving then would treat this
-    // already-accepted retry as a terminal, deletable meeting and hide it. Do
-    // the transition here (last, after the file-missing 409s, so a bail can't
-    // strand the row in `transcribing`) and reject if the row is no longer the
-    // failed meeting we loaded — e.g. a concurrent retry or delete won.
-    let retry_db_path = state.services.db_path.clone();
-    let marked = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db_at(&retry_db_path)?;
-        crate::db::meetings::MeetingRepository::begin_retry(&conn, local_id)
-    })
-    .await;
-
-    match marked {
-        Ok(Ok(true)) => {}
-        Ok(Ok(false)) => {
+        crate::sync::shared_library::RetryMeetingResult::MissingAudio(path) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "success": false,
+                    "message": format!("Audio file no longer on disk: {path} (and no .mp3 sibling)"),
+                })),
+            )
+                .into_response();
+        }
+        crate::sync::shared_library::RetryMeetingResult::StateChanged => {
             return (
                 StatusCode::CONFLICT,
                 Json(json!({
@@ -1345,25 +1010,8 @@ pub async fn retry_meeting(Path(id): Path<String>, State(state): State<MeetingSt
             )
                 .into_response();
         }
-        Ok(Err(e)) => {
-            error!("Failed to mark meeting {} retry in-flight: {}", id, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": e.to_string() })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            error!("DB task panicked marking meeting {} retry: {}", id, e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": "db task panicked" })),
-            )
-                .into_response();
-        }
-    }
+    };
 
-    let duration = meeting.duration_seconds.unwrap_or(0);
     let transcription = state.transcription.clone();
     tokio::spawn(async move {
         crate::meeting::retry_meeting_transcription(
@@ -1419,121 +1067,15 @@ pub async fn delete_meeting(Path(id): Path<String>, State(state): State<MeetingS
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    if let Some(sync) = &state.sync {
-        let meeting = match sync.meeting(record_id).await {
-            Ok(meeting) => meeting,
-            Err(error) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"success":false,"message":error.to_string()})),
-                )
-                    .into_response();
-            }
-        };
-        let Some(meeting) = meeting else {
-            return ApiError::not_found(format!("Meeting {record_id} not found")).into_response();
-        };
-        if !crate::meeting::MeetingPhase::is_terminal(&meeting.status) {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "success": false,
-                    "message": format!(
-                        "Meeting {id} is still in progress; stop or cancel it before deleting"
-                    ),
-                })),
-            )
-                .into_response();
-        }
-        if meeting.source == "shared" {
-            return match sync
-                .delete_shared_record(record_id, crate::sync::protocol::RecordKind::Meeting)
-                .await
-            {
-                Ok(()) => {
-                    let conn = match crate::db::open_db_at(&state.services.db_path) {
-                        Ok(conn) => conn,
-                        Err(error) => return ApiError::internal(error.to_string()).into_response(),
-                    };
-                    let local_cleanup = match crate::db::meetings::MeetingRepository::internal_id(
-                        &conn, record_id,
-                    ) {
-                        Ok(Some(local_id)) => {
-                            match crate::db::meetings::MeetingRepository::soft_delete_after_hub_delete(
-                                &conn, local_id,
-                            ) {
-                                Ok(crate::db::meetings::SoftDeleteOutcome::Deleted) => Some(local_id),
-                                Ok(other) => {
-                                    return ApiError::internal(format!(
-                                        "local meeting cleanup was refused: {other:?}"
-                                    ))
-                                    .into_response();
-                                }
-                                Err(error) => {
-                                    return ApiError::internal(error.to_string()).into_response()
-                                }
-                            }
-                        }
-                        Ok(None) => {
-                            if let Err(error) = crate::db::meetings::MeetingRepository::cleanup_deleted_sync_work(
-                                &conn, record_id,
-                            ) {
-                                return ApiError::internal(error.to_string()).into_response();
-                            }
-                            None
-                        }
-                        Err(error) => return ApiError::internal(error.to_string()).into_response(),
-                    };
-                    if let Some(local_id) = local_cleanup {
-                        state.status.clear_if_current(local_id).await;
-                    }
-                    (
-                        StatusCode::OK,
-                        Json(MeetingDeleteResponse {
-                            success: true,
-                            meeting_id: record_id,
-                            message: format!("Meeting {record_id} deleted"),
-                        }),
-                    )
-                        .into_response()
-                }
-                Err(error) => (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"success":false,"message":error.to_string()})),
-                )
-                    .into_response(),
-            };
-        }
-        if meeting.read_only {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"success":false,"message":"Home Hub is unavailable; shared deletions are not queued offline"})),
-            )
-                .into_response();
-        }
-    }
-    let (local_id, record_id) = match resolve_local_meeting(&state.services.db_path, &id) {
-        Ok(value) => value,
-        Err(error) => return error.into_response(),
+    let Some(sync) = &state.sync else {
+        return ApiError::internal("Shared Library service unavailable").into_response();
     };
-    let db_path = state.services.db_path.clone();
-
-    let outcome = tokio::task::spawn_blocking(move || {
-        let conn = crate::db::open_db_at(&db_path)?;
-        crate::db::meetings::MeetingRepository::soft_delete(&conn, local_id)
-    })
-    .await;
-
-    use crate::db::meetings::SoftDeleteOutcome;
-    match outcome {
-        Ok(Ok(SoftDeleteOutcome::Deleted)) => {
-            // The DB row is hidden, but the most recent meeting also lives on
-            // in the shared status handle (terminal phases keep id/title/error
-            // there so the UI can show the outcome). Clear it if it still
-            // points at this meeting, or GET /meetings/status would keep
-            // reporting the deleted meeting until the next recording starts.
-            if state.status.clear_if_current(local_id).await {
-                info!("Meeting {} cleared from live status after delete", id);
+    match sync.delete_meeting(record_id).await {
+        Ok(crate::sync::shared_library::DeleteResult::Deleted { local_id }) => {
+            if let Some(local_id) = local_id {
+                if state.status.clear_if_current(local_id).await {
+                    info!("Meeting {} cleared from live status after delete", id);
+                }
             }
             (
                 StatusCode::OK,
@@ -1545,7 +1087,7 @@ pub async fn delete_meeting(Path(id): Path<String>, State(state): State<MeetingS
             )
                 .into_response()
         }
-        Ok(Ok(SoftDeleteOutcome::NotFound)) => (
+        Ok(crate::sync::shared_library::DeleteResult::NotFound) => (
             StatusCode::NOT_FOUND,
             Json(json!({
                 "success": false,
@@ -1553,7 +1095,7 @@ pub async fn delete_meeting(Path(id): Path<String>, State(state): State<MeetingS
             })),
         )
             .into_response(),
-        Ok(Ok(SoftDeleteOutcome::InFlight)) => (
+        Ok(crate::sync::shared_library::DeleteResult::InFlight) => (
             StatusCode::CONFLICT,
             Json(json!({
                 "success": false,
@@ -1563,67 +1105,11 @@ pub async fn delete_meeting(Path(id): Path<String>, State(state): State<MeetingS
             })),
         )
             .into_response(),
-        Ok(Ok(SoftDeleteOutcome::RequiresHub)) => {
-            let Some(sync) = &state.sync else {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"success":false,"message":"Home Hub deletion is required"})),
-                )
-                    .into_response();
-            };
-            if let Err(error) = sync
-                .delete_shared_record(record_id, crate::sync::protocol::RecordKind::Meeting)
-                .await
-            {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(json!({"success":false,"message":error.to_string()})),
-                )
-                    .into_response();
-            }
-            let db_path = state.services.db_path.clone();
-            match tokio::task::spawn_blocking(move || {
-                let conn = crate::db::open_db_at(&db_path)?;
-                crate::db::meetings::MeetingRepository::soft_delete_after_hub_delete(
-                    &conn, local_id,
-                )
-            })
-            .await
-            {
-                Ok(Ok(SoftDeleteOutcome::Deleted | SoftDeleteOutcome::NotFound)) => {
-                    state.status.clear_if_current(local_id).await;
-                    (
-                        StatusCode::OK,
-                        Json(MeetingDeleteResponse {
-                            success: true,
-                            meeting_id: record_id,
-                            message: format!("Meeting {record_id} deleted"),
-                        }),
-                    )
-                        .into_response()
-                }
-                Ok(Ok(_)) => {
-                    ApiError::internal("local meeting cleanup was refused").into_response()
-                }
-                Ok(Err(error)) => ApiError::internal(error.to_string()).into_response(),
-                Err(error) => {
-                    ApiError::internal(format!("db task panicked: {error}")).into_response()
-                }
-            }
-        }
-        Ok(Err(e)) => {
+        Err(e) => {
             error!("Failed to delete meeting {}: {}", id, e);
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::SERVICE_UNAVAILABLE,
                 Json(json!({ "success": false, "message": e.to_string() })),
-            )
-                .into_response()
-        }
-        Err(e) => {
-            error!("DB task panicked deleting meeting {}: {}", id, e);
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "success": false, "message": "db task panicked" })),
             )
                 .into_response()
         }
@@ -1757,7 +1243,7 @@ pub async fn import_meeting(
 
     match import_meeting_file(args).await {
         Ok(result) => {
-            let meeting_id = match sync_id_for_local(&state.services.db_path, result.meeting_id) {
+            let meeting_id = match sync_id_for_local(&state, result.meeting_id) {
                 Ok(id) => id,
                 Err(error) => return error_response(error, "resolve meeting UUID"),
             };

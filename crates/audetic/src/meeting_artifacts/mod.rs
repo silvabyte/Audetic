@@ -1,7 +1,7 @@
 //! Generate and persist meeting artifacts using local agent CLIs.
 
 use anyhow::{Context, Result};
-use audetic_core::sync::{RecordId, SyncRole};
+use audetic_core::sync::RecordId;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use utoipa::ToSchema;
@@ -33,7 +33,15 @@ pub async fn generate_meeting_artifact(
     meeting_id: i64,
     request: GenerateArtifactRequest,
 ) -> Result<MeetingArtifact> {
-    let conn = crate::db::open_db().context("Failed to open audetic database")?;
+    generate_meeting_artifact_at(&crate::global::db_file()?, meeting_id, request).await
+}
+
+pub(crate) async fn generate_meeting_artifact_at(
+    db_path: &Path,
+    meeting_id: i64,
+    request: GenerateArtifactRequest,
+) -> Result<MeetingArtifact> {
+    let conn = crate::db::open_db_at(db_path).context("Failed to open audetic database")?;
     AgentProfileRepository::ensure_builtin_profiles(&conn)?;
 
     let meeting = MeetingRepository::get(&conn, meeting_id)?
@@ -139,18 +147,20 @@ pub async fn generate_shared_meeting_artifact(
     template.validate()?;
     let profile = resolve_profile(&conn, request.agent_profile_id)?;
     let title = format!("{} — {}", template.name, profile.name);
-    let run_id = RecordId::new();
-    let artifact_id = RecordId::new();
-    let identity = crate::db::sync_identity::SyncIdentityRepository::get_or_create_device(&conn)?;
-    conn.execute(
-        "INSERT INTO sync_artifact_runs (run_id, artifact_record_id, parent_record_id, origin_device_id, kind, title, template_id, agent_profile_name, agent_profile_id, status) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 'pending')",
-        rusqlite::params![run_id.to_string(),artifact_id.to_string(),meeting_id.to_string(),identity.device_id.to_string(),request.kind,&title,template.id,profile.name,profile.id],
+    let run = MeetingArtifactRepository::insert_shared_run(
+        &conn,
+        meeting_id,
+        &request.kind,
+        &title,
+        &template.id,
+        &profile.name,
+        profile.id,
     )?;
-    conn.execute("UPDATE sync_artifact_runs SET status='running', updated_at=CURRENT_TIMESTAMP WHERE run_id=?1",[run_id.to_string()])?;
+    MeetingArtifactRepository::set_shared_run_running(&conn, run.run_id)?;
 
     let output = async {
         let paths = prepare_run_files(
-            &run_id.to_string(),
+            &run.run_id.to_string(),
             &meeting_id.to_string(),
             meeting_title,
             transcript,
@@ -203,25 +213,13 @@ pub async fn generate_shared_meeting_artifact(
         ),
     };
     let completed_at = chrono::Utc::now().to_rfc3339();
-    let transaction = conn.unchecked_transaction()?;
-    let affected = transaction.execute(
-        "UPDATE sync_artifact_runs SET status=?1, content_markdown=?2, error=?3, updated_at=?4, completed_at=?4 \
-         WHERE run_id=?5 AND NOT EXISTS ( \
-             SELECT 1 FROM sync_tombstones t \
-             WHERE t.record_id=sync_artifact_runs.parent_record_id AND t.kind='meeting' \
-         )",
-        rusqlite::params![status.as_str(),content,error,completed_at,run_id.to_string()],
-    )?;
-    if affected == 0 {
-        anyhow::bail!("shared artifact run was cancelled because its meeting was deleted");
-    }
-    if status == crate::db::meeting_artifacts::ArtifactStatus::Completed {
-        let snapshot = crate::sync::protocol::CompletedArtifactSnapshot {
+    let snapshot = if status == crate::db::meeting_artifacts::ArtifactStatus::Completed {
+        Some(crate::sync::protocol::CompletedArtifactSnapshot {
             kind: crate::sync::protocol::RecordKind::Artifact,
             schema_version: 1,
-            record_id: artifact_id,
+            record_id: run.artifact_id,
             parent_record_id: meeting_id,
-            origin_device_id: identity.device_id,
+            origin_device_id: run.origin_device_id,
             local_version: 1,
             created_at: completed_at.clone(),
             updated_at: completed_at.clone(),
@@ -233,22 +231,25 @@ pub async fn generate_shared_meeting_artifact(
                 content_markdown: content.clone().expect("completed artifact has content"),
                 completed_at: completed_at.clone(),
             },
-        };
-        let role = crate::db::sync_settings::SyncSettingsRepository::get(&transaction)?.role;
-        if matches!(role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
-            crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
-                &transaction,
-                &snapshot.into(),
-            )?;
-        }
-    }
-    transaction.commit()?;
+        })
+    } else {
+        None
+    };
+    MeetingArtifactRepository::finish_shared_run(
+        &conn,
+        run.run_id,
+        status,
+        content.as_deref(),
+        error.as_deref(),
+        &completed_at,
+        snapshot.as_ref(),
+    )?;
     Ok(MeetingArtifact {
-        id: artifact_id,
+        id: run.artifact_id,
         meeting_id,
         local_id: 0,
         local_meeting_id: 0,
-        origin_device_id: identity.device_id,
+        origin_device_id: run.origin_device_id,
         sync_version: 1,
         kind: request.kind,
         title,

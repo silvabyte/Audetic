@@ -1,24 +1,22 @@
 //! Thin route-facing composition facade for the Library Sync domain.
 
-use audetic_core::sync::{RecordId, SyncRole, SyncSetupRequest, SyncSetupResult, SyncStatus};
+use audetic_core::sync::{RecordId, SyncSetupRequest, SyncSetupResult, SyncStatus};
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::client::NetworkHubAdapter;
-use super::library::HubLibrary;
-use super::protocol::{MeetingTitlePatch, RecordKind, SharedMeeting, HUB_LISTENER_ADDRESS};
+use super::protocol::{RecordKind, SharedMeeting, HUB_LISTENER_ADDRESS};
+use super::shared_library::{
+    ArtifactDeleteResult, DeleteResult, LibraryMeeting, LibraryPayload, MeetingPageRequest,
+    MeetingTitleResult, PayloadRequest, RetryMeetingResult, SharedLibraryService,
+};
 use super::tailscale::{SystemCommandRunner, Tailscale, TailscaleControl};
 use super::transition::RoleCoordinator;
-use super::transport::{HubCapabilities, StreamingPayloadResponse};
+use super::transport::HubCapabilities;
 
 pub use super::transition::TransitionError as SyncServiceError;
-
-pub enum PayloadSource {
-    Local(crate::db::shared_library::LibraryBlobRecord),
-    Remote(StreamingPayloadResponse),
-}
 
 #[derive(Clone)]
 pub struct SyncService {
@@ -26,11 +24,25 @@ pub struct SyncService {
     pub(super) coordinator: RoleCoordinator,
     #[cfg(not(test))]
     coordinator: RoleCoordinator,
+    library: SharedLibraryService,
 }
 
 impl SyncService {
-    pub(crate) fn db_path(&self) -> &std::path::Path {
-        self.coordinator.db_path()
+    pub(crate) fn default_local_library() -> anyhow::Result<Self> {
+        Ok(Self::local_library(crate::global::db_file()?))
+    }
+
+    pub(crate) fn local_library(db_path: PathBuf) -> Self {
+        let mut service = Self::with_dependencies(
+            db_path,
+            Arc::new(Tailscale::new(SystemCommandRunner)),
+            HubCapabilities::from_adapter(NetworkHubAdapter::default()),
+            HUB_LISTENER_ADDRESS
+                .parse()
+                .expect("valid listener address"),
+        );
+        service.library = SharedLibraryService::standalone(service.coordinator.clone());
+        service
     }
 
     pub fn production(db_path: PathBuf) -> Self {
@@ -50,13 +62,12 @@ impl SyncService {
         hub_capabilities: HubCapabilities,
         hub_bind_address: SocketAddr,
     ) -> Self {
+        let coordinator =
+            RoleCoordinator::new(db_path, tailscale, hub_capabilities, hub_bind_address);
+        let library = SharedLibraryService::new(coordinator.clone());
         Self {
-            coordinator: RoleCoordinator::new(
-                db_path,
-                tailscale,
-                hub_capabilities,
-                hub_bind_address,
-            ),
+            coordinator,
+            library,
         }
     }
 
@@ -73,38 +84,20 @@ impl SyncService {
         &self,
         params: &crate::history::SearchParams,
     ) -> Result<Vec<crate::history::HistoryEntry>, SyncServiceError> {
-        let access = self.coordinator.library_access()?;
-        let settings = access.settings.clone();
-        let result = super::library_reader::LibraryReader::new(
-            access.db_path.clone(),
-            access.capabilities.dictations(),
-        )
-        .read(&settings, params)
-        .await
-        .map_err(SyncServiceError::Data)?;
-        self.coordinator
-            .record_library_observation(&access, result.hub_reachable, result.error.as_deref())
-            .await?;
-        Ok(result.entries)
+        self.library
+            .dictations(params)
+            .await
+            .map_err(SyncServiceError::Data)
     }
 
     pub async fn history_entry(
         &self,
         id: RecordId,
     ) -> Result<Option<crate::history::HistoryEntry>, SyncServiceError> {
-        let mut offset = 0usize;
-        loop {
-            let mut params = crate::history::SearchParams::new().with_limit(100);
-            params.offset = offset;
-            let page = self.history(&params).await?;
-            if let Some(entry) = page.iter().find(|entry| entry.id == id) {
-                return Ok(Some(entry.clone()));
-            }
-            if page.len() < 100 {
-                return Ok(None);
-            }
-            offset = offset.saturating_add(page.len());
-        }
+        self.library
+            .dictation(id)
+            .await
+            .map_err(SyncServiceError::Data)
     }
 
     pub async fn meetings(
@@ -112,37 +105,22 @@ impl SyncService {
         query: Option<&str>,
         offset: usize,
         limit: usize,
-    ) -> Result<Vec<super::library_reader::LibraryMeeting>, SyncServiceError> {
-        let access = self.coordinator.library_access()?;
-        let settings = access.settings.clone();
-        let result = super::library_reader::MeetingLibraryReader::new(
-            access.db_path.clone(),
-            access.capabilities.meetings(),
-        )
-        .read(&settings, query, offset, limit)
-        .await
-        .map_err(SyncServiceError::Data)?;
-        self.coordinator
-            .record_library_observation(&access, result.hub_reachable, result.error.as_deref())
-            .await?;
-        Ok(result.meetings)
+    ) -> Result<Vec<LibraryMeeting>, SyncServiceError> {
+        self.library
+            .meetings(MeetingPageRequest {
+                query: query.map(str::to_owned),
+                offset,
+                limit,
+            })
+            .await
+            .map_err(SyncServiceError::Data)
     }
 
-    pub async fn meeting(
-        &self,
-        id: RecordId,
-    ) -> Result<Option<super::library_reader::LibraryMeeting>, SyncServiceError> {
-        let mut offset = 0;
-        loop {
-            let page = self.meetings(None, offset, 100).await?;
-            if let Some(value) = page.iter().find(|value| value.id == id) {
-                return Ok(Some(value.clone()));
-            }
-            if page.len() < 100 {
-                return Ok(None);
-            }
-            offset += page.len();
-        }
+    pub async fn meeting(&self, id: RecordId) -> Result<Option<LibraryMeeting>, SyncServiceError> {
+        self.library
+            .meeting(id)
+            .await
+            .map_err(SyncServiceError::Data)
     }
 
     pub async fn update_shared_meeting_title(
@@ -152,28 +130,96 @@ impl SyncService {
         expected_title_version: u64,
         title_source: Option<String>,
     ) -> Result<SharedMeeting, SyncServiceError> {
-        let access = self.coordinator.library_access()?;
-        let settings = access.settings;
-        let patch = MeetingTitlePatch {
-            title,
-            expected_title_version,
-            title_source,
-        };
-        match settings.role {
-            SyncRole::Standalone => Err(SyncServiceError::InvalidRequest(
-                "meeting is not shared".into(),
-            )),
-            SyncRole::HomeHub => HubLibrary::new(access.db_path)
-                .update_meeting_title(id, &patch)
-                .map_err(SyncServiceError::Data)?
-                .ok_or_else(|| SyncServiceError::InvalidRequest("meeting not found".into())),
-            SyncRole::ConnectedDevice => access
-                .capabilities
-                .mutations()
-                .update_meeting_title(settings.hub.as_ref().expect("connected hub"), id, patch)
-                .await
-                .map_err(SyncServiceError::Hub),
-        }
+        self.library
+            .update_shared_title(id, title, expected_title_version, title_source)
+            .await
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub async fn update_meeting_title(
+        &self,
+        id: RecordId,
+        title: String,
+    ) -> Result<MeetingTitleResult, SyncServiceError> {
+        self.library
+            .update_meeting_title(id, title)
+            .await
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub async fn regenerate_meeting_title(
+        &self,
+        id: RecordId,
+    ) -> Result<Option<i64>, SyncServiceError> {
+        self.library
+            .regenerate_meeting_title(id)
+            .await
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub fn public_meeting_id(&self, local_id: i64) -> Result<RecordId, SyncServiceError> {
+        self.library
+            .public_meeting_id(local_id)
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub fn recent_meeting_titles(&self, limit: usize) -> Result<Vec<String>, SyncServiceError> {
+        self.library
+            .recent_meeting_titles(limit)
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub async fn prepare_meeting_retry(
+        &self,
+        id: RecordId,
+    ) -> Result<RetryMeetingResult, SyncServiceError> {
+        self.library
+            .prepare_meeting_retry(id)
+            .await
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub async fn meeting_artifacts(
+        &self,
+        meeting_id: RecordId,
+    ) -> Result<Vec<crate::db::meeting_artifacts::MeetingArtifact>, SyncServiceError> {
+        self.library
+            .artifacts(meeting_id)
+            .await
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub async fn meeting_artifact(
+        &self,
+        meeting_id: RecordId,
+        artifact_id: RecordId,
+    ) -> Result<Option<crate::db::meeting_artifacts::MeetingArtifact>, SyncServiceError> {
+        self.library
+            .artifact(meeting_id, artifact_id)
+            .await
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub async fn generate_meeting_artifact(
+        &self,
+        meeting_id: RecordId,
+        request: crate::meeting_artifacts::GenerateArtifactRequest,
+    ) -> Result<crate::db::meeting_artifacts::MeetingArtifact, SyncServiceError> {
+        self.library
+            .generate_artifact(meeting_id, request)
+            .await
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub async fn delete_meeting_artifact(
+        &self,
+        meeting_id: RecordId,
+        artifact_id: RecordId,
+    ) -> Result<ArtifactDeleteResult, SyncServiceError> {
+        self.library
+            .delete_artifact(meeting_id, artifact_id)
+            .await
+            .map_err(SyncServiceError::Data)
     }
 
     pub async fn delete_shared_record(
@@ -181,23 +227,17 @@ impl SyncService {
         id: RecordId,
         kind: RecordKind,
     ) -> Result<(), SyncServiceError> {
-        let access = self.coordinator.library_access()?;
-        let settings = access.settings;
-        match settings.role {
-            SyncRole::Standalone => Err(SyncServiceError::InvalidRequest(
-                "record is not shared".into(),
-            )),
-            SyncRole::HomeHub => HubLibrary::new(access.db_path)
-                .delete(id, kind)
-                .map(|_| ())
-                .map_err(|error| SyncServiceError::Data(anyhow::anyhow!(error))),
-            SyncRole::ConnectedDevice => access
-                .capabilities
-                .mutations()
-                .delete_record(settings.hub.as_ref().expect("connected hub"), id, kind)
-                .await
-                .map_err(SyncServiceError::Hub),
-        }
+        self.library
+            .delete_shared_record(id, kind)
+            .await
+            .map_err(SyncServiceError::Data)
+    }
+
+    pub async fn delete_meeting(&self, id: RecordId) -> Result<DeleteResult, SyncServiceError> {
+        self.library
+            .delete_meeting(id)
+            .await
+            .map_err(SyncServiceError::Data)
     }
 
     pub async fn payload(
@@ -205,28 +245,15 @@ impl SyncService {
         id: RecordId,
         kind: RecordKind,
         range: Option<&str>,
-    ) -> Result<Option<PayloadSource>, SyncServiceError> {
-        let access = self.coordinator.library_access()?;
-        let settings = access.settings;
-        match settings.role {
-            SyncRole::Standalone => Ok(None),
-            SyncRole::HomeHub => HubLibrary::new(access.db_path)
-                .payload(id, kind)
-                .map(|value| value.map(PayloadSource::Local))
-                .map_err(SyncServiceError::Data),
-            SyncRole::ConnectedDevice => access
-                .capabilities
-                .payloads()
-                .stream_payload(
-                    settings.hub.as_ref().expect("connected hub"),
-                    id,
-                    kind,
-                    range,
-                )
-                .await
-                .map(|value| Some(PayloadSource::Remote(value)))
-                .map_err(SyncServiceError::Hub),
-        }
+    ) -> Result<Option<LibraryPayload>, SyncServiceError> {
+        self.library
+            .payload(PayloadRequest {
+                id,
+                kind,
+                range: range.map(str::to_owned),
+            })
+            .await
+            .map_err(SyncServiceError::Data)
     }
 
     pub async fn retry(&self) -> Result<u64, SyncServiceError> {

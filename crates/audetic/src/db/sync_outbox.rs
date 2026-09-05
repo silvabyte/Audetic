@@ -841,6 +841,25 @@ impl SyncOutboxRepository {
         }))
     }
 
+    pub fn deletion_masks(
+        conn: &Connection,
+        record_id: RecordId,
+        kind: RecordKind,
+    ) -> Result<bool> {
+        let snapshot = conn
+            .query_row(
+                "SELECT snapshot_json FROM sync_outbox_items WHERE record_id=?1 AND kind=?2",
+                params![record_id.to_string(), kind_name(kind)],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        snapshot
+            .map(|json| serde_json::from_str::<Snapshot>(&json))
+            .transpose()
+            .map(|snapshot| matches!(snapshot, Some(Snapshot::Delete(_))))
+            .context("reading deletion mask from sync outbox")
+    }
+
     /// Whether an upload attempt could have committed on the Home Hub even if
     /// this device did not receive the acceptance response. Deleting such a
     /// record locally is unsafe: an in-flight or previously interrupted upload
@@ -884,6 +903,7 @@ fn same_snapshot_except_recording_payload(left: &Snapshot, right: &Snapshot) -> 
             Snapshot::Dictation(value) => value.payload.recording_payload = Default::default(),
             Snapshot::Meeting(value) => value.payload.recording_payload = Default::default(),
             Snapshot::Artifact(_) => {}
+            Snapshot::Delete(_) => {}
         }
     }
     Ok(serde_json::to_value(left)? == serde_json::to_value(right)?)
@@ -908,6 +928,7 @@ fn set_recording_payload(snapshot: &mut Snapshot, descriptor: RecordingPayloadDe
         Snapshot::Dictation(value) => value.payload.recording_payload = descriptor,
         Snapshot::Meeting(value) => value.payload.recording_payload = descriptor,
         Snapshot::Artifact(_) => {}
+        Snapshot::Delete(_) => {}
     }
 }
 

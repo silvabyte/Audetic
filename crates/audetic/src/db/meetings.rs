@@ -167,12 +167,10 @@ impl MeetingRepository {
                 params![title, id],
             )
             .context("Failed to update meeting Manual Title")?;
-        // Sync publication follows the local commit so an outbox failure can
-        // never roll back the person's title edit.
-        transaction.commit()?;
         if affected > 0 {
-            Self::enqueue_if_completed(conn, id)?;
+            Self::enqueue_if_completed_from(&transaction, id)?;
         }
+        transaction.commit()?;
         Ok(affected > 0)
     }
 
@@ -200,27 +198,31 @@ impl MeetingRepository {
                 params![title, id, title_version],
             )
             .context("Failed to set Generated Title")?;
-        // Publish after committing the local title change.
-        transaction.commit()?;
         if affected > 0 {
-            Self::enqueue_if_completed(conn, id)?;
+            Self::enqueue_if_completed_from(&transaction, id)?;
         }
+        transaction.commit()?;
         Ok(affected > 0)
     }
 
     /// Intentionally return title ownership to generation. Only completed
     /// meetings with transcript text are eligible.
     pub fn release_title_for_regeneration(conn: &Connection, id: i64) -> Result<bool> {
-        let affected = conn
+        let transaction = conn.unchecked_transaction()?;
+        let affected = transaction
             .execute(
                 "UPDATE meetings SET title = NULL, title_source = NULL, \
                  title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
-                 title_version = title_version + 1 \
+                 title_version = title_version + 1, sync_version = sync_version + 1 \
                  WHERE id = ?1 AND deleted_at IS NULL AND status = ?2 \
                  AND transcript_text IS NOT NULL AND trim(transcript_text) <> ''",
                 params![id, MeetingPhase::Completed.as_str()],
             )
             .context("Failed to release Meeting Title for regeneration")?;
+        if affected > 0 {
+            Self::enqueue_if_completed_from(&transaction, id)?;
+        }
+        transaction.commit()?;
         Ok(affected > 0)
     }
 
@@ -558,18 +560,19 @@ impl MeetingRepository {
     fn soft_delete_impl(
         conn: &Connection,
         id: i64,
-        guard_possible_upload: bool,
+        _guard_possible_upload: bool,
     ) -> Result<SoftDeleteOutcome> {
         // Build the IN-list from the single terminal-status source. The values
         // are compile-time constants (never user input), so interpolating them
         // is injection-safe; `id` is still bound as a parameter.
         let terminal = MeetingPhase::TERMINAL_STATUSES.join("', '");
         let transaction = conn.unchecked_transaction()?;
-        let record_id: Option<String> = transaction
+        let identity: Option<(String, String, u64)> = transaction
             .query_row(
-                "SELECT sync_id FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
+                "SELECT sync_id, origin_device_id, sync_version FROM meetings \
+                 WHERE id = ?1 AND deleted_at IS NULL",
                 [id],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
         let status: Option<String> = transaction
@@ -586,57 +589,11 @@ impl MeetingRepository {
             transaction.commit()?;
             return Ok(SoftDeleteOutcome::InFlight);
         }
-        if guard_possible_upload {
-            let active_sync = transaction
-                .query_row(
-                    "SELECT role != 'standalone' FROM sync_settings WHERE singleton = 1",
-                    [],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()?
-                .unwrap_or(false);
-            let may_have_uploaded_children = if let Some(parent_record_id) = record_id.as_deref() {
-                transaction.query_row(
-                    "SELECT EXISTS( \
-                         SELECT 1 FROM sync_outbox_items o \
-                         WHERE o.kind = 'artifact' \
-                           AND (o.attempts > 0 OR o.accepted_hub_revision IS NOT NULL OR o.state = 'synced') \
-                           AND ( \
-                             o.record_id IN (SELECT sync_id FROM meeting_artifacts WHERE meeting_id = ?1) \
-                             OR o.record_id IN (SELECT artifact_record_id FROM sync_artifact_runs WHERE parent_record_id = ?2) \
-                           ) \
-                     )",
-                    params![id, parent_record_id],
-                    |row| row.get::<_, bool>(0),
-                )?
-            } else {
-                false
-            };
-            let meeting_may_have_uploaded = record_id
-                .as_deref()
-                .map(|record_id| {
-                    record_id
-                        .parse()
-                        .map_err(anyhow::Error::msg)
-                        .and_then(|record_id| {
-                            crate::db::sync_outbox::SyncOutboxRepository::may_have_reached_hub(
-                                &transaction,
-                                record_id,
-                                crate::sync::protocol::RecordKind::Meeting,
-                            )
-                        })
-                })
-                .transpose()?
-                .unwrap_or(false);
-            if active_sync && (meeting_may_have_uploaded || may_have_uploaded_children) {
-                transaction.commit()?;
-                return Ok(SoftDeleteOutcome::RequiresHub);
-            }
-        }
         let affected = transaction
             .execute(
                 &format!(
-                    "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP \
+                    "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP, \
+                     sync_version = sync_version + 1 \
                      WHERE id = ?1 AND deleted_at IS NULL AND status IN ('{terminal}')"
                 ),
                 params![id],
@@ -644,11 +601,26 @@ impl MeetingRepository {
             .context("Failed to soft-delete meeting")?;
 
         if affected > 0 {
-            let record_id: RecordId = record_id
-                .context("deleted meeting lost its sync UUID")?
-                .parse()
-                .map_err(anyhow::Error::msg)?;
+            let (record_id, origin_device_id, previous_version) =
+                identity.context("deleted meeting lost its sync UUID")?;
+            let record_id: RecordId = record_id.parse().map_err(anyhow::Error::msg)?;
+            let origin_device_id = origin_device_id.parse().map_err(anyhow::Error::msg)?;
             let paths = Self::cleanup_deleted_sync_work_from(&transaction, Some(id), record_id)?;
+            let settings = crate::db::sync_settings::SyncSettingsRepository::get(&transaction)?;
+            if matches!(settings.role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
+                crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
+                    &transaction,
+                    &crate::sync::protocol::DeleteSnapshot {
+                        kind: crate::sync::protocol::RecordKind::Meeting,
+                        schema_version: 1,
+                        record_id,
+                        origin_device_id,
+                        local_version: previous_version + 1,
+                        deleted_at: chrono::Utc::now().to_rfc3339(),
+                    }
+                    .into(),
+                )?;
+            }
             transaction.commit()?;
             if let Err(error) =
                 crate::db::sync_outbox::SyncOutboxRepository::reclaim_staged_paths(conn, &paths)
@@ -818,37 +790,35 @@ impl MeetingRepository {
         Ok(meetings)
     }
 
-    fn enqueue_if_completed(conn: &Connection, id: i64) -> Result<()> {
-        let transaction = conn.unchecked_transaction()?;
-        let meeting = Self::get_from(&transaction, id)?
-            .context("meeting disappeared during snapshot enqueue")?;
+    fn enqueue_if_completed_from(conn: &Connection, id: i64) -> Result<()> {
+        let meeting =
+            Self::get_from(conn, id)?.context("meeting disappeared during snapshot enqueue")?;
         if meeting.status != MeetingPhase::Completed.as_str() {
-            transaction.commit()?;
             return Ok(());
         }
-        let settings = crate::db::sync_settings::SyncSettingsRepository::get(&transaction)?;
+        let settings = crate::db::sync_settings::SyncSettingsRepository::get(conn)?;
         if matches!(settings.role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
             let existing = crate::db::sync_outbox::SyncOutboxRepository::payload_descriptor(
-                &transaction,
+                conn,
                 meeting.sync_id,
             )?;
             let recording_payload = existing
                 .unwrap_or_else(crate::sync::protocol::RecordingPayloadDescriptor::unavailable);
             crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
-                &transaction,
+                conn,
                 &meeting
                     .snapshot_with_payload(recording_payload.clone())?
                     .into(),
             )?;
             if !settings.upload_recording_payloads
                 && crate::db::sync_outbox::SyncOutboxRepository::payload_descriptor(
-                    &transaction,
+                    conn,
                     meeting.sync_id,
                 )?
                 .is_none()
             {
                 crate::db::sync_outbox::SyncOutboxRepository::enqueue_blob(
-                    &transaction,
+                    conn,
                     meeting.sync_id,
                     crate::sync::protocol::RecordKind::Meeting,
                     &recording_payload,
@@ -856,7 +826,6 @@ impl MeetingRepository {
                 )?;
             }
         }
-        transaction.commit()?;
         Ok(())
     }
 }
@@ -925,6 +894,90 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         conn
+    }
+
+    fn reject_outbox_writes(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_outbox_insert BEFORE INSERT ON sync_outbox_items \
+             BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END; \
+             CREATE TRIGGER reject_outbox_update BEFORE UPDATE ON sync_outbox_items \
+             BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn manual_and_generated_titles_roll_back_when_publication_fails() {
+        let conn = setup_db();
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+
+        let manual = MeetingRepository::insert(&conn, None, "/tmp/manual.wav").unwrap();
+        MeetingRepository::complete(&conn, manual, "/tmp/manual.txt", "manual", None, 1).unwrap();
+        let generated = MeetingRepository::insert(&conn, None, "/tmp/generated.wav").unwrap();
+        MeetingRepository::complete(&conn, generated, "/tmp/generated.txt", "generated", None, 1)
+            .unwrap();
+        let regeneration = MeetingRepository::insert(&conn, None, "/tmp/regeneration.wav").unwrap();
+        MeetingRepository::complete(
+            &conn,
+            regeneration,
+            "/tmp/regeneration.txt",
+            "regeneration",
+            None,
+            1,
+        )
+        .unwrap();
+        MeetingRepository::set_manual_title(&conn, regeneration, "Keep this title").unwrap();
+        let regeneration_version = MeetingRepository::get(&conn, regeneration)
+            .unwrap()
+            .unwrap()
+            .title_version;
+        reject_outbox_writes(&conn);
+
+        assert!(MeetingRepository::set_manual_title(&conn, manual, "Must roll back").is_err());
+        assert!(MeetingRepository::set_generated_title_if_unowned(
+            &conn,
+            generated,
+            "Must also roll back",
+            0,
+        )
+        .is_err());
+        assert!(MeetingRepository::release_title_for_regeneration(&conn, regeneration).is_err());
+        assert!(MeetingRepository::get(&conn, manual)
+            .unwrap()
+            .unwrap()
+            .title
+            .is_none());
+        assert!(MeetingRepository::get(&conn, generated)
+            .unwrap()
+            .unwrap()
+            .title
+            .is_none());
+        let regeneration = MeetingRepository::get(&conn, regeneration)
+            .unwrap()
+            .unwrap();
+        assert_eq!(regeneration.title.as_deref(), Some("Keep this title"));
+        assert_eq!(regeneration.title_version, regeneration_version);
+    }
+
+    #[test]
+    fn meeting_deletion_rolls_back_when_tombstone_publication_fails() {
+        let conn = setup_db();
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        let id = insert_completed(&conn, "Keep me", "/tmp/keep.wav");
+        reject_outbox_writes(&conn);
+
+        assert!(MeetingRepository::soft_delete(&conn, id).is_err());
+        assert!(MeetingRepository::get(&conn, id).unwrap().is_some());
     }
 
     #[test]
@@ -1528,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn soft_delete_requires_hub_after_upload_claim_and_force_cleanup_is_safe() {
+    fn soft_delete_replaces_claimed_upload_with_a_durable_tombstone() {
         let mut conn = setup_db();
         crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
         conn.execute(
@@ -1550,14 +1603,20 @@ mod tests {
 
         assert_eq!(
             MeetingRepository::soft_delete(&conn, id).unwrap(),
-            SoftDeleteOutcome::RequiresHub
-        );
-        assert!(MeetingRepository::get(&conn, id).unwrap().is_some());
-        assert_eq!(
-            MeetingRepository::soft_delete_after_hub_delete(&conn, id).unwrap(),
             SoftDeleteOutcome::Deleted
         );
         assert!(MeetingRepository::get(&conn, id).unwrap().is_none());
+        let snapshot: String = conn
+            .query_row(
+                "SELECT snapshot_json FROM sync_outbox_items WHERE kind='meeting'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<crate::sync::protocol::Snapshot>(&snapshot).unwrap(),
+            crate::sync::protocol::Snapshot::Delete(_)
+        ));
     }
 
     #[test]
@@ -1676,7 +1735,7 @@ mod tests {
     }
 
     #[test]
-    fn meeting_delete_requires_hub_when_child_artifact_upload_started() {
+    fn meeting_delete_supersedes_started_child_upload_with_parent_tombstone() {
         let conn = setup_db();
         crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
         conn.execute(
@@ -1716,8 +1775,17 @@ mod tests {
 
         assert_eq!(
             MeetingRepository::soft_delete(&conn, id).unwrap(),
-            SoftDeleteOutcome::RequiresHub
+            SoftDeleteOutcome::Deleted
         );
-        assert!(MeetingRepository::get(&conn, id).unwrap().is_some());
+        assert!(MeetingRepository::get(&conn, id).unwrap().is_none());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sync_outbox_items WHERE kind='artifact'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 }

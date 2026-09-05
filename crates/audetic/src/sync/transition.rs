@@ -9,7 +9,7 @@ use thiserror::Error;
 use tokio::sync::Mutex;
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -168,11 +168,24 @@ impl ConfigureReceipt {
 }
 
 #[derive(Clone)]
-pub(super) struct LibraryAccess {
+pub(super) struct LibraryContext {
     pub(super) db_path: PathBuf,
-    pub(super) settings: SyncSettings,
+    pub(super) role: LibraryRole,
     pub(super) capabilities: HubCapabilities,
     observation: ObservationToken,
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum LibraryRole {
+    Standalone,
+    HomeHub,
+    ConnectedDevice { hub: HubConnection },
+}
+
+#[derive(Clone, Debug)]
+pub(super) enum LibraryObservation {
+    Reachable,
+    Unreachable(String),
 }
 
 #[derive(Clone, Copy)]
@@ -316,10 +329,6 @@ impl RoleCoordinator {
             .map_err(SyncServiceError::TaskJoin)?
     }
 
-    pub(super) fn db_path(&self) -> &Path {
-        self.state.db_path()
-    }
-
     pub(super) async fn status(&self) -> Result<SyncStatus, SyncServiceError> {
         self.status_receipt().await.map(|(_, status)| status)
     }
@@ -437,12 +446,23 @@ impl RoleCoordinator {
         })
     }
 
-    pub(super) fn library_access(&self) -> Result<LibraryAccess, SyncServiceError> {
+    pub(super) fn library_context(&self) -> Result<LibraryContext, SyncServiceError> {
         self.check_available()?;
         let installation = self.load()?;
-        Ok(LibraryAccess {
+        let role = match installation.settings.role {
+            SyncRole::Standalone => LibraryRole::Standalone,
+            SyncRole::HomeHub => LibraryRole::HomeHub,
+            SyncRole::ConnectedDevice => LibraryRole::ConnectedDevice {
+                hub: installation.settings.hub.ok_or_else(|| {
+                    SyncServiceError::InvalidTransition(
+                        "persisted Connected Device role has no Home Hub".into(),
+                    )
+                })?,
+            },
+        };
+        Ok(LibraryContext {
             db_path: self.state.db_path().to_path_buf(),
-            settings: installation.settings,
+            role,
             capabilities: self.hub_capabilities.clone(),
             observation: ObservationToken(RoleVersion::new(installation.role_epoch)),
         })
@@ -450,20 +470,26 @@ impl RoleCoordinator {
 
     pub(super) async fn record_library_observation(
         &self,
-        access: &LibraryAccess,
-        reachable: bool,
-        error: Option<&str>,
+        context: &LibraryContext,
+        observation: LibraryObservation,
     ) -> Result<(), SyncServiceError> {
-        if access.settings.role == SyncRole::Standalone {
+        if matches!(context.role, LibraryRole::Standalone) {
             return Ok(());
         }
-        let role_version = access.observation.0;
-        self.state
+        let (reachable, error) = match &observation {
+            LibraryObservation::Reachable => (true, None),
+            LibraryObservation::Unreachable(error) => (false, Some(error.as_str())),
+        };
+        let role_version = context.observation.0;
+        let current = self
+            .state
             .observe_contact(role_version.value(), reachable, error)
             .map_err(SyncServiceError::State)?;
-        self.runtime
-            .observe_reachability(role_version, reachable)
-            .await;
+        if current {
+            self.runtime
+                .observe_reachability(role_version, reachable)
+                .await;
+        }
         Ok(())
     }
 
@@ -1878,6 +1904,42 @@ mod tests {
             hubs,
             path,
         }
+    }
+
+    #[tokio::test]
+    async fn stale_library_observation_cannot_cross_a_role_transition() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        let connection = crate::db::open_db_at(&fixture.path).unwrap();
+        connection
+            .execute(
+                "UPDATE sync_settings SET role='home_hub', role_epoch=role_epoch+1, \
+                 last_error=NULL WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+        let stale = fixture.service.coordinator.library_context().unwrap();
+        connection
+            .execute(
+                "UPDATE sync_settings SET role='standalone', role_epoch=role_epoch+1, \
+                 last_error='new role health' WHERE singleton=1",
+                [],
+            )
+            .unwrap();
+
+        fixture
+            .service
+            .coordinator
+            .record_library_observation(
+                &stale,
+                LibraryObservation::Unreachable("stale query failure".into()),
+            )
+            .await
+            .unwrap();
+
+        let settings = SyncSettingsRepository::get(&connection).unwrap();
+        assert_eq!(settings.role, SyncRole::Standalone);
+        assert_eq!(settings.last_error.as_deref(), Some("new role health"));
     }
 
     fn pause_at(

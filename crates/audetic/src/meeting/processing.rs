@@ -50,6 +50,16 @@ impl ProcessingServices {
     fn open_db(&self) -> anyhow::Result<rusqlite::Connection> {
         db::open_db_at(&self.db_path)
     }
+
+    pub fn public_meeting_id(&self, local_id: i64) -> anyhow::Result<audetic_core::sync::RecordId> {
+        MeetingRepository::get(&self.open_db()?, local_id)?
+            .map(|meeting| meeting.sync_id)
+            .ok_or_else(|| anyhow::anyhow!("meeting {local_id} not found"))
+    }
+
+    pub(crate) fn local_library_service(&self) -> crate::sync::SyncService {
+        crate::sync::SyncService::local_library(self.db_path.clone())
+    }
 }
 
 /// One pipeline invocation. The audio file at `audio_path` must already be

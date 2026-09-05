@@ -234,6 +234,16 @@ pub struct CompletedArtifactSnapshot {
     pub payload: CompletedArtifactPayload,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct DeleteSnapshot {
+    pub kind: RecordKind,
+    pub schema_version: u16,
+    pub record_id: RecordId,
+    pub origin_device_id: DeviceId,
+    pub local_version: u64,
+    pub deleted_at: String,
+}
+
 /// A bounded upload item. The untagged representation preserves the domain
 /// envelope on the wire: every variant carries and validates its own `kind`.
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -242,6 +252,7 @@ pub enum Snapshot {
     Dictation(DictationSnapshot),
     Meeting(MeetingSnapshot),
     Artifact(CompletedArtifactSnapshot),
+    Delete(DeleteSnapshot),
 }
 
 impl Snapshot {
@@ -250,6 +261,7 @@ impl Snapshot {
             Self::Dictation(value) => value.record_id,
             Self::Meeting(value) => value.record_id,
             Self::Artifact(value) => value.record_id,
+            Self::Delete(value) => value.record_id,
         }
     }
 
@@ -258,6 +270,7 @@ impl Snapshot {
             Self::Dictation(_) => RecordKind::Dictation,
             Self::Meeting(_) => RecordKind::Meeting,
             Self::Artifact(_) => RecordKind::Artifact,
+            Self::Delete(value) => value.kind,
         }
     }
 
@@ -266,6 +279,7 @@ impl Snapshot {
             Self::Dictation(value) => value.local_version,
             Self::Meeting(value) => value.local_version,
             Self::Artifact(value) => value.local_version,
+            Self::Delete(value) => value.local_version,
         }
     }
 
@@ -274,6 +288,7 @@ impl Snapshot {
             Self::Dictation(value) => value.origin_device_id,
             Self::Meeting(value) => value.origin_device_id,
             Self::Artifact(value) => value.origin_device_id,
+            Self::Delete(value) => value.origin_device_id,
         }
     }
 }
@@ -293,6 +308,12 @@ impl From<MeetingSnapshot> for Snapshot {
 impl From<CompletedArtifactSnapshot> for Snapshot {
     fn from(value: CompletedArtifactSnapshot) -> Self {
         Self::Artifact(value)
+    }
+}
+
+impl From<DeleteSnapshot> for Snapshot {
+    fn from(value: DeleteSnapshot) -> Self {
+        Self::Delete(value)
     }
 }
 

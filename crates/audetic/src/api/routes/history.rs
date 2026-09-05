@@ -12,8 +12,6 @@ use axum::{
 };
 use serde::Deserialize;
 use std::sync::Arc;
-use tower::ServiceExt;
-use tower_http::services::ServeFile;
 use utoipa::IntoParams;
 
 #[derive(Clone, Default)]
@@ -38,6 +36,11 @@ pub struct HistoryQueryParams {
 
 /// Create the history router.
 pub fn router(service: Option<Arc<crate::sync::SyncService>>) -> Router {
+    let service = service.or_else(|| {
+        crate::sync::SyncService::default_local_library()
+            .ok()
+            .map(Arc::new)
+    });
     Router::new()
         .route("/", get(list_history))
         .route("/:id", get(get_history_by_id))
@@ -61,37 +64,6 @@ pub async fn history_audio(
     Path(id): Path<RecordId>,
     request: axum::extract::Request,
 ) -> Response {
-    let db_path = state
-        .service
-        .as_ref()
-        .map(|service| service.db_path().to_path_buf())
-        .or_else(|| crate::global::db_file().ok());
-    if let Some(db_path) = db_path {
-        let local =
-            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<std::path::PathBuf>> {
-                let conn = crate::db::open_db_at(&db_path)?;
-                let workflow = crate::db::get_workflow_by_sync_id(&conn, id)?;
-                let Some(workflow) = workflow else {
-                    return Ok(None);
-                };
-                match workflow.data {
-                    crate::db::WorkflowData::VoiceToText(data) => {
-                        crate::sync::payload::resolve_operational_audio(std::path::Path::new(
-                            &data.audio_path,
-                        ))
-                        .map_err(Into::into)
-                    }
-                }
-            })
-            .await;
-        if let Ok(Ok(Some(path))) = local {
-            return ServeFile::new(path)
-                .oneshot(request)
-                .await
-                .map(IntoResponse::into_response)
-                .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
-        }
-    }
     let Some(service) = state.service else {
         return axum::http::StatusCode::NOT_FOUND.into_response();
     };
@@ -108,7 +80,7 @@ pub async fn history_audio(
         )
         .await
     {
-        Ok(Some(source)) => super::payload::serve(source, request).await,
+        Ok(Some(source)) => super::payload::serve(source),
         Ok(None) => axum::http::StatusCode::NOT_FOUND.into_response(),
         Err(_) => axum::http::StatusCode::BAD_GATEWAY.into_response(),
     }

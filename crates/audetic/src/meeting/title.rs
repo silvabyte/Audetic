@@ -145,7 +145,11 @@ pub(crate) fn spawn_title_generation_at(meeting_id: i64, db_path: PathBuf) {
 
 /// Validate a user-requested regeneration and release any current title.
 pub fn prepare_title_regeneration(meeting_id: i64) -> Result<()> {
-    let conn = crate::db::open_db().context("Failed to open audetic database")?;
+    prepare_title_regeneration_at(&crate::global::db_file()?, meeting_id)
+}
+
+pub(crate) fn prepare_title_regeneration_at(db_path: &Path, meeting_id: i64) -> Result<()> {
+    let conn = crate::db::open_db_at(db_path).context("Failed to open audetic database")?;
     AgentProfileRepository::ensure_builtin_profiles(&conn)?;
     let meeting = MeetingRepository::get(&conn, meeting_id)?
         .ok_or_else(|| anyhow::anyhow!("meeting {meeting_id} not found"))?;

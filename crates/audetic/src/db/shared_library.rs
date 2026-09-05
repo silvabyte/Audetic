@@ -54,6 +54,9 @@ impl SharedLibraryRepository {
             Snapshot::Dictation(value) => Self::apply_snapshot(conn, value),
             Snapshot::Meeting(value) => Self::apply_meeting_snapshot(conn, value),
             Snapshot::Artifact(value) => Self::apply_artifact_snapshot(conn, value),
+            Snapshot::Delete(value) => {
+                Self::apply_delete(conn, value.record_id, value.kind, &value.deleted_at)
+            }
         }
     }
     pub fn apply_snapshot(

@@ -308,6 +308,20 @@ fn decode_meeting_cursor(value: &str) -> Result<DictationCursor> {
 }
 
 fn canonicalize_snapshot(mut snapshot: Snapshot) -> std::result::Result<Snapshot, String> {
+    if let Snapshot::Delete(value) = &mut snapshot {
+        if value.schema_version != 1 {
+            return Err(format!(
+                "unsupported {:?} deletion schema version {}",
+                value.kind, value.schema_version
+            ));
+        }
+        if value.local_version == 0 {
+            return Err("local version must be positive".to_owned());
+        }
+        value.deleted_at = canonical_timestamp(&value.deleted_at)
+            .map_err(|_| "deleted_at must be RFC 3339".to_owned())?;
+        return Ok(snapshot);
+    }
     let (kind, declared, schema, version, created_at, updated_at) = match &mut snapshot {
         Snapshot::Dictation(value) => (
             RecordKind::Dictation,
@@ -333,6 +347,7 @@ fn canonicalize_snapshot(mut snapshot: Snapshot) -> std::result::Result<Snapshot
             &mut value.created_at,
             &mut value.updated_at,
         ),
+        Snapshot::Delete(_) => return Err("deletion validation did not terminate".to_owned()),
     };
     if declared != kind {
         return Err("snapshot kind does not match its payload".to_owned());
@@ -371,6 +386,7 @@ fn canonicalize_snapshot(mut snapshot: Snapshot) -> std::result::Result<Snapshot
             value.payload.completed_at = canonical_timestamp(&value.payload.completed_at)
                 .map_err(|_| "completed_at must be RFC 3339".to_owned())?;
         }
+        Snapshot::Delete(_) => return Err("deletion validation did not terminate".to_owned()),
     }
     Ok(snapshot)
 }
