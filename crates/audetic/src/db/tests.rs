@@ -146,6 +146,76 @@ fn numbered_migrations_are_idempotent_and_preserve_legacy_rows() {
 }
 
 #[test]
+fn populated_v7_database_migrates_to_zero_role_epoch_without_data_loss() {
+    let conn = Connection::open_in_memory().unwrap();
+    migrate(&conn).unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO sync_settings(singleton) VALUES(1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE sync_settings
+         SET role='home_hub',device_name='Kitchen Hub',upload_recording_payloads=1
+         WHERE singleton=1",
+        [],
+    )
+    .unwrap();
+    let (_, record_id) = insert_workflow_record(
+        &conn,
+        &Workflow::new(
+            WorkflowType::VoiceToText,
+            WorkflowData::VoiceToText(VoiceToTextData {
+                text: "persisted before role epochs".into(),
+                audio_path: "/tmp/v7.wav".into(),
+            }),
+        ),
+    )
+    .unwrap();
+    conn.execute("DELETE FROM schema_migrations WHERE version=8", [])
+        .unwrap();
+    conn.execute("ALTER TABLE sync_settings DROP COLUMN role_epoch", [])
+        .unwrap();
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 7);
+
+    migrate(&conn).unwrap();
+
+    let settings: (String, Option<String>, bool, i64) = conn
+        .query_row(
+            "SELECT role,device_name,upload_recording_payloads,role_epoch
+             FROM sync_settings WHERE singleton=1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        settings,
+        ("home_hub".into(), Some("Kitchen Hub".into()), true, 0)
+    );
+    let workflow_text: String = conn
+        .query_row(
+            "SELECT text FROM workflows WHERE sync_id=?1",
+            [record_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(workflow_text, "persisted before role epochs");
+    let outbox_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_outbox_items WHERE record_id=?1",
+            [record_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(outbox_count, 1);
+}
+
+#[test]
 fn test_insert_workflow() {
     let conn = setup_test_db().unwrap();
     let workflow = create_test_workflow("Test transcription");

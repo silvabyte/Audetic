@@ -21,7 +21,7 @@ use super::protocol::{MeetingTitlePatch, RecordKind, SharedMeeting};
 use super::protocol::{
     HUB_API_MOUNT_PATH, HUB_LISTENER_ADDRESS, HUB_LOOPBACK_BASE_URL, TAILSCALE_HTTPS_PORT,
 };
-use super::runtime::{PreparedRuntime, QuiescedWorker, RuntimeError, RuntimeSet, RuntimeSpec};
+use super::runtime::{ActivationOutcome, RuntimeError, RuntimeSet, RuntimeSpec, RuntimeTransition};
 use super::state::HomeHubCommit;
 use super::state::{CommitEffects, EpochMismatch, InstallationSnapshot, InstallationState};
 use super::tailscale::{
@@ -29,6 +29,22 @@ use super::tailscale::{
     TailscaleError, TailscaleStatus,
 };
 use super::transport::{DiscoveryOutcome, HubCapabilities, StreamingPayloadResponse};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransitionCheckpoint {
+    Prepared,
+    Verified,
+    Quiesced,
+    Committed,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct TransitionPause {
+    checkpoint: TransitionCheckpoint,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
 
 pub enum PayloadSource {
     Local(crate::db::shared_library::LibraryBlobRecord),
@@ -91,13 +107,16 @@ impl SyncServiceError {
 /// The transition mutex covers preview/verify/apply/commit/rollback as one
 /// serialized operation. SQLite transactions are kept short and never cross an
 /// await point.
+#[derive(Clone)]
 pub struct SyncService {
     state: InstallationState,
     runtime: RuntimeSet,
     tailscale: Arc<dyn TailscaleControl>,
     hub_capabilities: HubCapabilities,
-    transition: Mutex<()>,
-    shut_down: AtomicBool,
+    transition: Arc<Mutex<()>>,
+    shut_down: Arc<AtomicBool>,
+    #[cfg(test)]
+    transition_pause: Arc<std::sync::Mutex<Option<TransitionPause>>>,
 }
 
 impl SyncService {
@@ -123,14 +142,16 @@ impl SyncService {
         hub_bind_address: SocketAddr,
     ) -> Self {
         let state = InstallationState::new(db_path.clone());
-        let runtime = RuntimeSet::new(db_path, hub_capabilities.clone(), hub_bind_address);
+        let runtime = RuntimeSet::new(state.clone(), hub_capabilities.clone(), hub_bind_address);
         Self {
             state,
             runtime,
             tailscale,
             hub_capabilities,
-            transition: Mutex::new(()),
-            shut_down: AtomicBool::new(false),
+            transition: Arc::new(Mutex::new(())),
+            shut_down: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            transition_pause: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -139,35 +160,71 @@ impl SyncService {
     pub async fn initialize(&self) -> Result<SyncStatus, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
+        self.runtime
+            .acquire_ownership()
+            .await
+            .map_err(map_runtime_error)?;
+        let result = self.initialize_with_ownership().await;
+        if result.is_err() {
+            self.runtime.release_ownership_if_idle().await;
+        }
+        result
+    }
+
+    async fn initialize_with_ownership(&self) -> Result<SyncStatus, SyncServiceError> {
         let installation = self.load()?;
         let spec = runtime_spec(&installation, installation.role_epoch)?;
-        let prepared = self.prepare_runtime(spec).await?;
+        let persisted = self
+            .runtime
+            .begin_persisted_restore(spec)
+            .await
+            .map_err(map_runtime_error)?;
+        let transition = persisted.transition;
         let startup_error = match installation.settings.role {
             SyncRole::Standalone => None,
-            SyncRole::HomeHub => self.reconstruct_home_hub(&installation).await.err(),
+            SyncRole::HomeHub => match persisted.listener_error {
+                Some(error) => Some(SyncServiceError::Listener(error)),
+                None => self.reconstruct_home_hub(&installation).await.err(),
+            },
             SyncRole::ConnectedDevice => self
                 .verify_connected_device(&installation.settings)
                 .await
                 .err(),
         };
-        if let Some(error) = startup_error.as_ref() {
+        let health_result = if let Some(error) = startup_error.as_ref() {
             self.state
                 .record_error(installation.role_epoch, Some(&error.to_string()))
-                .map_err(SyncServiceError::Persistence)?;
+                .map(|_| ())
         } else if installation.settings.role != SyncRole::Standalone {
             self.state
                 .record_contact(installation.role_epoch)
-                .map_err(SyncServiceError::Persistence)?;
+                .map(|_| ())
         } else {
             self.state
                 .record_error(installation.role_epoch, None)
-                .map_err(SyncServiceError::Persistence)?;
+                .map(|_| ())
+        };
+        if let Err(error) = health_result {
+            let _ = self.runtime.abort_transition(transition).await;
+            return Err(SyncServiceError::Persistence(error));
         }
-        self.activate_runtime(prepared).await?;
+        let activation = match self.runtime.commit_transition(transition).await {
+            Ok(activation) => activation,
+            Err(error) => return Err(map_runtime_error(error)),
+        };
+        if startup_error.is_none() {
+            if let Some(error) = activation.listener_error.as_deref() {
+                self.state
+                    .record_error(installation.role_epoch, Some(error))
+                    .map_err(SyncServiceError::Persistence)?;
+            }
+        }
         self.runtime
             .observe_reachability(
                 installation.role_epoch,
-                installation.settings.role != SyncRole::Standalone && startup_error.is_none(),
+                installation.settings.role != SyncRole::Standalone
+                    && startup_error.is_none()
+                    && activation.listener_error.is_none(),
             )
             .await;
         self.status_unlocked().await
@@ -349,10 +406,18 @@ impl SyncService {
     }
 
     pub async fn retry(&self) -> Result<u64, SyncServiceError> {
+        let service = self.clone();
+        tokio::spawn(async move { service.retry_owned().await })
+            .await
+            .map_err(|error| SyncServiceError::RuntimeTask(error.to_string()))?
+    }
+
+    async fn retry_owned(&self) -> Result<u64, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
+        self.acquire_runtime_ownership().await?;
         let installation = self.load()?;
-        let prepared = if installation.settings.role == SyncRole::Standalone {
+        let runtime_transition = if installation.settings.role == SyncRole::Standalone {
             None
         } else {
             Some(
@@ -360,11 +425,9 @@ impl SyncService {
                     .await?,
             )
         };
-        let quiesced = if prepared.is_some() {
-            Some(self.quiesce_worker().await?)
-        } else {
-            None
-        };
+        if let Some(transition) = runtime_transition {
+            self.seal_runtime_transition(transition).await?;
+        }
         let result = crate::db::open_db_at(self.state.db_path())
             .context("opening sync database")
             .and_then(|connection| {
@@ -372,13 +435,8 @@ impl SyncService {
                     .map(|count| count as u64)
             })
             .map_err(SyncServiceError::Persistence);
-        if let Some(prepared) = prepared {
-            if let Err(error) = self.activate_runtime(prepared).await {
-                if let Some(quiesced) = quiesced {
-                    let _ = self.restore_worker(quiesced).await;
-                }
-                return Err(error);
-            }
+        if let Some(transition) = runtime_transition {
+            self.activate_runtime(transition).await?;
         }
         result
     }
@@ -387,8 +445,19 @@ impl SyncService {
         &self,
         enabled: bool,
     ) -> Result<bool, SyncServiceError> {
+        let service = self.clone();
+        tokio::spawn(async move { service.update_recording_payload_policy_owned(enabled).await })
+            .await
+            .map_err(|error| SyncServiceError::RuntimeTask(error.to_string()))?
+    }
+
+    async fn update_recording_payload_policy_owned(
+        &self,
+        enabled: bool,
+    ) -> Result<bool, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
+        self.acquire_runtime_ownership().await?;
         let installation = self.load()?;
         let mut settings = installation.settings.clone();
         if settings.role == SyncRole::Standalone {
@@ -409,17 +478,20 @@ impl SyncService {
             role_epoch: next_epoch,
             ..installation.clone()
         };
-        let prepared = self
+        let runtime_transition = self
             .prepare_runtime(runtime_spec(&target, next_epoch)?)
             .await?;
-        let quiesced = self.quiesce_worker().await?;
+        self.transition_checkpoint(TransitionCheckpoint::Prepared)
+            .await;
+        self.seal_runtime_transition(runtime_transition).await?;
+        self.transition_checkpoint(TransitionCheckpoint::Quiesced)
+            .await;
         let committed = self
             .state
             .commit_payload_policy(installation.role_epoch, enabled)
             .map_err(map_state_error);
         if let Err(error) = committed {
-            prepared.abort().await;
-            return Err(match self.restore_worker(quiesced).await {
+            return Err(match self.abort_runtime(runtime_transition).await {
                 Ok(()) => error,
                 Err(rollback) => SyncServiceError::Rollback {
                     source_error: error.to_string(),
@@ -427,7 +499,9 @@ impl SyncService {
                 },
             });
         }
-        self.activate_runtime(prepared).await?;
+        self.transition_checkpoint(TransitionCheckpoint::Committed)
+            .await;
+        self.activate_runtime(runtime_transition).await?;
         Ok(enabled)
     }
 
@@ -472,8 +546,19 @@ impl SyncService {
         &self,
         request: SyncSetupRequest,
     ) -> Result<SyncSetupResult, SyncServiceError> {
+        let service = self.clone();
+        tokio::spawn(async move { service.configure_owned(request).await })
+            .await
+            .map_err(|error| SyncServiceError::RuntimeTask(error.to_string()))?
+    }
+
+    async fn configure_owned(
+        &self,
+        request: SyncSetupRequest,
+    ) -> Result<SyncSetupResult, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
+        self.acquire_runtime_ownership().await?;
         let installation = self.load()?;
         let current = installation.settings.clone();
         if current.role != SyncRole::Standalone
@@ -559,21 +644,19 @@ impl SyncService {
 
         let current = &installation.settings;
         let ownership = installation.serve_ownership.as_ref();
-        let prepared = self
+        let runtime_transition = self
             .prepare_runtime(RuntimeSpec::Standalone {
                 role_epoch: installation.role_epoch.checked_add(1).ok_or_else(|| {
                     SyncServiceError::Persistence(anyhow::anyhow!("role epoch exhausted"))
                 })?,
             })
             .await?;
-        let quiesced = self.quiesce_worker_if_running().await?;
         let removed_mapping = if current.role == SyncRole::HomeHub {
             if ownership.is_some_and(is_exact_audetic_serve_ownership) {
                 match self.tailscale_remove().await {
                     Ok(removed) => removed,
                     Err(error) => {
-                        prepared.abort().await;
-                        return Err(match self.restore_optional_worker(quiesced).await {
+                        return Err(match self.abort_runtime(runtime_transition).await {
                             Ok(()) => error,
                             Err(rollback) => SyncServiceError::Rollback {
                                 source_error: error.to_string(),
@@ -589,21 +672,25 @@ impl SyncService {
             false
         };
 
+        self.transition_checkpoint(TransitionCheckpoint::Verified)
+            .await;
+        self.seal_runtime_transition(runtime_transition).await?;
+        self.transition_checkpoint(TransitionCheckpoint::Quiesced)
+            .await;
         let settings = settings_from_request(request, None);
         if let Err(error) = self
             .state
             .commit_standalone(installation.role_epoch, &settings)
             .map_err(map_state_error)
         {
-            prepared.abort().await;
             let mut rollback_errors = Vec::new();
+            if let Err(rollback) = self.abort_runtime(runtime_transition).await {
+                rollback_errors.push(rollback.to_string());
+            }
             if removed_mapping {
                 if let Err(rollback) = self.tailscale_apply().await {
                     rollback_errors.push(rollback.to_string());
                 }
-            }
-            if let Err(rollback) = self.restore_optional_worker(quiesced).await {
-                rollback_errors.push(rollback.to_string());
             }
             return Err(if rollback_errors.is_empty() {
                 error
@@ -614,7 +701,9 @@ impl SyncService {
                 }
             });
         }
-        self.activate_runtime(prepared).await?;
+        self.transition_checkpoint(TransitionCheckpoint::Committed)
+            .await;
+        self.activate_runtime(runtime_transition).await?;
         Ok(())
     }
 
@@ -654,31 +743,35 @@ impl SyncService {
             serve_ownership: Some(expected_ownership()),
             role_epoch: next_epoch,
         };
-        let prepared = self
+        let runtime_transition = self
             .prepare_runtime(runtime_spec_with_home_identity(
                 &target,
                 hub_id,
                 &owner_login,
             )?)
             .await?;
-        let quiesced = self.quiesce_worker_if_running().await?;
+        self.transition_checkpoint(TransitionCheckpoint::Prepared)
+            .await;
         let mapping_created = match self
             .verify_home_hub_network(&tailscale_status, hub_id, &owner_login)
             .await
         {
             Ok(mapping_created) => mapping_created,
             Err((error, mapping_created)) => {
-                prepared.abort().await;
-                let error = self.rollback_created_mapping(mapping_created, error).await;
-                return Err(match self.restore_optional_worker(quiesced).await {
-                    Ok(()) => error,
-                    Err(rollback) => SyncServiceError::Rollback {
-                        source_error: error.to_string(),
-                        rollback_error: rollback.to_string(),
-                    },
-                });
+                return Err(self
+                    .rollback_home_transition(runtime_transition, mapping_created, error)
+                    .await);
             }
         };
+        self.transition_checkpoint(TransitionCheckpoint::Verified)
+            .await;
+        if let Err(error) = self.quiesce_worker(runtime_transition).await {
+            return Err(self
+                .rollback_home_transition(runtime_transition, mapping_created, error)
+                .await);
+        }
+        self.transition_checkpoint(TransitionCheckpoint::Quiesced)
+            .await;
         let ownership = expected_ownership();
         let effects = match self.state.commit_home_hub(
             installation.role_epoch,
@@ -693,23 +786,26 @@ impl SyncService {
         ) {
             Ok(effects) => effects,
             Err(error) => {
-                prepared.abort().await;
-                let error = self
-                    .rollback_created_mapping(mapping_created, map_state_error(error))
-                    .await;
-                return Err(match self.restore_optional_worker(quiesced).await {
-                    Ok(()) => error,
-                    Err(rollback) => SyncServiceError::Rollback {
-                        source_error: error.to_string(),
-                        rollback_error: rollback.to_string(),
-                    },
-                });
+                return Err(self
+                    .rollback_home_transition(
+                        runtime_transition,
+                        mapping_created,
+                        map_state_error(error),
+                    )
+                    .await);
             }
         };
         self.cleanup_after_commit(&effects, "Home Hub activation");
-        self.activate_runtime(prepared).await?;
+        self.transition_checkpoint(TransitionCheckpoint::Committed)
+            .await;
+        let activation = self.activate_runtime(runtime_transition).await?;
+        if let Some(error) = activation.listener_error.as_deref() {
+            self.state
+                .record_error(effects.role_epoch, Some(error))
+                .map_err(SyncServiceError::Persistence)?;
+        }
         self.runtime
-            .observe_reachability(effects.role_epoch, true)
+            .observe_reachability(effects.role_epoch, activation.listener_error.is_none())
             .await;
         Ok(())
     }
@@ -814,10 +910,14 @@ impl SyncService {
             role_epoch: next_epoch,
             ..installation.clone()
         };
-        let prepared = self
+        let runtime_transition = self
             .prepare_runtime(runtime_spec(&target, next_epoch)?)
             .await?;
-        let quiesced = self.quiesce_worker_if_running().await?;
+        self.transition_checkpoint(TransitionCheckpoint::Prepared)
+            .await;
+        self.seal_runtime_transition(runtime_transition).await?;
+        self.transition_checkpoint(TransitionCheckpoint::Quiesced)
+            .await;
         let effects = match self.state.commit_connected_device(
             installation.role_epoch,
             &settings,
@@ -826,9 +926,8 @@ impl SyncService {
         ) {
             Ok(effects) => effects,
             Err(error) => {
-                prepared.abort().await;
                 let error = map_state_error(error);
-                return Err(match self.restore_optional_worker(quiesced).await {
+                return Err(match self.abort_runtime(runtime_transition).await {
                     Ok(()) => error,
                     Err(rollback) => SyncServiceError::Rollback {
                         source_error: error.to_string(),
@@ -838,7 +937,9 @@ impl SyncService {
             }
         };
         self.cleanup_after_commit(&effects, "Connected Device activation");
-        self.activate_runtime(prepared).await?;
+        self.transition_checkpoint(TransitionCheckpoint::Committed)
+            .await;
+        self.activate_runtime(runtime_transition).await?;
         self.runtime
             .observe_reachability(effects.role_epoch, true)
             .await;
@@ -952,7 +1053,9 @@ impl SyncService {
             last_contact_at: settings.last_contact_at,
             pending_items,
             pending_bytes,
-            last_error: outbox_error.or(settings.last_error),
+            last_error: outbox_error
+                .or(runtime.listener_error)
+                .or(settings.last_error),
             upload_recording_payloads: settings.upload_recording_payloads,
             cache_level: settings.cache_level,
             shared_config_enabled: settings.shared_config_enabled,
@@ -1036,63 +1139,101 @@ impl SyncService {
     async fn prepare_runtime(
         &self,
         spec: RuntimeSpec,
-    ) -> Result<PreparedRuntime, SyncServiceError> {
-        self.runtime.prepare(spec).await.map_err(map_runtime_error)
-    }
-
-    async fn activate_runtime(&self, prepared: PreparedRuntime) -> Result<(), SyncServiceError> {
+    ) -> Result<RuntimeTransition, SyncServiceError> {
         self.runtime
-            .activate(prepared)
+            .begin_transition(spec)
             .await
             .map_err(map_runtime_error)
     }
 
-    async fn quiesce_worker(&self) -> Result<QuiescedWorker, SyncServiceError> {
-        self.runtime
-            .quiesce_worker()
-            .await
-            .map_err(map_runtime_error)
-    }
-
-    async fn quiesce_worker_if_running(&self) -> Result<Option<QuiescedWorker>, SyncServiceError> {
-        if self.runtime.snapshot().await.outbox_worker_running {
-            self.quiesce_worker().await.map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-
-    async fn restore_worker(&self, quiesced: QuiescedWorker) -> Result<(), SyncServiceError> {
-        self.runtime
-            .restore_worker(quiesced)
-            .await
-            .map_err(map_runtime_error)
-    }
-
-    async fn restore_optional_worker(
+    async fn activate_runtime(
         &self,
-        quiesced: Option<QuiescedWorker>,
+        transition: RuntimeTransition,
+    ) -> Result<ActivationOutcome, SyncServiceError> {
+        self.runtime
+            .commit_transition(transition)
+            .await
+            .map_err(map_runtime_error)
+    }
+
+    async fn quiesce_worker(&self, transition: RuntimeTransition) -> Result<(), SyncServiceError> {
+        self.runtime
+            .quiesce_current_worker(transition)
+            .await
+            .map_err(map_runtime_error)
+    }
+
+    async fn seal_runtime_transition(
+        &self,
+        transition: RuntimeTransition,
     ) -> Result<(), SyncServiceError> {
-        if let Some(quiesced) = quiesced {
-            self.restore_worker(quiesced).await?;
+        if let Err(error) = self.quiesce_worker(transition).await {
+            return Err(match self.abort_runtime(transition).await {
+                Ok(()) => error,
+                Err(rollback) => SyncServiceError::Rollback {
+                    source_error: error.to_string(),
+                    rollback_error: rollback.to_string(),
+                },
+            });
         }
         Ok(())
     }
 
-    async fn rollback_created_mapping(
+    async fn abort_runtime(&self, transition: RuntimeTransition) -> Result<(), SyncServiceError> {
+        self.runtime
+            .abort_transition(transition)
+            .await
+            .map_err(map_runtime_error)
+    }
+
+    async fn acquire_runtime_ownership(&self) -> Result<(), SyncServiceError> {
+        self.runtime
+            .acquire_ownership()
+            .await
+            .map_err(map_runtime_error)
+    }
+
+    async fn transition_checkpoint(&self, checkpoint: TransitionCheckpoint) {
+        #[cfg(test)]
+        {
+            let pause = self
+                .transition_pause
+                .lock()
+                .ok()
+                .and_then(|pause| pause.clone())
+                .filter(|pause| pause.checkpoint == checkpoint);
+            if let Some(pause) = pause {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
+        }
+        #[cfg(not(test))]
+        let _ = checkpoint;
+    }
+
+    async fn rollback_home_transition(
         &self,
+        transition: RuntimeTransition,
         mapping_created: bool,
         source_error: SyncServiceError,
     ) -> SyncServiceError {
+        let mut rollback_errors = Vec::new();
+        if let Err(error) = self.abort_runtime(transition).await {
+            rollback_errors.push(error.to_string());
+        }
         if mapping_created {
             if let Err(rollback) = self.tailscale_remove().await {
-                return SyncServiceError::Rollback {
-                    source_error: source_error.to_string(),
-                    rollback_error: rollback.to_string(),
-                };
+                rollback_errors.push(rollback.to_string());
             }
         }
-        source_error
+        if rollback_errors.is_empty() {
+            source_error
+        } else {
+            SyncServiceError::Rollback {
+                source_error: source_error.to_string(),
+                rollback_error: rollback_errors.join("; "),
+            }
+        }
     }
 
     async fn observe_contact(
@@ -1190,6 +1331,10 @@ fn map_runtime_error(error: RuntimeError) -> SyncServiceError {
     match error {
         RuntimeError::Listener(error) => SyncServiceError::Listener(error),
         RuntimeError::Invariant(error) => SyncServiceError::RuntimeTask(error),
+        RuntimeError::Ownership(error) => SyncServiceError::RuntimeTask(error),
+        RuntimeError::NoOwnership => {
+            SyncServiceError::RuntimeTask("sync runtime has no process ownership lease".into())
+        }
         RuntimeError::Shutdown => SyncServiceError::Shutdown,
     }
 }
@@ -1550,6 +1695,31 @@ mod tests {
             hubs,
             path,
         }
+    }
+
+    fn pause_at(
+        service: &SyncService,
+        checkpoint: TransitionCheckpoint,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *service.transition_pause.lock().unwrap() = Some(TransitionPause {
+            checkpoint,
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        (entered, release)
+    }
+
+    async fn wait_for_settled_runtime(service: &SyncService, role: SyncRole) {
+        for _ in 0..100 {
+            let snapshot = service.runtime.snapshot().await;
+            if snapshot.role == Some(role) && !snapshot.transition_in_progress {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("runtime did not settle as {role:?}");
     }
 
     fn request(role: SyncRole) -> SyncSetupRequest {
@@ -2247,6 +2417,7 @@ mod tests {
             .configure(connected_request(hub_id))
             .await
             .unwrap();
+        fixture.service.shutdown().await.unwrap();
         fixture.hubs.fail.store(true, Ordering::SeqCst);
 
         let restarted = SyncService::with_dependencies(
@@ -2478,6 +2649,7 @@ mod tests {
             super::super::runtime::RuntimeSnapshot {
                 role: Some(SyncRole::Standalone),
                 role_epoch: Some(0),
+                ownership_held: true,
                 ..Default::default()
             }
         );
@@ -2526,9 +2698,10 @@ mod tests {
         let hubs = Arc::new(FakeHubs::default());
         let service =
             SyncService::with_dependencies(path, tailscale, test_capabilities(hubs), address);
-        let prepared = service
+        service.runtime.acquire_ownership().await.unwrap();
+        let transition = service
             .runtime
-            .prepare(RuntimeSpec::HomeHub {
+            .begin_transition(RuntimeSpec::HomeHub {
                 role_epoch: 1,
                 hub_id: HubId::new(),
                 owner_login: "owner@example.com".into(),
@@ -2539,7 +2712,7 @@ mod tests {
             .unwrap();
         tokio::net::TcpStream::connect(address).await.unwrap();
 
-        prepared.abort().await;
+        service.runtime.abort_transition(transition).await.unwrap();
 
         assert_eq!(service.runtime.snapshot().await.role, None);
         tokio::net::TcpListener::bind(address).await.unwrap();
@@ -2567,6 +2740,7 @@ mod tests {
             .configure(request(SyncRole::HomeHub))
             .await
             .unwrap();
+        fixture.service.shutdown().await.unwrap();
         let restarted = SyncService::with_dependencies(
             fixture.path.clone(),
             fixture.tailscale.clone(),
@@ -2581,6 +2755,258 @@ mod tests {
         assert!(runtime.hub_listener_running);
         assert!(runtime.outbox_worker_running);
         restarted.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn persisted_home_hub_bind_failure_is_degraded_but_keeps_local_outbox_running() {
+        let fixture = fixture();
+        fixture
+            .service
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap();
+        fixture.service.shutdown().await.unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        let (_, record_id) = crate::db::insert_workflow_record(
+            &conn,
+            &crate::db::Workflow::new(
+                crate::db::WorkflowType::VoiceToText,
+                crate::db::WorkflowData::VoiceToText(crate::db::VoiceToTextData {
+                    text: "queued while the listener is unavailable".into(),
+                    audio_path: "/missing".into(),
+                }),
+            ),
+        )
+        .unwrap();
+        drop(conn);
+        let occupied = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = occupied.local_addr().unwrap();
+        let restarted = SyncService::with_dependencies(
+            fixture.path.clone(),
+            fixture.tailscale.clone(),
+            test_capabilities(fixture.hubs.clone()),
+            address,
+        );
+
+        let status = restarted.initialize().await.unwrap();
+
+        assert_eq!(status.role, SyncRole::HomeHub);
+        assert!(!status.hub_reachable);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("listener")));
+        let runtime = restarted.runtime.snapshot().await;
+        assert!(!runtime.hub_listener_running);
+        assert!(runtime.outbox_worker_running);
+        for _ in 0..100 {
+            let conn = crate::db::open_db_at(&fixture.path).unwrap();
+            let state: String = conn
+                .query_row(
+                    "SELECT state FROM sync_outbox_items WHERE record_id=?1",
+                    [record_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if state == "synced" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM sync_outbox_items WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "synced");
+        restarted.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn second_runtime_for_the_same_database_cannot_write_to_persisted_authority() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        let old_hub = HubId::new();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        SyncSettingsRepository::save(
+            &conn,
+            &SyncSettings {
+                role: SyncRole::ConnectedDevice,
+                hub: connected_request(old_hub).hub,
+                ..SyncSettings::default()
+            },
+        )
+        .unwrap();
+        crate::db::insert_workflow_record(
+            &conn,
+            &crate::db::Workflow::new(
+                crate::db::WorkflowType::VoiceToText,
+                crate::db::WorkflowData::VoiceToText(crate::db::VoiceToTextData {
+                    text: "must not be uploaded by a second runtime".into(),
+                    audio_path: "/missing".into(),
+                }),
+            ),
+        )
+        .unwrap();
+        drop(conn);
+        let second_hubs = Arc::new(FakeHubs::default());
+        let second = SyncService::with_dependencies(
+            fixture.path.clone(),
+            fixture.tailscale.clone(),
+            test_capabilities(second_hubs.clone()),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+
+        let error = second.initialize().await.unwrap_err();
+
+        assert!(matches!(error, SyncServiceError::RuntimeTask(_)));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(second_hubs.snapshot_uploads.lock().unwrap().is_empty());
+        assert!(second_hubs.blob_uploads.lock().unwrap().is_empty());
+        assert!(!second.runtime.snapshot().await.ownership_held);
+        drop(fixture.service);
+        let status = second.initialize().await.unwrap();
+        assert_eq!(status.role, SyncRole::ConnectedDevice);
+        second.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropped_callers_cannot_cancel_home_hub_promotion_at_transition_boundaries() {
+        for checkpoint in [
+            TransitionCheckpoint::Prepared,
+            TransitionCheckpoint::Verified,
+            TransitionCheckpoint::Quiesced,
+            TransitionCheckpoint::Committed,
+        ] {
+            let fixture = fixture();
+            fixture.service.initialize().await.unwrap();
+            let (entered, release) = pause_at(&fixture.service, checkpoint);
+            let service = fixture.service.clone();
+            let caller =
+                tokio::spawn(async move { service.configure(request(SyncRole::HomeHub)).await });
+            tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+                .await
+                .expect("transition did not reach checkpoint");
+
+            caller.abort();
+            assert!(caller.await.unwrap_err().is_cancelled());
+            release.notify_one();
+
+            wait_for_settled_runtime(&fixture.service, SyncRole::HomeHub).await;
+            let runtime = fixture.service.runtime.snapshot().await;
+            assert!(runtime.hub_listener_running, "checkpoint {checkpoint:?}");
+            assert!(runtime.outbox_worker_running, "checkpoint {checkpoint:?}");
+            assert_eq!(
+                *fixture.tailscale.mapping.lock().unwrap(),
+                MappingState::OwnedByAudetic,
+                "checkpoint {checkpoint:?}"
+            );
+            fixture.service.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn dropped_demotion_caller_still_restores_worker_and_serve_mapping_on_commit_failure() {
+        let fixture = fixture();
+        fixture
+            .service
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_cancelled_standalone_role
+             BEFORE UPDATE OF role ON sync_settings
+             WHEN NEW.role='standalone'
+             BEGIN SELECT RAISE(ABORT, 'simulated cancelled demotion failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+        let (entered, release) = pause_at(&fixture.service, TransitionCheckpoint::Quiesced);
+        let service = fixture.service.clone();
+        let caller =
+            tokio::spawn(async move { service.configure(request(SyncRole::Standalone)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("demotion did not quiesce the worker");
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.notify_one();
+
+        wait_for_settled_runtime(&fixture.service, SyncRole::HomeHub).await;
+        let runtime = fixture.service.runtime.snapshot().await;
+        assert!(runtime.hub_listener_running);
+        assert!(runtime.outbox_worker_running);
+        assert_eq!(
+            *fixture.tailscale.mapping.lock().unwrap(),
+            MappingState::OwnedByAudetic
+        );
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_termination_before_commit_rolls_back_promotion() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        let (entered, release) = pause_at(&fixture.service, TransitionCheckpoint::Prepared);
+        let service = fixture.service.clone();
+        let caller =
+            tokio::spawn(async move { service.configure(request(SyncRole::HomeHub)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("promotion did not prepare its listener");
+        fixture
+            .service
+            .runtime
+            .terminate_provisional_listener()
+            .await
+            .unwrap();
+        release.notify_one();
+
+        let error = caller.await.unwrap().unwrap_err();
+
+        assert!(matches!(error, SyncServiceError::Listener(_)));
+        let installation = fixture.service.state.load().unwrap();
+        assert_eq!(installation.settings.role, SyncRole::Standalone);
+        assert_eq!(
+            *fixture.tailscale.mapping.lock().unwrap(),
+            MappingState::Vacant
+        );
+        let runtime = fixture.service.runtime.snapshot().await;
+        assert_eq!(runtime.role, Some(SyncRole::Standalone));
+        assert!(!runtime.transition_in_progress);
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_listener_termination_marks_degraded_health_and_retains_worker() {
+        let fixture = fixture();
+        fixture
+            .service
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap();
+
+        fixture
+            .service
+            .runtime
+            .terminate_active_listener()
+            .await
+            .unwrap();
+
+        let status = fixture.service.status().await.unwrap();
+        let runtime = fixture.service.runtime.snapshot().await;
+        assert!(!status.hub_reachable);
+        assert!(status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("listener")));
+        assert!(!runtime.hub_listener_running);
+        assert!(runtime.outbox_worker_running);
         fixture.service.shutdown().await.unwrap();
     }
 

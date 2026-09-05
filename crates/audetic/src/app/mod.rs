@@ -56,6 +56,31 @@ impl DictationCommandTarget for RecordingMachine {
 
 #[async_trait::async_trait(?Send)]
 trait MeetingCaptureCommandTarget {
+    async fn start(
+        &mut self,
+        _options: Option<crate::meeting::MeetingStartOptions>,
+    ) -> Result<crate::meeting::MeetingStartResult> {
+        Err(anyhow!("meeting start is unavailable"))
+    }
+    async fn stop(&mut self) -> Result<crate::meeting::MeetingStopResult> {
+        Err(anyhow!("meeting stop is unavailable"))
+    }
+    async fn cancel(&mut self) -> Result<crate::meeting::MeetingStopResult> {
+        Err(anyhow!("meeting cancel is unavailable"))
+    }
+    async fn confirm(
+        &mut self,
+        _start_seconds: Option<f64>,
+        _end_seconds: Option<f64>,
+    ) -> Result<crate::meeting::MeetingStopResult> {
+        Err(anyhow!("meeting confirm is unavailable"))
+    }
+    async fn toggle(
+        &mut self,
+        _options: Option<crate::meeting::MeetingStartOptions>,
+    ) -> Result<crate::meeting::ToggleOutcome> {
+        Err(anyhow!("meeting toggle is unavailable"))
+    }
     async fn default_input_switched(&mut self) -> Result<()>;
     async fn default_output_switched(&mut self) -> Result<()>;
     async fn microphone_stream_died(&mut self, death: StreamDeath) -> Result<()>;
@@ -64,6 +89,36 @@ trait MeetingCaptureCommandTarget {
 
 #[async_trait::async_trait(?Send)]
 impl MeetingCaptureCommandTarget for MeetingMachine {
+    async fn start(
+        &mut self,
+        options: Option<crate::meeting::MeetingStartOptions>,
+    ) -> Result<crate::meeting::MeetingStartResult> {
+        MeetingMachine::start(self, options).await
+    }
+
+    async fn stop(&mut self) -> Result<crate::meeting::MeetingStopResult> {
+        MeetingMachine::stop(self).await
+    }
+
+    async fn cancel(&mut self) -> Result<crate::meeting::MeetingStopResult> {
+        MeetingMachine::cancel(self).await
+    }
+
+    async fn confirm(
+        &mut self,
+        start_seconds: Option<f64>,
+        end_seconds: Option<f64>,
+    ) -> Result<crate::meeting::MeetingStopResult> {
+        MeetingMachine::confirm(self, start_seconds, end_seconds).await
+    }
+
+    async fn toggle(
+        &mut self,
+        options: Option<crate::meeting::MeetingStartOptions>,
+    ) -> Result<crate::meeting::ToggleOutcome> {
+        MeetingMachine::toggle(self, options).await
+    }
+
     async fn default_input_switched(&mut self) -> Result<()> {
         MeetingMachine::default_input_switched(self).await
     }
@@ -218,6 +273,108 @@ async fn handle_capture_stream_died(
 async fn handle_default_output_switched(meeting: &mut impl MeetingCaptureCommandTarget) {
     if let Err(e) = meeting.default_output_switched().await {
         error!("Failed to switch System Tap to the current Default Output: {e}");
+    }
+}
+
+async fn handle_daemon_command(
+    dictation: &impl DictationCommandTarget,
+    meeting: &mut impl MeetingCaptureCommandTarget,
+    command: DaemonCommand,
+) {
+    match command {
+        command @ DaemonCommand::ToggleRecording(_) => {
+            handle_dictation_command(dictation, command).await;
+        }
+        DaemonCommand::SettledDeviceSwitch(settled) => {
+            handle_settled_switch(dictation, meeting, settled).await;
+        }
+        DaemonCommand::CaptureStreamDied(death) => {
+            handle_capture_stream_died(dictation, meeting, death).await;
+        }
+        DaemonCommand::MeetingStart { options, reply } => {
+            let result = meeting.start(options).await;
+            match &result {
+                Ok(r) => info!(
+                    "Meeting {} started: {:?} ({})",
+                    r.meeting_id,
+                    r.audio_path,
+                    r.capture_state.as_str()
+                ),
+                Err(e) => error!("Failed to start meeting: {}", e),
+            }
+            let _ = reply.send(result);
+        }
+        DaemonCommand::MeetingStop { reply } => {
+            let result = meeting.stop().await;
+            match &result {
+                Ok(r) => info!("Meeting {} stopped ({}s)", r.meeting_id, r.duration_seconds),
+                Err(e) => error!("Failed to stop meeting: {}", e),
+            }
+            let _ = reply.send(result);
+        }
+        DaemonCommand::MeetingCancel { reply } => {
+            let result = meeting.cancel().await;
+            match &result {
+                Ok(r) => info!(
+                    "Meeting {} cancelled ({}s)",
+                    r.meeting_id, r.duration_seconds
+                ),
+                Err(e) => error!("Failed to cancel meeting: {}", e),
+            }
+            let _ = reply.send(result);
+        }
+        DaemonCommand::MeetingConfirm {
+            start_seconds,
+            end_seconds,
+            reply,
+        } => {
+            let result = meeting.confirm(start_seconds, end_seconds).await;
+            match &result {
+                Ok(r) => info!(
+                    "Meeting {} confirmed for transcription ({}s)",
+                    r.meeting_id, r.duration_seconds
+                ),
+                Err(e) => error!("Failed to confirm meeting: {}", e),
+            }
+            let _ = reply.send(result);
+        }
+        DaemonCommand::MeetingToggle { options, reply } => {
+            let result = meeting.toggle(options).await;
+            match &result {
+                Ok(outcome) => match outcome {
+                    crate::meeting::ToggleOutcome::Started(r) => {
+                        info!("Meeting {} started via toggle", r.meeting_id);
+                    }
+                    crate::meeting::ToggleOutcome::Stopped(r) => {
+                        info!(
+                            "Meeting {} stopped via toggle ({}s)",
+                            r.meeting_id, r.duration_seconds
+                        );
+                    }
+                },
+                Err(e) => error!("Failed to toggle meeting: {}", e),
+            }
+            let _ = reply.send(result);
+        }
+    }
+}
+
+async fn drain_api_commands(
+    mut api_task: tokio::task::JoinHandle<Result<()>>,
+    rx: &mut mpsc::Receiver<DaemonCommand>,
+    dictation: &impl DictationCommandTarget,
+    meeting: &mut impl MeetingCaptureCommandTarget,
+) -> Result<Result<()>, tokio::task::JoinError> {
+    loop {
+        tokio::select! {
+            result = &mut api_task => return result,
+            command = rx.recv() => {
+                let Some(command) = command else {
+                    return api_task.await;
+                };
+                handle_daemon_command(dictation, meeting, command).await;
+            }
+        }
     }
 }
 
@@ -405,87 +562,13 @@ pub async fn run_service() -> Result<()> {
         let Some(command) = command else {
             break;
         };
-        match command {
-            command @ DaemonCommand::ToggleRecording(_) => {
-                handle_dictation_command(&recording_machine, command).await;
-            }
-            DaemonCommand::SettledDeviceSwitch(settled) => {
-                handle_settled_switch(&recording_machine, &mut meeting_machine, settled).await;
-            }
-            DaemonCommand::CaptureStreamDied(death) => {
-                handle_capture_stream_died(&recording_machine, &mut meeting_machine, death).await;
-            }
-            DaemonCommand::MeetingStart { options, reply } => {
-                let result = meeting_machine.start(options).await;
-                match &result {
-                    Ok(r) => info!(
-                        "Meeting {} started: {:?} ({})",
-                        r.meeting_id,
-                        r.audio_path,
-                        r.capture_state.as_str()
-                    ),
-                    Err(e) => error!("Failed to start meeting: {}", e),
-                }
-                let _ = reply.send(result);
-            }
-            DaemonCommand::MeetingStop { reply } => {
-                let result = meeting_machine.stop().await;
-                match &result {
-                    Ok(r) => info!("Meeting {} stopped ({}s)", r.meeting_id, r.duration_seconds),
-                    Err(e) => error!("Failed to stop meeting: {}", e),
-                }
-                let _ = reply.send(result);
-            }
-            DaemonCommand::MeetingCancel { reply } => {
-                let result = meeting_machine.cancel().await;
-                match &result {
-                    Ok(r) => info!(
-                        "Meeting {} cancelled ({}s)",
-                        r.meeting_id, r.duration_seconds
-                    ),
-                    Err(e) => error!("Failed to cancel meeting: {}", e),
-                }
-                let _ = reply.send(result);
-            }
-            DaemonCommand::MeetingConfirm {
-                start_seconds,
-                end_seconds,
-                reply,
-            } => {
-                let result = meeting_machine.confirm(start_seconds, end_seconds).await;
-                match &result {
-                    Ok(r) => info!(
-                        "Meeting {} confirmed for transcription ({}s)",
-                        r.meeting_id, r.duration_seconds
-                    ),
-                    Err(e) => error!("Failed to confirm meeting: {}", e),
-                }
-                let _ = reply.send(result);
-            }
-            DaemonCommand::MeetingToggle { options, reply } => {
-                let result = meeting_machine.toggle(options).await;
-                match &result {
-                    Ok(outcome) => match outcome {
-                        crate::meeting::ToggleOutcome::Started(r) => {
-                            info!("Meeting {} started via toggle", r.meeting_id);
-                        }
-                        crate::meeting::ToggleOutcome::Stopped(r) => {
-                            info!(
-                                "Meeting {} stopped via toggle ({}s)",
-                                r.meeting_id, r.duration_seconds
-                            );
-                        }
-                    },
-                    Err(e) => error!("Failed to toggle meeting: {}", e),
-                }
-                let _ = reply.send(result);
-            }
-        }
+        handle_daemon_command(&recording_machine, &mut meeting_machine, command).await;
     }
 
     let _ = shutdown_tx.send(true);
-    let (api_result, sync_result) =
-        drain_api_before_runtime_shutdown(api_task, sync_service.shutdown()).await;
+    let api_result =
+        drain_api_commands(api_task, &mut rx, &recording_machine, &mut meeting_machine).await;
+    let sync_result = sync_service.shutdown().await;
     match api_result {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!("API server stopped with an error: {error}"),
@@ -496,18 +579,6 @@ pub async fn run_service() -> Result<()> {
     }
 
     Ok(())
-}
-
-async fn drain_api_before_runtime_shutdown<F, T>(
-    api_task: tokio::task::JoinHandle<Result<()>>,
-    runtime_shutdown: F,
-) -> (Result<Result<()>, tokio::task::JoinError>, T)
-where
-    F: std::future::Future<Output = T>,
-{
-    let api_result = api_task.await;
-    let runtime_result = runtime_shutdown.await;
-    (api_result, runtime_result)
 }
 
 #[cfg(unix)]
@@ -639,30 +710,140 @@ mod tests {
 
     use super::*;
 
+    #[derive(Default)]
+    struct ShutdownMeetingTarget {
+        starts: usize,
+        meeting_id: i64,
+    }
+
+    #[async_trait::async_trait(?Send)]
+    impl MeetingCaptureCommandTarget for ShutdownMeetingTarget {
+        async fn start(
+            &mut self,
+            _options: Option<crate::meeting::MeetingStartOptions>,
+        ) -> Result<crate::meeting::MeetingStartResult> {
+            self.starts += 1;
+            Ok(crate::meeting::MeetingStartResult {
+                meeting_id: self.meeting_id,
+                audio_path: PathBuf::from("/tmp/shutdown-meeting.wav"),
+                capture_state: crate::meeting::CaptureState::MicOnly,
+            })
+        }
+
+        async fn default_input_switched(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn default_output_switched(&mut self) -> Result<()> {
+            Ok(())
+        }
+
+        async fn microphone_stream_died(&mut self, _death: StreamDeath) -> Result<()> {
+            Ok(())
+        }
+
+        async fn system_stream_died(&mut self, _death: StreamDeath) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct UnusedShutdownTranscription;
+
+    #[async_trait::async_trait]
+    impl crate::transcription::job_service::TranscriptionJobService for UnusedShutdownTranscription {
+        async fn submit_and_poll(
+            &self,
+            _file_path: &std::path::Path,
+            _language: Option<&str>,
+        ) -> Result<crate::transcription::job_service::TranscriptionJobResult> {
+            Err(anyhow!("unused shutdown test transcription"))
+        }
+    }
+
+    struct UnusedShutdownInspector;
+
+    #[async_trait::async_trait]
+    impl crate::meeting::MediaInspector for UnusedShutdownInspector {
+        async fn probe_duration_seconds(&self, _path: &std::path::Path) -> Option<u64> {
+            None
+        }
+    }
+
     #[tokio::test]
-    async fn runtime_shutdown_waits_for_in_flight_api_work_to_drain() {
-        let request_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let release_request = Arc::new(tokio::sync::Notify::new());
-        let api_finished = Arc::clone(&request_finished);
-        let api_release = Arc::clone(&release_request);
+    async fn graceful_shutdown_services_a_meeting_command_already_queued_by_the_api() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("audetic.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let conn = crate::db::open_db_at(&db_path).unwrap();
+        let meeting_id = crate::db::meetings::MeetingRepository::insert(
+            &conn,
+            None,
+            "/tmp/shutdown-meeting.wav",
+        )
+        .unwrap();
+        drop(conn);
+        let transcription: Arc<dyn crate::transcription::job_service::TranscriptionJobService> =
+            Arc::new(UnusedShutdownTranscription);
+        let post_processing = Arc::new(PostProcessingService::new(db_path.clone()));
+        let state = crate::api::routes::meetings::MeetingState {
+            tx,
+            status: MeetingStatusHandle::default(),
+            transcription: transcription.clone(),
+            services: crate::meeting::ProcessingServices::new(
+                transcription,
+                post_processing,
+                db_path,
+            ),
+            inspector: Arc::new(UnusedShutdownInspector),
+            meetings_dir: temp.path().join("meetings"),
+            sync: None,
+        };
+        let router = crate::api::routes::meetings::router(state);
         let api_task = tokio::spawn(async move {
-            api_release.notified().await;
-            api_finished.store(true, Ordering::SeqCst);
+            use tower::ServiceExt;
+
+            let response = router
+                .oneshot(
+                    axum::http::Request::post("/meetings/start")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .context("dispatching meeting start through the API router")?;
+            anyhow::ensure!(
+                response.status() == axum::http::StatusCode::OK,
+                "meeting request failed with {}",
+                response.status()
+            );
             Ok(())
         });
-        let teardown_saw_drained_api = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let teardown_observation = Arc::clone(&teardown_saw_drained_api);
-        let request_observation = Arc::clone(&request_finished);
-        let teardown = async move {
-            teardown_observation
-                .store(request_observation.load(Ordering::SeqCst), Ordering::SeqCst);
+        for _ in 0..100 {
+            if rx.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(rx.len(), 1, "meeting command was not queued by the API");
+        let dictation = RoutingDictationTarget {
+            switches: AtomicUsize::new(0),
+            deaths: AtomicUsize::new(0),
         };
-        release_request.notify_one();
+        let mut meeting = ShutdownMeetingTarget {
+            starts: 0,
+            meeting_id,
+        };
 
-        let (api_result, ()) = drain_api_before_runtime_shutdown(api_task, teardown).await;
+        let api_result = tokio::time::timeout(
+            Duration::from_secs(1),
+            drain_api_commands(api_task, &mut rx, &dictation, &mut meeting),
+        )
+        .await
+        .expect("graceful drain must not deadlock")
+        .expect("API task must remain joinable");
 
-        assert!(api_result.unwrap().is_ok());
-        assert!(teardown_saw_drained_api.load(Ordering::SeqCst));
+        assert!(api_result.is_ok());
+        assert_eq!(meeting.starts, 1);
     }
 
     struct FakeDefaultInput {
