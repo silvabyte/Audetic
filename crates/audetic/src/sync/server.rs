@@ -1,4 +1,5 @@
 use audetic_core::sync::HubId;
+use axum::extract::rejection::QueryRejection;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
 use axum::http::{header, header::ORIGIN, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
@@ -129,6 +130,7 @@ impl HubServer {
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ChangePageQuery {
     /// Last committed cursor already applied by the caller. Use zero to begin.
     #[param(required = true)]
@@ -159,8 +161,18 @@ struct ChangePageQuery {
 )]
 async fn page_changes(
     State(state): State<Arc<HubServerConfig>>,
-    Query(query): Query<ChangePageQuery>,
+    query: Result<Query<ChangePageQuery>, QueryRejection>,
 ) -> Response {
+    let Query(query) = match query {
+        Ok(query) => query,
+        Err(_) => {
+            return hub_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_change_query",
+                "the after, target, and limit query values must be valid",
+            );
+        }
+    };
     let Some(library) = &state.library else {
         return library_unavailable();
     };
@@ -1128,6 +1140,48 @@ mod tests {
             serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
                 .unwrap();
         assert_eq!(error.code, "incompatible_protocol");
+    }
+
+    #[tokio::test]
+    async fn malformed_change_queries_return_typed_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("hub.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let actual_hub_id = hub_id();
+        let server = HubServer::new(
+            HubServerConfig::new(actual_hub_id, "Alice@Example.com")
+                .unwrap()
+                .with_library(HubLibrary::new(db_path)),
+        );
+
+        for query in [
+            "after=invalid",
+            "after=0&target=invalid",
+            "after=0&limit=invalid",
+        ] {
+            let response = server
+                .router()
+                .oneshot(
+                    Request::get(format!("{HUB_CHANGES_ROUTE}?{query}"))
+                        .header(
+                            super::super::identity::TAILSCALE_USER_LOGIN_HEADER,
+                            "Alice@Example.com",
+                        )
+                        .header(PROTOCOL_VERSION_HEADER, "2")
+                        .header(HUB_ID_HEADER, actual_hub_id.to_string())
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+            assert_eq!(response.headers()[HUB_ID_HEADER], actual_hub_id.to_string());
+            let error: HubApiError =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(error.code, "invalid_change_query", "{query}");
+        }
     }
 
     #[tokio::test]
