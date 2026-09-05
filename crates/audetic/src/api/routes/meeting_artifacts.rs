@@ -17,14 +17,14 @@ use crate::meeting_artifacts::{GenerateArtifactRequest, GenerateArtifactResponse
 
 #[derive(Clone)]
 pub struct MeetingArtifactState {
-    sync: Option<Arc<crate::sync::SyncService>>,
+    library: Option<Arc<crate::sync::shared_library::SharedLibrary>>,
 }
 
-pub fn router(sync: Option<Arc<crate::sync::SyncService>>) -> Router {
-    let sync = sync.or_else(|| {
+pub fn router(library: Option<Arc<crate::sync::shared_library::SharedLibrary>>) -> Router {
+    let library = library.or_else(|| {
         crate::sync::SyncService::default_local_library()
             .ok()
-            .map(Arc::new)
+            .map(|system| Arc::new(system.library()))
     });
     Router::new()
         .route(
@@ -35,7 +35,7 @@ pub fn router(sync: Option<Arc<crate::sync::SyncService>>) -> Router {
             "/meetings/:id/artifacts/:artifact_id",
             get(get_meeting_artifact).delete(delete_meeting_artifact),
         )
-        .with_state(MeetingArtifactState { sync })
+        .with_state(MeetingArtifactState { library })
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -63,13 +63,10 @@ pub async fn list_meeting_artifacts(
     State(state): State<MeetingArtifactState>,
 ) -> ApiResult<Json<MeetingArtifactsResponse>> {
     let record_id: RecordId = id.parse().map_err(ApiError::bad_request)?;
-    let sync = state
-        .sync
+    let library = state
+        .library
         .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?;
-    let artifacts = sync
-        .meeting_artifacts(record_id)
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+    let artifacts = library.artifacts(record_id).await.map_err(ApiError::from)?;
     Ok(Json(MeetingArtifactsResponse { artifacts }))
 }
 
@@ -90,13 +87,13 @@ pub async fn generate_artifact(
     Json(request): Json<GenerateArtifactRequest>,
 ) -> ApiResult<Json<GenerateArtifactResponse>> {
     let record_id: RecordId = id.parse().map_err(ApiError::bad_request)?;
-    let sync = state
-        .sync
+    let library = state
+        .library
         .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?;
-    let artifact = sync
-        .generate_meeting_artifact(record_id, request)
+    let artifact = library
+        .generate_artifact(record_id, request)
         .await
-        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        .map_err(ApiError::from)?;
     Ok(Json(GenerateArtifactResponse { artifact }))
 }
 
@@ -119,14 +116,13 @@ pub async fn get_meeting_artifact(
 ) -> ApiResult<Json<MeetingArtifact>> {
     let meeting_record_id: RecordId = id.parse().map_err(ApiError::bad_request)?;
     let artifact_record_id: RecordId = artifact_id.parse().map_err(ApiError::bad_request)?;
-    let sync = state
-        .sync
+    let library = state
+        .library
         .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?;
-    let artifact = sync
-        .meeting_artifact(meeting_record_id, artifact_record_id)
+    let artifact = library
+        .artifact(meeting_record_id, artifact_record_id)
         .await
-        .map_err(|error| ApiError::internal(error.to_string()))?
-        .ok_or_else(|| ApiError::not_found(format!("Artifact {artifact_record_id} not found")))?;
+        .map_err(ApiError::from)?;
     Ok(Json(artifact))
 }
 
@@ -149,31 +145,13 @@ pub async fn delete_meeting_artifact(
 ) -> ApiResult<Json<DeleteArtifactResponse>> {
     let meeting_record_id: RecordId = id.parse().map_err(ApiError::bad_request)?;
     let artifact_record_id: RecordId = artifact_id.parse().map_err(ApiError::bad_request)?;
-    let sync = state
-        .sync
+    let library = state
+        .library
         .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?;
-    match sync
-        .delete_meeting_artifact(meeting_record_id, artifact_record_id)
+    library
+        .delete_artifact(meeting_record_id, artifact_record_id)
         .await
-        .map_err(|error| {
-            ApiError::new(
-                axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                error.to_string(),
-            )
-        })? {
-        crate::sync::shared_library::ArtifactDeleteResult::Deleted => {}
-        crate::sync::shared_library::ArtifactDeleteResult::NotFound => {
-            return Err(ApiError::not_found(format!(
-                "Artifact {artifact_record_id} not found"
-            )));
-        }
-        crate::sync::shared_library::ArtifactDeleteResult::InFlight => {
-            return Err(ApiError::new(
-                axum::http::StatusCode::CONFLICT,
-                "Artifact is still being generated; wait for it to finish before deleting",
-            ));
-        }
-    }
+        .map_err(ApiError::from)?;
     Ok(Json(DeleteArtifactResponse {
         success: true,
         id: artifact_record_id,

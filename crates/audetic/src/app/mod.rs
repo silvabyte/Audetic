@@ -797,7 +797,7 @@ mod tests {
             ),
             inspector: Arc::new(UnusedShutdownInspector),
             meetings_dir: temp.path().join("meetings"),
-            sync: None,
+            library: None,
         };
         let router = crate::api::routes::meetings::router(state);
         let api_task = tokio::spawn(async move {

@@ -29,6 +29,20 @@ pub enum ApplySnapshotError {
     Database(#[from] anyhow::Error),
 }
 
+#[derive(Debug, Error)]
+pub enum MeetingTitleUpdateError {
+    #[error("Meeting Title cannot be blank")]
+    InvalidTitle,
+    #[error("invalid Meeting Title source")]
+    InvalidSource,
+    #[error("Meeting Title version conflict")]
+    Conflict,
+    #[error(transparent)]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Database(#[from] anyhow::Error),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApplyResult {
     pub revision: u64,
@@ -257,7 +271,13 @@ impl SharedLibraryRepository {
             .query_row(
                 "SELECT record_id, origin_device_id, text, source_created_at, source_updated_at,
                     local_version, authoritative_revision
-             FROM shared_dictations WHERE record_id = ?1 AND deleted_at IS NULL",
+             FROM shared_dictations WHERE record_id = ?1 AND deleted_at IS NULL
+               AND NOT EXISTS (
+                 SELECT 1 FROM sync_outbox_items o
+                 WHERE o.record_id = shared_dictations.record_id
+                   AND o.kind = 'dictation'
+                   AND json_type(o.snapshot_json, '$.deleted_at') IS NOT NULL
+               )",
                 [record_id.to_string()],
                 |row| {
                     let record: String = row.get(0)?;
@@ -299,8 +319,14 @@ impl SharedLibraryRepository {
     ) -> Result<Vec<SharedDictation>> {
         let mut sql = "SELECT record_id, origin_device_id, text, source_created_at,
             source_updated_at, local_version, authoritative_revision FROM shared_dictations
-            WHERE deleted_at IS NULL"
-            .to_owned();
+            WHERE deleted_at IS NULL
+              AND NOT EXISTS (
+                SELECT 1 FROM sync_outbox_items o
+                WHERE o.record_id = shared_dictations.record_id
+                  AND o.kind = 'dictation'
+                  AND json_type(o.snapshot_json, '$.deleted_at') IS NOT NULL
+              )"
+        .to_owned();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(query) = query {
             sql.push_str(" AND text LIKE ?");
@@ -551,7 +577,14 @@ impl SharedLibraryRepository {
         after: Option<(&str, RecordId)>,
         limit: usize,
     ) -> Result<Vec<SharedMeeting>> {
-        let mut sql = "SELECT record_id FROM shared_meetings WHERE deleted_at IS NULL".to_owned();
+        let mut sql = "SELECT record_id FROM shared_meetings WHERE deleted_at IS NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM sync_outbox_items o
+              WHERE o.record_id = shared_meetings.record_id
+                AND o.kind = 'meeting'
+                AND json_type(o.snapshot_json, '$.deleted_at') IS NOT NULL
+            )"
+        .to_owned();
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
         if let Some(query) = query {
             sql.push_str(" AND (COALESCE(title,'') LIKE ? OR transcript_text LIKE ?)");
@@ -586,14 +619,14 @@ impl SharedLibraryRepository {
         conn: &mut Connection,
         record_id: RecordId,
         patch: &MeetingTitlePatch,
-    ) -> Result<Option<SharedMeeting>> {
+    ) -> std::result::Result<Option<SharedMeeting>, MeetingTitleUpdateError> {
         let title = patch.title.trim();
         if title.is_empty() {
-            anyhow::bail!("Meeting Title cannot be blank");
+            return Err(MeetingTitleUpdateError::InvalidTitle);
         }
         let title_source = patch.title_source.as_deref().unwrap_or("manual");
         if !matches!(title_source, "manual" | "generated") {
-            anyhow::bail!("invalid title source");
+            return Err(MeetingTitleUpdateError::InvalidSource);
         }
         let tx = conn.transaction()?;
         let current = get_meeting_from(&tx, record_id)?;
@@ -601,7 +634,7 @@ impl SharedLibraryRepository {
             return Ok(None);
         };
         if current.title_version != patch.expected_title_version {
-            anyhow::bail!("title_version_conflict");
+            return Err(MeetingTitleUpdateError::Conflict);
         }
         let revision = current.authoritative_revision + 1;
         tx.execute(
@@ -611,6 +644,14 @@ impl SharedLibraryRepository {
         tx.execute("UPDATE shared_record_index SET authoritative_revision=?2,updated_at=CURRENT_TIMESTAMP WHERE record_id=?1",params![record_id.to_string(),revision])?;
         let updated =
             get_meeting_from(&tx, record_id)?.context("meeting disappeared after title update")?;
+        crate::db::meetings::MeetingRepository::mirror_authoritative_title(
+            &tx,
+            record_id,
+            updated.title.as_deref(),
+            updated.title_source.as_deref(),
+            updated.title_version,
+            &updated.updated_at,
+        )?;
         append_change(
             &tx,
             PendingChange {
@@ -916,7 +957,14 @@ struct StoredMeetingRow {
 
 fn get_meeting_from(conn: &Connection, record_id: RecordId) -> Result<Option<SharedMeeting>> {
     let row: Option<StoredMeetingRow> = conn.query_row(
-        "SELECT record_id,origin_device_id,title,title_source,title_version,source_filename,transcript_text,transcript_segments,duration_seconds,status,source_created_at,source_updated_at,source_completed_at,local_version,authoritative_revision FROM shared_meetings WHERE record_id=?1 AND deleted_at IS NULL",
+        "SELECT record_id,origin_device_id,title,title_source,title_version,source_filename,transcript_text,transcript_segments,duration_seconds,status,source_created_at,source_updated_at,source_completed_at,local_version,authoritative_revision
+         FROM shared_meetings WHERE record_id=?1 AND deleted_at IS NULL
+           AND NOT EXISTS (
+             SELECT 1 FROM sync_outbox_items o
+             WHERE o.record_id = shared_meetings.record_id
+               AND o.kind = 'meeting'
+               AND json_type(o.snapshot_json, '$.deleted_at') IS NOT NULL
+           )",
         [record_id.to_string()], |row| Ok(StoredMeetingRow { record_id:row.get(0)?,origin_device_id:row.get(1)?,title:row.get(2)?,title_source:row.get(3)?,title_version:row.get(4)?,source_filename:row.get(5)?,transcript_text:row.get(6)?,transcript_segments:row.get(7)?,duration_seconds:row.get(8)?,status:row.get(9)?,created_at:row.get(10)?,updated_at:row.get(11)?,completed_at:row.get(12)?,local_version:row.get(13)?,authoritative_revision:row.get(14)? })
     ).optional()?;
     row.map(|row| {

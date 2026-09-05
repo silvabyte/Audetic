@@ -57,8 +57,8 @@ impl ProcessingServices {
             .ok_or_else(|| anyhow::anyhow!("meeting {local_id} not found"))
     }
 
-    pub(crate) fn local_library_service(&self) -> crate::sync::SyncService {
-        crate::sync::SyncService::local_library(self.db_path.clone())
+    pub(crate) fn local_library(&self) -> crate::sync::shared_library::SharedLibrary {
+        crate::sync::SyncService::local_library(self.db_path.clone()).library()
     }
 }
 

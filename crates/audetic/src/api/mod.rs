@@ -118,14 +118,14 @@ impl ApiServer {
             services,
             inspector,
             meetings_dir,
-            sync: None,
+            library: None,
         });
         self
     }
 
     pub fn with_sync_service(mut self, service: std::sync::Arc<crate::sync::SyncService>) -> Self {
         if let Some(meeting_state) = self.meeting_state.as_mut() {
-            meeting_state.sync = Some(service.clone());
+            meeting_state.library = Some(std::sync::Arc::new(service.library()));
         }
         self.sync_state = Some(routes::sync::SyncApiState::new(service));
         self
@@ -142,14 +142,16 @@ impl ApiServer {
         // Build the API surface. All routes nest under `/api` so the daemon
         // can serve the bundled web-ui at `/` without colliding with API
         // paths (e.g. /meetings is also a SPA route).
-        let history_sync = self.sync_state.as_ref().map(|state| state.service.clone());
-        let artifact_sync = self.sync_state.as_ref().map(|state| state.service.clone());
+        let shared_library = self
+            .sync_state
+            .as_ref()
+            .map(|state| std::sync::Arc::new(state.service.library()));
         let mut api = Router::new()
             .route("/", get(status))
             .route("/version", get(version))
             .route("/openapi.json", get(openapi_spec))
             .nest("", routes::recording::router(self.recording_state))
-            .nest("/history", routes::history::router(history_sync))
+            .nest("/history", routes::history::router(shared_library.clone()))
             .nest("/keybind", routes::keybind::router())
             .nest("/logs", routes::logs::router())
             .nest("/models", routes::models::router())
@@ -166,7 +168,7 @@ impl ApiServer {
             .merge(routes::transcribe::router())
             .merge(routes::agents::router())
             .merge(routes::summary_templates::router())
-            .merge(routes::meeting_artifacts::router(artifact_sync))
+            .merge(routes::meeting_artifacts::router(shared_library))
             .merge(routes::post_processing::router(self.post_processing_state))
             .layer(Extension(self.instance_id));
 

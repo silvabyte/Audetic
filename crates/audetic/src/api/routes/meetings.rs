@@ -48,7 +48,7 @@ pub struct MeetingState {
     /// Uploaded files are staged into a `.uploads` sub-dir, then moved
     /// alongside live recordings on success.
     pub meetings_dir: PathBuf,
-    pub sync: Option<Arc<crate::sync::SyncService>>,
+    pub library: Option<Arc<crate::sync::shared_library::SharedLibrary>>,
 }
 
 /// Request body for start/toggle endpoints.
@@ -223,8 +223,8 @@ pub struct MeetingTitleRegenerationResponse {
 }
 
 pub fn router(mut state: MeetingState) -> Router {
-    if state.sync.is_none() {
-        state.sync = Some(Arc::new(state.services.local_library_service()));
+    if state.library.is_none() {
+        state.library = Some(Arc::new(state.services.local_library()));
     }
     Router::new()
         .route("/meetings/start", post(start_meeting))
@@ -311,8 +311,10 @@ fn parse_record_id(value: &str) -> Result<RecordId, ApiError> {
 }
 
 fn sync_id_for_local(state: &MeetingState, local_id: i64) -> anyhow::Result<RecordId> {
-    match state.sync.as_ref() {
-        Some(sync) => sync.public_meeting_id(local_id).map_err(anyhow::Error::new),
+    match state.library.as_ref() {
+        Some(library) => library
+            .public_meeting_id(local_id)
+            .map_err(anyhow::Error::new),
         None => state.services.public_meeting_id(local_id),
     }
 }
@@ -648,20 +650,24 @@ fn default_meeting_status_json(
 pub async fn list_meetings(
     Query(params): Query<MeetingsListQuery>,
     State(state): State<MeetingState>,
-) -> Result<Json<MeetingsListResponse>, StatusCode> {
+) -> ApiResult<Json<MeetingsListResponse>> {
     let limit = params
         .limit
         .unwrap_or(20)
         .clamp(1, crate::sync::protocol::MAX_MEETING_PAGE);
     let offset = params.offset.unwrap_or(0);
-    let sync = state
-        .sync
+    let library = state
+        .library
         .as_ref()
-        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
-    let meetings = sync
-        .meetings(params.q.as_deref(), offset, limit)
+        .ok_or_else(|| ApiError::internal("Shared Library unavailable"))?;
+    let meetings = library
+        .meetings(crate::sync::shared_library::MeetingPageRequest {
+            query: params.q,
+            offset,
+            limit,
+        })
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .map_err(ApiError::from)?;
     Ok(Json(MeetingsListResponse {
         meetings: meetings.into_iter().map(summary_from_library).collect(),
     }))
@@ -723,11 +729,11 @@ pub async fn recent_meeting_titles(
 ) -> ApiResult<Json<RecentMeetingTitlesResponse>> {
     let limit = params.limit.unwrap_or(10).min(50);
     let titles = state
-        .sync
+        .library
         .as_ref()
         .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?
         .recent_meeting_titles(limit)
-        .map_err(|error| ApiError::internal(error.to_string()))?;
+        .map_err(ApiError::from)?;
     Ok(Json(RecentMeetingTitlesResponse { titles }))
 }
 
@@ -753,25 +759,14 @@ pub async fn update_meeting_title(
     if title.is_empty() {
         return Err(ApiError::bad_request("Meeting Title cannot be blank"));
     }
-    let sync = state
-        .sync
+    let library = state
+        .library
         .as_ref()
         .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?;
-    let meeting = sync
+    let meeting = library
         .update_meeting_title(record_id, title)
         .await
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("conflict") || message.contains("HTTP 409") {
-                ApiError::new(StatusCode::CONFLICT, message)
-            } else if message.contains("not found") {
-                ApiError::not_found(message)
-            } else if message.contains("unavailable") {
-                ApiError::new(StatusCode::SERVICE_UNAVAILABLE, message)
-            } else {
-                ApiError::internal(message)
-            }
-        })?;
+        .map_err(ApiError::from)?;
     if let Some(local_id) = meeting.local_id {
         state
             .status
@@ -801,21 +796,14 @@ pub async fn regenerate_meeting_title(
     State(state): State<MeetingState>,
 ) -> ApiResult<(StatusCode, Json<MeetingTitleRegenerationResponse>)> {
     let record_id = parse_record_id(&id)?;
-    let sync = state
-        .sync
+    let library = state
+        .library
         .as_ref()
         .ok_or_else(|| ApiError::internal("Shared Library service unavailable"))?;
-    let local_id = sync
+    let local_id = library
         .regenerate_meeting_title(record_id)
         .await
-        .map_err(|error| {
-            let message = error.to_string();
-            if message.contains("not found") {
-                ApiError::not_found(message)
-            } else {
-                ApiError::new(StatusCode::CONFLICT, message)
-            }
-        })?;
+        .map_err(ApiError::from)?;
     if let Some(local_id) = local_id {
         state.status.set_title_if_current(local_id, None).await;
     }
@@ -851,17 +839,14 @@ pub async fn get_meeting(
 ) -> Result<Json<MeetingDetailResponse>, Response> {
     let record_id = parse_record_id(&id).map_err(IntoResponse::into_response)?;
     state
-        .sync
+        .library
         .as_ref()
         .ok_or_else(|| ApiError::internal("Shared Library service unavailable").into_response())?
         .meeting(record_id)
         .await
-        .map_err(|error| ApiError::internal(error.to_string()).into_response())?
+        .map_err(|error| ApiError::from(error).into_response())
         .map(detail_from_library)
         .map(Json)
-        .ok_or_else(|| {
-            ApiError::not_found(format!("Meeting {record_id} not found")).into_response()
-        })
 }
 
 /// Stream a meeting's audio file for in-browser playback. Used by the review
@@ -889,24 +874,23 @@ pub async fn meeting_audio(
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    let Some(sync) = &state.sync else {
+    let Some(library) = &state.library else {
         return audio_not_found(record_id);
     };
     let range = request
         .headers()
         .get(axum::http::header::RANGE)
         .and_then(|value| value.to_str().ok());
-    match sync
-        .payload(record_id, crate::sync::protocol::RecordKind::Meeting, range)
+    match library
+        .payload(crate::sync::shared_library::PayloadRequest {
+            id: record_id,
+            kind: crate::sync::protocol::RecordKind::Meeting,
+            range: range.map(str::to_owned),
+        })
         .await
     {
-        Ok(Some(source)) => super::payload::serve(source),
-        Ok(None) => audio_not_found(record_id),
-        Err(error) => (
-            StatusCode::BAD_GATEWAY,
-            Json(json!({"success":false,"message":error.to_string()})),
-        )
-            .into_response(),
+        Ok(source) => super::payload::serve(source),
+        Err(error) => ApiError::from(error).into_response(),
     }
 }
 
@@ -947,70 +931,20 @@ pub async fn retry_meeting(Path(id): Path<String>, State(state): State<MeetingSt
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    let Some(sync) = state.sync.as_ref() else {
+    let Some(library) = state.library.as_ref() else {
         return ApiError::internal("Shared Library service unavailable").into_response();
     };
-    let prepared = match sync.prepare_meeting_retry(record_id).await {
+    let prepared = match library.prepare_meeting_retry(record_id).await {
         Ok(value) => value,
         Err(error) => {
             error!("Failed to prepare meeting {} retry: {}", id, error);
-            return ApiError::internal(error.to_string()).into_response();
+            return ApiError::from(error).into_response();
         }
     };
-    let (local_id, record_id, resolved_path, duration) = match prepared {
-        crate::sync::shared_library::RetryMeetingResult::Ready {
-            local_id,
-            record_id,
-            audio_path,
-            duration_seconds,
-        } => (local_id, record_id, audio_path, duration_seconds),
-        crate::sync::shared_library::RetryMeetingResult::NotFound => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({
-                    "success": false,
-                    "message": format!("Meeting {} not found", id),
-                })),
-            )
-                .into_response();
-        }
-        crate::sync::shared_library::RetryMeetingResult::WrongState(status) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "success": false,
-                    "message": format!(
-                        "Meeting {} is in state '{}'; only failed meetings can be retried",
-                        id, status
-                    ),
-                })),
-            )
-                .into_response();
-        }
-        crate::sync::shared_library::RetryMeetingResult::MissingAudio(path) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "success": false,
-                    "message": format!("Audio file no longer on disk: {path} (and no .mp3 sibling)"),
-                })),
-            )
-                .into_response();
-        }
-        crate::sync::shared_library::RetryMeetingResult::StateChanged => {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "success": false,
-                    "message": format!(
-                        "Meeting {} is no longer eligible for retry; its state changed",
-                        id
-                    ),
-                })),
-            )
-                .into_response();
-        }
-    };
+    let local_id = prepared.local_id;
+    let record_id = prepared.record_id;
+    let resolved_path = prepared.audio_path;
+    let duration = prepared.duration_seconds;
 
     let transcription = state.transcription.clone();
     tokio::spawn(async move {
@@ -1067,11 +1001,12 @@ pub async fn delete_meeting(Path(id): Path<String>, State(state): State<MeetingS
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
-    let Some(sync) = &state.sync else {
+    let Some(library) = &state.library else {
         return ApiError::internal("Shared Library service unavailable").into_response();
     };
-    match sync.delete_meeting(record_id).await {
-        Ok(crate::sync::shared_library::DeleteResult::Deleted { local_id }) => {
+    match library.delete_meeting(record_id).await {
+        Ok(result) => {
+            let local_id = result.local_id;
             if let Some(local_id) = local_id {
                 if state.status.clear_if_current(local_id).await {
                     info!("Meeting {} cleared from live status after delete", id);
@@ -1087,31 +1022,9 @@ pub async fn delete_meeting(Path(id): Path<String>, State(state): State<MeetingS
             )
                 .into_response()
         }
-        Ok(crate::sync::shared_library::DeleteResult::NotFound) => (
-            StatusCode::NOT_FOUND,
-            Json(json!({
-                "success": false,
-                "message": format!("Meeting {id} not found"),
-            })),
-        )
-            .into_response(),
-        Ok(crate::sync::shared_library::DeleteResult::InFlight) => (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "success": false,
-                "message": format!(
-                    "Meeting {id} is still in progress; stop or cancel it before deleting"
-                ),
-            })),
-        )
-            .into_response(),
         Err(e) => {
             error!("Failed to delete meeting {}: {}", id, e);
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({ "success": false, "message": e.to_string() })),
-            )
-                .into_response()
+            ApiError::from(e).into_response()
         }
     }
 }

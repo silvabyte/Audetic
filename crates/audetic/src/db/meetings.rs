@@ -248,6 +248,39 @@ impl MeetingRepository {
         Ok(titles)
     }
 
+    /// Mirror a Home Hub-owned title onto an overlapping operational row.
+    ///
+    /// This intentionally does not increment `sync_version`, enqueue an origin
+    /// snapshot, or dispatch work. The authoritative row remains the owner;
+    /// the local copy exists so standalone/offline reads and later destination
+    /// seeding retain the accepted title.
+    pub fn mirror_authoritative_title(
+        conn: &Connection,
+        record_id: RecordId,
+        title: Option<&str>,
+        title_source: Option<&str>,
+        title_version: u64,
+        updated_at: &str,
+    ) -> Result<Option<i64>> {
+        let title_version = i64::try_from(title_version)
+            .context("authoritative Meeting Title version exceeds local storage")?;
+        conn.query_row(
+            "UPDATE meetings SET title=?2,title_source=?3,title_version=?4,title_updated_at=?5
+             WHERE sync_id=?1 AND deleted_at IS NULL
+             RETURNING id",
+            params![
+                record_id.to_string(),
+                title,
+                title_source,
+                title_version,
+                updated_at
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("mirroring authoritative Meeting Title")
+    }
+
     /// Mark meeting as completed with transcript and duration. Clears any
     /// `error` column from a prior failed run so a successful retry leaves
     /// the row in a clean terminal state (otherwise the UI would still show

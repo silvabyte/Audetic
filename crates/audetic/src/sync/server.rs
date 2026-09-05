@@ -557,7 +557,7 @@ async fn update_meeting_title(
             Json(HubApiError::new("not_found", "meeting not found")),
         )
             .into_response(),
-        Err(error) if error.to_string().contains("title_version_conflict") => (
+        Err(crate::db::shared_library::MeetingTitleUpdateError::Conflict) => (
             StatusCode::CONFLICT,
             Json(HubApiError::new(
                 "title_version_conflict",
@@ -565,11 +565,28 @@ async fn update_meeting_title(
             )),
         )
             .into_response(),
-        Err(error) => (
+        Err(
+            crate::db::shared_library::MeetingTitleUpdateError::InvalidTitle
+            | crate::db::shared_library::MeetingTitleUpdateError::InvalidSource,
+        ) => (
             StatusCode::BAD_REQUEST,
-            Json(HubApiError::new("invalid_title", error.to_string())),
+            Json(HubApiError::new(
+                "invalid_title",
+                "Meeting Title is invalid",
+            )),
         )
             .into_response(),
+        Err(error) => {
+            tracing::error!(%error, "authoritative Meeting Title update failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(HubApiError::new(
+                    "library_error",
+                    "Shared Library operation failed",
+                )),
+            )
+                .into_response()
+        }
     }
 }
 

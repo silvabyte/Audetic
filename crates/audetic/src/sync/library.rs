@@ -156,8 +156,12 @@ impl HubLibrary {
         &self,
         record_id: RecordId,
         patch: &MeetingTitlePatch,
-    ) -> Result<Option<SharedMeeting>> {
-        let mut connection = crate::db::open_db_at(&self.db_path)?;
+    ) -> std::result::Result<
+        Option<SharedMeeting>,
+        crate::db::shared_library::MeetingTitleUpdateError,
+    > {
+        let mut connection = crate::db::open_db_at(&self.db_path)
+            .map_err(crate::db::shared_library::MeetingTitleUpdateError::Database)?;
         SharedLibraryRepository::compare_and_set_meeting_title(&mut connection, record_id, patch)
     }
 
