@@ -175,14 +175,14 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::sync::protocol::{
-        DictationPage, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting, SnapshotBatch,
-        SnapshotBatchResponse,
+        ChangeCursor, ChangePage, ChangeTarget, DictationPage, MeetingPage, MeetingTitlePatch,
+        RecordKind, SharedMeeting, SnapshotBatch, SnapshotBatchResponse,
     };
     use crate::sync::tailscale::{
         MappingState, ServeAssessment, TailscaleControl, TailscaleError, TailscaleStatus,
     };
     use crate::sync::transport::{
-        BlobUpload, DiscoveryOutcome, HubCapabilities, HubProbe, HubTransferError,
+        BlobUpload, DiscoveryOutcome, HubCapabilities, HubChangeSource, HubProbe, HubTransferError,
         RemoteDictationLibrary, RemoteLibraryMutations, RemoteMeetingLibrary, RemotePayloadSource,
         ReplicationTransport, StreamingPayloadResponse,
     };
@@ -347,6 +347,21 @@ mod tests {
         }
     }
 
+    struct UnusedChangeSource;
+
+    #[async_trait]
+    impl HubChangeSource for UnusedChangeSource {
+        async fn page_changes(
+            &self,
+            _hub: &HubConnection,
+            _after: ChangeCursor,
+            _target: Option<ChangeTarget>,
+            _limit: usize,
+        ) -> Result<ChangePage, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
+
     fn test_router() -> (Router, tempfile::TempDir, HubConnection) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("audetic.db");
@@ -364,6 +379,7 @@ mod tests {
             library.clone(),
             library,
             Arc::new(UnusedRemotePayloads),
+            Arc::new(UnusedChangeSource),
         );
         let service = Arc::new(SyncService::with_dependencies(
             path,

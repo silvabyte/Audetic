@@ -71,9 +71,6 @@ impl LibraryChangeFeedRepository {
         if after > target_cursor {
             bail!("change cursor is past the immutable target");
         }
-        if requested_target.is_some() && after == target_cursor {
-            bail!("change continuation cannot advance beyond its supplied cursor");
-        }
 
         let after_sql = to_i64(after.value(), "after cursor")?;
         let target_sql = to_i64(target_cursor.value(), "target cursor")?;
@@ -157,6 +154,12 @@ impl LibraryChangeFeedRepository {
                 "SELECT record_id,kind,origin_device_id,authoritative_revision
                  FROM shared_record_index
                  WHERE deleted_at IS NULL
+                   AND NOT EXISTS (
+                     SELECT 1 FROM sync_outbox_items o
+                     WHERE o.record_id=shared_record_index.record_id
+                       AND o.kind=shared_record_index.kind
+                       AND json_type(o.snapshot_json,'$.deleted_at') IS NOT NULL
+                   )
                  ORDER BY CASE kind WHEN 'dictation' THEN 0 WHEN 'meeting' THEN 1 ELSE 2 END,
                           record_id",
             )?;
@@ -178,8 +181,7 @@ impl LibraryChangeFeedRepository {
             let Some(snapshot) =
                 super::shared_library::authoritative_snapshot(conn, kind, record_id)?
             else {
-                // A local deletion waiting for Hub acceptance is intentionally
-                // hidden from the authoritative projection until it commits.
+                // Projection reads retain their own visibility guards.
                 continue;
             };
             let changed_at = snapshot_changed_at(&snapshot).to_owned();
@@ -438,15 +440,34 @@ mod tests {
         assert_eq!(continuation.changes.len(), 1);
         assert_eq!(continuation.changes[0].record_id, second_id);
 
+        for _ in 0..2 {
+            let repeated_completion = LibraryChangeFeedRepository::page(
+                &conn,
+                continuation.through_cursor,
+                Some(continuation.target_cursor),
+                10,
+            )
+            .unwrap();
+            assert_eq!(
+                repeated_completion.target_cursor,
+                continuation.target_cursor
+            );
+            assert_eq!(repeated_completion.after_cursor.value(), 2);
+            assert_eq!(repeated_completion.through_cursor.value(), 2);
+            assert!(repeated_completion.complete);
+            assert!(repeated_completion.changes.is_empty());
+        }
+
         let next = LibraryChangeFeedRepository::page(&conn, continuation.through_cursor, None, 10)
             .unwrap();
         assert!(next.complete);
         assert_eq!(next.target_cursor.cursor().value(), 3);
         assert_eq!(next.changes[0].record_id, third_id);
+
         assert!(LibraryChangeFeedRepository::page(
             &conn,
-            next.through_cursor,
-            Some(next.target_cursor),
+            ChangeCursor::new(3),
+            Some(ChangeTarget::new(ChangeCursor::new(2))),
             10,
         )
         .is_err());
@@ -464,6 +485,19 @@ mod tests {
         assert_eq!(page.through_cursor, ChangeCursor::ZERO);
         assert!(page.complete);
         assert!(page.changes.is_empty());
+
+        let repeated = LibraryChangeFeedRepository::page(
+            &conn,
+            ChangeCursor::ZERO,
+            Some(ChangeTarget::new(ChangeCursor::ZERO)),
+            MAX_CHANGE_PAGE,
+        )
+        .unwrap();
+        assert_eq!(repeated.target_cursor.cursor(), ChangeCursor::ZERO);
+        assert_eq!(repeated.after_cursor, ChangeCursor::ZERO);
+        assert_eq!(repeated.through_cursor, ChangeCursor::ZERO);
+        assert!(repeated.complete);
+        assert!(repeated.changes.is_empty());
     }
 
     #[test]

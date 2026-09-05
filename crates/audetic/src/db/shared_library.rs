@@ -483,6 +483,9 @@ impl SharedLibraryRepository {
             &snapshot.payload.recording_payload,
         )?;
         let mut accepted_snapshot = snapshot.clone();
+        accepted_snapshot.payload.title = title;
+        accepted_snapshot.payload.title_source = title_source;
+        accepted_snapshot.payload.title_version = title_version;
         accepted_snapshot.payload.recording_payload =
             payload_descriptor_from(&tx, snapshot.record_id)?;
         append_change(
@@ -816,10 +819,18 @@ impl SharedLibraryRepository {
         blob: &LibraryBlobRecord,
     ) -> Result<usize> {
         let tx = conn
-            .transaction()
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .context("starting verified blob transaction")?;
         if !Self::has_payload_association(&tx, &blob.checksum, blob.byte_size, &blob.media_type)? {
             anyhow::bail!("no accepted record references this Recording Payload checksum");
+        }
+        let cache_owns_path: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_cache_blobs WHERE local_path=?1)",
+            [blob.canonical_path.to_string_lossy()],
+            |row| row.get(0),
+        )?;
+        if cache_owns_path {
+            anyhow::bail!("authoritative and cache Recording Payloads must use disjoint paths");
         }
         tx.execute(
             "INSERT INTO library_blobs(checksum,canonical_path,byte_size,media_type,verified)
@@ -1564,6 +1575,56 @@ mod tests {
     }
 
     #[test]
+    fn authoritative_blob_registration_rejects_a_cache_owned_path() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let record_id = RecordId::new();
+        let origin = DeviceId::new();
+        let bytes = b"disjoint authoritative payload";
+        let checksum = format!("{:x}", sha2::Sha256::digest(bytes));
+        let mut value = snapshot(record_id, origin);
+        value.payload.recording_payload = RecordingPayloadDescriptor::pending(
+            checksum.clone(),
+            bytes.len() as u64,
+            "audio/wav".into(),
+        );
+        SharedLibraryRepository::apply_snapshot(&mut conn, &value).unwrap();
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("cache-owned");
+        std::fs::write(&path, bytes).unwrap();
+        let source = audetic_core::sync::HubId::new();
+        conn.execute(
+            "INSERT INTO library_cache_sources(source_hub_id) VALUES(?1)",
+            [source.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO library_cache_blobs
+                (source_hub_id,checksum,local_path,byte_size,media_type,verified)
+             VALUES(?1,?2,?3,?4,'audio/wav',1)",
+            params![
+                source.to_string(),
+                checksum,
+                path.to_string_lossy(),
+                bytes.len() as u64,
+            ],
+        )
+        .unwrap();
+
+        assert!(SharedLibraryRepository::register_verified_blob(
+            &mut conn,
+            &LibraryBlobRecord {
+                checksum,
+                canonical_path: path,
+                byte_size: bytes.len() as u64,
+                media_type: "audio/wav".into(),
+            },
+        )
+        .is_err());
+    }
+
+    #[test]
     fn registering_shared_checksum_updates_only_live_associations() {
         let mut conn = Connection::open_in_memory().unwrap();
         crate::db::migrate(&conn).unwrap();
@@ -1683,6 +1744,31 @@ mod tests {
             .unwrap();
         assert_eq!(current.title.as_deref(), Some("Hub-owned title"));
         assert_eq!(current.title_source.as_deref(), Some("manual"));
+
+        let page = crate::db::library_change_feed::LibraryChangeFeedRepository::page(
+            &conn,
+            ChangeCursor::new(2),
+            None,
+            1,
+        )
+        .unwrap();
+        assert_eq!(page.changes.len(), 1);
+        let change = &page.changes[0];
+        assert_eq!(
+            change.authoritative_revision,
+            current.authoritative_revision
+        );
+        let Some(Snapshot::Meeting(feed_snapshot)) = &change.snapshot else {
+            panic!("newer meeting change omitted its authoritative snapshot");
+        };
+        assert_eq!(feed_snapshot.payload.title, current.title);
+        assert_eq!(feed_snapshot.payload.title_source, current.title_source);
+        assert_eq!(feed_snapshot.payload.title_version, current.title_version);
+        assert_eq!(feed_snapshot.updated_at, current.updated_at);
+        assert_eq!(
+            feed_snapshot.payload.recording_payload,
+            current.recording_payload
+        );
     }
 
     #[test]

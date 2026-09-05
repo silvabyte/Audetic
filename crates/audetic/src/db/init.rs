@@ -6,6 +6,7 @@ use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const LATEST_SCHEMA_VERSION: i64 = 9;
+type Migration = (i64, &'static str, fn(&Connection) -> Result<()>);
 
 /// Open the application database and run pending migrations.
 ///
@@ -75,6 +76,10 @@ pub fn configure_connection(conn: &Connection) -> Result<()> {
 /// public preserves the existing in-memory test setup API; production code
 /// should invoke it only through the startup migration entry points above.
 pub fn migrate(conn: &Connection) -> Result<()> {
+    migrate_through(conn, LATEST_SCHEMA_VERSION)
+}
+
+fn migrate_through(conn: &Connection, target_version: i64) -> Result<()> {
     configure_connection(conn)?;
 
     // WAL is database-persistent rather than connection-local, so set it only
@@ -86,7 +91,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN EXCLUSIVE TRANSACTION")
         .context("Failed to begin exclusive database migration")?;
 
-    let result = apply_pending_migrations(conn);
+    let result = apply_pending_migrations_through(conn, target_version);
     match result {
         Ok(()) => conn
             .execute_batch("COMMIT")
@@ -98,7 +103,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     }
 }
 
-fn apply_pending_migrations(conn: &Connection) -> Result<()> {
+#[cfg(test)]
+pub(super) fn migrate_through_v8_for_test(conn: &Connection) -> Result<()> {
+    migrate_through(conn, 8)
+}
+
+fn apply_pending_migrations_through(conn: &Connection, target_version: i64) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS schema_migrations (
             version INTEGER PRIMARY KEY,
@@ -114,58 +124,47 @@ fn apply_pending_migrations(conn: &Connection) -> Result<()> {
         })
         .context("Failed to read current schema version")?;
     if let Some(version) = newest {
-        if version > LATEST_SCHEMA_VERSION {
+        if version > target_version {
             bail!(
                 "Database schema version {version} is newer than supported version \
-                 {LATEST_SCHEMA_VERSION}"
+                 {target_version}"
             );
         }
     }
 
-    apply_migration(conn, 1, "baseline", migrate_baseline)?;
-    apply_migration(
-        conn,
-        2,
-        "sync_identity_and_settings",
-        migrate_sync_foundation,
-    )?;
-    apply_migration(
-        conn,
-        3,
-        "sync_serve_ownership",
-        migrate_sync_serve_ownership,
-    )?;
-    apply_migration(
-        conn,
-        4,
-        "dictation_shared_library",
-        migrate_dictation_shared_library,
-    )?;
-    apply_migration(
-        conn,
-        5,
-        "meeting_artifact_shared_library",
-        migrate_meeting_artifact_shared_library,
-    )?;
-    apply_migration(
-        conn,
-        6,
-        "recording_payload_sync",
-        migrate_recording_payload_sync,
-    )?;
-    apply_migration(
-        conn,
-        7,
-        "payload_staging_failures",
-        migrate_payload_staging_failures,
-    )?;
-    apply_migration(conn, 8, "sync_role_epoch", migrate_sync_role_epoch)?;
-    apply_migration(
-        conn,
-        9,
-        "replay_safe_library_cache",
-        migrate_replay_safe_library_cache,
-    )?;
+    let migrations: &[Migration] = &[
+        (1, "baseline", migrate_baseline),
+        (2, "sync_identity_and_settings", migrate_sync_foundation),
+        (3, "sync_serve_ownership", migrate_sync_serve_ownership),
+        (
+            4,
+            "dictation_shared_library",
+            migrate_dictation_shared_library,
+        ),
+        (
+            5,
+            "meeting_artifact_shared_library",
+            migrate_meeting_artifact_shared_library,
+        ),
+        (6, "recording_payload_sync", migrate_recording_payload_sync),
+        (
+            7,
+            "payload_staging_failures",
+            migrate_payload_staging_failures,
+        ),
+        (8, "sync_role_epoch", migrate_sync_role_epoch),
+        (
+            9,
+            "replay_safe_library_cache",
+            migrate_replay_safe_library_cache,
+        ),
+    ];
+    for &(version, name, migration) in migrations {
+        if version > target_version {
+            break;
+        }
+        apply_migration(conn, version, name, migration)?;
+    }
     Ok(())
 }
 
@@ -986,9 +985,11 @@ fn migrate_replay_safe_library_cache(conn: &Connection) -> Result<()> {
             CHECK(active = 0 OR complete = 1)
          );
          CREATE UNIQUE INDEX idx_library_cache_one_active_per_source
-            ON library_cache_generations(source_hub_id) WHERE active = 1;
+             ON library_cache_generations(source_hub_id) WHERE active = 1;
+         CREATE UNIQUE INDEX idx_library_cache_one_inactive_per_source
+             ON library_cache_generations(source_hub_id) WHERE active = 0;
          CREATE INDEX idx_library_cache_incomplete
-            ON library_cache_generations(source_hub_id,complete,created_at);
+             ON library_cache_generations(source_hub_id,complete,created_at);
 
          CREATE TABLE library_cache_items (
             source_hub_id TEXT NOT NULL,
@@ -1033,17 +1034,34 @@ fn migrate_replay_safe_library_cache(conn: &Connection) -> Result<()> {
          );
 
          CREATE TABLE library_cache_blobs (
-            source_hub_id TEXT NOT NULL,
-            checksum TEXT NOT NULL,
-            local_path TEXT NOT NULL UNIQUE,
-            byte_size INTEGER NOT NULL CHECK(byte_size > 0),
-            media_type TEXT NOT NULL,
-            verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0,1)),
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            PRIMARY KEY(source_hub_id,checksum),
-            FOREIGN KEY(source_hub_id) REFERENCES library_cache_sources(source_hub_id)
-         );
+             source_hub_id TEXT NOT NULL,
+             checksum TEXT NOT NULL,
+             local_path TEXT NOT NULL UNIQUE,
+             byte_size INTEGER NOT NULL CHECK(byte_size BETWEEN 1 AND 1073741824),
+             media_type TEXT NOT NULL CHECK(length(CAST(media_type AS BLOB)) BETWEEN 1 AND 255
+                 AND instr(media_type,char(10))=0 AND instr(media_type,char(13))=0),
+              verified INTEGER NOT NULL DEFAULT 0 CHECK(verified IN (0,1)),
+              cleanup_pending INTEGER NOT NULL DEFAULT 0 CHECK(cleanup_pending IN (0,1)),
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY(source_hub_id,checksum),
+              FOREIGN KEY(source_hub_id) REFERENCES library_cache_sources(source_hub_id),
+              CHECK(cleanup_pending = 0 OR verified = 0)
+          );
+
+         CREATE TABLE library_cache_blob_cleanup (
+             source_hub_id TEXT NOT NULL,
+             checksum TEXT NOT NULL,
+             local_path TEXT NOT NULL UNIQUE,
+             attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+             last_error TEXT,
+             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+             PRIMARY KEY(source_hub_id,checksum),
+             FOREIGN KEY(source_hub_id,checksum)
+                 REFERENCES library_cache_blobs(source_hub_id,checksum)
+                 ON DELETE CASCADE
+          );
 
          CREATE TABLE library_cache_blob_refs (
             source_hub_id TEXT NOT NULL,
@@ -1051,20 +1069,16 @@ fn migrate_replay_safe_library_cache(conn: &Connection) -> Result<()> {
             record_id TEXT NOT NULL,
             payload_role TEXT NOT NULL DEFAULT 'recording' CHECK(payload_role='recording'),
             kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting')),
-            checksum TEXT,
-            byte_size INTEGER,
-            media_type TEXT,
-            availability TEXT NOT NULL
-                CHECK(availability IN ('pending','available','unavailable','needs_attention')),
-            PRIMARY KEY(source_hub_id,generation_id,record_id,payload_role),
-            FOREIGN KEY(source_hub_id,generation_id,record_id)
-                REFERENCES library_cache_items(source_hub_id,generation_id,record_id)
-                ON DELETE CASCADE,
-            CHECK((availability IN ('unavailable','needs_attention')
-                    AND checksum IS NULL AND byte_size IS NULL AND media_type IS NULL)
-               OR (availability IN ('pending','available')
-                    AND checksum IS NOT NULL AND byte_size > 0 AND media_type IS NOT NULL))
-         );
+             checksum TEXT NOT NULL,
+             byte_size INTEGER NOT NULL CHECK(byte_size BETWEEN 1 AND 1073741824),
+             media_type TEXT NOT NULL CHECK(length(CAST(media_type AS BLOB)) BETWEEN 1 AND 255
+                 AND instr(media_type,char(10))=0 AND instr(media_type,char(13))=0),
+             availability TEXT NOT NULL CHECK(availability = 'available'),
+             PRIMARY KEY(source_hub_id,generation_id,record_id,payload_role),
+             FOREIGN KEY(source_hub_id,generation_id,record_id)
+                 REFERENCES library_cache_items(source_hub_id,generation_id,record_id)
+                 ON DELETE CASCADE
+          );
          CREATE INDEX idx_library_cache_blob_refs_checksum
             ON library_cache_blob_refs(source_hub_id,checksum,generation_id);
 
@@ -1081,14 +1095,14 @@ fn migrate_replay_safe_library_cache(conn: &Connection) -> Result<()> {
          );
 
          CREATE TABLE library_cache_live_pages (
-            source_hub_id TEXT NOT NULL,
-            after_cursor INTEGER NOT NULL CHECK(after_cursor >= 0),
-            through_cursor INTEGER NOT NULL CHECK(through_cursor >= after_cursor),
-            target_cursor INTEGER NOT NULL CHECK(target_cursor >= through_cursor),
-            page_hash TEXT NOT NULL,
-            PRIMARY KEY(source_hub_id,after_cursor),
-            FOREIGN KEY(source_hub_id) REFERENCES library_cache_sources(source_hub_id)
-                ON DELETE CASCADE
+             source_hub_id TEXT NOT NULL,
+             after_cursor INTEGER NOT NULL CHECK(after_cursor >= 0),
+             through_cursor INTEGER NOT NULL CHECK(through_cursor >= after_cursor),
+             target_cursor INTEGER NOT NULL CHECK(target_cursor >= through_cursor),
+             page_hash TEXT NOT NULL,
+             PRIMARY KEY(source_hub_id,target_cursor,after_cursor),
+             FOREIGN KEY(source_hub_id) REFERENCES library_cache_sources(source_hub_id)
+                 ON DELETE CASCADE
          );",
     )
     .context("Failed to install replay-safe Library Cache schema")?;

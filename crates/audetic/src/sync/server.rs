@@ -21,10 +21,10 @@ use super::library::HubLibrary;
 use super::protocol::{
     is_canonical_sha256, ChangeCursor, ChangePage, ChangeTarget, DictationPage, HubApiError,
     HubInfo, MeetingPage, MeetingTitlePatch, ProtocolRange, RecordKind, SharedMeeting,
-    SnapshotBatch, SnapshotBatchResponse, HUB_BLOBS_ROUTE, HUB_CHANGES_ROUTE, HUB_DICTATIONS_ROUTE,
-    HUB_ID_HEADER, HUB_INFO_ROUTE, HUB_MEETINGS_ROUTE, HUB_SNAPSHOTS_ROUTE, MAX_BLOB_BYTES,
-    MAX_DICTATION_PAGE, MAX_MEETING_PAGE, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
-    TAILSCALE_FUNNEL_REQUEST_HEADER,
+    SnapshotBatch, SnapshotBatchResponse, HUB_BLOBS_ROUTE, HUB_CHANGES_MIN_PROTOCOL_VERSION,
+    HUB_CHANGES_ROUTE, HUB_DICTATIONS_ROUTE, HUB_ID_HEADER, HUB_INFO_ROUTE, HUB_MEETINGS_ROUTE,
+    HUB_SNAPSHOTS_ROUTE, MAX_BLOB_BYTES, MAX_DICTATION_PAGE, MAX_MEETING_PAGE,
+    PROTOCOL_VERSION_HEADER, TAILSCALE_FUNNEL_REQUEST_HEADER,
 };
 
 #[derive(Clone, Debug)]
@@ -142,12 +142,18 @@ struct ChangePageQuery {
     get,
     path = "/v1/changes",
     tag = "hub_cache",
-    params(ChangePageQuery),
+    params(
+        ChangePageQuery,
+        ("Tailscale-User-Login" = String, Header, description = "Exact identity injected by Tailscale Serve"),
+        ("X-Audetic-Protocol-Version" = u16, Header, description = "Required sync protocol version; the change feed requires version 2"),
+        ("X-Audetic-Hub-ID" = String, Header, description = "Required expected stable Hub ID"),
+    ),
     responses(
         (status = 200, description = "Stable bounded page of self-contained authoritative changes", body = ChangePage),
         (status = 400, description = "Missing, malformed, nonadvancing, or unbounded cursor request", body = HubApiError),
         (status = 403, description = "Untrusted caller", body = HubApiError),
         (status = 409, description = "Wrong expected Hub ID", body = HubApiError),
+        (status = 426, description = "Unsupported sync protocol", body = HubApiError),
     )
 )]
 async fn page_changes(
@@ -758,7 +764,13 @@ async fn enforce_hub_policy(
             "a valid Audetic protocol version header is required",
         );
     };
-    if version != PROTOCOL_VERSION {
+    let supported = ProtocolRange::supported();
+    let route_minimum = if request.uri().path() == HUB_CHANGES_ROUTE {
+        HUB_CHANGES_MIN_PROTOCOL_VERSION
+    } else {
+        supported.minimum
+    };
+    if !supported.accepts(version) || version < route_minimum {
         return rejection(
             &state,
             StatusCode::UPGRADE_REQUIRED,
@@ -882,7 +894,9 @@ pub struct HubApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sync::protocol::{DictationPayload, DictationSnapshot, RecordKind, SnapshotBatch};
+    use crate::sync::protocol::{
+        DictationPayload, DictationSnapshot, RecordKind, SnapshotBatch, PROTOCOL_VERSION,
+    };
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
     use sha2::{Digest, Sha256};
@@ -1019,7 +1033,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn protocol_is_required_and_incompatible_versions_are_rejected() {
+    async fn protocol_is_required_and_versions_outside_the_supported_range_are_rejected() {
         let (server, _) = server();
         let missing = Request::builder()
             .method(Method::GET)
@@ -1041,19 +1055,113 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
 
-        let mut incompatible = request("Alice@Example.com").body(Body::empty()).unwrap();
-        incompatible
-            .headers_mut()
-            .insert(PROTOCOL_VERSION_HEADER, HeaderValue::from_static("2"));
-        assert_eq!(
-            server
+        for version in ["1", "2"] {
+            let response = server
                 .router()
-                .oneshot(incompatible)
+                .clone()
+                .oneshot(
+                    Request::get(HUB_INFO_ROUTE)
+                        .header(
+                            super::super::identity::TAILSCALE_USER_LOGIN_HEADER,
+                            "Alice@Example.com",
+                        )
+                        .header(PROTOCOL_VERSION_HEADER, version)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
                 .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "protocol {version}");
+        }
+
+        for version in ["0", "3"] {
+            let response = server
+                .router()
+                .clone()
+                .oneshot(
+                    Request::get(HUB_INFO_ROUTE)
+                        .header(
+                            super::super::identity::TAILSCALE_USER_LOGIN_HEADER,
+                            "Alice@Example.com",
+                        )
+                        .header(PROTOCOL_VERSION_HEADER, version)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UPGRADE_REQUIRED,
+                "protocol {version}"
+            );
+            let error: HubApiError =
+                serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                    .unwrap();
+            assert_eq!(error.code, "incompatible_protocol");
+        }
+    }
+
+    #[tokio::test]
+    async fn changes_require_protocol_two_before_query_extraction() {
+        let (server, actual_hub_id) = server();
+        let response = server
+            .router()
+            .oneshot(
+                Request::get("/v1/changes?after=not-a-cursor")
+                    .header(
+                        super::super::identity::TAILSCALE_USER_LOGIN_HEADER,
+                        "Alice@Example.com",
+                    )
+                    .header(PROTOCOL_VERSION_HEADER, "1")
+                    .header(HUB_ID_HEADER, actual_hub_id.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED);
+        assert_eq!(response.headers()[HUB_ID_HEADER], actual_hub_id.to_string());
+        let error: HubApiError =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(error.code, "incompatible_protocol");
+    }
+
+    #[tokio::test]
+    async fn protocol_two_can_request_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("hub.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let actual_hub_id = hub_id();
+        let server = HubServer::new(
+            HubServerConfig::new(actual_hub_id, "Alice@Example.com")
                 .unwrap()
-                .status(),
-            StatusCode::UPGRADE_REQUIRED
+                .with_library(HubLibrary::new(db_path)),
         );
+        let response = server
+            .router()
+            .oneshot(
+                Request::get("/v1/changes?after=0")
+                    .header(
+                        super::super::identity::TAILSCALE_USER_LOGIN_HEADER,
+                        "Alice@Example.com",
+                    )
+                    .header(PROTOCOL_VERSION_HEADER, "2")
+                    .header(HUB_ID_HEADER, actual_hub_id.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let page: ChangePage =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert!(page.complete);
+        assert_eq!(page.target_cursor.cursor(), ChangeCursor::ZERO);
     }
 
     #[tokio::test]
@@ -1511,5 +1619,32 @@ mod tests {
             .components
             .as_ref()
             .is_some_and(|components| components.schemas.contains_key("HubId")));
+    }
+
+    #[test]
+    fn changes_openapi_requires_policy_headers_and_documents_typed_upgrade_response() {
+        let document = serde_json::to_value(HubApiDoc::openapi()).unwrap();
+        let operation = &document["paths"]["/v1/changes"]["get"];
+        let parameters = operation["parameters"]
+            .as_array()
+            .expect("change operation has parameters");
+
+        for name in [
+            "Tailscale-User-Login",
+            "X-Audetic-Protocol-Version",
+            "X-Audetic-Hub-ID",
+        ] {
+            let parameter = parameters
+                .iter()
+                .find(|parameter| parameter["name"] == name)
+                .unwrap_or_else(|| panic!("change operation omitted {name}"));
+            assert_eq!(parameter["in"], "header", "{name}");
+            assert_eq!(parameter["required"], true, "{name}");
+        }
+
+        assert_eq!(
+            operation["responses"]["426"]["content"]["application/json"]["schema"]["$ref"],
+            "#/components/schemas/HubApiError"
+        );
     }
 }

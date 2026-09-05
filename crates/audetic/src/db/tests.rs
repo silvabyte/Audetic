@@ -1,8 +1,9 @@
-use super::init::migrate;
+use super::init::{migrate, migrate_through_v8_for_test};
 use super::operations::*;
 use super::schemas::{VoiceToTextData, Workflow, WorkflowData, WorkflowType};
 use anyhow::Result;
 use rusqlite::Connection;
+use sha2::Digest;
 
 fn setup_test_db() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
@@ -188,6 +189,7 @@ fn populated_v7_database_migrates_to_zero_role_epoch_without_data_loss() {
         "DROP TABLE library_cache_live_pages;
          DROP TABLE library_cache_live_overlay;
          DROP TABLE library_cache_blob_refs;
+         DROP TABLE library_cache_blob_cleanup;
          DROP TABLE library_cache_blobs;
          DROP TABLE library_cache_applied_pages;
          DROP TABLE library_cache_tombstones;
@@ -236,6 +238,300 @@ fn populated_v7_database_migrates_to_zero_role_epoch_without_data_loss() {
         )
         .unwrap();
     assert_eq!(outbox_count, 1);
+}
+
+#[test]
+fn populated_v8_database_migrates_once_to_a_complete_replay_feed() {
+    const ORIGIN: &str = "10000000-0000-4000-8000-000000000001";
+    const DICTATION: &str = "20000000-0000-4000-8000-000000000001";
+    const MEETING: &str = "30000000-0000-4000-8000-000000000001";
+    const LIVE_ARTIFACT: &str = "40000000-0000-4000-8000-000000000001";
+    const PENDING_DELETE_ARTIFACT: &str = "40000000-0000-4000-8000-000000000002";
+    const INDEXED_TOMBSTONE: &str = "50000000-0000-4000-8000-000000000001";
+    const PREARRIVAL_TOMBSTONE: &str = "50000000-0000-4000-8000-000000000002";
+
+    let temp = tempfile::tempdir().unwrap();
+    let db_path = temp.path().join("populated-v8.sqlite");
+    let conn = Connection::open(&db_path).unwrap();
+    migrate_through_v8_for_test(&conn).unwrap();
+
+    let version: i64 = conn
+        .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(version, 8);
+    let replay_feed_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM sqlite_master
+                WHERE type='table' AND name='shared_library_change_feed_v1'
+             )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!replay_feed_exists);
+
+    conn.execute(
+        "INSERT INTO sync_settings(singleton,role,device_name,role_epoch)
+         VALUES(1,'home_hub','Migration fixture Hub',7)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO meetings
+            (title,title_source,title_version,status,audio_path,transcript_text,
+             duration_seconds,completed_at,sync_id,origin_device_id,sync_version)
+         VALUES('Hub-owned planning title','manual',4,'completed','/tmp/planning.wav',
+                'migration transcript',90,'2026-09-05T09:11:30Z',?1,?2,2)",
+        rusqlite::params![MEETING, ORIGIN],
+    )
+    .unwrap();
+
+    let insert_index = |record_id: &str, kind: &str, revision: u64, deleted_at: Option<&str>| {
+        conn.execute(
+            "INSERT INTO shared_record_index
+                (record_id,kind,origin_device_id,authoritative_revision,deleted_at)
+             VALUES(?1,?2,?3,?4,?5)",
+            rusqlite::params![record_id, kind, ORIGIN, revision, deleted_at],
+        )
+        .unwrap();
+    };
+    insert_index(DICTATION, "dictation", 3, None);
+    insert_index(MEETING, "meeting", 5, None);
+    insert_index(LIVE_ARTIFACT, "artifact", 2, None);
+    insert_index(PENDING_DELETE_ARTIFACT, "artifact", 1, None);
+    insert_index(
+        INDEXED_TOMBSTONE,
+        "meeting",
+        6,
+        Some("2026-09-05T11:00:00Z"),
+    );
+
+    conn.execute(
+        "INSERT INTO shared_dictations
+            (record_id,origin_device_id,text,source_created_at,source_updated_at,
+             local_version,authoritative_revision)
+         VALUES(?1,?2,'migrated dictation','2026-09-05T09:00:00Z',
+                '2026-09-05T09:01:00Z',2,3)",
+        rusqlite::params![DICTATION, ORIGIN],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO shared_meetings
+            (record_id,origin_device_id,title,title_source,title_version,title_authority,
+             source_filename,transcript_text,duration_seconds,status,source_created_at,
+             source_updated_at,source_completed_at,local_version,authoritative_revision)
+         VALUES(?1,?2,'Hub-owned planning title','manual',4,'hub','planning.wav',
+                'migration transcript',90,'completed','2026-09-05T09:10:00Z',
+                '2026-09-05T09:12:00Z','2026-09-05T09:11:30Z',2,5)",
+        rusqlite::params![MEETING, ORIGIN],
+    )
+    .unwrap();
+    for (record_id, title) in [
+        (LIVE_ARTIFACT, "Retained summary"),
+        (PENDING_DELETE_ARTIFACT, "Pending deletion"),
+    ] {
+        conn.execute(
+            "INSERT INTO shared_artifacts
+                (record_id,parent_record_id,origin_device_id,artifact_kind,title,
+                 content_markdown,source_created_at,source_updated_at,source_completed_at,
+                 local_version,authoritative_revision)
+             VALUES(?1,?2,?3,'summary',?4,'# Migrated','2026-09-05T09:13:00Z',
+                    '2026-09-05T09:14:00Z','2026-09-05T09:14:00Z',1,
+                    CASE WHEN ?1=?5 THEN 2 ELSE 1 END)",
+            rusqlite::params![record_id, MEETING, ORIGIN, title, LIVE_ARTIFACT],
+        )
+        .unwrap();
+    }
+
+    let payload_bytes = b"genuine v8 payload";
+    let checksum = format!("{:x}", sha2::Sha256::digest(payload_bytes));
+    let payload_path = temp.path().join("authoritative-payload.wav");
+    std::fs::write(&payload_path, payload_bytes).unwrap();
+    conn.execute(
+        "INSERT INTO library_blobs
+            (checksum,canonical_path,byte_size,media_type,verified)
+         VALUES(?1,?2,?3,'audio/wav',1)",
+        rusqlite::params![
+            checksum,
+            payload_path.to_string_lossy(),
+            payload_bytes.len() as u64
+        ],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO library_record_blobs
+            (record_id,kind,checksum,byte_size,media_type,availability)
+         VALUES(?1,'dictation',?2,?3,'audio/wav','available')",
+        rusqlite::params![DICTATION, checksum, payload_bytes.len() as u64],
+    )
+    .unwrap();
+    let pending_checksum = "b".repeat(64);
+    conn.execute(
+        "INSERT INTO library_record_blobs
+            (record_id,kind,checksum,byte_size,media_type,availability)
+         VALUES(?1,'meeting',?2,42,'audio/wav','pending')",
+        rusqlite::params![MEETING, pending_checksum],
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO sync_tombstones(record_id,kind,deleted_version,deleted_at)
+         VALUES(?1,'meeting',6,'2026-09-05T11:00:00Z')",
+        [INDEXED_TOMBSTONE],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO sync_tombstones(record_id,kind,deleted_version,deleted_at)
+         VALUES(?1,'dictation',2,'2026-09-05T11:05:00Z')",
+        [PREARRIVAL_TOMBSTONE],
+    )
+    .unwrap();
+
+    let pending_delete =
+        crate::sync::protocol::Snapshot::Delete(crate::sync::protocol::DeleteSnapshot {
+            kind: crate::sync::protocol::RecordKind::Artifact,
+            schema_version: 1,
+            record_id: PENDING_DELETE_ARTIFACT.parse().unwrap(),
+            origin_device_id: ORIGIN.parse().unwrap(),
+            local_version: 2,
+            deleted_at: "2026-09-05T11:10:00Z".into(),
+        });
+    conn.execute(
+        "INSERT INTO sync_outbox_items
+            (record_id,kind,local_version,snapshot_json,state)
+         VALUES(?1,'artifact',2,?2,'pending')",
+        rusqlite::params![
+            PENDING_DELETE_ARTIFACT,
+            serde_json::to_string(&pending_delete).unwrap()
+        ],
+    )
+    .unwrap();
+    drop(conn);
+
+    let conn = super::migrate_db_at(&db_path).unwrap();
+    let first_feed_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_library_change_feed_v1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    migrate(&conn).unwrap();
+    let second_feed_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_library_change_feed_v1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(second_feed_count, first_feed_count);
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM schema_migrations WHERE version=9",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        1
+    );
+
+    let page = super::library_change_feed::LibraryChangeFeedRepository::page(
+        &conn,
+        crate::sync::protocol::ChangeCursor::ZERO,
+        None,
+        crate::sync::protocol::MAX_CHANGE_PAGE,
+    )
+    .unwrap();
+    assert!(page.complete);
+    assert!(
+        page.changes
+            .iter()
+            .all(|change| { change.record_id.to_string() != PENDING_DELETE_ARTIFACT }),
+        "a locally deleted artifact awaiting Hub acceptance was seeded as live"
+    );
+    assert_eq!(page.changes.len(), 5);
+
+    let dictation = page
+        .changes
+        .iter()
+        .find(|change| change.record_id.to_string() == DICTATION)
+        .unwrap();
+    let Some(crate::sync::protocol::Snapshot::Dictation(snapshot)) = &dictation.snapshot else {
+        panic!("migrated dictation did not produce an upsert snapshot");
+    };
+    assert_eq!(
+        snapshot.payload.recording_payload.availability,
+        audetic_core::sync::PayloadAvailability::Available
+    );
+    assert_eq!(
+        snapshot.payload.recording_payload.checksum.as_deref(),
+        Some(checksum.as_str())
+    );
+
+    let live_artifact = page
+        .changes
+        .iter()
+        .find(|change| change.record_id.to_string() == LIVE_ARTIFACT)
+        .unwrap();
+    assert_eq!(
+        live_artifact.operation,
+        crate::sync::protocol::ChangeOperation::Upsert
+    );
+    assert!(matches!(
+        live_artifact.snapshot.as_ref(),
+        Some(crate::sync::protocol::Snapshot::Artifact(_))
+    ));
+
+    let meeting = page
+        .changes
+        .iter()
+        .find(|change| change.record_id.to_string() == MEETING)
+        .unwrap();
+    let Some(crate::sync::protocol::Snapshot::Meeting(snapshot)) = &meeting.snapshot else {
+        panic!("migrated meeting did not produce an upsert snapshot");
+    };
+    assert_eq!(
+        snapshot.payload.title.as_deref(),
+        Some("Hub-owned planning title")
+    );
+    assert_eq!(snapshot.payload.title_source.as_deref(), Some("manual"));
+    assert_eq!(snapshot.payload.title_version, 4);
+    assert_eq!(
+        snapshot.payload.recording_payload.availability,
+        audetic_core::sync::PayloadAvailability::Pending
+    );
+
+    for tombstone in [INDEXED_TOMBSTONE, PREARRIVAL_TOMBSTONE] {
+        let change = page
+            .changes
+            .iter()
+            .find(|change| change.record_id.to_string() == tombstone)
+            .unwrap();
+        assert_eq!(
+            change.operation,
+            crate::sync::protocol::ChangeOperation::Delete
+        );
+        assert!(change.snapshot.is_none());
+    }
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM library_record_blobs", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        2
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT state FROM sync_outbox_items WHERE record_id=?1",
+            [PENDING_DELETE_ARTIFACT],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "pending"
+    );
 }
 
 #[test]

@@ -24,8 +24,9 @@ pub const MAX_MEETING_PAGE: usize = 100;
 pub const MAX_CHANGE_PAGE: usize = 250;
 pub const MAX_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
+pub const HUB_CHANGES_MIN_PROTOCOL_VERSION: u16 = 2;
 
 pub const HUB_ID_HEADER: &str = "x-audetic-hub-id";
 pub const PROTOCOL_VERSION_HEADER: &str = "x-audetic-protocol-version";
@@ -574,12 +575,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn supported_protocol_range_accepts_only_slice_one_version() {
+    fn supported_protocol_range_accepts_versions_one_through_two() {
         let range = ProtocolRange::supported();
 
-        assert!(range.accepts(PROTOCOL_VERSION));
-        assert!(!range.accepts(PROTOCOL_VERSION - 1));
-        assert!(!range.accepts(PROTOCOL_VERSION + 1));
+        assert_eq!(range.minimum, 1);
+        assert_eq!(range.current, 2);
+        assert!(!range.accepts(0));
+        assert!(range.accepts(1));
+        assert!(range.accepts(2));
+        assert!(!range.accepts(3));
     }
 
     #[test]

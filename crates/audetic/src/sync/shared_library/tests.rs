@@ -5,12 +5,13 @@ use std::sync::Arc;
 
 use crate::db::sync_outbox::SyncOutboxRepository;
 use crate::sync::protocol::{
-    DeleteSnapshot, DictationPage, DictationPayload, DictationSnapshot, MeetingPage, RecordKind,
-    RecordingPayloadDescriptor, SharedDictation, SharedMeeting,
+    ChangeCursor, ChangePage, ChangeTarget, DeleteSnapshot, DictationPage, DictationPayload,
+    DictationSnapshot, MeetingPage, RecordKind, RecordingPayloadDescriptor, SharedDictation,
+    SharedMeeting,
 };
 use crate::sync::transport::{
-    HubCapabilities, HubTransferError, RemoteDictationLibrary, RemoteLibraryMutations,
-    RemoteMeetingLibrary,
+    HubCapabilities, HubChangeSource, HubTransferError, RemoteDictationLibrary,
+    RemoteLibraryMutations, RemoteMeetingLibrary,
 };
 
 use super::*;
@@ -124,6 +125,21 @@ impl RemoteLibraryMutations for PagedHub {
     }
 }
 
+struct UnusedChangeSource;
+
+#[async_trait]
+impl HubChangeSource for UnusedChangeSource {
+    async fn page_changes(
+        &self,
+        _hub: &HubConnection,
+        _after: ChangeCursor,
+        _target: Option<ChangeTarget>,
+        _limit: usize,
+    ) -> Result<ChangePage, HubTransferError> {
+        Err(HubTransferError::Retryable("unused".to_owned()))
+    }
+}
+
 fn connected_library<T>(path: std::path::PathBuf, remote: Arc<T>) -> SharedLibrary
 where
     T: RemoteDictationLibrary + RemoteMeetingLibrary + RemoteLibraryMutations + 'static,
@@ -136,6 +152,7 @@ where
         remote.clone(),
         remote,
         network,
+        Arc::new(UnusedChangeSource),
     );
     crate::sync::SyncService::with_dependencies(
         path,

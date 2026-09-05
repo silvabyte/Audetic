@@ -231,6 +231,7 @@ pub struct HubCapabilities {
     meetings: Arc<dyn RemoteMeetingLibrary>,
     mutations: Arc<dyn RemoteLibraryMutations>,
     payloads: Arc<dyn RemotePayloadSource>,
+    changes: Arc<dyn HubChangeSource>,
 }
 
 impl HubCapabilities {
@@ -242,6 +243,7 @@ impl HubCapabilities {
             + RemoteMeetingLibrary
             + RemoteLibraryMutations
             + RemotePayloadSource
+            + HubChangeSource
             + 'static,
     {
         let adapter = Arc::new(adapter);
@@ -251,7 +253,8 @@ impl HubCapabilities {
             dictations: adapter.clone(),
             meetings: adapter.clone(),
             mutations: adapter.clone(),
-            payloads: adapter,
+            payloads: adapter.clone(),
+            changes: adapter,
         }
     }
 
@@ -279,6 +282,10 @@ impl HubCapabilities {
         self.payloads.as_ref()
     }
 
+    pub fn changes(&self) -> Arc<dyn HubChangeSource> {
+        Arc::clone(&self.changes)
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         probe: Arc<dyn HubProbe>,
@@ -287,6 +294,7 @@ impl HubCapabilities {
         meetings: Arc<dyn RemoteMeetingLibrary>,
         mutations: Arc<dyn RemoteLibraryMutations>,
         payloads: Arc<dyn RemotePayloadSource>,
+        changes: Arc<dyn HubChangeSource>,
     ) -> Self {
         Self {
             probe,
@@ -295,6 +303,7 @@ impl HubCapabilities {
             meetings,
             mutations,
             payloads,
+            changes,
         }
     }
 }
@@ -314,6 +323,7 @@ mod tests {
             Arc::as_ptr(&capabilities.meetings) as *const (),
             Arc::as_ptr(&capabilities.mutations) as *const (),
             Arc::as_ptr(&capabilities.payloads) as *const (),
+            Arc::as_ptr(&capabilities.changes) as *const (),
         ];
 
         assert!(pointers.windows(2).all(|pair| pair[0] == pair[1]));

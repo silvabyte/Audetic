@@ -1744,6 +1744,14 @@ mod tests {
     }
 
     fn info_response(hub_id: HubId, owner: &str) -> TransportResponse {
+        info_response_with_protocol(hub_id, owner, ProtocolRange::supported())
+    }
+
+    fn info_response_with_protocol(
+        hub_id: HubId,
+        owner: &str,
+        protocol: ProtocolRange,
+    ) -> TransportResponse {
         TransportResponse {
             status: 200,
             headers: hub_headers(hub_id),
@@ -1751,7 +1759,7 @@ mod tests {
                 hub_id,
                 owner_login: owner.to_owned(),
                 device_name: Some("Home Hub".to_owned()),
-                protocol: ProtocolRange::supported(),
+                protocol,
                 audetic_version: "0.1.26".to_owned(),
             })
             .unwrap(),
@@ -1837,7 +1845,50 @@ mod tests {
             "https://hub.example.ts.net:8443/audetic/v1/info"
         );
         assert_eq!(requests[0].headers[HUB_ID_HEADER], hub_id.to_string());
-        assert_eq!(requests[0].headers[PROTOCOL_VERSION_HEADER], "1");
+        assert_eq!(requests[0].headers[PROTOCOL_VERSION_HEADER], "2");
+    }
+
+    #[tokio::test]
+    async fn protocol_one_only_info_is_rejected_before_any_changes_request() {
+        let hub_id = hub_id();
+        let transport = FakeTransport::with_responses(vec![info_response_with_protocol(
+            hub_id,
+            "owner@example.com",
+            ProtocolRange {
+                current: 1,
+                minimum: 1,
+            },
+        )]);
+        let client =
+            HubClient::with_transport("https://hub.example.ts.net/audetic/", transport.clone())
+                .unwrap();
+
+        let error = async {
+            client
+                .handshake(HandshakeExpectation {
+                    hub_id: Some(hub_id),
+                    owner_login: Some("owner@example.com"),
+                })
+                .await?;
+            client
+                .page_changes(hub_id, ChangeCursor::ZERO, None, 25)
+                .await?;
+            Ok::<(), HubClientError>(())
+        }
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            HubClientError::IncompatibleProtocol {
+                minimum: 1,
+                current: 1
+            }
+        ));
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/audetic/v1/info");
+        assert!(!requests[0].url.path().ends_with(HUB_CHANGES_PATH));
     }
 
     #[tokio::test]
@@ -2110,6 +2161,7 @@ mod tests {
         assert!(query.contains("target=9"));
         assert!(query.contains("limit=25"));
         assert_eq!(requests[0].headers[HUB_ID_HEADER], hub_id.to_string());
+        assert_eq!(requests[0].headers[PROTOCOL_VERSION_HEADER], "2");
     }
 
     #[tokio::test]

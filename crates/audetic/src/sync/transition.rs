@@ -1681,16 +1681,17 @@ mod tests {
     use crate::db::sync_serve::SyncServeRepository;
     use crate::db::sync_settings::SyncSettingsRepository;
     use crate::sync::protocol::{
-        DictationPage, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting, Snapshot,
-        SnapshotBatch, SnapshotBatchResponse, SnapshotDisposition, SnapshotResult,
+        ChangeCursor, ChangePage, ChangeTarget, DictationPage, MeetingPage, MeetingTitlePatch,
+        RecordKind, SharedMeeting, Snapshot, SnapshotBatch, SnapshotBatchResponse,
+        SnapshotDisposition, SnapshotResult,
     };
     use crate::sync::tailscale::{
         MappingState, ServeAssessment, TailscaleControl, TailscaleStatus,
     };
     use crate::sync::transport::{
-        BlobUpload, DiscoveryOutcome, HubProbe, HubTransferError, RemoteDictationLibrary,
-        RemoteLibraryMutations, RemoteMeetingLibrary, RemotePayloadSource, ReplicationTransport,
-        StreamingPayloadResponse,
+        BlobUpload, DiscoveryOutcome, HubChangeSource, HubProbe, HubTransferError,
+        RemoteDictationLibrary, RemoteLibraryMutations, RemoteMeetingLibrary, RemotePayloadSource,
+        ReplicationTransport, StreamingPayloadResponse,
     };
     use crate::sync::SyncService;
 
@@ -1875,6 +1876,19 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl HubChangeSource for FakeHubs {
+        async fn page_changes(
+            &self,
+            _hub: &HubConnection,
+            _after: ChangeCursor,
+            _target: Option<ChangeTarget>,
+            _limit: usize,
+        ) -> Result<ChangePage, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
+
     struct UnusedRemoteLibrary;
 
     #[async_trait]
@@ -1953,11 +1967,12 @@ mod tests {
         let unused_library = Arc::new(UnusedRemoteLibrary);
         HubCapabilities::for_test(
             hubs.clone(),
-            hubs,
+            hubs.clone(),
             unused_library.clone(),
             unused_library.clone(),
             unused_library,
             Arc::new(UnusedRemotePayloads),
+            hubs,
         )
     }
 
