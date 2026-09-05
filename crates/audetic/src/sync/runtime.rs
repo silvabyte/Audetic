@@ -79,9 +79,23 @@ pub struct PersistedTransition {
     pub listener_error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ActivationOutcome {
-    pub listener_error: Option<String>,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ActivationOutcome {
+    Healthy,
+    Degraded { listener_error: String },
+}
+
+impl ActivationOutcome {
+    pub const fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy)
+    }
+
+    pub fn listener_error(&self) -> Option<&str> {
+        match self {
+            Self::Healthy => None,
+            Self::Degraded { listener_error } => Some(listener_error),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -562,10 +576,6 @@ impl RuntimeSet {
     ) -> Result<ActivationOutcome, RuntimeError> {
         let mut inner = self.shared.inner.lock().await;
         Self::ensure_available(&inner)?;
-        {
-            let provisional = Self::provisional(&inner, transition)?;
-            Self::validate_provisional_listener(&inner, provisional)?;
-        }
         let mut provisional = Self::take_provisional(&mut inner, transition)?;
         let mut previous = inner.active.take();
         let mut hub = if provisional.spec.role() == SyncRole::HomeHub {
@@ -577,40 +587,18 @@ impl RuntimeSet {
         } else {
             None
         };
-        let candidate_error = hub.as_ref().and_then(HubRuntime::liveness_error);
-        if provisional.spec.role() == SyncRole::HomeHub
-            && candidate_error.is_some()
-            && !provisional.allow_degraded_listener
-        {
-            let error = RuntimeError::Listener(
-                candidate_error
-                    .unwrap_or_else(|| "Home Hub listener terminated before activation".into()),
-            );
-            if provisional.reuse_active_hub {
-                if let Some(previous) = previous.as_mut() {
-                    previous.hub = hub.take();
+        let candidate_error =
+            if provisional.spec.role() == SyncRole::HomeHub {
+                match hub.as_ref() {
+                    Some(hub) => hub.liveness_error(),
+                    None => Some(provisional.listener_error.clone().unwrap_or_else(|| {
+                        "Home Hub listener is unavailable after activation".into()
+                    })),
                 }
             } else {
-                provisional.hub = hub.take();
-            }
-            let restore_spec = provisional.worker_quiesced.then(|| {
-                previous
-                    .as_ref()
-                    .map(|active| active.spec.clone())
-                    .ok_or_else(|| RuntimeError::Invariant("quiesced runtime disappeared".into()))
-            });
-            inner.active = previous;
-            provisional.stop().await;
-            if let Some(restore_spec) = restore_spec.transpose()? {
-                let outbox = self.prepare_outbox(&restore_spec)?.activate()?;
-                let active = inner.active.as_mut().ok_or_else(|| {
-                    RuntimeError::Invariant("runtime disappeared during activation rollback".into())
-                })?;
-                active.outbox = Some(outbox);
-            }
-            return Err(error);
-        }
-        if provisional.allow_degraded_listener && candidate_error.is_some() {
+                None
+            };
+        if candidate_error.is_some() {
             if let Some(hub) = hub.take() {
                 let _ = hub.stop().await;
             }
@@ -634,7 +622,10 @@ impl RuntimeSet {
         if let Some(previous) = previous {
             previous.stop().await?;
         }
-        Ok(ActivationOutcome { listener_error })
+        Ok(match listener_error {
+            Some(listener_error) => ActivationOutcome::Degraded { listener_error },
+            None => ActivationOutcome::Healthy,
+        })
     }
 
     pub async fn snapshot(&self) -> RuntimeSnapshot {

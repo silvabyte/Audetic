@@ -223,7 +223,7 @@ impl SyncService {
             Err(error) => return Err(map_runtime_error(error)),
         };
         if startup_error.is_none() {
-            if let Some(error) = activation.listener_error.as_deref() {
+            if let Some(error) = activation.listener_error() {
                 self.state
                     .record_error(installation.role_epoch, Some(error))
                     .map_err(SyncServiceError::Persistence)?;
@@ -234,7 +234,7 @@ impl SyncService {
                 installation.role_epoch,
                 installation.settings.role != SyncRole::Standalone
                     && startup_error.is_none()
-                    && activation.listener_error.is_none(),
+                    && activation.is_healthy(),
             )
             .await;
         self.status_unlocked().await
@@ -446,7 +446,11 @@ impl SyncService {
             })
             .map_err(SyncServiceError::Persistence);
         if let Some(transition) = runtime_transition {
-            self.activate_runtime(transition).await?;
+            let activation = self.activate_runtime(transition).await?;
+            if installation.settings.role == SyncRole::HomeHub {
+                self.record_home_activation(installation.role_epoch, &activation)
+                    .await?;
+            }
         }
         result
     }
@@ -819,14 +823,8 @@ impl SyncService {
         self.transition_checkpoint(TransitionCheckpoint::Committed)
             .await;
         let activation = self.activate_runtime(runtime_transition).await?;
-        if let Some(error) = activation.listener_error.as_deref() {
-            self.state
-                .record_error(effects.role_epoch, Some(error))
-                .map_err(SyncServiceError::Persistence)?;
-        }
-        self.runtime
-            .observe_reachability(effects.role_epoch, activation.listener_error.is_none())
-            .await;
+        self.record_home_activation(effects.role_epoch, &activation)
+            .await?;
         Ok(())
     }
 
@@ -1281,6 +1279,28 @@ impl SyncService {
         self.runtime
             .observe_reachability(role_epoch, reachable)
             .await;
+        Ok(())
+    }
+
+    async fn record_home_activation(
+        &self,
+        role_epoch: u64,
+        activation: &ActivationOutcome,
+    ) -> Result<(), SyncServiceError> {
+        match activation {
+            ActivationOutcome::Healthy => {
+                self.state
+                    .record_contact(role_epoch)
+                    .map_err(SyncServiceError::Persistence)?;
+                self.runtime.observe_reachability(role_epoch, true).await;
+            }
+            ActivationOutcome::Degraded { listener_error } => {
+                self.state
+                    .record_error(role_epoch, Some(listener_error))
+                    .map_err(SyncServiceError::Persistence)?;
+                self.runtime.observe_reachability(role_epoch, false).await;
+            }
+        }
         Ok(())
     }
 
@@ -3045,6 +3065,61 @@ mod tests {
         );
         let runtime = fixture.service.runtime.snapshot().await;
         assert_eq!(runtime.role, Some(SyncRole::Standalone));
+        assert!(!runtime.transition_in_progress);
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_termination_after_commit_degrades_home_runtime_and_retry_recovers() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        let (entered, release) = pause_at(&fixture.service, TransitionCheckpoint::Committed);
+        let service = fixture.service.clone();
+        let caller =
+            tokio::spawn(async move { service.configure(request(SyncRole::HomeHub)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("promotion did not durably commit");
+        fixture
+            .service
+            .runtime
+            .terminate_provisional_listener()
+            .await
+            .unwrap();
+        release.notify_one();
+
+        let result = caller.await.unwrap().unwrap();
+
+        assert_eq!(result.status.role, SyncRole::HomeHub);
+        assert!(!result.status.hub_reachable);
+        assert!(result
+            .status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("listener")));
+        let installation = fixture.service.state.load().unwrap();
+        assert_eq!(installation.settings.role, SyncRole::HomeHub);
+        assert_eq!(
+            *fixture.tailscale.mapping.lock().unwrap(),
+            MappingState::OwnedByAudetic
+        );
+        let runtime = fixture.service.runtime.snapshot().await;
+        assert_eq!(runtime.role, Some(SyncRole::HomeHub));
+        assert_eq!(runtime.role_epoch, Some(installation.role_epoch));
+        assert!(!runtime.hub_listener_running);
+        assert!(runtime.outbox_worker_running);
+        assert!(!runtime.transition_in_progress);
+
+        fixture.service.retry().await.unwrap();
+
+        let recovered = fixture.service.status().await.unwrap();
+        let runtime = fixture.service.runtime.snapshot().await;
+        assert!(recovered.hub_reachable);
+        assert!(recovered.last_error.is_none());
+        assert_eq!(runtime.role, Some(SyncRole::HomeHub));
+        assert_eq!(runtime.role_epoch, Some(installation.role_epoch));
+        assert!(runtime.hub_listener_running);
+        assert!(runtime.outbox_worker_running);
         assert!(!runtime.transition_in_progress);
         fixture.service.shutdown().await.unwrap();
     }
