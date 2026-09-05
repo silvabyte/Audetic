@@ -1,4 +1,5 @@
 use anyhow::Result;
+use audetic_core::sync::{DeviceId, RecordId};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -37,6 +38,9 @@ impl WorkflowType {
 #[derive(Debug)]
 pub struct Workflow {
     pub id: Option<i64>,
+    pub sync_id: Option<RecordId>,
+    pub origin_device_id: Option<DeviceId>,
+    pub sync_version: u64,
     pub workflow_type: WorkflowType,
     pub data: WorkflowData,
     pub created_at: Option<String>,
@@ -58,6 +62,9 @@ impl Workflow {
     ) -> Result<Workflow> {
         Ok(Workflow {
             id: Some(id),
+            sync_id: None,
+            origin_device_id: None,
+            sync_version: 1,
             workflow_type: WorkflowType::parse(&workflow_type)?,
             data: serde_json::from_str(&json)?,
             created_at: Some(created_at),
@@ -67,6 +74,9 @@ impl Workflow {
     pub fn new(workflow_type: WorkflowType, data: WorkflowData) -> Self {
         Workflow {
             id: None,
+            sync_id: None,
+            origin_device_id: None,
+            sync_version: 1,
             workflow_type,
             data,
             created_at: None,

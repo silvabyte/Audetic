@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Some(CliCommand::Provider(args)) => provider::handle_provider_command(args).await,
-        Some(CliCommand::Setup) => setup::handle_setup_command().await,
+        Some(CliCommand::Setup(args)) => setup::handle_setup_command(args).await,
         Some(CliCommand::History(args)) => history::handle_history_command(args).await,
         Some(CliCommand::Logs(args)) => logs::handle_logs_command(args).await,
         Some(CliCommand::Keybind(args)) => keybind::handle_keybind_command(args).await,

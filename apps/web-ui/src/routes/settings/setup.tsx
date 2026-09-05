@@ -29,6 +29,7 @@ import type {
   SetupCapabilityId,
   SetupState,
 } from "@/stores/setup-store";
+import { SharedLibraryCard } from "./shared-library-card";
 
 const CAPABILITY_ORDER: SetupCapabilityId[] = [
   "omarchy",
@@ -59,7 +60,8 @@ const CAPABILITY_LABELS: Record<SetupCapabilityId, string> = {
 export const settingsSetupRoute: RouteObject = {
   path: "setup",
   loader: async () => {
-    await getRootStore().setup.recheck();
+    const store = getRootStore();
+    await Promise.all([store.setup.recheck(), store.sync.refresh()]);
     return null;
   },
   Component: SettingsSetup,
@@ -122,6 +124,8 @@ function SettingsSetup() {
               <SetupSkeleton />
             ) : setup ? (
               <>
+                <SharedLibraryCard />
+
                 <VoicePath
                   capture={phaseState([
                     store.setup.capability("hyprland_session")?.state,

@@ -22,9 +22,9 @@ export class MeetingArtifactsStore {
   profiles: AgentProfile[] = [];
   profilesState: Status = "idle";
 
-  byMeeting: Record<number, MeetingArtifact[]> = {};
-  meetingState: Record<number, Status> = {};
-  generatingByMeeting: Record<number, boolean> = {};
+  byMeeting: Record<string, MeetingArtifact[]> = {};
+  meetingState: Record<string, Status> = {};
+  generatingByMeeting: Record<string, boolean> = {};
 
   lastError: string | null = null;
 
@@ -79,7 +79,7 @@ export class MeetingArtifactsStore {
     }
   }
 
-  async loadArtifacts(meetingId: number): Promise<void> {
+  async loadArtifacts(meetingId: string): Promise<void> {
     if (this.meetingState[meetingId] === "loading") return;
     runInAction(() => {
       this.meetingState[meetingId] = "loading";
@@ -102,7 +102,7 @@ export class MeetingArtifactsStore {
   }
 
   async generateArtifact(
-    meetingId: number,
+    meetingId: string,
     request: GenerateArtifactRequest,
   ): Promise<MeetingArtifact | null> {
     runInAction(() => {
@@ -133,7 +133,7 @@ export class MeetingArtifactsStore {
     }
   }
 
-  async deleteArtifact(meetingId: number, artifactId: number): Promise<boolean> {
+  async deleteArtifact(meetingId: string, artifactId: string): Promise<boolean> {
     try {
       const { error } = await daemon.DELETE("/meetings/{id}/artifacts/{artifact_id}", {
         params: { path: { id: meetingId, artifact_id: artifactId } },

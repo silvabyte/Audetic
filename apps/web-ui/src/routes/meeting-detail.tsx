@@ -17,7 +17,6 @@ import {
   ChevronDown,
   Copy,
   FileText,
-  FolderOpen,
   Loader2,
   Pencil,
   RefreshCcw,
@@ -64,14 +63,13 @@ import type {
 
 const DETAIL_INTENTS = {
   copyTranscript: "copy-transcript",
-  openAudio: "open-audio-folder",
 } as const;
 
 export const meetingDetailRoute: RouteObject = {
   path: "meetings/:id",
   loader: async ({ params }: LoaderFunctionArgs) => {
-    const id = Number(params.id);
-    if (!Number.isFinite(id)) return null;
+    const id = params.id;
+    if (!id) return null;
     await getRootStore().meetings.loadDetail(id);
     return null;
   },
@@ -87,17 +85,6 @@ export const meetingDetailRoute: RouteObject = {
         }
         return null;
       }
-      case DETAIL_INTENTS.openAudio: {
-        // Open the enclosing directory in the user's file manager. In
-        // Electron this is available through the preload bridge; for
-        // Phase 3 we skip the main-process IPC and just copy the path.
-        const path = String(form.get("path") ?? "");
-        if (path) {
-          await navigator.clipboard.writeText(path);
-          toast.success("Path copied to clipboard");
-        }
-        return null;
-      }
       default:
         return null;
     }
@@ -107,7 +94,7 @@ export const meetingDetailRoute: RouteObject = {
 
 function MeetingDetailRoute() {
   const params = useParams();
-  const id = Number(params.id);
+  const id = params.id ?? "";
   const store = useStore();
 
   // Auto-refresh while transcription is in flight (live recording or post-
@@ -115,7 +102,7 @@ function MeetingDetailRoute() {
   // global `/meetings/status` poll only tracks the live recording machine,
   // not per-meeting retry jobs, so this loop owns refresh for retries.
   useEffect(() => {
-    if (!Number.isFinite(id)) return;
+    if (!id) return;
     let cancelled = false;
     const tick = (): void => {
       if (cancelled) return;
@@ -144,7 +131,7 @@ function MeetingDetailRoute() {
 
       <Observer>
         {() => {
-          if (!Number.isFinite(id)) {
+          if (!id) {
             return <p className="text-sm text-destructive">Invalid meeting id.</p>;
           }
           const detail = store.meetings.detailCache[id];
@@ -167,7 +154,7 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
   meetingId,
 }: {
   detail: MeetingDetail;
-  meetingId: number;
+  meetingId: string;
 }) {
   const store = useStore();
   const meetingArtifacts = store.meetingArtifacts;
@@ -209,11 +196,23 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
         status={detail.status}
         showGenerate={detail.status === "completed"}
         canGenerate={
-          detail.status === "completed" && Boolean(detail.transcript_text)
+          detail.status === "completed" && Boolean(detail.transcript_text) && !detail.offline
         }
-        canDelete={isDeletableMeetingStatus(detail.status)}
+        canMutate={!detail.offline && !detail.read_only}
+        canDelete={isDeletableMeetingStatus(detail.status) && !detail.offline && !detail.read_only}
         onDelete={handleDelete}
       />
+
+      <div className="flex flex-wrap gap-2 text-xs text-muted-foreground">
+        <span className="rounded-full bg-muted px-2 py-1">{detail.source}</span>
+        {detail.upload_state && (
+          <span className="rounded-full bg-muted px-2 py-1">sync: {detail.upload_state}</span>
+        )}
+        <span className="rounded-full bg-muted px-2 py-1">
+          audio: {detail.payload_availability}
+        </span>
+        {detail.offline && <span className="rounded-full bg-destructive/10 px-2 py-1 text-destructive">hub offline</span>}
+      </div>
 
       {isTranscribing && (
         <Card>
@@ -258,7 +257,7 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
               <pre className="whitespace-pre-wrap">{detail.error}</pre>
-              <Button
+              {detail.source === "local" && detail.payload_availability === "available" && <Button
                 variant="default"
                 size="sm"
                 onClick={() => {
@@ -267,7 +266,7 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
               >
                 <RefreshCcw className="mr-1 h-3.5 w-3.5" />
                 Retry transcription
-              </Button>
+              </Button>}
             </CardContent>
           </Card>
         ))}
@@ -288,6 +287,7 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
                 meetingId={meetingId}
                 text={detail.transcript_text}
                 segments={detail.transcript_segments}
+                audioAvailable={detail.payload_availability === "available"}
               />
               <Form method="post" replace>
                 <input
@@ -317,20 +317,9 @@ const MeetingDetailBody = observer(function MeetingDetailBody({
 
       <MeetingArtifactsPanel
         meetingId={meetingId}
-        canGenerate={detail.status === "completed" && Boolean(detail.transcript_text)}
+        canGenerate={detail.status === "completed" && Boolean(detail.transcript_text) && !detail.offline}
       />
 
-      <Card>
-        <CardHeader>
-          <CardTitle>Files</CardTitle>
-        </CardHeader>
-        <CardContent className="space-y-3 text-sm">
-          <FileRow label="Audio" path={detail.audio_path} />
-          {detail.transcript_path && (
-            <FileRow label="Transcript" path={detail.transcript_path} />
-          )}
-        </CardContent>
-      </Card>
     </>
   );
 });
@@ -344,10 +333,11 @@ function MeetingTitleHeader({
   status,
   showGenerate,
   canGenerate,
+  canMutate,
   canDelete,
   onDelete,
 }: {
-  meetingId: number;
+  meetingId: string;
   title: string | null;
   sourceFilename: string | null;
   startedAt: string;
@@ -355,6 +345,7 @@ function MeetingTitleHeader({
   status: string;
   showGenerate: boolean;
   canGenerate: boolean;
+  canMutate: boolean;
   canDelete: boolean;
   onDelete: () => Promise<void>;
 }) {
@@ -512,7 +503,7 @@ function MeetingTitleHeader({
                       !generating && "cursor-text",
                     )}
                     onClick={() => {
-                      if (generating) return;
+                      if (generating || !canMutate) return;
                       store.meetings.clearTitleMutationFeedback(meetingId);
                       setDraft(title ?? "");
                       setValidationError(null);
@@ -531,7 +522,7 @@ function MeetingTitleHeader({
                       setEditing(true);
                     }}
                     aria-label={`Edit meeting title: ${displayTitle}`}
-                    disabled={generating}
+                    disabled={generating || !canMutate}
                   >
                     <Pencil className="h-3.5 w-3.5" />
                   </button>
@@ -568,7 +559,7 @@ function MeetingTitleHeader({
                   type="button"
                   variant="outline"
                   size="sm"
-                  disabled={!canGenerate || saving || generating}
+                  disabled={!canGenerate || !canMutate || saving || generating}
                   onClick={() => void generateTitle()}
                   title={canGenerate ? undefined : "A transcript is required"}
                 >
@@ -608,10 +599,12 @@ function TranscriptPlayer({
   meetingId,
   text,
   segments,
+  audioAvailable,
 }: {
-  meetingId: number;
+  meetingId: string;
   text: string;
   segments: TranscriptSegment[] | null | undefined;
+  audioAvailable: boolean;
 }) {
   const audioRef = useRef<HTMLAudioElement>(null);
   // Last index we scrolled to, so the follow-the-playhead scroll fires only when
@@ -635,7 +628,7 @@ function TranscriptPlayer({
   return (
     <Observer>
       {() => {
-        if (!segments || segments.length === 0) {
+        if (!audioAvailable || !segments || segments.length === 0) {
           return (
             <pre className="whitespace-pre-wrap text-sm font-sans">{text}</pre>
           );
@@ -705,34 +698,11 @@ function formatTimestamp(seconds: number): string {
   return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
 }
 
-function FileRow({ label, path }: { label: string; path: string }) {
-  return (
-    <div className="flex items-center justify-between gap-3">
-      <div className="min-w-0 flex-1">
-        <div className="text-xs text-muted-foreground">{label}</div>
-        <div className="truncate font-mono text-xs">{path}</div>
-      </div>
-      <Form method="post" replace>
-        <input type="hidden" name="intent" value={DETAIL_INTENTS.openAudio} />
-        <input type="hidden" name="path" value={path} />
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button type="submit" variant="ghost" size="sm">
-              <FolderOpen className="h-3.5 w-3.5" />
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent>Copy path to clipboard</TooltipContent>
-        </Tooltip>
-      </Form>
-    </div>
-  );
-}
-
 const MeetingArtifactsPanel = observer(function MeetingArtifactsPanel({
   meetingId,
   canGenerate,
 }: {
-  meetingId: number;
+  meetingId: string;
   canGenerate: boolean;
 }) {
   const store = useStore();
@@ -993,7 +963,7 @@ async function copyArtifact(artifact: MeetingArtifact): Promise<void> {
 
 async function deleteArtifact(
   store: MeetingArtifactsStore,
-  meetingId: number,
+  meetingId: string,
   artifact: MeetingArtifact,
 ): Promise<void> {
   if (!window.confirm(`Delete "${artifact.title}"?`)) return;

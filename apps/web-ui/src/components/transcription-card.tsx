@@ -1,4 +1,5 @@
 import { Form } from "react-router-dom";
+import type { ReactNode } from "react";
 import { Observer } from "mobx-react-lite";
 import { Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -18,6 +19,19 @@ export function TranscriptionCard({ entry }: { entry: HistoryEntry }) {
         <Card>
           <CardContent className="p-4 space-y-3">
             <p className="text-sm whitespace-pre-wrap">{entry.text}</p>
+            <div className="flex flex-wrap gap-1.5 text-[11px] text-muted-foreground">
+              {entry.upload_state === "pending" || entry.upload_state === "uploading" ? (
+                <StateChip>Pending upload</StateChip>
+              ) : null}
+              {entry.upload_state === "needs_attention" ? (
+                <StateChip>Upload needs attention</StateChip>
+              ) : null}
+              {entry.offline ? <StateChip>Hub offline</StateChip> : null}
+              {entry.read_only ? <StateChip>Read only</StateChip> : null}
+              <StateChip>
+                {entry.source === "shared" ? "Shared" : "Local"} · {entry.origin_device_id.slice(0, 8)}
+              </StateChip>
+            </div>
             <div className="flex items-center justify-between text-xs text-muted-foreground">
               <span>{new Date(entry.created_at).toLocaleString()}</span>
               <Form method="post" replace>
@@ -38,5 +52,13 @@ export function TranscriptionCard({ entry }: { entry: HistoryEntry }) {
         </Card>
       )}
     </Observer>
+  );
+}
+
+function StateChip({ children }: { children: ReactNode }) {
+  return (
+    <span className="rounded-full border border-border/70 bg-muted/45 px-2 py-0.5">
+      {children}
+    </span>
   );
 }

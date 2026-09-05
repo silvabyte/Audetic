@@ -2,6 +2,7 @@ use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 
 use audetic_core::keybind::KeybindTarget;
+use audetic_core::sync::{HubId, RecordId};
 
 #[derive(Parser, Debug)]
 #[command(name = "audetic")]
@@ -20,8 +21,8 @@ pub enum CliCommand {
     Version,
     /// Inspect or configure transcription providers
     Provider(ProviderCliArgs),
-    /// Assess dictation and meeting setup readiness
-    Setup,
+    /// Assess setup readiness and configure optional Library Sync
+    Setup(SetupCliArgs),
     /// Search and view transcription history
     History(HistoryCliArgs),
     /// View application and transcription logs
@@ -36,6 +37,30 @@ pub enum CliCommand {
     Meeting(MeetingCliArgs),
     /// Manage post-processing jobs (run commands on daemon events)
     PostProcessing(PostProcessingCliArgs),
+}
+
+#[derive(ClapArgs, Debug, Default)]
+pub struct SetupCliArgs {
+    /// Configure the Library Sync role without prompting
+    #[arg(long, value_enum)]
+    pub sync_role: Option<SyncRoleArg>,
+    /// Home Hub base URL from the command printed by the Home Hub
+    #[arg(long, requires = "sync_role")]
+    pub hub_url: Option<String>,
+    /// Home Hub UUID from the command printed by the Home Hub
+    #[arg(long, requires = "sync_role")]
+    pub hub_id: Option<HubId>,
+    /// Optional display name for this Audetic device
+    #[arg(long, requires = "sync_role")]
+    pub device_name: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum SyncRoleArg {
+    Standalone,
+    HomeHub,
+    ConnectedDevice,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -169,12 +194,12 @@ pub enum MeetingCommand {
     /// Show details of a specific meeting
     Show {
         /// Meeting ID
-        id: i64,
+        id: RecordId,
     },
     /// Delete a meeting (hides it from all views; audio stays on disk)
     Delete {
         /// Meeting ID
-        id: i64,
+        id: RecordId,
     },
     /// Import an existing audio or video file as a new meeting
     Import {
@@ -232,9 +257,9 @@ pub struct HistoryCliArgs {
     /// Maximum number of results to show
     #[arg(short, long, default_value = "20")]
     pub limit: usize,
-    /// ID of specific workflow to copy to clipboard
+    /// Stable UUID of a specific dictation to copy to clipboard
     #[arg(short, long)]
-    pub copy: Option<i64>,
+    pub copy: Option<audetic_core::sync::RecordId>,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -379,6 +404,67 @@ mod tests {
 
         assert!(help.contains("validates initialization"));
         assert!(!help.contains("records brief sample"));
+    }
+
+    #[test]
+    fn setup_accepts_the_generated_connected_device_command() {
+        let cli = Cli::try_parse_from([
+            "audetic",
+            "setup",
+            "--sync-role",
+            "connected-device",
+            "--hub-url",
+            "https://home.example.ts.net:8443/audetic/",
+            "--hub-id",
+            "67e55044-10b1-426f-9247-bb680e5fe0c8",
+            "--device-name",
+            "Travel Laptop",
+        ])
+        .unwrap();
+
+        let Some(CliCommand::Setup(args)) = cli.command else {
+            panic!("expected setup command");
+        };
+        assert_eq!(args.sync_role, Some(SyncRoleArg::ConnectedDevice));
+        assert_eq!(
+            args.hub_url.as_deref(),
+            Some("https://home.example.ts.net:8443/audetic/")
+        );
+        assert_eq!(
+            args.hub_id.unwrap().to_string(),
+            "67e55044-10b1-426f-9247-bb680e5fe0c8"
+        );
+        assert_eq!(args.device_name.as_deref(), Some("Travel Laptop"));
+    }
+
+    #[test]
+    fn setup_role_values_are_stable_kebab_case() {
+        for role in ["standalone", "home-hub", "connected-device"] {
+            Cli::try_parse_from(["audetic", "setup", "--sync-role", role]).unwrap();
+        }
+        assert!(
+            Cli::try_parse_from(["audetic", "setup", "--sync-role", "connected_device"]).is_err()
+        );
+    }
+
+    #[test]
+    fn setup_connection_fields_require_a_sync_role() {
+        assert!(Cli::try_parse_from([
+            "audetic",
+            "setup",
+            "--hub-url",
+            "https://home.example.ts.net:8443/audetic/"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn meeting_item_commands_require_public_uuid_ids() {
+        let id = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        for command in ["show", "delete"] {
+            assert!(Cli::try_parse_from(["audetic", "meeting", command, id]).is_ok());
+            assert!(Cli::try_parse_from(["audetic", "meeting", command, "42"]).is_err());
+        }
     }
 }
 

@@ -86,6 +86,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/history/{id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["history_audio"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/keybind": {
         parameters: {
             query?: never;
@@ -764,6 +780,86 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sync/configure": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["configure_sync_role"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/discover": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["discover_home_hubs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/payload-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["update_sync_payload_policy"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["retry_sync_outbox"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_sync_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/system/deps": {
         parameters: {
             query?: never;
@@ -940,19 +1036,23 @@ export interface components {
         AgentProfilesResponse: {
             profiles: components["schemas"]["AgentProfile"][];
         };
+        ApiErrorBody: {
+            error: boolean;
+            message: string;
+        };
         /** @enum {string} */
         ArtifactStatus: "pending" | "running" | "completed" | "error";
+        /** @enum {string} */
+        CacheLevel: "live_only" | "text_for_offline_use" | "text_and_available_audio";
         /** @description The `last_completed_job` nested block inside `RecordingStatusResponse`. */
         CompletedJobSummary: {
             created_at: string;
-            /** Format: int64 */
-            history_id?: number | null;
+            history_id?: null | components["schemas"]["RecordId"];
             job_id: string;
             text: string;
         };
         DeleteArtifactResponse: {
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
             success: boolean;
         };
         DeleteResponse: {
@@ -960,6 +1060,8 @@ export interface components {
             id: number;
             success: boolean;
         };
+        /** Format: uuid */
+        DeviceId: string;
         /** @description Progress of a model download. */
         DownloadProgress: {
             /** Format: int64 */
@@ -1007,14 +1109,36 @@ export interface components {
         GenerateArtifactResponse: {
             artifact: components["schemas"]["MeetingArtifact"];
         };
-        /** @description A single history entry with formatted display data. */
         HistoryEntry: {
-            audio_path: string;
             created_at: string;
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
+            offline: boolean;
+            origin_device_id: components["schemas"]["DeviceId"];
+            payload_availability: components["schemas"]["PayloadAvailability"];
+            read_only: boolean;
+            source: components["schemas"]["HistorySource"];
             text: string;
+            upload_state?: null | components["schemas"]["UploadState"];
         };
+        /**
+         * @description A single history entry with formatted display data.
+         * @enum {string}
+         */
+        HistorySource: "local" | "shared";
+        HubCandidate: {
+            connection: components["schemas"]["HubConnection"];
+            device_name?: string | null;
+            /** Format: int32 */
+            protocol_version: number;
+        };
+        HubConnection: {
+            /** @description Canonical base URL ending in `/audetic/`. */
+            base_url: string;
+            hub_id: components["schemas"]["HubId"];
+            owner_login: string;
+        };
+        /** Format: uuid */
+        HubId: string;
         /**
          * @description Phase string for the install status endpoint. Renderer uses this to drive
          *     progress UI and decide when to stop polling.
@@ -1137,14 +1261,15 @@ export interface components {
             content_markdown?: string | null;
             created_at: string;
             error?: string | null;
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
             kind: string;
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
+            origin_device_id: components["schemas"]["DeviceId"];
             status: components["schemas"]["ArtifactStatus"];
             stderr?: string | null;
             stdout?: string | null;
+            /** Format: int64 */
+            sync_version: number;
             template_id?: string | null;
             title: string;
             updated_at: string;
@@ -1174,33 +1299,35 @@ export interface components {
          *     survive.
          */
         MeetingDeleteResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
         /** @description Full meeting record including transcript text when available. */
         MeetingDetailResponse: {
-            audio_path: string;
             completed_at?: string | null;
             created_at: string;
             /** Format: int64 */
             duration_seconds?: number | null;
             error?: string | null;
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
+            offline: boolean;
+            origin_device_id: components["schemas"]["DeviceId"];
+            payload_availability: components["schemas"]["PayloadAvailability"];
+            read_only: boolean;
+            source: string;
             source_filename?: string | null;
             started_at: string;
             status: string;
             title?: string | null;
             title_source?: null | components["schemas"]["MeetingTitleSource"];
-            transcript_path?: string | null;
             /**
              * @description Per-segment timestamps for clickable transcript lines. `None` for
              *     meetings transcribed before timestamps were captured.
              */
             transcript_segments?: components["schemas"]["Segment"][] | null;
             transcript_text?: string | null;
+            upload_state?: null | components["schemas"]["UploadState"];
         };
         /**
          * @description Confirmation that an imported media file has been accepted as a new
@@ -1208,8 +1335,7 @@ export interface components {
          *     `GET /meetings/{id}` for phase progression and the final transcript.
          */
         MeetingImportResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
@@ -1218,8 +1344,7 @@ export interface components {
          *     re-queued; the actual work runs in the background.
          */
         MeetingRetryResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
@@ -1232,10 +1357,8 @@ export interface components {
          *     where audio is being written, and capture-source state.
          */
         MeetingStartResponse: {
-            audio_path: string;
             capture_state: string;
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
@@ -1245,13 +1368,11 @@ export interface components {
          */
         MeetingStatusResponse: {
             active: boolean;
-            audio_path?: string | null;
             capture_degraded: boolean;
             /** Format: int64 */
             duration_seconds?: number | null;
             last_error?: string | null;
-            /** Format: int64 */
-            meeting_id?: number | null;
+            meeting_id?: null | components["schemas"]["RecordId"];
             phase: string;
             title?: string | null;
         };
@@ -1262,8 +1383,7 @@ export interface components {
         MeetingStopResponse: {
             /** Format: int64 */
             duration_seconds: number;
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
@@ -1272,27 +1392,28 @@ export interface components {
          *     without loading the full transcript.
          */
         MeetingSummary: {
-            audio_path: string;
             /** Format: int64 */
             duration_seconds?: number | null;
-            /** Format: int64 */
-            id: number;
+            id: components["schemas"]["RecordId"];
+            offline: boolean;
+            origin_device_id: components["schemas"]["DeviceId"];
+            payload_availability: components["schemas"]["PayloadAvailability"];
+            read_only: boolean;
+            source: string;
             source_filename?: string | null;
             started_at: string;
             status: string;
             title?: string | null;
             title_source?: null | components["schemas"]["MeetingTitleSource"];
-            transcript_path?: string | null;
+            upload_state?: null | components["schemas"]["UploadState"];
         };
         MeetingTitleRegenerationResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             success: boolean;
         };
         MeetingTitleResponse: {
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             title?: string | null;
             title_source?: null | components["schemas"]["MeetingTitleSource"];
         };
@@ -1308,12 +1429,10 @@ export interface components {
          *     `duration_seconds` appears on stop, hence the optional fields.
          */
         MeetingToggleResponse: {
-            audio_path?: string | null;
             capture_state?: string | null;
             /** Format: int64 */
             duration_seconds?: number | null;
-            /** Format: int64 */
-            meeting_id: number;
+            meeting_id: components["schemas"]["RecordId"];
             message: string;
             phase: string;
             success: boolean;
@@ -1359,6 +1478,8 @@ export interface components {
             event: components["schemas"]["EventKind"];
             name: string;
         };
+        /** @enum {string} */
+        PayloadAvailability: "available" | "pending" | "unavailable" | "needs_attention";
         PlatformInfo: {
             arch_linux: boolean;
             architecture: string;
@@ -1432,6 +1553,8 @@ export interface components {
         RecentMeetingTitlesResponse: {
             titles: string[];
         };
+        /** Format: uuid */
+        RecordId: string;
         /**
          * @description Default (non-waybar) recording status snapshot. The waybar variant
          *     is a different shape — see the union response on the handler.
@@ -1462,6 +1585,8 @@ export interface components {
             start: number;
             text: string;
         };
+        /** @enum {string} */
+        ServeMappingState: "vacant" | "audetic" | "collision";
         /** @description Response for GET / — service identity and basic status. */
         ServiceInfo: {
             service: string;
@@ -1514,6 +1639,70 @@ export interface components {
         };
         SummaryTemplatesResponse: {
             templates: components["schemas"]["SummaryTemplate"][];
+        };
+        SyncDiscoveryFailure: {
+            candidate: string;
+            reason: string;
+        };
+        /** @description Current Tailscale and Serve readiness as observed by the daemon. */
+        SyncNetworkAssessment: {
+            backend_state?: string | null;
+            dns_name?: string | null;
+            error?: string | null;
+            funnel_enabled?: boolean | null;
+            owner_login?: string | null;
+            ready: boolean;
+            serve_mapping?: null | components["schemas"]["ServeMappingState"];
+            serve_preview: string;
+        };
+        SyncPayloadPolicyRequest: {
+            upload_recording_payloads: boolean;
+        };
+        SyncPayloadPolicyResponse: {
+            upload_recording_payloads: boolean;
+        };
+        SyncRetryResponse: {
+            /** Format: int64 */
+            retried_items: number;
+        };
+        /** @enum {string} */
+        SyncRole: "standalone" | "home_hub" | "connected_device";
+        SyncSetupRequest: {
+            cache_level: components["schemas"]["CacheLevel"];
+            /** @description Home Hub activation changes Tailscale Serve only when explicitly true. */
+            confirm_serve_change?: boolean;
+            device_name?: string | null;
+            hub?: null | components["schemas"]["HubConnection"];
+            role: components["schemas"]["SyncRole"];
+            shared_config_enabled: boolean;
+            upload_recording_payloads: boolean;
+        };
+        SyncSetupResult: {
+            discovered_hubs: components["schemas"]["HubCandidate"][];
+            discovery_failures: components["schemas"]["SyncDiscoveryFailure"][];
+            serve_preview?: string | null;
+            setup_command?: string | null;
+            status: components["schemas"]["SyncStatus"];
+        };
+        SyncStatus: {
+            /** Format: int64 */
+            applied_shared_config_version?: number | null;
+            cache_level: components["schemas"]["CacheLevel"];
+            device_id: components["schemas"]["DeviceId"];
+            device_name?: string | null;
+            hub?: null | components["schemas"]["HubConnection"];
+            hub_reachable: boolean;
+            last_contact_at?: string | null;
+            last_error?: string | null;
+            local_hub_id?: null | components["schemas"]["HubId"];
+            network: components["schemas"]["SyncNetworkAssessment"];
+            /** Format: int64 */
+            pending_bytes: number;
+            /** Format: int64 */
+            pending_items: number;
+            role: components["schemas"]["SyncRole"];
+            shared_config_enabled: boolean;
+            upload_recording_payloads: boolean;
         };
         /** @description Availability of external tools the daemon depends on. */
         SystemDeps: {
@@ -1583,6 +1772,8 @@ export interface components {
             event?: null | components["schemas"]["EventKind"];
             name?: string | null;
         };
+        /** @enum {string} */
+        UploadState: "pending" | "uploading" | "synced" | "needs_attention";
         /** @description Response for GET /version. */
         VersionInfo: {
             /** @description Random identity generated once for this daemon process. */
@@ -1700,6 +1891,8 @@ export interface operations {
                 to?: string | null;
                 /** @description Maximum results (default 20) */
                 limit?: number | null;
+                /** @description Number of canonical merged results to skip. */
+                offset?: number | null;
             };
             header?: never;
             path?: never;
@@ -1723,8 +1916,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Transcription history id */
-                id: number;
+                /** @description Stable transcription UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -1740,6 +1933,41 @@ export interface operations {
                 };
             };
             /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    history_audio: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Stable transcription UUID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recording Payload bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Recording Payload byte range */
+            206: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Recording Payload unavailable */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1855,8 +2083,10 @@ export interface operations {
     list_meetings: {
         parameters: {
             query?: {
-                /** @description Maximum meetings to return (default 20) */
+                /** @description Maximum meetings to return (default 20, maximum 100). */
                 limit?: number | null;
+                offset?: number | null;
+                q?: string | null;
             };
             header?: never;
             path?: never;
@@ -2112,8 +2342,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2142,8 +2372,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2179,8 +2409,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2202,8 +2432,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2236,10 +2466,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
-                /** @description Artifact id */
-                artifact_id: number;
+                /** @description Meeting UUID */
+                id: string;
+                /** @description Artifact UUID */
+                artifact_id: string;
             };
             cookie?: never;
         };
@@ -2268,10 +2498,10 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
-                /** @description Artifact id */
-                artifact_id: number;
+                /** @description Meeting UUID */
+                id: string;
+                /** @description Artifact UUID */
+                artifact_id: string;
             };
             cookie?: never;
         };
@@ -2300,8 +2530,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2328,8 +2558,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2365,8 +2595,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2402,8 +2632,8 @@ export interface operations {
             query?: never;
             header?: never;
             path: {
-                /** @description Meeting id */
-                id: number;
+                /** @description Meeting UUID */
+                id: string;
             };
             cookie?: never;
         };
@@ -2961,6 +3191,204 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["SummaryTemplatesResponse"];
+                };
+            };
+        };
+    };
+    configure_sync_role: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SyncSetupRequest"];
+            };
+        };
+        responses: {
+            /** @description Preview or committed role transition */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncSetupResult"];
+                };
+            };
+            /** @description Invalid settings or disallowed role transition */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description Tailscale Serve or Funnel collision */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The transition could not be persisted */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The requested role could not be verified or started */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    discover_home_hubs: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Compatible Home Hubs visible on the tailnet */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncSetupResult"];
+                };
+            };
+            /** @description Tailscale is not authenticated or suitable for discovery */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description Tailscale or discovery transport is unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    update_sync_payload_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SyncPayloadPolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description Device-local Recording Payload upload policy updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncPayloadPolicyResponse"];
+                };
+            };
+            /** @description No Shared Library role is active */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The device-local policy could not be persisted */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    retry_sync_outbox: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Delayed and needs-attention items made immediately retryable */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncRetryResponse"];
+                };
+            };
+            /** @description Outbox could not be updated */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    get_sync_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Persisted role and current sync readiness */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncStatus"];
+                };
+            };
+            /** @description Persisted sync state could not be read */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
                 };
             };
         };

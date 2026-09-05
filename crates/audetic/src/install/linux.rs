@@ -96,6 +96,10 @@ impl InstallPaths {
     fn current_systemd_unit(&self) -> PathBuf {
         self.systemd_unit(CURRENT_SERVICE)
     }
+
+    fn database(&self) -> PathBuf {
+        self.data_dir.join("audetic.db")
+    }
 }
 
 fn ensure_runtime_dirs(paths: &InstallPaths) -> Result<()> {
@@ -416,6 +420,7 @@ pub fn uninstall(opts: UninstallOptions) -> Result<()> {
     for service in &services {
         plan.action(format!("Stop and disable systemd user service {service}"));
     }
+    let cleanup_serve = super::plan_audetic_serve_cleanup(&mut plan, &paths.database());
     if let Some(cli) = super::cli_target_path() {
         plan.remove(cli, "Standalone `audetic` CLI");
     }
@@ -423,6 +428,7 @@ pub fn uninstall(opts: UninstallOptions) -> Result<()> {
 
     let outcome = plan.execute(&opts, || {
         stop_and_disable(&services);
+        super::cleanup_audetic_serve_if_planned(cleanup_serve);
         Ok(())
     })?;
 

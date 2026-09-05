@@ -5,6 +5,7 @@
 
 use crate::db::{self, Workflow, WorkflowData};
 use anyhow::{anyhow, Result};
+use audetic_core::sync::{DeviceId, PayloadAvailability, RecordId, UploadState};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -19,6 +20,8 @@ pub struct SearchParams {
     pub to: Option<String>,
     /// Maximum number of results
     pub limit: usize,
+    /// Number of canonical results to skip.
+    pub offset: usize,
 }
 
 impl SearchParams {
@@ -52,12 +55,24 @@ impl SearchParams {
 }
 
 /// A single history entry with formatted display data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum HistorySource {
+    Local,
+    Shared,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct HistoryEntry {
-    pub id: i64,
+    pub id: RecordId,
     pub text: String,
-    pub audio_path: String,
     pub created_at: String,
+    pub origin_device_id: DeviceId,
+    pub source: HistorySource,
+    pub upload_state: Option<UploadState>,
+    pub payload_availability: PayloadAvailability,
+    pub offline: bool,
+    pub read_only: bool,
 }
 
 impl From<Workflow> for HistoryEntry {
@@ -66,10 +81,32 @@ impl From<Workflow> for HistoryEntry {
             WorkflowData::VoiceToText(data) => (data.text, data.audio_path),
         };
         Self {
-            id: workflow.id.unwrap_or(0),
+            id: workflow.sync_id.expect("persisted workflows have UUIDs"),
             text,
-            audio_path,
-            created_at: workflow.created_at.unwrap_or_else(|| "Unknown".to_string()),
+            created_at: workflow
+                .created_at
+                .map(|value| {
+                    chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%d %H:%M:%S")
+                        .map(|timestamp| {
+                            timestamp
+                                .and_utc()
+                                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                        })
+                        .unwrap_or(value)
+                })
+                .unwrap_or_else(|| "Unknown".to_string()),
+            origin_device_id: workflow
+                .origin_device_id
+                .expect("persisted workflows have origins"),
+            source: HistorySource::Local,
+            upload_state: None,
+            payload_availability: if std::path::Path::new(&audio_path).exists() {
+                PayloadAvailability::Available
+            } else {
+                PayloadAvailability::Unavailable
+            },
+            offline: false,
+            read_only: false,
         }
     }
 }
@@ -78,47 +115,36 @@ impl From<Workflow> for HistoryEntry {
 ///
 /// If no filters are specified, returns recent transcriptions.
 pub fn search(params: &SearchParams) -> Result<Vec<HistoryEntry>> {
-    let conn = db::init_db()?;
-
-    let workflows = if params.has_filters() {
-        db::search_workflows(
-            &conn,
-            params.query.as_deref(),
-            params.from.as_deref(),
-            params.to.as_deref(),
-            params.limit,
-        )?
-    } else {
-        db::get_recent_workflows(&conn, params.limit)?
-    };
+    let conn = db::open_db()?;
+    let workflows = db::list_visible_workflows(
+        &conn,
+        params.query.as_deref(),
+        params.from.as_deref(),
+        params.to.as_deref(),
+        params.offset,
+        params.limit.clamp(1, 100),
+    )?;
 
     Ok(workflows.into_iter().map(HistoryEntry::from).collect())
 }
 
 /// Get recent transcription history.
 pub fn get_recent(limit: usize) -> Result<Vec<HistoryEntry>> {
-    let conn = db::init_db()?;
+    let conn = db::open_db()?;
     let workflows = db::get_recent_workflows(&conn, limit)?;
     Ok(workflows.into_iter().map(HistoryEntry::from).collect())
 }
 
 /// Get a single transcription by ID.
-pub fn get_by_id(id: i64) -> Result<Option<HistoryEntry>> {
-    let conn = db::init_db()?;
-    // Use search with a high limit to find by ID
-    // TODO: Add a proper get_by_id to db module
-    let workflows = db::search_workflows(&conn, None, None, None, 10000)?;
-
-    Ok(workflows
-        .into_iter()
-        .find(|w| w.id == Some(id))
-        .map(HistoryEntry::from))
+pub fn get_by_id(id: RecordId) -> Result<Option<HistoryEntry>> {
+    let conn = db::open_db()?;
+    Ok(db::get_workflow_by_sync_id(&conn, id)?.map(HistoryEntry::from))
 }
 
 /// Get the text content of a transcription by ID.
 ///
 /// Returns the raw text, suitable for copying to clipboard or returning via API.
-pub fn get_text_by_id(id: i64) -> Result<String> {
+pub fn get_text_by_id(id: RecordId) -> Result<String> {
     get_by_id(id)?
         .map(|entry| entry.text)
         .ok_or_else(|| anyhow!("Workflow with ID {} not found", id))

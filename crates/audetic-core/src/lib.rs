@@ -18,4 +18,5 @@ pub mod jobs_client;
 pub mod keybind;
 pub mod local_models;
 pub mod setup;
+pub mod sync;
 pub mod url;

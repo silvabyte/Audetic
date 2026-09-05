@@ -148,6 +148,10 @@ impl InstallPaths {
             )
         })
     }
+
+    fn database(&self) -> PathBuf {
+        self.data_dir.join("audetic.db")
+    }
 }
 
 fn ensure_runtime_dirs(paths: &InstallPaths) -> Result<()> {
@@ -459,6 +463,7 @@ pub fn uninstall(opts: UninstallOptions) -> Result<()> {
     plan.remove(paths.plist_path.clone(), "Daemon LaunchAgent");
     plan.remove(paths.menubar_plist_path.clone(), "Menu bar LaunchAgent");
     plan.remove(paths.log_dir.clone(), "Log directory");
+    let cleanup_serve = super::plan_audetic_serve_cleanup(&mut plan, &paths.database());
     if let Some(cli) = super::cli_target_path() {
         plan.remove(cli, "Standalone `audetic` CLI");
     }
@@ -466,6 +471,7 @@ pub fn uninstall(opts: UninstallOptions) -> Result<()> {
 
     let outcome = plan.execute(&opts, || {
         bootout_agents();
+        super::cleanup_audetic_serve_if_planned(cleanup_serve);
         Ok(())
     })?;
 

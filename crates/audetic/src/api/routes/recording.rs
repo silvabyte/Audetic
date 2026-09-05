@@ -46,7 +46,7 @@ pub struct ToggleResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CompletedJobSummary {
     pub job_id: String,
-    pub history_id: Option<i64>,
+    pub history_id: Option<audetic_core::sync::RecordId>,
     pub text: String,
     pub created_at: String,
 }

@@ -5,7 +5,14 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+use serde::Serialize;
+use utoipa::ToSchema;
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiErrorBody {
+    pub error: bool,
+    pub message: String,
+}
 
 /// API error type that converts to JSON responses.
 #[derive(Debug)]
@@ -33,14 +40,22 @@ impl ApiError {
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
     }
+
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(json!({
-            "error": true,
-            "message": self.message,
-        }));
+        let body = Json(ApiErrorBody {
+            error: true,
+            message: self.message,
+        });
         (self.status, body).into_response()
     }
 }
@@ -51,5 +66,52 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl From<crate::sync::shared_library::LibraryError> for ApiError {
+    fn from(error: crate::sync::shared_library::LibraryError) -> Self {
+        use crate::sync::shared_library::LibraryError;
+        match error {
+            LibraryError::NotFound(message) => Self::not_found(message),
+            LibraryError::Conflict(message) => Self::conflict(message),
+            LibraryError::Unavailable(message) => Self::unavailable(message),
+            LibraryError::Invalid(message) => Self::bad_request(message),
+            LibraryError::Internal { operation, source } => {
+                tracing::error!(%operation, error = %source, "Shared Library operation failed");
+                Self::internal("Shared Library operation failed")
+            }
+        }
+    }
+}
+
 /// Result type for API handlers.
 pub type ApiResult<T> = Result<T, ApiError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync::shared_library::LibraryError;
+
+    #[test]
+    fn library_errors_have_one_stable_http_mapping() {
+        let cases = [
+            (
+                LibraryError::NotFound("missing".into()),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                LibraryError::Conflict("changed".into()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                LibraryError::Unavailable("offline".into()),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                LibraryError::Invalid("invalid".into()),
+                StatusCode::BAD_REQUEST,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(ApiError::from(error).into_response().status(), expected);
+        }
+    }
+}

@@ -33,6 +33,12 @@ pub mod paths {
     pub const VERSION: &str = "/version";
     pub const TOGGLE: &str = "/toggle";
     pub const MEETINGS_TOGGLE: &str = "/meetings/toggle";
+    pub const MEETINGS: &str = "/meetings";
+    pub const MEETINGS_START: &str = "/meetings/start";
+    pub const MEETINGS_STOP: &str = "/meetings/stop";
+    pub const MEETINGS_CONFIRM: &str = "/meetings/confirm";
+    pub const MEETINGS_CANCEL: &str = "/meetings/cancel";
+    pub const MEETINGS_STATUS: &str = "/meetings/status";
     pub const MEETINGS_IMPORT: &str = "/meetings/import";
     pub const AGENT_PROFILES: &str = "/agent-profiles";
     pub const SUMMARY_TEMPLATES: &str = "/summary/templates";
@@ -50,6 +56,11 @@ pub mod paths {
     pub const MODELS: &str = "/models";
     pub const TRANSCRIBE: &str = "/transcribe";
     pub const SETUP: &str = "/setup";
+    pub const SYNC_STATUS: &str = "/sync/status";
+    pub const SYNC_DISCOVER: &str = "/sync/discover";
+    pub const SYNC_CONFIGURE: &str = "/sync/configure";
+    pub const SYNC_PAYLOAD_POLICY: &str = "/sync/payload-policy";
+    pub const SYNC_RETRY: &str = "/sync/retry";
     pub const SYSTEM_RESTART: &str = "/system/restart";
     pub const KEYBIND_STATUS: &str = "/keybind/status";
     pub const KEYBIND_INSTALL: &str = "/keybind/install";
@@ -61,13 +72,32 @@ pub fn agent_profile_test_path(id: i64) -> String {
     format!("{}/{id}/test", paths::AGENT_PROFILES)
 }
 
+pub fn history_entry_path(id: &crate::sync::RecordId) -> String {
+    format!("{}/{id}", paths::HISTORY)
+}
+
+pub fn history_audio_path(id: &crate::sync::RecordId) -> String {
+    format!("{}/{id}/audio", paths::HISTORY)
+}
+
 /// Path to a meeting's generated artifacts: `/meetings/{id}/artifacts`.
-pub fn meeting_artifacts_path(id: i64) -> String {
+pub fn meeting_path(id: &crate::sync::RecordId) -> String {
+    format!("{}/{id}", paths::MEETINGS)
+}
+
+pub fn meeting_audio_path(id: &crate::sync::RecordId) -> String {
+    format!("{}/{id}/audio", paths::MEETINGS)
+}
+
+pub fn meeting_artifacts_path(id: &crate::sync::RecordId) -> String {
     format!("/meetings/{id}/artifacts")
 }
 
 /// Path to one generated meeting artifact: `/meetings/{id}/artifacts/{artifact_id}`.
-pub fn meeting_artifact_path(id: i64, artifact_id: i64) -> String {
+pub fn meeting_artifact_path(
+    id: &crate::sync::RecordId,
+    artifact_id: &crate::sync::RecordId,
+) -> String {
     format!("/meetings/{id}/artifacts/{artifact_id}")
 }
 
@@ -115,6 +145,10 @@ mod tests {
         );
         assert_eq!(api_url(paths::VERSION), "http://127.0.0.1:3737/api/version");
         assert_eq!(api_url(paths::SETUP), "http://127.0.0.1:3737/api/setup");
+        assert_eq!(
+            api_url(paths::SYNC_STATUS),
+            "http://127.0.0.1:3737/api/sync/status"
+        );
         assert_eq!(
             api_url(paths::KEYBIND_INSTALL),
             "http://127.0.0.1:3737/api/keybind/install"

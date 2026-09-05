@@ -22,7 +22,7 @@ export function MeetingReviewPanel({
   title,
   startedAt,
 }: {
-  meetingId: number;
+  meetingId: string;
   durationSeconds: number;
   title: string | null;
   startedAt: string | null;
@@ -188,7 +188,7 @@ function ClockField({
 
   function commit(): void {
     const parsed = parseClock(text);
-    if (parsed != null) onChange(clamp(parsed, 0, max));
+        if (parsed !== null && parsed !== undefined) onChange(clamp(parsed, 0, max));
     else setText(formatted); // revert unparseable input
   }
 

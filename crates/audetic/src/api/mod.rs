@@ -33,6 +33,8 @@ use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::info;
 use utoipa::{OpenApi, ToSchema};
 
+use std::future::Future;
+
 use crate::config::Config;
 use crate::post_processing::PostProcessingService;
 
@@ -66,6 +68,7 @@ pub struct ApiServer {
     post_processing_state: routes::post_processing::PostProcessingApiState,
     runtime_provider: crate::config::WhisperConfig,
     instance_id: ProcessInstanceId,
+    sync_state: Option<routes::sync::SyncApiState>,
 }
 
 impl ApiServer {
@@ -88,6 +91,7 @@ impl ApiServer {
             },
             runtime_provider: config.whisper.clone(),
             instance_id: ProcessInstanceId(uuid::Uuid::new_v4().to_string()),
+            sync_state: None,
         }
     }
 
@@ -114,20 +118,40 @@ impl ApiServer {
             services,
             inspector,
             meetings_dir,
+            library: None,
         });
         self
     }
 
+    pub fn with_sync_service(mut self, service: std::sync::Arc<crate::sync::SyncService>) -> Self {
+        if let Some(meeting_state) = self.meeting_state.as_mut() {
+            meeting_state.library = Some(std::sync::Arc::new(service.library()));
+        }
+        self.sync_state = Some(routes::sync::SyncApiState::new(service));
+        self
+    }
+
     pub async fn start(self) -> Result<()> {
+        self.start_with_shutdown(std::future::pending::<()>()).await
+    }
+
+    pub async fn start_with_shutdown(
+        self,
+        shutdown: impl Future<Output = ()> + Send + 'static,
+    ) -> Result<()> {
         // Build the API surface. All routes nest under `/api` so the daemon
         // can serve the bundled web-ui at `/` without colliding with API
         // paths (e.g. /meetings is also a SPA route).
+        let shared_library = self
+            .sync_state
+            .as_ref()
+            .map(|state| std::sync::Arc::new(state.service.library()));
         let mut api = Router::new()
             .route("/", get(status))
             .route("/version", get(version))
             .route("/openapi.json", get(openapi_spec))
             .nest("", routes::recording::router(self.recording_state))
-            .nest("/history", routes::history::router())
+            .nest("/history", routes::history::router(shared_library.clone()))
             .nest("/keybind", routes::keybind::router())
             .nest("/logs", routes::logs::router())
             .nest("/models", routes::models::router())
@@ -144,13 +168,16 @@ impl ApiServer {
             .merge(routes::transcribe::router())
             .merge(routes::agents::router())
             .merge(routes::summary_templates::router())
-            .merge(routes::meeting_artifacts::router())
+            .merge(routes::meeting_artifacts::router(shared_library))
             .merge(routes::post_processing::router(self.post_processing_state))
             .layer(Extension(self.instance_id));
 
         let has_meeting = self.meeting_state.is_some();
         if let Some(meeting_state) = self.meeting_state {
             api = api.merge(routes::meetings::router(meeting_state));
+        }
+        if let Some(sync_state) = self.sync_state {
+            api = api.merge(routes::sync::router(sync_state));
         }
 
         let app = Router::new()
@@ -169,7 +196,9 @@ impl ApiServer {
             if has_meeting { "enabled" } else { "disabled" }
         );
 
-        axum::serve(listener, app).await?;
+        axum::serve(listener, app)
+            .with_graceful_shutdown(shutdown)
+            .await?;
 
         Ok(())
     }

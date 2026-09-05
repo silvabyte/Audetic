@@ -7,17 +7,8 @@ use serde_json::Value;
 use std::path::PathBuf;
 
 use crate::args::{MeetingCliArgs, MeetingCommand};
-use audetic_core::url::{api_url, paths};
-
-/// Daemon API base — single derived value so we never inline
-/// `http://127.0.0.1:3737/api/...` in this module.
-fn base_url() -> String {
-    let mut url = api_url("");
-    if url.ends_with('/') {
-        url.pop();
-    }
-    url
-}
+use audetic_core::sync::RecordId;
+use audetic_core::url::{api_url, meeting_path, paths};
 
 pub async fn handle_meeting_command(args: MeetingCliArgs) -> Result<()> {
     match args.command {
@@ -66,7 +57,7 @@ async fn start_meeting(title: Option<String>) -> Result<()> {
     }
 
     let response = client
-        .post(format!("{}/meetings/start", base_url()))
+        .post(api_url(paths::MEETINGS_START))
         .json(&body)
         .send()
         .await
@@ -74,7 +65,10 @@ async fn start_meeting(title: Option<String>) -> Result<()> {
 
     let json = json_or_error(response, "start meeting").await?;
 
-    let meeting_id = json.get("meeting_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let meeting_id = json
+        .get("meeting_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
     let capture = json
         .get("capture_state")
         .and_then(|v| v.as_str())
@@ -85,10 +79,6 @@ async fn start_meeting(title: Option<String>) -> Result<()> {
         meeting_id, capture
     );
 
-    if let Some(path) = json.get("audio_path").and_then(|v| v.as_str()) {
-        println!("Audio: {}", path);
-    }
-
     Ok(())
 }
 
@@ -96,7 +86,7 @@ async fn stop_meeting() -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .post(format!("{}/meetings/stop", base_url()))
+        .post(api_url(paths::MEETINGS_STOP))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -105,7 +95,9 @@ async fn stop_meeting() -> Result<()> {
 
     println!(
         "Meeting stopped (id: {}, duration: {}s)",
-        json.get("meeting_id").and_then(|v| v.as_i64()).unwrap_or(0),
+        json.get("meeting_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
         json.get("duration_seconds")
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
@@ -162,7 +154,7 @@ async fn confirm_meeting(start: Option<String>, end: Option<String>) -> Result<(
     }
 
     let response = client
-        .post(format!("{}/meetings/confirm", base_url()))
+        .post(api_url(paths::MEETINGS_CONFIRM))
         .json(&body)
         .send()
         .await
@@ -172,7 +164,9 @@ async fn confirm_meeting(start: Option<String>, end: Option<String>) -> Result<(
 
     println!(
         "Meeting confirmed (id: {}, duration: {}s)",
-        json.get("meeting_id").and_then(|v| v.as_i64()).unwrap_or(0),
+        json.get("meeting_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
         json.get("duration_seconds")
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
@@ -188,7 +182,7 @@ async fn cancel_meeting() -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .post(format!("{}/meetings/cancel", base_url()))
+        .post(api_url(paths::MEETINGS_CANCEL))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -197,7 +191,9 @@ async fn cancel_meeting() -> Result<()> {
 
     println!(
         "Meeting cancelled (id: {}, duration: {}s)",
-        json.get("meeting_id").and_then(|v| v.as_i64()).unwrap_or(0),
+        json.get("meeting_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
         json.get("duration_seconds")
             .and_then(|v| v.as_u64())
             .unwrap_or(0)
@@ -210,7 +206,7 @@ async fn show_status() -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/meetings/status", base_url()))
+        .get(api_url(paths::MEETINGS_STATUS))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -221,7 +217,7 @@ async fn show_status() -> Result<()> {
         .get("phase")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
-    let meeting_id = json.get("meeting_id").and_then(|v| v.as_i64());
+    let meeting_id = json.get("meeting_id").and_then(Value::as_str);
     let title = json
         .get("title")
         .and_then(|v| v.as_str())
@@ -230,7 +226,6 @@ async fn show_status() -> Result<()> {
         .get("duration_seconds")
         .and_then(|v| v.as_u64())
         .unwrap_or(0);
-    let audio_path = json.get("audio_path").and_then(|v| v.as_str());
     let last_error = json.get("last_error").and_then(|v| v.as_str());
 
     match phase {
@@ -244,42 +239,46 @@ async fn show_status() -> Result<()> {
                 "Meeting: {} (recording, {:02}:{:02})",
                 title, minutes, seconds
             );
-            if let Some(path) = audio_path {
-                println!("Audio: {}", path);
-            }
         }
         "review" => {
             let minutes = duration / 60;
             let seconds = duration % 60;
             println!(
                 "Meeting #{}: awaiting review ({:02}:{:02} recorded)",
-                meeting_id.unwrap_or(0),
+                meeting_id.unwrap_or("unknown"),
                 minutes,
                 seconds
             );
-            if let Some(path) = audio_path {
-                println!("Audio: {}", path);
-            }
             println!(
                 "Run 'audetic meeting confirm' to transcribe (optionally --start/--end to trim), \
                  or 'audetic meeting cancel' to discard."
             );
         }
         "compressing" => {
-            println!("Meeting #{}: compressing audio...", meeting_id.unwrap_or(0));
+            println!(
+                "Meeting #{}: compressing audio...",
+                meeting_id.unwrap_or("unknown")
+            );
         }
         "transcribing" => {
-            println!("Meeting #{}: transcribing...", meeting_id.unwrap_or(0));
+            println!(
+                "Meeting #{}: transcribing...",
+                meeting_id.unwrap_or("unknown")
+            );
         }
         "completed" => {
-            println!("Meeting #{}: completed", meeting_id.unwrap_or(0));
+            println!("Meeting #{}: completed", meeting_id.unwrap_or("unknown"));
         }
         "cancelled" => {
-            println!("Meeting #{}: cancelled", meeting_id.unwrap_or(0));
+            println!("Meeting #{}: cancelled", meeting_id.unwrap_or("unknown"));
         }
         "error" => {
             let err = last_error.unwrap_or("unknown error");
-            println!("Meeting #{}: error — {}", meeting_id.unwrap_or(0), err);
+            println!(
+                "Meeting #{}: error — {}",
+                meeting_id.unwrap_or("unknown"),
+                err
+            );
         }
         other => {
             println!("Meeting status: {}", other);
@@ -293,7 +292,7 @@ async fn list_meetings(limit: usize) -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/meetings?limit={}", base_url(), limit))
+        .get(format!("{}?limit={}", api_url(paths::MEETINGS), limit))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -307,7 +306,14 @@ async fn list_meetings(limit: usize) -> Result<()> {
         }
 
         for meeting in meetings {
-            let id = meeting.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let id = meeting
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let origin = meeting
+                .get("origin_device_id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
             let title = meeting
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -329,8 +335,14 @@ async fn list_meetings(limit: usize) -> Result<()> {
             let seconds = duration % 60;
 
             println!(
-                "#{} {} [{}] {:02}:{:02} - {}",
-                id, title, status, minutes, seconds, started
+                "#{} {} [{}] {:02}:{:02} - {} (origin {})",
+                id,
+                title,
+                status,
+                minutes,
+                seconds,
+                started,
+                origin.chars().take(8).collect::<String>(),
             );
         }
     }
@@ -338,11 +350,11 @@ async fn list_meetings(limit: usize) -> Result<()> {
     Ok(())
 }
 
-async fn show_meeting(id: i64) -> Result<()> {
+async fn show_meeting(id: RecordId) -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .get(format!("{}/meetings/{}", base_url(), id))
+        .get(api_url(&meeting_path(&id)))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -370,10 +382,6 @@ async fn show_meeting(id: i64) -> Result<()> {
         println!("Started: {}", started);
     }
 
-    if let Some(audio) = json.get("audio_path").and_then(|v| v.as_str()) {
-        println!("Audio: {}", audio);
-    }
-
     if let Some(err) = json.get("error").and_then(|v| v.as_str()) {
         if !err.is_empty() {
             println!("Error: {}", err);
@@ -392,11 +400,11 @@ async fn show_meeting(id: i64) -> Result<()> {
 /// Delete a meeting. The daemon soft-deletes it (hidden from all views, audio
 /// kept on disk); a missing/already-deleted meeting comes back as a friendly
 /// 404 via `json_or_error`.
-async fn delete_meeting(id: i64) -> Result<()> {
+async fn delete_meeting(id: RecordId) -> Result<()> {
     let client = reqwest::Client::new();
 
     let response = client
-        .delete(format!("{}/meetings/{}", base_url(), id))
+        .delete(api_url(&meeting_path(&id)))
         .send()
         .await
         .context("Failed to connect to Audetic service. Is it running?")?;
@@ -454,7 +462,10 @@ async fn import_meeting(path: PathBuf, title: Option<String>) -> Result<()> {
         .context("Failed to connect to Audetic service. Is it running?")?;
 
     let json = json_or_error(response, "import meeting").await?;
-    let meeting_id = json.get("meeting_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let meeting_id = json
+        .get("meeting_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
 
     println!("Imported {} as meeting #{}", filename, meeting_id);
     println!(

@@ -82,7 +82,7 @@ impl PostProcessingService {
 }
 
 fn load_jobs(db_path: &Path, kind: super::event::EventKind) -> anyhow::Result<Vec<Job>> {
-    let conn = crate::db::init_db_at(db_path)?;
+    let conn = crate::db::open_db_at(db_path)?;
     JobRepository::list_enabled_for_event(&conn, kind)
 }
 

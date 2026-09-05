@@ -9,6 +9,7 @@ import { OnboardingStore } from "./onboarding-store";
 import { PostProcessingStore } from "./post-processing-store";
 import { StatusStore } from "./status-store";
 import { SetupStore } from "./setup-store";
+import { SyncStore } from "./sync-store";
 import { UiStore } from "./ui-store";
 
 /**
@@ -26,6 +27,7 @@ export class RootStore {
   postProcessing: PostProcessingStore;
   onboarding: OnboardingStore;
   setup: SetupStore;
+  sync: SyncStore;
   ui: UiStore;
 
   constructor() {
@@ -38,6 +40,7 @@ export class RootStore {
     this.postProcessing = new PostProcessingStore(this);
     this.onboarding = new OnboardingStore(this);
     this.setup = new SetupStore(this);
+    this.sync = new SyncStore();
     this.ui = new UiStore(this);
     makeAutoObservable(this);
   }
@@ -46,6 +49,7 @@ export class RootStore {
   start(): void {
     this.status.start();
     this.meetings.start();
+    this.sync.start();
     // Prime the optional FFmpeg installer state. Missing FFmpeg affects
     // meeting readiness but never blocks app render.
     void this.onboarding.check();
@@ -58,6 +62,7 @@ export class RootStore {
   stop(): void {
     this.status.stop();
     this.meetings.stop();
+    this.sync.stop();
   }
 
   /**

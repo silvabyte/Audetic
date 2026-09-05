@@ -4,6 +4,7 @@
 //! `operations.rs` — raw SQL with rusqlite, no ORM.
 
 use anyhow::{Context, Result};
+use audetic_core::sync::{DeviceId, RecordId, SyncRole};
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::meeting::status::MeetingPhase;
@@ -20,12 +21,18 @@ pub enum SoftDeleteOutcome {
     /// The meeting is still in-flight (recording / review / processing), so
     /// deletion was refused; stop or cancel it first.
     InFlight,
+    /// An upload attempt may already have committed on the active Home Hub.
+    /// The caller must create the hub tombstone before hiding the local row.
+    RequiresHub,
 }
 
 /// A meeting record from the database.
 #[derive(Debug, Clone)]
 pub struct MeetingRecord {
     pub id: i64,
+    pub sync_id: RecordId,
+    pub origin_device_id: DeviceId,
+    pub sync_version: u64,
     pub title: Option<String>,
     pub title_source: Option<String>,
     pub title_version: i64,
@@ -81,22 +88,30 @@ impl MeetingRepository {
         let source_filename = source_filename
             .map(str::trim)
             .filter(|filename| !filename.is_empty());
-        conn.execute(
+        let transaction = conn.unchecked_transaction()?;
+        let identity =
+            crate::db::sync_identity::SyncIdentityRepository::get_or_create_device(&transaction)?;
+        let sync_id = RecordId::new();
+        transaction.execute(
             "INSERT INTO meetings \
-             (title, title_source, title_updated_at, status, audio_path, source_filename) \
+             (title, title_source, title_updated_at, status, audio_path, source_filename, sync_id, origin_device_id) \
              VALUES (?1, CASE WHEN ?1 IS NULL THEN NULL ELSE 'manual' END, \
                      CASE WHEN ?1 IS NULL THEN NULL \
-                          ELSE strftime('%Y-%m-%d %H:%M:%f', 'now') END, ?2, ?3, ?4)",
+                          ELSE strftime('%Y-%m-%d %H:%M:%f', 'now') END, ?2, ?3, ?4, ?5, ?6)",
             params![
                 title,
                 MeetingPhase::Recording.as_str(),
                 audio_path,
-                source_filename
+                source_filename,
+                sync_id.to_string(),
+                identity.device_id.to_string(),
             ],
         )
         .context("Failed to insert meeting")?;
 
-        Ok(conn.last_insert_rowid())
+        let id = transaction.last_insert_rowid();
+        transaction.commit()?;
+        Ok(id)
     }
 
     /// Update the meeting status.
@@ -140,17 +155,22 @@ impl MeetingRepository {
         if title.is_empty() {
             anyhow::bail!("Meeting Title cannot be blank");
         }
-        let affected = conn
+        let transaction = conn.unchecked_transaction()?;
+        let affected = transaction
             .execute(
                 "UPDATE meetings SET \
                  title = ?1, \
                  title_source = 'manual', \
                  title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
-                 title_version = title_version + 1 \
+                 title_version = title_version + 1, sync_version = sync_version + 1 \
                  WHERE id = ?2 AND deleted_at IS NULL",
                 params![title, id],
             )
             .context("Failed to update meeting Manual Title")?;
+        if affected > 0 {
+            Self::enqueue_if_completed_from(&transaction, id)?;
+        }
+        transaction.commit()?;
         Ok(affected > 0)
     }
 
@@ -167,31 +187,42 @@ impl MeetingRepository {
         if title.is_empty() {
             return Ok(false);
         }
-        let affected = conn
+        let transaction = conn.unchecked_transaction()?;
+        let affected = transaction
             .execute(
                 "UPDATE meetings SET title = ?1, title_source = 'generated', \
-                 title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+                 title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
+                 sync_version = sync_version + 1 \
                  WHERE id = ?2 AND deleted_at IS NULL \
                  AND title IS NULL AND title_source IS NULL AND title_version = ?3",
                 params![title, id, title_version],
             )
             .context("Failed to set Generated Title")?;
+        if affected > 0 {
+            Self::enqueue_if_completed_from(&transaction, id)?;
+        }
+        transaction.commit()?;
         Ok(affected > 0)
     }
 
     /// Intentionally return title ownership to generation. Only completed
     /// meetings with transcript text are eligible.
     pub fn release_title_for_regeneration(conn: &Connection, id: i64) -> Result<bool> {
-        let affected = conn
+        let transaction = conn.unchecked_transaction()?;
+        let affected = transaction
             .execute(
                 "UPDATE meetings SET title = NULL, title_source = NULL, \
                  title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
-                 title_version = title_version + 1 \
+                 title_version = title_version + 1, sync_version = sync_version + 1 \
                  WHERE id = ?1 AND deleted_at IS NULL AND status = ?2 \
                  AND transcript_text IS NOT NULL AND trim(transcript_text) <> ''",
                 params![id, MeetingPhase::Completed.as_str()],
             )
             .context("Failed to release Meeting Title for regeneration")?;
+        if affected > 0 {
+            Self::enqueue_if_completed_from(&transaction, id)?;
+        }
+        transaction.commit()?;
         Ok(affected > 0)
     }
 
@@ -203,7 +234,7 @@ impl MeetingRepository {
                 "SELECT title FROM meetings \
                  WHERE deleted_at IS NULL AND title_source = 'manual' AND title IS NOT NULL \
                  GROUP BY title \
-                 ORDER BY MAX(COALESCE(title_updated_at, started_at)) DESC, MAX(id) DESC \
+                 ORDER BY MAX(julianday(COALESCE(title_updated_at, started_at))) DESC, MAX(id) DESC \
                  LIMIT ?1",
             )
             .context("Failed to prepare recent Manual Titles query")?;
@@ -215,6 +246,76 @@ impl MeetingRepository {
             titles.push(row?);
         }
         Ok(titles)
+    }
+
+    /// Mirror a Home Hub-owned title onto an overlapping operational row.
+    ///
+    /// This intentionally does not increment `sync_version`, enqueue an origin
+    /// snapshot, or dispatch work. The authoritative row remains the owner;
+    /// the local copy exists so standalone/offline reads and later destination
+    /// seeding retain the accepted title.
+    pub fn mirror_authoritative_title(
+        conn: &Connection,
+        record_id: RecordId,
+        title: Option<&str>,
+        title_source: Option<&str>,
+        title_version: u64,
+        updated_at: &str,
+    ) -> Result<Option<i64>> {
+        let title_version = i64::try_from(title_version)
+            .context("authoritative Meeting Title version exceeds local storage")?;
+        conn.query_row(
+            "UPDATE meetings SET title=?2,title_source=?3,title_version=?4,title_updated_at=?5
+             WHERE sync_id=?1 AND deleted_at IS NULL
+             RETURNING id",
+            params![
+                record_id.to_string(),
+                title,
+                title_source,
+                title_version,
+                updated_at
+            ],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("mirroring authoritative Meeting Title")
+    }
+
+    /// Best-effort enrichment for a committed Connected Device title receipt.
+    ///
+    /// The local row and its pre-request title version are both fenced. A
+    /// concurrent local edit therefore wins instead of being overwritten by a
+    /// delayed response. This intentionally does not publish origin work.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mirror_authoritative_title_if_version(
+        conn: &Connection,
+        local_id: i64,
+        record_id: RecordId,
+        expected_title_version: u64,
+        title: Option<&str>,
+        title_source: Option<&str>,
+        title_version: u64,
+        updated_at: &str,
+    ) -> Result<bool> {
+        let expected_title_version = i64::try_from(expected_title_version)
+            .context("expected Meeting Title version exceeds local storage")?;
+        let title_version = i64::try_from(title_version)
+            .context("authoritative Meeting Title version exceeds local storage")?;
+        conn.execute(
+            "UPDATE meetings SET title=?4,title_source=?5,title_version=?6,title_updated_at=?7
+             WHERE id=?1 AND sync_id=?2 AND deleted_at IS NULL AND title_version=?3",
+            params![
+                local_id,
+                record_id.to_string(),
+                expected_title_version,
+                title,
+                title_source,
+                title_version,
+                updated_at
+            ],
+        )
+        .map(|changed| changed == 1)
+        .context("mirroring fenced authoritative Meeting Title")
     }
 
     /// Mark meeting as completed with transcript and duration. Clears any
@@ -236,21 +337,111 @@ impl MeetingRepository {
         let segments_json = transcript_segments
             .filter(|s| !s.is_empty())
             .and_then(|s| serde_json::to_string(s).ok());
-        conn.execute(
-            "UPDATE meetings SET status = ?1, transcript_path = ?2, transcript_text = ?3, \
+        let initial_settings = crate::db::sync_settings::SyncSettingsRepository::get(conn)?;
+        let before = Self::get_from(conn, id)?.context("meeting disappeared before completion")?;
+        let staging = if matches!(
+            initial_settings.role,
+            SyncRole::HomeHub | SyncRole::ConnectedDevice
+        ) && initial_settings.upload_recording_payloads
+        {
+            crate::db::operations::attempt_recording_staging(
+                conn,
+                std::path::Path::new(&before.audio_path),
+            )
+        } else {
+            crate::db::operations::RecordingStaging::default()
+        };
+        let staged_path = staging.staged.as_ref().map(|value| value.path.clone());
+        let result = (|| -> Result<bool> {
+            let transaction = conn.unchecked_transaction()?;
+            let settings = crate::db::sync_settings::SyncSettingsRepository::get(&transaction)?;
+            let current = Self::get_from(&transaction, id)?
+                .context("meeting disappeared before completion")?;
+            let staging_applies = settings.upload_recording_payloads
+                && initial_settings.upload_recording_payloads
+                && matches!(settings.role, SyncRole::HomeHub | SyncRole::ConnectedDevice)
+                && current.sync_id == before.sync_id
+                && current.audio_path == before.audio_path;
+            let recording_payload = staging_applies
+                .then(|| {
+                    staging
+                        .staged
+                        .as_ref()
+                        .map(|value| value.descriptor.clone())
+                })
+                .flatten()
+                .unwrap_or_else(crate::sync::protocol::RecordingPayloadDescriptor::unavailable);
+            transaction
+                .execute(
+                    "UPDATE meetings SET status = ?1, transcript_path = ?2, transcript_text = ?3, \
              transcript_segments = ?4, duration_seconds = ?5, error = NULL, \
              completed_at = CURRENT_TIMESTAMP WHERE id = ?6",
-            params![
-                MeetingPhase::Completed.as_str(),
-                transcript_path,
-                transcript_text,
-                segments_json,
-                duration_seconds,
-                id,
-            ],
-        )
-        .context("Failed to complete meeting")?;
-        Ok(())
+                    params![
+                        MeetingPhase::Completed.as_str(),
+                        transcript_path,
+                        transcript_text,
+                        segments_json,
+                        duration_seconds,
+                        id,
+                    ],
+                )
+                .context("Failed to complete meeting")?;
+            let meeting =
+                Self::get_from(&transaction, id)?.context("completed meeting disappeared")?;
+            if matches!(settings.role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
+                let snapshot = meeting.snapshot_with_payload(recording_payload.clone())?;
+                crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
+                    &transaction,
+                    &snapshot.into(),
+                )?;
+                if staging_applies {
+                    if let Some(error) = staging.error.as_deref() {
+                        crate::db::sync_outbox::SyncOutboxRepository::enqueue_blob_staging_failure(
+                            &transaction,
+                            meeting.sync_id,
+                            crate::sync::protocol::RecordKind::Meeting,
+                            error,
+                        )?;
+                    } else {
+                        crate::db::sync_outbox::SyncOutboxRepository::enqueue_blob(
+                            &transaction,
+                            meeting.sync_id,
+                            crate::sync::protocol::RecordKind::Meeting,
+                            &recording_payload,
+                            staging
+                                .staged
+                                .as_ref()
+                                .map(|payload| payload.path.as_path()),
+                        )?;
+                    }
+                } else if !settings.upload_recording_payloads {
+                    crate::db::sync_outbox::SyncOutboxRepository::enqueue_blob(
+                        &transaction,
+                        meeting.sync_id,
+                        crate::sync::protocol::RecordKind::Meeting,
+                        &recording_payload,
+                        None,
+                    )?;
+                }
+            }
+            transaction.commit()?;
+            Ok(staging_applies && staging.staged.is_some())
+        })();
+        let keep_staged = result.as_ref().is_ok_and(|keep| *keep);
+        drop(staging);
+        if !keep_staged {
+            if let Some(path) = staged_path {
+                if let Err(error) =
+                    crate::db::sync_outbox::SyncOutboxRepository::reclaim_staged_paths(
+                        conn,
+                        &[path],
+                    )
+                {
+                    tracing::warn!(%error, "failed to reclaim unowned meeting staging file");
+                }
+            }
+        }
+        result.map(|_| ())
     }
 
     /// Mark meeting as failed with error and persist the recorded duration.
@@ -330,12 +521,35 @@ impl MeetingRepository {
 
     /// Mark meeting as cancelled with the recorded duration.
     pub fn cancel(conn: &Connection, id: i64, duration_seconds: i64) -> Result<()> {
-        conn.execute(
-            "UPDATE meetings SET status = ?1, duration_seconds = ?2, \
+        let transaction = conn.unchecked_transaction()?;
+        let record_id = transaction
+            .query_row("SELECT sync_id FROM meetings WHERE id=?1", [id], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        transaction
+            .execute(
+                "UPDATE meetings SET status = ?1, duration_seconds = ?2, \
              completed_at = CURRENT_TIMESTAMP WHERE id = ?3",
-            params![MeetingPhase::Cancelled.as_str(), duration_seconds, id],
-        )
-        .context("Failed to mark meeting as cancelled")?;
+                params![MeetingPhase::Cancelled.as_str(), duration_seconds, id],
+            )
+            .context("Failed to mark meeting as cancelled")?;
+        let paths = record_id
+            .map(|record_id| {
+                crate::db::sync_outbox::SyncOutboxRepository::remove_record_state(
+                    &transaction,
+                    record_id.parse().map_err(anyhow::Error::msg)?,
+                    crate::sync::protocol::RecordKind::Meeting,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
+        transaction.commit()?;
+        if let Err(error) =
+            crate::db::sync_outbox::SyncOutboxRepository::reclaim_staged_paths(conn, &paths)
+        {
+            tracing::warn!(%error, "failed to reclaim cancelled meeting staging files");
+        }
         Ok(())
     }
 
@@ -361,14 +575,95 @@ impl MeetingRepository {
     /// (`MeetingStatusHandle::clear_if_current`), or `GET /meetings/status`
     /// keeps reporting the deleted meeting until the next recording.
     pub fn soft_delete(conn: &Connection, id: i64) -> Result<SoftDeleteOutcome> {
+        Self::soft_delete_impl(conn, id, true)
+    }
+
+    /// Finish local cleanup after the Home Hub has accepted the meeting
+    /// deletion. This bypasses the upload-race guard because the authoritative
+    /// tombstone now wins any delayed snapshot.
+    pub fn soft_delete_after_hub_delete(conn: &Connection, id: i64) -> Result<SoftDeleteOutcome> {
+        Self::soft_delete_impl(conn, id, false)
+    }
+
+    /// Cancel transient artifact work and remove every durable upload row that
+    /// could recreate a meeting or one of its children after deletion.
+    pub fn cleanup_deleted_sync_work(conn: &Connection, record_id: RecordId) -> Result<()> {
+        let transaction = conn.unchecked_transaction()?;
+        let paths = Self::cleanup_deleted_sync_work_from(&transaction, None, record_id)?;
+        transaction.commit()?;
+        if let Err(error) =
+            crate::db::sync_outbox::SyncOutboxRepository::reclaim_staged_paths(conn, &paths)
+        {
+            tracing::warn!(%error, "failed to reclaim deleted meeting staging files");
+        }
+        Ok(())
+    }
+
+    fn cleanup_deleted_sync_work_from(
+        conn: &Connection,
+        local_id: Option<i64>,
+        record_id: RecordId,
+    ) -> Result<Vec<std::path::PathBuf>> {
+        if let Some(local_id) = local_id {
+            conn.execute(
+                "DELETE FROM sync_outbox_items WHERE kind = 'artifact' AND record_id IN \
+                 (SELECT sync_id FROM meeting_artifacts WHERE meeting_id = ?1)",
+                params![local_id],
+            )?;
+        }
+        conn.execute(
+            "DELETE FROM sync_outbox_items WHERE kind = 'artifact' AND record_id IN \
+             (SELECT artifact_record_id FROM sync_artifact_runs WHERE parent_record_id = ?1)",
+            params![record_id.to_string()],
+        )?;
+        conn.execute(
+            "DELETE FROM sync_artifact_runs WHERE parent_record_id = ?1",
+            params![record_id.to_string()],
+        )?;
+        crate::db::sync_outbox::SyncOutboxRepository::remove_record_state(
+            conn,
+            record_id,
+            crate::sync::protocol::RecordKind::Meeting,
+        )
+    }
+
+    fn soft_delete_impl(
+        conn: &Connection,
+        id: i64,
+        _guard_possible_upload: bool,
+    ) -> Result<SoftDeleteOutcome> {
         // Build the IN-list from the single terminal-status source. The values
         // are compile-time constants (never user input), so interpolating them
         // is injection-safe; `id` is still bound as a parameter.
         let terminal = MeetingPhase::TERMINAL_STATUSES.join("', '");
-        let affected = conn
+        let transaction = conn.unchecked_transaction()?;
+        let identity: Option<(String, String, u64)> = transaction
+            .query_row(
+                "SELECT sync_id, origin_device_id, sync_version FROM meetings \
+                 WHERE id = ?1 AND deleted_at IS NULL",
+                [id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if status
+            .as_deref()
+            .is_some_and(|status| !MeetingPhase::is_terminal(status))
+        {
+            transaction.commit()?;
+            return Ok(SoftDeleteOutcome::InFlight);
+        }
+        let affected = transaction
             .execute(
                 &format!(
-                    "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP \
+                    "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP, \
+                     sync_version = sync_version + 1 \
                      WHERE id = ?1 AND deleted_at IS NULL AND status IN ('{terminal}')"
                 ),
                 params![id],
@@ -376,13 +671,39 @@ impl MeetingRepository {
             .context("Failed to soft-delete meeting")?;
 
         if affected > 0 {
+            let (record_id, origin_device_id, previous_version) =
+                identity.context("deleted meeting lost its sync UUID")?;
+            let record_id: RecordId = record_id.parse().map_err(anyhow::Error::msg)?;
+            let origin_device_id = origin_device_id.parse().map_err(anyhow::Error::msg)?;
+            let paths = Self::cleanup_deleted_sync_work_from(&transaction, Some(id), record_id)?;
+            let settings = crate::db::sync_settings::SyncSettingsRepository::get(&transaction)?;
+            if matches!(settings.role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
+                crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
+                    &transaction,
+                    &crate::sync::protocol::DeleteSnapshot {
+                        kind: crate::sync::protocol::RecordKind::Meeting,
+                        schema_version: 1,
+                        record_id,
+                        origin_device_id,
+                        local_version: previous_version + 1,
+                        deleted_at: chrono::Utc::now().to_rfc3339(),
+                    }
+                    .into(),
+                )?;
+            }
+            transaction.commit()?;
+            if let Err(error) =
+                crate::db::sync_outbox::SyncOutboxRepository::reclaim_staged_paths(conn, &paths)
+            {
+                tracing::warn!(%error, "failed to reclaim deleted meeting staging files");
+            }
             return Ok(SoftDeleteOutcome::Deleted);
         }
 
         // Nothing was hidden — read the live row only to choose between 404 and
         // 409. This is advisory: the guarded UPDATE above already guarantees we
         // never stamp an in-flight meeting, regardless of how this read races.
-        let status: Option<String> = conn
+        let status: Option<String> = transaction
             .query_row(
                 "SELECT status FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
                 params![id],
@@ -391,6 +712,7 @@ impl MeetingRepository {
             .optional()
             .context("Failed to look up meeting after delete")?;
 
+        transaction.commit()?;
         Ok(match status {
             Some(s) if !MeetingPhase::is_terminal(&s) => SoftDeleteOutcome::InFlight,
             // Either gone (no live row) or a terminal row a concurrent delete
@@ -401,11 +723,15 @@ impl MeetingRepository {
 
     /// Get a meeting by ID. Soft-deleted meetings are treated as absent.
     pub fn get(conn: &Connection, id: i64) -> Result<Option<MeetingRecord>> {
+        Self::get_from(conn, id)
+    }
+
+    fn get_from(conn: &Connection, id: i64) -> Result<Option<MeetingRecord>> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, title_source, title_version, status, audio_path, source_filename, \
                  transcript_path, transcript_text, duration_seconds, started_at, completed_at, \
-                 error, created_at, deleted_at, transcript_segments \
+                 error, created_at, deleted_at, transcript_segments, sync_id, origin_device_id, sync_version \
                  FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
             )
             .context("Failed to prepare meeting query")?;
@@ -414,6 +740,15 @@ impl MeetingRepository {
             .query_map(params![id], |row| {
                 Ok(MeetingRecord {
                     id: row.get(0)?,
+                    sync_id: row
+                        .get::<_, String>(16)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    origin_device_id: row
+                        .get::<_, String>(17)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    sync_version: row.get(18)?,
                     title: row.get(1)?,
                     title_source: row.get(2)?,
                     title_version: row.get(3)?,
@@ -445,15 +780,38 @@ impl MeetingRepository {
         }
     }
 
+    pub fn get_by_sync_id(conn: &Connection, sync_id: RecordId) -> Result<Option<MeetingRecord>> {
+        let id = conn
+            .query_row(
+                "SELECT id FROM meetings WHERE sync_id = ?1 AND deleted_at IS NULL",
+                [sync_id.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        id.map(|id| Self::get(conn, id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn internal_id(conn: &Connection, sync_id: RecordId) -> Result<Option<i64>> {
+        conn.query_row(
+            "SELECT id FROM meetings WHERE sync_id = ?1 AND deleted_at IS NULL",
+            [sync_id.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .context("Failed to resolve meeting UUID")
+    }
+
     /// List meetings, newest first. Soft-deleted meetings are excluded.
     pub fn list(conn: &Connection, limit: usize) -> Result<Vec<MeetingRecord>> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, title, title_source, title_version, status, audio_path, source_filename, \
                  transcript_path, transcript_text, duration_seconds, started_at, completed_at, \
-                 error, created_at, deleted_at, transcript_segments \
+                 error, created_at, deleted_at, transcript_segments, sync_id, origin_device_id, sync_version \
                  FROM meetings WHERE deleted_at IS NULL \
-                 ORDER BY started_at DESC, id DESC LIMIT ?1",
+                 ORDER BY started_at DESC, sync_id DESC LIMIT ?1",
             )
             .context("Failed to prepare meetings list query")?;
 
@@ -461,6 +819,15 @@ impl MeetingRepository {
             .query_map(params![limit as i64], |row| {
                 Ok(MeetingRecord {
                     id: row.get(0)?,
+                    sync_id: row
+                        .get::<_, String>(16)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    origin_device_id: row
+                        .get::<_, String>(17)?
+                        .parse()
+                        .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                    sync_version: row.get(18)?,
                     title: row.get(1)?,
                     title_source: row.get(2)?,
                     title_version: row.get(3)?,
@@ -492,6 +859,100 @@ impl MeetingRepository {
 
         Ok(meetings)
     }
+
+    fn enqueue_if_completed_from(conn: &Connection, id: i64) -> Result<()> {
+        let meeting =
+            Self::get_from(conn, id)?.context("meeting disappeared during snapshot enqueue")?;
+        if meeting.status != MeetingPhase::Completed.as_str() {
+            return Ok(());
+        }
+        let settings = crate::db::sync_settings::SyncSettingsRepository::get(conn)?;
+        if matches!(settings.role, SyncRole::HomeHub | SyncRole::ConnectedDevice) {
+            let existing = crate::db::sync_outbox::SyncOutboxRepository::payload_descriptor(
+                conn,
+                meeting.sync_id,
+            )?;
+            let recording_payload = existing
+                .unwrap_or_else(crate::sync::protocol::RecordingPayloadDescriptor::unavailable);
+            crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(
+                conn,
+                &meeting
+                    .snapshot_with_payload(recording_payload.clone())?
+                    .into(),
+            )?;
+            if !settings.upload_recording_payloads
+                && crate::db::sync_outbox::SyncOutboxRepository::payload_descriptor(
+                    conn,
+                    meeting.sync_id,
+                )?
+                .is_none()
+            {
+                crate::db::sync_outbox::SyncOutboxRepository::enqueue_blob(
+                    conn,
+                    meeting.sync_id,
+                    crate::sync::protocol::RecordKind::Meeting,
+                    &recording_payload,
+                    None,
+                )?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl MeetingRecord {
+    pub fn snapshot(&self) -> Result<crate::sync::protocol::MeetingSnapshot> {
+        self.snapshot_with_payload(Default::default())
+    }
+
+    pub fn snapshot_with_payload(
+        &self,
+        recording_payload: crate::sync::protocol::RecordingPayloadDescriptor,
+    ) -> Result<crate::sync::protocol::MeetingSnapshot> {
+        let transcript_text = self
+            .transcript_text
+            .clone()
+            .filter(|text| !text.trim().is_empty())
+            .context("successful meeting has no transcript")?;
+        let completed_at = self
+            .completed_at
+            .clone()
+            .context("successful meeting has no completion timestamp")?;
+        Ok(crate::sync::protocol::MeetingSnapshot {
+            kind: crate::sync::protocol::RecordKind::Meeting,
+            schema_version: 1,
+            record_id: self.sync_id,
+            origin_device_id: self.origin_device_id,
+            local_version: self.sync_version,
+            created_at: portable_timestamp(&self.started_at)?,
+            updated_at: portable_timestamp(&completed_at)?,
+            payload: crate::sync::protocol::MeetingPayload {
+                title: self.title.clone(),
+                title_source: self.title_source.clone(),
+                title_version: self.title_version.try_into().unwrap_or_default(),
+                source_filename: self.source_filename.clone(),
+                transcript_text,
+                transcript_segments: self.transcript_segments.clone(),
+                duration_seconds: self
+                    .duration_seconds
+                    .unwrap_or_default()
+                    .try_into()
+                    .unwrap_or_default(),
+                status: self.status.clone(),
+                completed_at: portable_timestamp(&completed_at)?,
+                recording_payload,
+            },
+        })
+    }
+}
+
+fn portable_timestamp(value: &str) -> Result<String> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(timestamp.with_timezone(&chrono::Utc).to_rfc3339());
+    }
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")
+        .map(|timestamp| timestamp.and_utc().to_rfc3339())
+        .with_context(|| format!("invalid meeting timestamp {value:?}"))
 }
 
 #[cfg(test)]
@@ -503,6 +964,90 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         migrate(&conn).unwrap();
         conn
+    }
+
+    fn reject_outbox_writes(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TRIGGER reject_outbox_insert BEFORE INSERT ON sync_outbox_items \
+             BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END; \
+             CREATE TRIGGER reject_outbox_update BEFORE UPDATE ON sync_outbox_items \
+             BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn manual_and_generated_titles_roll_back_when_publication_fails() {
+        let conn = setup_db();
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+
+        let manual = MeetingRepository::insert(&conn, None, "/tmp/manual.wav").unwrap();
+        MeetingRepository::complete(&conn, manual, "/tmp/manual.txt", "manual", None, 1).unwrap();
+        let generated = MeetingRepository::insert(&conn, None, "/tmp/generated.wav").unwrap();
+        MeetingRepository::complete(&conn, generated, "/tmp/generated.txt", "generated", None, 1)
+            .unwrap();
+        let regeneration = MeetingRepository::insert(&conn, None, "/tmp/regeneration.wav").unwrap();
+        MeetingRepository::complete(
+            &conn,
+            regeneration,
+            "/tmp/regeneration.txt",
+            "regeneration",
+            None,
+            1,
+        )
+        .unwrap();
+        MeetingRepository::set_manual_title(&conn, regeneration, "Keep this title").unwrap();
+        let regeneration_version = MeetingRepository::get(&conn, regeneration)
+            .unwrap()
+            .unwrap()
+            .title_version;
+        reject_outbox_writes(&conn);
+
+        assert!(MeetingRepository::set_manual_title(&conn, manual, "Must roll back").is_err());
+        assert!(MeetingRepository::set_generated_title_if_unowned(
+            &conn,
+            generated,
+            "Must also roll back",
+            0,
+        )
+        .is_err());
+        assert!(MeetingRepository::release_title_for_regeneration(&conn, regeneration).is_err());
+        assert!(MeetingRepository::get(&conn, manual)
+            .unwrap()
+            .unwrap()
+            .title
+            .is_none());
+        assert!(MeetingRepository::get(&conn, generated)
+            .unwrap()
+            .unwrap()
+            .title
+            .is_none());
+        let regeneration = MeetingRepository::get(&conn, regeneration)
+            .unwrap()
+            .unwrap();
+        assert_eq!(regeneration.title.as_deref(), Some("Keep this title"));
+        assert_eq!(regeneration.title_version, regeneration_version);
+    }
+
+    #[test]
+    fn meeting_deletion_rolls_back_when_tombstone_publication_fails() {
+        let conn = setup_db();
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        let id = insert_completed(&conn, "Keep me", "/tmp/keep.wav");
+        reject_outbox_writes(&conn);
+
+        assert!(MeetingRepository::soft_delete(&conn, id).is_err());
+        assert!(MeetingRepository::get(&conn, id).unwrap().is_some());
     }
 
     #[test]
@@ -756,9 +1301,20 @@ mod tests {
     fn test_list_meetings() {
         let conn = setup_db();
 
-        MeetingRepository::insert(&conn, Some("Meeting 1"), "/tmp/m1.wav").unwrap();
-        MeetingRepository::insert(&conn, Some("Meeting 2"), "/tmp/m2.wav").unwrap();
-        MeetingRepository::insert(&conn, Some("Meeting 3"), "/tmp/m3.wav").unwrap();
+        let first = MeetingRepository::insert(&conn, Some("Meeting 1"), "/tmp/m1.wav").unwrap();
+        let second = MeetingRepository::insert(&conn, Some("Meeting 2"), "/tmp/m2.wav").unwrap();
+        let third = MeetingRepository::insert(&conn, Some("Meeting 3"), "/tmp/m3.wav").unwrap();
+        for (id, started_at) in [
+            (first, "2026-09-05 10:00:00"),
+            (second, "2026-09-05 11:00:00"),
+            (third, "2026-09-05 12:00:00"),
+        ] {
+            conn.execute(
+                "UPDATE meetings SET started_at=?1 WHERE id=?2",
+                params![started_at, id],
+            )
+            .unwrap();
+        }
 
         let meetings = MeetingRepository::list(&conn, 2).unwrap();
         assert_eq!(meetings.len(), 2);
@@ -925,6 +1481,100 @@ mod tests {
         );
     }
 
+    #[test]
+    fn recent_manual_titles_orders_sqlite_and_rfc3339_timestamps_chronologically() {
+        let conn = setup_db();
+        let newer = MeetingRepository::insert(&conn, Some("Newer SQLite"), "/tmp/new.wav").unwrap();
+        let older =
+            MeetingRepository::insert(&conn, Some("Older RFC3339"), "/tmp/old.wav").unwrap();
+        conn.execute(
+            "UPDATE meetings SET title_updated_at='2026-09-05 12:30:00' WHERE id=?1",
+            [newer],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE meetings SET title_updated_at='2026-09-05T11:45:00Z' WHERE id=?1",
+            [older],
+        )
+        .unwrap();
+
+        assert_eq!(
+            MeetingRepository::recent_manual_titles(&conn, 10).unwrap(),
+            vec!["Newer SQLite", "Older RFC3339"]
+        );
+    }
+
+    #[test]
+    fn list_uses_sync_id_as_the_canonical_equal_timestamp_tiebreaker() {
+        let conn = setup_db();
+        let mut expected = Vec::new();
+        for index in 0..120 {
+            let local_id = MeetingRepository::insert(&conn, None, "/tmp/missing.wav").unwrap();
+            let suffix = 120 - index;
+            let sync_id: RecordId = format!("00000000-0000-0000-0000-{suffix:012}")
+                .parse()
+                .unwrap();
+            conn.execute(
+                "UPDATE meetings SET started_at='2026-09-05 12:00:00', sync_id=?1 WHERE id=?2",
+                params![sync_id.to_string(), local_id],
+            )
+            .unwrap();
+            expected.push(sync_id);
+        }
+        expected.sort_by(|left, right| right.cmp(left));
+
+        let page = MeetingRepository::list(&conn, 100).unwrap();
+
+        assert_eq!(
+            page.into_iter()
+                .map(|meeting| meeting.sync_id)
+                .collect::<Vec<_>>(),
+            expected[..100]
+        );
+    }
+
+    #[test]
+    fn payload_failure_does_not_poison_later_meeting_metadata_snapshots() {
+        let conn = setup_db();
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        let id = MeetingRepository::insert(&conn, None, "/tmp/missing.wav").unwrap();
+        MeetingRepository::complete(&conn, id, "/tmp/m.txt", "transcript", None, 10).unwrap();
+        let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        conn.execute(
+            "UPDATE sync_outbox_blobs SET checksum=?2,staged_path='/missing',byte_size=7,
+                 media_type='audio/wav',availability='needs_attention',state='needs_attention',
+                 last_error='upload exhausted' WHERE record_id=?1",
+            params![
+                meeting.sync_id.to_string(),
+                "239f59ed55e737c77147cf55ad0c1b030b6d7ee748a7426952f9b852d5a935e5"
+            ],
+        )
+        .unwrap();
+
+        assert!(MeetingRepository::set_manual_title(&conn, id, "Updated title").unwrap());
+        let json: String = conn
+            .query_row(
+                "SELECT snapshot_json FROM sync_outbox_items WHERE record_id=?1",
+                [meeting.sync_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let snapshot: crate::sync::protocol::Snapshot = serde_json::from_str(&json).unwrap();
+        let crate::sync::protocol::Snapshot::Meeting(snapshot) = snapshot else {
+            panic!("expected meeting snapshot")
+        };
+        assert_eq!(snapshot.payload.title.as_deref(), Some("Updated title"));
+        assert_eq!(
+            snapshot.payload.recording_payload.availability,
+            audetic_core::sync::PayloadAvailability::Pending
+        );
+    }
+
     /// Insert a meeting already in a terminal (deletable) state. `insert`
     /// always starts at `recording`, which is in-flight, so terminal-state
     /// tests move it to `completed` first.
@@ -1061,5 +1711,214 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn soft_delete_replaces_claimed_upload_with_a_durable_tombstone() {
+        let mut conn = setup_db();
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role = 'home_hub' WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+        let id = MeetingRepository::insert(&conn, None, "/tmp/claimed.wav").unwrap();
+        MeetingRepository::complete(&conn, id, "/tmp/claimed.txt", "claimed", None, 10).unwrap();
+        crate::db::sync_outbox::SyncOutboxRepository::claim_items(
+            &mut conn,
+            0,
+            "worker",
+            "2026-09-04T10:00:00Z",
+            "2026-09-04T10:00:30Z",
+            25,
+        )
+        .unwrap();
+
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, id).unwrap(),
+            SoftDeleteOutcome::Deleted
+        );
+        assert!(MeetingRepository::get(&conn, id).unwrap().is_none());
+        let snapshot: String = conn
+            .query_row(
+                "SELECT snapshot_json FROM sync_outbox_items WHERE kind='meeting'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(matches!(
+            serde_json::from_str::<crate::sync::protocol::Snapshot>(&snapshot).unwrap(),
+            crate::sync::protocol::Snapshot::Delete(_)
+        ));
+    }
+
+    #[test]
+    fn meeting_delete_cleans_artifact_runs_and_every_related_outbox_row() {
+        let conn = setup_db();
+        let id = insert_completed(&conn, "Cleanup", "/tmp/cleanup.wav");
+        let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        let artifact_id = RecordId::new();
+        let run_id = RecordId::new();
+        conn.execute(
+            "INSERT INTO sync_artifact_runs \
+             (run_id, artifact_record_id, parent_record_id, origin_device_id, kind, title, status) \
+             VALUES (?1, ?2, ?3, ?4, 'summary', 'Summary', 'error')",
+            params![
+                run_id.to_string(),
+                artifact_id.to_string(),
+                meeting.sync_id.to_string(),
+                meeting.origin_device_id.to_string()
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_outbox_items \
+             (record_id, kind, local_version, snapshot_json, state, last_error) \
+             VALUES (?1, 'artifact', 1, '{}', 'needs_attention', 'rejected')",
+            [artifact_id.to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            MeetingRepository::soft_delete_after_hub_delete(&conn, id).unwrap(),
+            SoftDeleteOutcome::Deleted
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM sync_artifact_runs", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM sync_outbox_items", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn meeting_delete_removes_blob_row_and_reclaims_unshared_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("audetic.db");
+        let conn = crate::db::migrate_db_at(&db_path).unwrap();
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub',upload_recording_payloads=1 WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        let source = temp.path().join("delete.wav");
+        std::fs::write(&source, b"delete payload").unwrap();
+        let id = MeetingRepository::insert(&conn, None, source.to_string_lossy().as_ref()).unwrap();
+        MeetingRepository::complete(&conn, id, "/tmp/delete.txt", "done", None, 1).unwrap();
+        let staged: String = conn
+            .query_row("SELECT staged_path FROM sync_outbox_blobs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, id).unwrap(),
+            SoftDeleteOutcome::Deleted
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM sync_outbox_blobs", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert!(!std::path::Path::new(&staged).exists());
+    }
+
+    #[test]
+    fn meeting_cancellation_removes_preexisting_item_and_blob_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("audetic.db");
+        let conn = crate::db::migrate_db_at(&db_path).unwrap();
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub',upload_recording_payloads=1 WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        let source = temp.path().join("cancel.wav");
+        std::fs::write(&source, b"cancel payload").unwrap();
+        let id = MeetingRepository::insert(&conn, None, source.to_string_lossy().as_ref()).unwrap();
+        MeetingRepository::complete(&conn, id, "/tmp/cancel.txt", "done", None, 1).unwrap();
+        let staged: String = conn
+            .query_row("SELECT staged_path FROM sync_outbox_blobs", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        MeetingRepository::update_status(&conn, id, MeetingPhase::Review).unwrap();
+
+        MeetingRepository::cancel(&conn, id, 1).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT (SELECT COUNT(*) FROM sync_outbox_items) +
+                        (SELECT COUNT(*) FROM sync_outbox_blobs)",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
+        assert!(!std::path::Path::new(&staged).exists());
+    }
+
+    #[test]
+    fn meeting_delete_supersedes_started_child_upload_with_parent_tombstone() {
+        let conn = setup_db();
+        crate::db::sync_settings::SyncSettingsRepository::get(&conn).unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role = 'home_hub' WHERE singleton = 1",
+            [],
+        )
+        .unwrap();
+        let id = insert_completed(&conn, "Child upload", "/tmp/child.wav");
+        let artifact = crate::db::meeting_artifacts::MeetingArtifactRepository::insert_pending(
+            &conn, id, "summary", "Summary", None, None,
+        )
+        .unwrap();
+        crate::db::meeting_artifacts::MeetingArtifactRepository::complete(
+            &conn,
+            artifact,
+            "# Summary",
+            "",
+            "",
+        )
+        .unwrap();
+        let artifact =
+            crate::db::meeting_artifacts::MeetingArtifactRepository::get(&conn, artifact)
+                .unwrap()
+                .unwrap();
+        conn.execute(
+            "UPDATE sync_outbox_items SET attempts = 1, state = 'uploading' \
+             WHERE record_id = ?1 AND kind = 'artifact'",
+            [artifact.id.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sync_outbox_items SET attempts = 0, state = 'pending' \
+             WHERE record_id = ?1 AND kind = 'meeting'",
+            [artifact.meeting_id.to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            MeetingRepository::soft_delete(&conn, id).unwrap(),
+            SoftDeleteOutcome::Deleted
+        );
+        assert!(MeetingRepository::get(&conn, id).unwrap().is_none());
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM sync_outbox_items WHERE kind='artifact'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+            0
+        );
     }
 }

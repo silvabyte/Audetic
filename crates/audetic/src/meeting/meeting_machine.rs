@@ -27,6 +27,19 @@ use super::processing::{process_meeting, ProcessingArgs, ProcessingServices};
 use super::progress::LiveProgressObserver;
 use super::status::{MeetingPhase, MeetingStartOptions, MeetingStatusHandle};
 
+fn open_runtime_db(path: &Path) -> Result<rusqlite::Connection> {
+    #[cfg(test)]
+    {
+        // Unit tests construct MeetingMachine directly rather than through
+        // app startup, so retain their explicit initialization boundary.
+        db::init_db_at(path)
+    }
+    #[cfg(not(test))]
+    {
+        db::open_db_at(path)
+    }
+}
+
 /// Which audio sources were actually capturing at the start of a meeting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureState {
@@ -137,7 +150,7 @@ impl MeetingMachine {
 
         // Insert meeting record in DB
         let meeting_id = {
-            let conn = db::init_db_at(&self.db_path)?;
+            let conn = open_runtime_db(&self.db_path)?;
             MeetingRepository::insert(&conn, opts.title.as_deref(), &audio_path.to_string_lossy())?
         };
 
@@ -170,7 +183,7 @@ impl MeetingMachine {
                 let _ = self.mic_source.stop();
                 let _ = self.system_source.stop();
                 // Clean up DB row so we don't leave a dangling "recording" meeting
-                if let Ok(conn) = db::init_db_at(&self.db_path) {
+                if let Ok(conn) = open_runtime_db(&self.db_path) {
                     let _ = MeetingRepository::fail(
                         &conn,
                         meeting_id,
@@ -355,7 +368,7 @@ impl MeetingMachine {
 
         if !mic_captured_audio && !system_captured_audio {
             // Persist failure so the meeting row isn't left stuck in `recording`.
-            if let Ok(conn) = db::init_db_at(&self.db_path) {
+            if let Ok(conn) = open_runtime_db(&self.db_path) {
                 let _ = MeetingRepository::fail(
                     &conn,
                     meeting_id,
@@ -391,7 +404,7 @@ impl MeetingMachine {
         // the captured duration and freeze the live timer so the UI shows the
         // recording's length (and the trim end bound). The user proceeds via
         // `confirm` (optionally trimming) or discards via `cancel`.
-        if let Ok(conn) = db::init_db_at(&self.db_path) {
+        if let Ok(conn) = open_runtime_db(&self.db_path) {
             if let Err(e) =
                 MeetingRepository::set_review(&conn, meeting_id, duration_seconds as i64)
             {
@@ -520,7 +533,7 @@ impl MeetingMachine {
         }
 
         // Persist cancelled status.
-        if let Ok(conn) = db::init_db_at(&self.db_path) {
+        if let Ok(conn) = open_runtime_db(&self.db_path) {
             let _ = MeetingRepository::cancel(&conn, meeting_id, duration_seconds as i64);
         }
 
@@ -677,7 +690,7 @@ pub async fn retry_meeting_transcription(
         meeting_id, audio_path
     );
 
-    if let Ok(conn) = db::init_db() {
+    if let Ok(conn) = db::open_db() {
         if let Err(e) =
             MeetingRepository::update_status(&conn, meeting_id, MeetingPhase::Transcribing)
         {
@@ -694,7 +707,7 @@ pub async fn retry_meeting_transcription(
                 warn!("Failed to write transcript file: {}", e);
             }
 
-            if let Ok(conn) = db::init_db() {
+            if let Ok(conn) = db::open_db() {
                 if let Err(e) = MeetingRepository::complete(
                     &conn,
                     meeting_id,
@@ -718,7 +731,7 @@ pub async fn retry_meeting_transcription(
         Err(e) => {
             error!("Meeting {} retry transcription failed: {}", meeting_id, e);
             let error_msg = e.to_string();
-            if let Ok(conn) = db::init_db() {
+            if let Ok(conn) = db::open_db() {
                 let _ = MeetingRepository::fail(&conn, meeting_id, &error_msg, duration_seconds);
             }
         }
