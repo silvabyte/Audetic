@@ -250,11 +250,8 @@ impl SyncService {
         &self,
         request: SyncSetupRequest,
     ) -> Result<SyncSetupResult, SyncServiceError> {
-        Ok(self
-            .coordinator
-            .configure(request)
-            .await?
-            .into_setup_result())
+        let receipt = self.coordinator.configure(request).await?;
+        Ok(self.coordinator.enrich_configure_receipt(receipt).await)
     }
 
     pub async fn shutdown(&self) -> Result<(), SyncServiceError> {

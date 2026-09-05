@@ -2,7 +2,8 @@
 
 use anyhow::Context;
 use audetic_core::sync::{
-    HubConnection, SyncDiscoveryFailure, SyncRole, SyncSetupRequest, SyncSetupResult, SyncStatus,
+    HubConnection, ServeMappingState, SyncDiscoveryFailure, SyncNetworkAssessment, SyncRole,
+    SyncSetupRequest, SyncSetupResult, SyncStatus,
 };
 use thiserror::Error;
 use tokio::sync::Mutex;
@@ -170,6 +171,12 @@ struct VerifiedEnvironment {
     applied_serve: AppliedServe,
 }
 
+struct ConfiguredTransition {
+    target: InstallationSnapshot,
+    verified_connection: Option<HubConnection>,
+    activation: ActivationHealth,
+}
+
 /// Owns every external side effect until the durable role commit succeeds.
 /// There is one compensation path, so adding a new pre-commit failure cannot
 /// accidentally skip Serve or runtime restoration.
@@ -291,6 +298,57 @@ impl RoleCoordinator {
 
     pub(super) async fn status(&self) -> Result<SyncStatus, SyncServiceError> {
         self.status_receipt().await.map(|(_, status)| status)
+    }
+
+    /// Enrichment is deliberately outside the transition lock and cannot turn
+    /// an already committed mutation into an API error.
+    pub(super) async fn enrich_configure_receipt(
+        &self,
+        mut receipt: ConfigureReceipt,
+    ) -> SyncSetupResult {
+        match self.state.load() {
+            Ok(current) if RoleVersion::new(current.role_epoch) == receipt.role_version => {
+                match crate::db::open_db_at(self.state.db_path())
+                    .context("opening sync database for configure receipt enrichment")
+                    .and_then(|connection| {
+                        let (items, error) =
+                            crate::db::sync_outbox::SyncOutboxRepository::counts(&connection)?;
+                        let bytes = crate::db::sync_outbox::SyncOutboxRepository::pending_bytes(
+                            &connection,
+                        )?;
+                        Ok((items, bytes, error))
+                    }) {
+                    Ok((items, bytes, error)) => {
+                        receipt.status.pending_items = items;
+                        receipt.status.pending_bytes = bytes;
+                        if let Some(error) = error {
+                            append_receipt_error(&mut receipt.status, error);
+                        }
+                    }
+                    Err(error) => append_receipt_error(
+                        &mut receipt.status,
+                        format!("configure receipt outbox enrichment failed: {error}"),
+                    ),
+                }
+                let network = self.serve.network_assessment().await;
+                if let Some(error) = network.error.clone() {
+                    append_receipt_error(
+                        &mut receipt.status,
+                        format!("configure receipt network enrichment failed: {error}"),
+                    );
+                }
+                receipt.status.network = network;
+            }
+            Ok(_) => append_receipt_error(
+                &mut receipt.status,
+                "configure receipt enrichment skipped after a newer role transition".into(),
+            ),
+            Err(error) => append_receipt_error(
+                &mut receipt.status,
+                format!("configure receipt state enrichment failed: {error}"),
+            ),
+        }
+        receipt.into_setup_result()
     }
 
     async fn status_receipt(&self) -> Result<(RoleVersion, SyncStatus), SyncServiceError> {
@@ -496,15 +554,41 @@ impl RoleCoordinator {
         self.check_available()?;
         self.acquire_runtime_ownership().await?;
         let installation = self.load()?;
-        self.verify_environment(&installation, VerificationIntent::Committed)
-            .await?;
-        let runtime_transition = if installation.settings.role == SyncRole::Standalone {
-            None
-        } else {
-            Some(
-                self.prepare_runtime(runtime_spec(&installation, installation.role_epoch)?)
-                    .await?,
-            )
+        let runtime_transition = match installation.settings.role {
+            SyncRole::HomeHub => {
+                // A Home Hub verifies its public handshake through Serve. The
+                // local listener therefore has to be accepting before that
+                // verification can be meaningful.
+                let transition = self
+                    .prepare_runtime(runtime_spec(&installation, installation.role_epoch)?)
+                    .await?;
+                if let Err(error) = self
+                    .verify_environment(&installation, VerificationIntent::Committed)
+                    .await
+                {
+                    return Err(match self.abort_runtime(transition).await {
+                        Ok(()) => error,
+                        Err(rollback) => saga_error(
+                            error,
+                            vec![CompensationError::Transition(Box::new(rollback))],
+                        ),
+                    });
+                }
+                Some(transition)
+            }
+            SyncRole::ConnectedDevice => {
+                self.verify_environment(&installation, VerificationIntent::Committed)
+                    .await?;
+                Some(
+                    self.prepare_runtime(runtime_spec(&installation, installation.role_epoch)?)
+                        .await?,
+                )
+            }
+            SyncRole::Standalone => {
+                self.verify_environment(&installation, VerificationIntent::Committed)
+                    .await?;
+                None
+            }
         };
         if let Some(transition) = runtime_transition {
             self.seal_runtime_transition(transition).await?;
@@ -610,10 +694,9 @@ impl RoleCoordinator {
         let serve_preview = (request.role == SyncRole::HomeHub).then(|| self.serve.preview());
         let plan = TransitionPlan::configure(request, &installation)?;
 
-        let (verified_connection, activation) = match plan {
+        let configured = match plan {
             TransitionPlan::Standalone(request) => {
-                self.configure_standalone(request, &installation).await?;
-                (None, ActivationHealth::Inactive)
+                self.configure_standalone(request, &installation).await?
             }
             TransitionPlan::HomeHub {
                 request,
@@ -624,46 +707,26 @@ impl RoleCoordinator {
                         .prepare_home_hub()
                         .await
                         .map_err(TransitionError::from)?;
-                    let (role_version, status) = self.status_receipt().await?;
-                    return Ok(ConfigureReceipt {
-                        role_version,
-                        activation: ActivationHealth::Inactive,
-                        verified_connection: None,
-                        setup_command: None,
-                        status,
+                    return Ok(configure_receipt(
+                        &installation,
+                        None,
+                        ActivationHealth::Inactive,
                         serve_preview,
-                    });
+                    ));
                 }
-                let (connection, health) = self.configure_home_hub(request, &installation).await?;
-                (connection, health)
+                self.configure_home_hub(request, &installation).await?
             }
             TransitionPlan::ConnectedDevice(request) => {
-                let (connection, health) = self
-                    .configure_connected_device(request, &installation)
-                    .await?;
-                (connection, health)
+                self.configure_connected_device(request, &installation)
+                    .await?
             }
         };
-
-        let (role_version, status) = self.status_receipt().await?;
-        let setup_command = if status.role == SyncRole::HomeHub {
-            verified_connection.as_ref().map(|connection| {
-                format!(
-                    "audetic setup --sync-role connected-device --hub-url {} --hub-id {}",
-                    connection.base_url, connection.hub_id
-                )
-            })
-        } else {
-            None
-        };
-        Ok(ConfigureReceipt {
-            role_version,
-            verified_connection,
-            setup_command,
-            activation,
-            status,
+        Ok(configure_receipt(
+            &configured.target,
+            configured.verified_connection,
+            configured.activation,
             serve_preview,
-        })
+        ))
     }
 
     pub(super) async fn shutdown(&self) -> Result<(), SyncServiceError> {
@@ -686,7 +749,7 @@ impl RoleCoordinator {
         &self,
         request: SyncSetupRequest,
         installation: &InstallationSnapshot,
-    ) -> Result<(), SyncServiceError> {
+    ) -> Result<ConfiguredTransition, SyncServiceError> {
         if request.hub.is_some() {
             return Err(SyncServiceError::InvalidRequest(
                 "Standalone settings cannot contain a Home Hub connection".into(),
@@ -726,24 +789,34 @@ impl RoleCoordinator {
         self.transition_checkpoint(TransitionCheckpoint::Quiesced)
             .await;
         let settings = settings_from_request(request, None);
-        if let Err(error) = self
+        let effects = match self
             .state
             .commit_standalone(installation.role_epoch, &settings)
             .map_err(SyncServiceError::State)
         {
-            return Err(self.compensate_saga(saga, error).await);
-        }
+            Ok(effects) => effects,
+            Err(error) => return Err(self.compensate_saga(saga, error).await),
+        };
         self.transition_checkpoint(TransitionCheckpoint::Committed)
             .await;
         self.activate_runtime(saga.committed()).await?;
-        Ok(())
+        Ok(ConfiguredTransition {
+            target: InstallationSnapshot {
+                settings,
+                serve_ownership: None,
+                role_epoch: effects.role_epoch,
+                ..installation.clone()
+            },
+            verified_connection: None,
+            activation: ActivationHealth::Inactive,
+        })
     }
 
     async fn configure_home_hub(
         &self,
         request: SyncSetupRequest,
         installation: &InstallationSnapshot,
-    ) -> Result<(Option<HubConnection>, ActivationHealth), SyncServiceError> {
+    ) -> Result<ConfiguredTransition, SyncServiceError> {
         if request.hub.is_some() {
             return Err(SyncServiceError::InvalidRequest(
                 "Home Hub settings cannot contain another hub connection".into(),
@@ -837,17 +910,22 @@ impl RoleCoordinator {
         self.transition_checkpoint(TransitionCheckpoint::Committed)
             .await;
         let activation = self.activate_runtime(saga.committed()).await?;
-        self.record_verified_activation(effects.role_epoch, &activation)
-            .await?;
-        let health = activation_health(&activation);
-        Ok((verified_connection, health))
+        self.record_committed_activation(effects.role_epoch, &activation)
+            .await;
+        let mut target = target;
+        target.role_epoch = effects.role_epoch;
+        Ok(ConfiguredTransition {
+            target,
+            verified_connection,
+            activation: activation_health(&activation),
+        })
     }
 
     async fn configure_connected_device(
         &self,
         request: SyncSetupRequest,
         installation: &InstallationSnapshot,
-    ) -> Result<(Option<HubConnection>, ActivationHealth), SyncServiceError> {
+    ) -> Result<ConfiguredTransition, SyncServiceError> {
         let mut requested_hub = request.hub.clone().ok_or_else(|| {
             SyncServiceError::InvalidRequest(
                 "Connected Device settings require a Home Hub connection".into(),
@@ -911,7 +989,12 @@ impl RoleCoordinator {
         self.runtime
             .observe_reachability(RoleVersion::new(effects.role_epoch), true)
             .await;
-        Ok((verified.connection, activation_health(&activation)))
+        target.role_epoch = effects.role_epoch;
+        Ok(ConfiguredTransition {
+            target,
+            verified_connection: verified.connection,
+            activation: activation_health(&activation),
+        })
     }
 
     /// The only role/environment invariant checker. Configure, persisted
@@ -1173,6 +1256,19 @@ impl RoleCoordinator {
         Ok(())
     }
 
+    async fn record_committed_activation(&self, role_epoch: u64, activation: &ActivationOutcome) {
+        if let Err(error) = self
+            .record_verified_activation(role_epoch, activation)
+            .await
+        {
+            tracing::warn!(
+                %error,
+                role_epoch,
+                "committed sync activation health could not be persisted"
+            );
+        }
+    }
+
     fn cleanup_after_commit(&self, effects: &CommitEffects, activation: &str) {
         let cleanup = self
             .state
@@ -1263,6 +1359,82 @@ fn activation_health(outcome: &ActivationOutcome) -> ActivationHealth {
     }
 }
 
+fn configure_receipt(
+    target: &InstallationSnapshot,
+    verified_connection: Option<HubConnection>,
+    activation: ActivationHealth,
+    serve_preview: Option<String>,
+) -> ConfigureReceipt {
+    let role_version = RoleVersion::new(target.role_epoch);
+    let activation_error = match &activation {
+        ActivationHealth::Degraded { error } => Some(error.clone()),
+        ActivationHealth::Inactive | ActivationHealth::Healthy => None,
+    };
+    let hub_reachable = target.settings.role != SyncRole::Standalone
+        && matches!(activation, ActivationHealth::Healthy);
+    let dns_name = verified_connection.as_ref().and_then(|connection| {
+        canonicalize_base_url(&connection.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_owned))
+    });
+    let owner_login = verified_connection
+        .as_ref()
+        .map(|connection| connection.owner_login.clone())
+        .or_else(|| target.identity.owner_login.clone());
+    let network = SyncNetworkAssessment {
+        ready: hub_reachable,
+        backend_state: hub_reachable.then(|| "Running".into()),
+        dns_name,
+        owner_login,
+        serve_mapping: (target.settings.role == SyncRole::HomeHub)
+            .then_some(ServeMappingState::Audetic),
+        funnel_enabled: (target.settings.role == SyncRole::HomeHub).then_some(false),
+        serve_preview: serve_preview.clone().unwrap_or_default(),
+        error: activation_error.clone(),
+    };
+    let setup_command = if target.settings.role == SyncRole::HomeHub {
+        verified_connection.as_ref().map(|connection| {
+            format!(
+                "audetic setup --sync-role connected-device --hub-url {} --hub-id {}",
+                connection.base_url, connection.hub_id
+            )
+        })
+    } else {
+        None
+    };
+    ConfigureReceipt {
+        role_version,
+        status: SyncStatus {
+            device_id: target.identity.device_id,
+            role: target.settings.role,
+            device_name: target.settings.device_name.clone(),
+            local_hub_id: target.identity.hub_id,
+            hub: target.settings.hub.clone(),
+            hub_reachable,
+            last_contact_at: target.settings.last_contact_at.clone(),
+            pending_items: 0,
+            pending_bytes: 0,
+            last_error: activation_error.or_else(|| target.settings.last_error.clone()),
+            upload_recording_payloads: target.settings.upload_recording_payloads,
+            cache_level: target.settings.cache_level,
+            shared_config_enabled: target.settings.shared_config_enabled,
+            applied_shared_config_version: target.settings.shared_config_version,
+            network,
+        },
+        activation,
+        serve_preview,
+        verified_connection,
+        setup_command,
+    }
+}
+
+fn append_receipt_error(status: &mut SyncStatus, error: String) {
+    status.last_error = Some(match status.last_error.take() {
+        Some(existing) => format!("{existing}; {error}"),
+        None => error,
+    });
+}
+
 fn settings_from_request(request: SyncSetupRequest, hub: Option<HubConnection>) -> SyncSettings {
     SyncSettings {
         role: request.role,
@@ -1287,6 +1459,7 @@ mod tests {
     use semver::Version;
     use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use crate::db::sync_identity::SyncIdentityRepository;
     use crate::db::sync_serve::SyncServeRepository;
@@ -1311,6 +1484,8 @@ mod tests {
         owner_login: StdMutex<String>,
         fail_apply: AtomicBool,
         fail_status: AtomicBool,
+        status_calls: std::sync::atomic::AtomicUsize,
+        status_delay_ms: std::sync::atomic::AtomicU64,
         apply_calls: std::sync::atomic::AtomicUsize,
         remove_calls: std::sync::atomic::AtomicUsize,
     }
@@ -1323,6 +1498,8 @@ mod tests {
                 owner_login: StdMutex::new("owner@example.com".into()),
                 fail_apply: AtomicBool::new(false),
                 fail_status: AtomicBool::new(false),
+                status_calls: std::sync::atomic::AtomicUsize::new(0),
+                status_delay_ms: std::sync::atomic::AtomicU64::new(0),
                 apply_calls: std::sync::atomic::AtomicUsize::new(0),
                 remove_calls: std::sync::atomic::AtomicUsize::new(0),
             }
@@ -1344,6 +1521,11 @@ mod tests {
 
     impl TailscaleControl for FakeTailscale {
         fn status(&self) -> Result<TailscaleStatus, TailscaleError> {
+            self.status_calls.fetch_add(1, Ordering::SeqCst);
+            let delay = self.status_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
             if self.fail_status.load(Ordering::SeqCst) {
                 Err(TailscaleError::MissingStatusField("Self"))
             } else {
@@ -1387,6 +1569,7 @@ mod tests {
     #[derive(Default)]
     struct FakeHubs {
         fail: AtomicBool,
+        listener_address: StdMutex<Option<SocketAddr>>,
         blob_upload_calls: std::sync::atomic::AtomicUsize,
         snapshot_uploads: StdMutex<Vec<(HubId, Vec<RecordId>)>>,
         blob_uploads: StdMutex<Vec<(HubId, RecordId)>>,
@@ -1398,6 +1581,30 @@ mod tests {
             if self.fail.load(Ordering::SeqCst) {
                 Err(HubTransferError::Transport("hub offline".into()))
             } else {
+                let listener_address = *self.listener_address.lock().unwrap();
+                if let Some(address) = listener_address {
+                    let listener_handshake = async {
+                        let mut stream = tokio::net::TcpStream::connect(address).await?;
+                        stream
+                            .write_all(b"GET /v1/info HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                            .await?;
+                        let mut response = [0_u8; 1024];
+                        let read = stream.read(&mut response).await?;
+                        anyhow::ensure!(
+                            response[..read]
+                                .windows(b"x-audetic".len())
+                                .any(|value| value == b"x-audetic"),
+                            "listener did not return an Audetic response"
+                        );
+                        anyhow::Ok(())
+                    };
+                    tokio::time::timeout(std::time::Duration::from_millis(250), listener_handshake)
+                        .await
+                        .map_err(|_| {
+                            HubTransferError::Transport("listener handshake timed out".into())
+                        })?
+                        .map_err(|error| HubTransferError::Transport(error.to_string()))?;
+                }
                 Ok(HubCandidate {
                     connection: hub.clone(),
                     device_name: Some("Hub".into()),
@@ -2828,6 +3035,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn configure_receipt_survives_outbox_enrichment_failure_after_commit() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        let receipt = fixture
+            .service
+            .coordinator
+            .configure(request(SyncRole::Standalone))
+            .await
+            .unwrap();
+        let connection = crate::db::open_db_at(&fixture.path).unwrap();
+        connection
+            .execute("DROP TABLE sync_outbox_items", [])
+            .unwrap();
+        drop(connection);
+
+        let result = fixture
+            .service
+            .coordinator
+            .enrich_configure_receipt(receipt)
+            .await;
+
+        assert_eq!(result.status.role, SyncRole::Standalone);
+        assert!(result
+            .status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("outbox enrichment failed")));
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configure_receipt_survives_network_enrichment_failure_after_commit() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        let receipt = fixture
+            .service
+            .coordinator
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap();
+        fixture.tailscale.fail_status.store(true, Ordering::SeqCst);
+
+        let result = fixture
+            .service
+            .coordinator
+            .enrich_configure_receipt(receipt)
+            .await;
+
+        assert_eq!(result.status.role, SyncRole::HomeHub);
+        assert!(result.status.hub_reachable);
+        assert!(result
+            .status
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("network enrichment failed")));
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configure_receipt_enrichment_does_not_block_the_next_transition() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        let receipt = fixture
+            .service
+            .coordinator
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap();
+        let prior_status_calls = fixture.tailscale.status_calls.load(Ordering::SeqCst);
+        fixture
+            .tailscale
+            .status_delay_ms
+            .store(2_000, Ordering::SeqCst);
+        let coordinator = fixture.service.coordinator.clone();
+        let enrichment =
+            tokio::spawn(async move { coordinator.enrich_configure_receipt(receipt).await });
+        for _ in 0..100 {
+            if fixture.tailscale.status_calls.load(Ordering::SeqCst) > prior_status_calls {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let next = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            fixture
+                .service
+                .coordinator
+                .configure(request(SyncRole::Standalone)),
+        )
+        .await
+        .expect("receipt enrichment must not retain the transition lock")
+        .unwrap();
+
+        assert_eq!(next.status.role, SyncRole::Standalone);
+        enrichment.await.unwrap();
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn demotion_quiescence_failure_restores_runtime_and_serve_mapping() {
         let fixture = fixture();
         fixture
@@ -3006,6 +3313,40 @@ mod tests {
         let runtime = restarted.coordinator.runtime.snapshot().await;
         assert!(runtime.hub_listener_running);
         assert!(runtime.outbox_worker_running);
+        restarted.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retry_prepares_home_listener_before_the_public_handshake() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("audetic.db");
+        crate::db::migrate_db_at(&path).unwrap();
+        let tailscale = Arc::new(FakeTailscale::default());
+        let hubs = Arc::new(FakeHubs::default());
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        *hubs.listener_address.lock().unwrap() = Some(address);
+        let service = SyncService::with_dependencies(
+            path.clone(),
+            tailscale.clone(),
+            test_capabilities(hubs.clone()),
+            address,
+        );
+        service.configure(request(SyncRole::HomeHub)).await.unwrap();
+        service.shutdown().await.unwrap();
+
+        let occupied = std::net::TcpListener::bind(address).unwrap();
+        let restarted =
+            SyncService::with_dependencies(path, tailscale, test_capabilities(hubs), address);
+        assert!(!restarted.initialize().await.unwrap().hub_reachable);
+        drop(occupied);
+
+        restarted.retry().await.unwrap();
+
+        let status = restarted.status().await.unwrap();
+        assert!(status.hub_reachable);
+        assert!(status.last_error.is_none());
         restarted.shutdown().await.unwrap();
     }
 
