@@ -160,6 +160,15 @@ impl LibraryChangeFeedRepository {
                        AND o.kind=shared_record_index.kind
                        AND json_type(o.snapshot_json,'$.deleted_at') IS NOT NULL
                    )
+                   AND NOT EXISTS (
+                     SELECT 1
+                     FROM shared_artifacts a
+                     INNER JOIN sync_outbox_items o
+                       ON o.record_id=a.parent_record_id AND o.kind='meeting'
+                     WHERE shared_record_index.kind='artifact'
+                       AND a.record_id=shared_record_index.record_id
+                       AND json_type(o.snapshot_json,'$.deleted_at') IS NOT NULL
+                   )
                  ORDER BY CASE kind WHEN 'dictation' THEN 0 WHEN 'meeting' THEN 1 ELSE 2 END,
                           record_id",
             )?;

@@ -131,6 +131,7 @@ impl HubServer {
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 struct ChangePageQuery {
     /// Last committed cursor already applied by the caller. Use zero to begin.
+    #[param(required = true)]
     after: Option<ChangeCursor>,
     /// Immutable target returned by the first page of this traversal.
     target: Option<ChangeTarget>,
@@ -1641,6 +1642,13 @@ mod tests {
             assert_eq!(parameter["in"], "header", "{name}");
             assert_eq!(parameter["required"], true, "{name}");
         }
+
+        let after = parameters
+            .iter()
+            .find(|parameter| parameter["name"] == "after")
+            .expect("change operation omitted after cursor");
+        assert_eq!(after["in"], "query");
+        assert_eq!(after["required"], true);
 
         assert_eq!(
             operation["responses"]["426"]["content"]["application/json"]["schema"]["$ref"],

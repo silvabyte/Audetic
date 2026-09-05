@@ -17,8 +17,8 @@ use super::protocol::{
     hub_blob_path, hub_payload_path, ChangeCursor, ChangePage, ChangeTarget, DictationPage,
     HubApiError, HubInfo, MeetingPage, MeetingTitlePatch, RecordKind, ServeSpec, SharedMeeting,
     SnapshotBatch, SnapshotBatchResponse, HUB_CHANGES_PATH, HUB_DICTATIONS_PATH, HUB_ID_HEADER,
-    HUB_INFO_PATH, HUB_MEETINGS_PATH, HUB_SNAPSHOTS_PATH, MAX_BLOB_BYTES, PROTOCOL_VERSION,
-    PROTOCOL_VERSION_HEADER,
+    HUB_INFO_PATH, HUB_MEETINGS_PATH, HUB_SNAPSHOTS_PATH, MAX_BLOB_BYTES, MIN_PROTOCOL_VERSION,
+    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
 };
 use super::transport::{
     BlobUpload, DiscoveryFailure, DiscoveryOutcome, HubChangeSource, HubProbe, HubTransferError,
@@ -385,7 +385,7 @@ impl<T: HubTransport> HubClient<T> {
             .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
         let mut headers = BTreeMap::from([(
             PROTOCOL_VERSION_HEADER.to_owned(),
-            PROTOCOL_VERSION.to_string(),
+            MIN_PROTOCOL_VERSION.to_string(),
         )]);
         if let Some(hub_id) = expectation.hub_id {
             headers.insert(HUB_ID_HEADER.to_owned(), hub_id.to_string());
@@ -1845,11 +1845,14 @@ mod tests {
             "https://hub.example.ts.net:8443/audetic/v1/info"
         );
         assert_eq!(requests[0].headers[HUB_ID_HEADER], hub_id.to_string());
-        assert_eq!(requests[0].headers[PROTOCOL_VERSION_HEADER], "2");
+        assert_eq!(
+            requests[0].headers[PROTOCOL_VERSION_HEADER],
+            MIN_PROTOCOL_VERSION.to_string()
+        );
     }
 
     #[tokio::test]
-    async fn protocol_one_only_info_is_rejected_before_any_changes_request() {
+    async fn protocol_one_only_hub_is_discovered_then_rejected_before_any_changes_request() {
         let hub_id = hub_id();
         let transport = FakeTransport::with_responses(vec![info_response_with_protocol(
             hub_id,
@@ -1888,6 +1891,10 @@ mod tests {
         let requests = transport.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url.path(), "/audetic/v1/info");
+        assert_eq!(
+            requests[0].headers[PROTOCOL_VERSION_HEADER],
+            MIN_PROTOCOL_VERSION.to_string()
+        );
         assert!(!requests[0].url.path().ends_with(HUB_CHANGES_PATH));
     }
 

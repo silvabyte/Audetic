@@ -245,8 +245,10 @@ fn populated_v8_database_migrates_once_to_a_complete_replay_feed() {
     const ORIGIN: &str = "10000000-0000-4000-8000-000000000001";
     const DICTATION: &str = "20000000-0000-4000-8000-000000000001";
     const MEETING: &str = "30000000-0000-4000-8000-000000000001";
+    const PENDING_DELETE_MEETING: &str = "30000000-0000-4000-8000-000000000002";
     const LIVE_ARTIFACT: &str = "40000000-0000-4000-8000-000000000001";
     const PENDING_DELETE_ARTIFACT: &str = "40000000-0000-4000-8000-000000000002";
+    const CHILD_OF_PENDING_DELETE_MEETING: &str = "40000000-0000-4000-8000-000000000003";
     const INDEXED_TOMBSTONE: &str = "50000000-0000-4000-8000-000000000001";
     const PREARRIVAL_TOMBSTONE: &str = "50000000-0000-4000-8000-000000000002";
 
@@ -300,8 +302,10 @@ fn populated_v8_database_migrates_once_to_a_complete_replay_feed() {
     };
     insert_index(DICTATION, "dictation", 3, None);
     insert_index(MEETING, "meeting", 5, None);
+    insert_index(PENDING_DELETE_MEETING, "meeting", 2, None);
     insert_index(LIVE_ARTIFACT, "artifact", 2, None);
     insert_index(PENDING_DELETE_ARTIFACT, "artifact", 1, None);
+    insert_index(CHILD_OF_PENDING_DELETE_MEETING, "artifact", 1, None);
     insert_index(
         INDEXED_TOMBSTONE,
         "meeting",
@@ -329,6 +333,17 @@ fn populated_v8_database_migrates_once_to_a_complete_replay_feed() {
         rusqlite::params![MEETING, ORIGIN],
     )
     .unwrap();
+    conn.execute(
+        "INSERT INTO shared_meetings
+            (record_id,origin_device_id,title,title_source,title_version,title_authority,
+             source_filename,transcript_text,duration_seconds,status,source_created_at,
+             source_updated_at,source_completed_at,local_version,authoritative_revision)
+         VALUES(?1,?2,'Pending deletion','manual',1,'hub','pending.wav',
+                'pending deletion transcript',30,'completed','2026-09-05T09:20:00Z',
+                '2026-09-05T09:21:00Z','2026-09-05T09:20:30Z',1,2)",
+        rusqlite::params![PENDING_DELETE_MEETING, ORIGIN],
+    )
+    .unwrap();
     for (record_id, title) in [
         (LIVE_ARTIFACT, "Retained summary"),
         (PENDING_DELETE_ARTIFACT, "Pending deletion"),
@@ -345,6 +360,21 @@ fn populated_v8_database_migrates_once_to_a_complete_replay_feed() {
         )
         .unwrap();
     }
+    conn.execute(
+        "INSERT INTO shared_artifacts
+            (record_id,parent_record_id,origin_device_id,artifact_kind,title,
+             content_markdown,source_created_at,source_updated_at,source_completed_at,
+             local_version,authoritative_revision)
+         VALUES(?1,?2,?3,'summary','Orphan candidate','# Must not migrate',
+                '2026-09-05T09:22:00Z','2026-09-05T09:23:00Z',
+                '2026-09-05T09:23:00Z',1,1)",
+        rusqlite::params![
+            CHILD_OF_PENDING_DELETE_MEETING,
+            PENDING_DELETE_MEETING,
+            ORIGIN
+        ],
+    )
+    .unwrap();
 
     let payload_bytes = b"genuine v8 payload";
     let checksum = format!("{:x}", sha2::Sha256::digest(payload_bytes));
@@ -409,9 +439,28 @@ fn populated_v8_database_migrates_once_to_a_complete_replay_feed() {
         ],
     )
     .unwrap();
+    let pending_meeting_delete =
+        crate::sync::protocol::Snapshot::Delete(crate::sync::protocol::DeleteSnapshot {
+            kind: crate::sync::protocol::RecordKind::Meeting,
+            schema_version: 1,
+            record_id: PENDING_DELETE_MEETING.parse().unwrap(),
+            origin_device_id: ORIGIN.parse().unwrap(),
+            local_version: 2,
+            deleted_at: "2026-09-05T11:11:00Z".into(),
+        });
+    conn.execute(
+        "INSERT INTO sync_outbox_items
+            (record_id,kind,local_version,snapshot_json,state)
+         VALUES(?1,'meeting',2,?2,'pending')",
+        rusqlite::params![
+            PENDING_DELETE_MEETING,
+            serde_json::to_string(&pending_meeting_delete).unwrap()
+        ],
+    )
+    .unwrap();
     drop(conn);
 
-    let conn = super::migrate_db_at(&db_path).unwrap();
+    let mut conn = super::migrate_db_at(&db_path).unwrap();
     let first_feed_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM shared_library_change_feed_v1",
@@ -452,7 +501,29 @@ fn populated_v8_database_migrates_once_to_a_complete_replay_feed() {
             .all(|change| { change.record_id.to_string() != PENDING_DELETE_ARTIFACT }),
         "a locally deleted artifact awaiting Hub acceptance was seeded as live"
     );
+    for omitted in [PENDING_DELETE_MEETING, CHILD_OF_PENDING_DELETE_MEETING] {
+        assert!(
+            page.changes
+                .iter()
+                .all(|change| change.record_id.to_string() != omitted),
+            "record beneath a pending meeting deletion was seeded as live: {omitted}"
+        );
+    }
     assert_eq!(page.changes.len(), 5);
+
+    let source = audetic_core::sync::HubId::new();
+    let generation = super::library_cache::LibraryCacheStore::begin_generation(
+        &mut conn,
+        source,
+        audetic_core::sync::CacheLevel::TextForOfflineUse,
+        crate::sync::protocol::ChangeCursor::ZERO,
+        page.target_cursor,
+    )
+    .unwrap();
+    super::library_cache::LibraryCacheStore::apply_validated_page(
+        &mut conn, source, generation, &page,
+    )
+    .unwrap();
 
     let dictation = page
         .changes

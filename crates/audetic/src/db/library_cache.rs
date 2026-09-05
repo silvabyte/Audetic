@@ -159,18 +159,15 @@ impl LibraryCacheStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("starting cache generation")?;
         ensure_source(&tx, source_hub_id)?;
-        let traversal: (Option<i64>, bool) = tx.query_row(
-            "SELECT s.live_target_cursor,
-                    EXISTS(SELECT 1 FROM library_cache_generations g
-                           WHERE g.source_hub_id=s.source_hub_id AND g.active=0)
-             FROM library_cache_sources s WHERE s.source_hub_id=?1",
+        let generation_in_progress: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM library_cache_generations
+                WHERE source_hub_id=?1 AND active=0
+             )",
             [source_hub_id.to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| row.get(0),
         )?;
-        if traversal.0.is_some() {
-            bail!("a Live Only traversal is already in progress for this source Hub");
-        }
-        if traversal.1 {
+        if generation_in_progress {
             bail!("a cache generation is already in progress for this source Hub");
         }
         let saved_cursor = Self::source_cursor(&tx, source_hub_id)?;
@@ -193,6 +190,12 @@ impl LibraryCacheStore {
             }
             Some(active.id)
         };
+        tx.execute(
+            "UPDATE library_cache_sources
+             SET live_target_cursor=NULL,updated_at=CURRENT_TIMESTAMP
+             WHERE source_hub_id=?1",
+            [source_hub_id.to_string()],
+        )?;
         tx.execute(
             "INSERT INTO library_cache_generations
                 (source_hub_id,cache_level,start_cursor,target_cursor,applied_cursor)
@@ -261,6 +264,28 @@ impl LibraryCacheStore {
         Ok(ChangeCursor::new(
             u64::try_from(cursor).context("negative source cache cursor")?,
         ))
+    }
+
+    pub fn live_traversal_target(
+        conn: &Connection,
+        source_hub_id: HubId,
+    ) -> Result<Option<ChangeTarget>> {
+        let target = conn
+            .query_row(
+                "SELECT live_target_cursor FROM library_cache_sources WHERE source_hub_id=?1",
+                [source_hub_id.to_string()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .context("reading source-scoped Live Only target")?
+            .flatten();
+        target
+            .map(|target| {
+                Ok(ChangeTarget::new(ChangeCursor::new(
+                    u64::try_from(target).context("negative Live Only target")?,
+                )))
+            })
+            .transpose()
     }
 
     pub fn apply_validated_page(
@@ -361,7 +386,8 @@ impl LibraryCacheStore {
         )?;
         tx.execute(
             "UPDATE library_cache_sources
-             SET change_cursor=MAX(change_cursor,?2),updated_at=CURRENT_TIMESTAMP
+             SET change_cursor=MAX(change_cursor,?2),live_target_cursor=NULL,
+                 updated_at=CURRENT_TIMESTAMP
              WHERE source_hub_id=?1",
             params![
                 source_hub_id.to_string(),
@@ -394,10 +420,6 @@ impl LibraryCacheStore {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         let saved = ChangeCursor::new(u64::try_from(saved).context("negative live cursor")?);
-        if duplicate_live_page(&tx, source_hub_id, page, &hash)? {
-            tx.commit()?;
-            return Ok(ApplyPageOutcome::Duplicate);
-        }
         let full_generation_in_progress: bool = tx.query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM library_cache_generations
@@ -408,6 +430,10 @@ impl LibraryCacheStore {
         )?;
         if full_generation_in_progress {
             bail!("a full Library Cache generation is already in progress for this source Hub");
+        }
+        if duplicate_live_page(&tx, source_hub_id, page, &hash)? {
+            tx.commit()?;
+            return Ok(ApplyPageOutcome::Duplicate);
         }
         if page.after_cursor != saved {
             bail!("Live Only page has a gap or inconsistent overlap");
@@ -2625,7 +2651,7 @@ mod tests {
     }
 
     #[test]
-    fn live_only_traversal_blocks_full_generation_after_reopen() {
+    fn full_generation_supersedes_stale_live_only_traversal_after_reopen() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("cache.db");
         let source = HubId::new();
@@ -2650,12 +2676,36 @@ mod tests {
         }
 
         let mut reopened = crate::db::open_db_at(&db_path).unwrap();
-        assert!(LibraryCacheStore::begin_generation(
+        assert_eq!(
+            LibraryCacheStore::live_traversal_target(&reopened, source).unwrap(),
+            Some(ChangeTarget::new(ChangeCursor::new(2)))
+        );
+        LibraryCacheStore::begin_generation(
             &mut reopened,
             source,
             CacheLevel::TextForOfflineUse,
             ChangeCursor::ZERO,
             ChangeTarget::new(ChangeCursor::new(2)),
+        )
+        .unwrap();
+        assert_eq!(
+            LibraryCacheStore::live_traversal_target(&reopened, source).unwrap(),
+            None
+        );
+        assert!(LibraryCacheStore::apply_live_only_page(
+            &mut reopened,
+            source,
+            &page(
+                1,
+                2,
+                vec![dictation_change(
+                    2,
+                    RecordId::new(),
+                    DeviceId::new(),
+                    1,
+                    "stale live worker",
+                )],
+            ),
         )
         .is_err());
     }
