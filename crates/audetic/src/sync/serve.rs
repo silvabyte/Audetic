@@ -61,14 +61,14 @@ impl HomeHubNetwork {
         &self.owner_login
     }
 
-    pub fn connection(&self, hub_id: HubId, owner_login: &str) -> HubConnection {
+    pub fn connection(&self, hub_id: HubId) -> HubConnection {
         HubConnection {
             base_url: format!(
                 "https://{}:{TAILSCALE_HTTPS_PORT}{HUB_API_MOUNT_PATH}",
                 self.dns_name
             ),
             hub_id,
-            owner_login: owner_login.to_owned(),
+            owner_login: self.owner_login.clone(),
         }
     }
 }

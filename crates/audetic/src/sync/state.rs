@@ -4,7 +4,7 @@
 //! Serve ownership, and authority-scoped outbox resets. Callers receive one
 //! coherent snapshot and commit role changes with an epoch compare-and-set.
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use audetic_core::sync::{DeviceId, HubId, SyncRole};
 use thiserror::Error;
 
@@ -15,26 +15,26 @@ use crate::db::sync_serve::{SyncServeOwnership, SyncServeRepository};
 use crate::db::sync_settings::{SyncSettings, SyncSettingsRepository};
 
 #[derive(Clone, Debug)]
-pub struct InstallationSnapshot {
-    pub identity: SyncIdentity,
-    pub settings: SyncSettings,
-    pub serve_ownership: Option<SyncServeOwnership>,
-    pub role_epoch: u64,
+pub(super) struct InstallationSnapshot {
+    pub(super) identity: SyncIdentity,
+    pub(super) settings: SyncSettings,
+    pub(super) serve_ownership: Option<SyncServeOwnership>,
+    pub(super) role_epoch: u64,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CommitEffects {
-    pub role_epoch: u64,
-    pub obsolete_staged_paths: Vec<PathBuf>,
+pub(super) struct CommitEffects {
+    pub(super) role_epoch: u64,
+    pub(super) obsolete_staged_paths: Vec<PathBuf>,
 }
 
-pub struct HomeHubCommit<'a> {
-    pub settings: &'a SyncSettings,
-    pub hub_id: HubId,
-    pub owner_login: &'a str,
-    pub local_device_id: DeviceId,
-    pub reset_destination: bool,
-    pub ownership: &'a SyncServeOwnership,
+pub(super) struct HomeHubCommit<'a> {
+    pub(super) settings: &'a SyncSettings,
+    pub(super) hub_id: HubId,
+    pub(super) owner_login: &'a str,
+    pub(super) local_device_id: DeviceId,
+    pub(super) reset_destination: bool,
+    pub(super) ownership: &'a SyncServeOwnership,
 }
 
 #[derive(Debug, Error)]
@@ -44,21 +44,37 @@ pub struct EpochMismatch {
     pub actual: u64,
 }
 
+#[derive(Debug, Error)]
+pub enum StateError {
+    #[error(transparent)]
+    EpochMismatch(#[from] EpochMismatch),
+    #[error("sync persistence failed: {0}")]
+    Storage(#[source] anyhow::Error),
+}
+
+impl From<anyhow::Error> for StateError {
+    fn from(error: anyhow::Error) -> Self {
+        Self::Storage(error)
+    }
+}
+
+type StateResult<T> = Result<T, StateError>;
+
 #[derive(Clone)]
-pub struct InstallationState {
+pub(super) struct InstallationState {
     db_path: PathBuf,
 }
 
 impl InstallationState {
-    pub fn new(db_path: PathBuf) -> Self {
+    pub(super) fn new(db_path: PathBuf) -> Self {
         Self { db_path }
     }
 
-    pub fn db_path(&self) -> &Path {
+    pub(super) fn db_path(&self) -> &Path {
         &self.db_path
     }
 
-    pub fn load(&self) -> Result<InstallationSnapshot> {
+    pub(super) fn load(&self) -> StateResult<InstallationSnapshot> {
         let mut conn = self.open()?;
         let transaction = conn
             .transaction()
@@ -78,11 +94,11 @@ impl InstallationState {
         })
     }
 
-    pub fn commit_home_hub(
+    pub(super) fn commit_home_hub(
         &self,
         expected_epoch: u64,
         command: HomeHubCommit<'_>,
-    ) -> Result<CommitEffects> {
+    ) -> StateResult<CommitEffects> {
         debug_assert_eq!(command.settings.role, SyncRole::HomeHub);
         self.commit(expected_epoch, |transaction| {
             SyncIdentityRepository::save_hub(transaction, command.hub_id, command.owner_login)?;
@@ -99,13 +115,13 @@ impl InstallationState {
         })
     }
 
-    pub fn commit_connected_device(
+    pub(super) fn commit_connected_device(
         &self,
         expected_epoch: u64,
         settings: &SyncSettings,
         local_device_id: DeviceId,
         reset_destination: bool,
-    ) -> Result<CommitEffects> {
+    ) -> StateResult<CommitEffects> {
         debug_assert_eq!(settings.role, SyncRole::ConnectedDevice);
         self.commit(expected_epoch, |transaction| {
             SyncSettingsRepository::save(transaction, settings)?;
@@ -120,11 +136,11 @@ impl InstallationState {
         })
     }
 
-    pub fn commit_standalone(
+    pub(super) fn commit_standalone(
         &self,
         expected_epoch: u64,
         settings: &SyncSettings,
-    ) -> Result<CommitEffects> {
+    ) -> StateResult<CommitEffects> {
         debug_assert_eq!(settings.role, SyncRole::Standalone);
         self.commit(expected_epoch, |transaction| {
             SyncSettingsRepository::save(transaction, settings)?;
@@ -133,11 +149,11 @@ impl InstallationState {
         })
     }
 
-    pub fn commit_payload_policy(
+    pub(super) fn commit_payload_policy(
         &self,
         expected_epoch: u64,
         enabled: bool,
-    ) -> Result<CommitEffects> {
+    ) -> StateResult<CommitEffects> {
         self.commit(expected_epoch, |transaction| {
             SyncSettingsRepository::update_payload_policy(transaction, enabled)?;
             if enabled {
@@ -151,26 +167,34 @@ impl InstallationState {
         })
     }
 
-    pub fn record_contact(&self, expected_epoch: u64) -> Result<bool> {
+    pub(super) fn record_contact(&self, expected_epoch: u64) -> StateResult<bool> {
         let conn = self.open()?;
-        SyncSettingsRepository::record_contact(
+        Ok(SyncSettingsRepository::record_contact(
             &conn,
             expected_epoch,
             &chrono::Utc::now().to_rfc3339(),
-        )
+        )?)
     }
 
-    pub fn record_error(&self, expected_epoch: u64, error: Option<&str>) -> Result<bool> {
+    pub(super) fn record_error(
+        &self,
+        expected_epoch: u64,
+        error: Option<&str>,
+    ) -> StateResult<bool> {
         let conn = self.open()?;
-        SyncSettingsRepository::record_error(&conn, expected_epoch, error)
+        Ok(SyncSettingsRepository::record_error(
+            &conn,
+            expected_epoch,
+            error,
+        )?)
     }
 
-    pub fn observe_contact(
+    pub(super) fn observe_contact(
         &self,
         expected_epoch: u64,
         reachable: bool,
         error: Option<&str>,
-    ) -> Result<bool> {
+    ) -> StateResult<bool> {
         if reachable {
             self.record_contact(expected_epoch)
         } else if let Some(error) = error {
@@ -180,32 +204,34 @@ impl InstallationState {
         }
     }
 
-    pub fn epoch_is_current(&self, expected_epoch: u64) -> Result<bool> {
+    pub(super) fn epoch_is_current(&self, expected_epoch: u64) -> StateResult<bool> {
         let conn = self.open()?;
         Ok(SyncSettingsRepository::role_epoch(&conn)? == expected_epoch)
     }
 
-    pub fn reclaim_obsolete_staged_paths(
+    pub(super) fn reclaim_obsolete_staged_paths(
         &self,
         expected_epoch: u64,
         paths: &[PathBuf],
-    ) -> Result<bool> {
+    ) -> StateResult<bool> {
         if paths.is_empty() {
             return Ok(true);
         }
         let conn = self.open()?;
-        crate::db::sync_outbox::SyncOutboxRepository::reclaim_staged_paths_for_epoch(
-            &conn,
-            expected_epoch,
-            paths,
+        Ok(
+            crate::db::sync_outbox::SyncOutboxRepository::reclaim_staged_paths_for_epoch(
+                &conn,
+                expected_epoch,
+                paths,
+            )?,
         )
     }
 
     fn commit(
         &self,
         expected_epoch: u64,
-        apply: impl FnOnce(&rusqlite::Connection) -> Result<Vec<PathBuf>>,
-    ) -> Result<CommitEffects> {
+        apply: impl FnOnce(&rusqlite::Connection) -> anyhow::Result<Vec<PathBuf>>,
+    ) -> StateResult<CommitEffects> {
         let mut conn = self.open()?;
         let transaction = conn
             .transaction()
@@ -217,11 +243,10 @@ impl InstallationState {
             Some(epoch) => epoch,
             None => {
                 let actual = SyncSettingsRepository::role_epoch(&transaction)?;
-                return Err(EpochMismatch {
+                return Err(StateError::EpochMismatch(EpochMismatch {
                     expected: expected_epoch,
                     actual,
-                }
-                .into());
+                }));
             }
         };
         let obsolete_staged_paths = apply(&transaction)?;
@@ -234,8 +259,10 @@ impl InstallationState {
         })
     }
 
-    fn open(&self) -> Result<rusqlite::Connection> {
-        crate::db::open_db_at(&self.db_path).context("opening sync database")
+    fn open(&self) -> StateResult<rusqlite::Connection> {
+        crate::db::open_db_at(&self.db_path)
+            .context("opening sync database")
+            .map_err(StateError::Storage)
     }
 }
 
@@ -263,7 +290,10 @@ mod tests {
         let error = state
             .commit_standalone(initial.role_epoch, &settings)
             .unwrap_err();
-        let mismatch = error.downcast_ref::<EpochMismatch>().unwrap();
+        assert!(matches!(error, StateError::EpochMismatch(_)));
+        let StateError::EpochMismatch(mismatch) = error else {
+            return;
+        };
         assert_eq!(mismatch.expected, initial.role_epoch);
         assert_eq!(mismatch.actual, committed.role_epoch);
     }

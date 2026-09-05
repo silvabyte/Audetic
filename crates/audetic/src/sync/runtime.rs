@@ -10,6 +10,8 @@ use tokio_util::sync::CancellationToken;
 use std::fs::{File, OpenOptions};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use super::library::HubLibrary;
@@ -18,8 +20,23 @@ use super::server::{HubServer, HubServerConfig};
 use super::state::InstallationState;
 use super::transport::HubCapabilities;
 
+/// Opaque identity for one committed role generation. Runtime observations can
+/// only be applied with a token issued for that generation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct RoleVersion(u64);
+
+impl RoleVersion {
+    pub(super) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub(super) const fn value(self) -> u64 {
+        self.0
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum RuntimeSpec {
+pub(super) enum RuntimeSpec {
     Standalone {
         role_epoch: u64,
     },
@@ -38,7 +55,7 @@ pub enum RuntimeSpec {
 }
 
 impl RuntimeSpec {
-    pub const fn role(&self) -> SyncRole {
+    pub(super) const fn role(&self) -> SyncRole {
         match self {
             Self::Standalone { .. } => SyncRole::Standalone,
             Self::HomeHub { .. } => SyncRole::HomeHub,
@@ -46,19 +63,19 @@ impl RuntimeSpec {
         }
     }
 
-    pub const fn role_epoch(&self) -> u64 {
+    pub(super) const fn role_version(&self) -> RoleVersion {
         match self {
             Self::Standalone { role_epoch }
             | Self::HomeHub { role_epoch, .. }
-            | Self::ConnectedDevice { role_epoch, .. } => *role_epoch,
+            | Self::ConnectedDevice { role_epoch, .. } => RoleVersion::new(*role_epoch),
         }
     }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RuntimeSnapshot {
+pub(super) struct RuntimeSnapshot {
     pub role: Option<SyncRole>,
-    pub role_epoch: Option<u64>,
+    pub(super) role_version: Option<RoleVersion>,
     pub hub_listener_running: bool,
     pub outbox_worker_running: bool,
     pub hub_reachable: bool,
@@ -69,31 +86,36 @@ pub struct RuntimeSnapshot {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RuntimeTransition {
+pub(super) struct RuntimeTransition {
     id: u64,
 }
 
 #[derive(Clone, Debug)]
-pub struct PersistedTransition {
-    pub transition: RuntimeTransition,
-    pub listener_error: Option<String>,
+pub(super) struct PersistedTransition {
+    pub(super) transition: RuntimeTransition,
+    pub(super) listener_error: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ActivationOutcome {
-    Healthy,
-    Degraded { listener_error: String },
+pub(super) enum ActivationOutcome {
+    Healthy {
+        role_version: RoleVersion,
+    },
+    Degraded {
+        role_version: RoleVersion,
+        listener_error: String,
+    },
 }
 
 impl ActivationOutcome {
-    pub const fn is_healthy(&self) -> bool {
-        matches!(self, Self::Healthy)
+    pub(super) const fn is_healthy(&self) -> bool {
+        matches!(self, Self::Healthy { .. })
     }
 
-    pub fn listener_error(&self) -> Option<&str> {
+    pub(super) fn listener_error(&self) -> Option<&str> {
         match self {
-            Self::Healthy => None,
-            Self::Degraded { listener_error } => Some(listener_error),
+            Self::Healthy { .. } => None,
+            Self::Degraded { listener_error, .. } => Some(listener_error),
         }
     }
 }
@@ -362,6 +384,10 @@ struct RuntimeShared {
     inner: Mutex<RuntimeInner>,
     #[cfg(test)]
     shutdown_pause: StdMutex<Option<ShutdownPause>>,
+    #[cfg(test)]
+    fail_next_quiesce: AtomicBool,
+    #[cfg(test)]
+    quiesce_pause: StdMutex<Option<ShutdownPause>>,
 }
 
 #[cfg(test)]
@@ -373,12 +399,12 @@ struct ShutdownPause {
 
 /// Owns the process lease plus every active and provisional sync resource.
 #[derive(Clone)]
-pub struct RuntimeSet {
+pub(super) struct RuntimeSet {
     shared: Arc<RuntimeShared>,
 }
 
 impl RuntimeSet {
-    pub fn new(
+    pub(super) fn new(
         state: InstallationState,
         hub_capabilities: HubCapabilities,
         hub_bind_address: SocketAddr,
@@ -397,11 +423,15 @@ impl RuntimeSet {
                 }),
                 #[cfg(test)]
                 shutdown_pause: StdMutex::new(None),
+                #[cfg(test)]
+                fail_next_quiesce: AtomicBool::new(false),
+                #[cfg(test)]
+                quiesce_pause: StdMutex::new(None),
             }),
         }
     }
 
-    pub async fn acquire_ownership(&self) -> Result<(), RuntimeError> {
+    pub(super) async fn acquire_ownership(&self) -> Result<(), RuntimeError> {
         {
             let inner = self.shared.inner.lock().await;
             if inner.shut_down {
@@ -425,21 +455,21 @@ impl RuntimeSet {
         Ok(())
     }
 
-    pub async fn release_ownership_if_idle(&self) {
+    pub(super) async fn release_ownership_if_idle(&self) {
         let mut inner = self.shared.inner.lock().await;
         if inner.active.is_none() && inner.provisional.is_none() {
             inner.lease.take();
         }
     }
 
-    pub async fn begin_transition(
+    pub(super) async fn begin_transition(
         &self,
         spec: RuntimeSpec,
     ) -> Result<RuntimeTransition, RuntimeError> {
         self.begin(spec, false).await.map(|value| value.transition)
     }
 
-    pub async fn begin_persisted_restore(
+    pub(super) async fn begin_persisted_restore(
         &self,
         spec: RuntimeSpec,
     ) -> Result<PersistedTransition, RuntimeError> {
@@ -451,19 +481,33 @@ impl RuntimeSet {
         spec: RuntimeSpec,
         allow_degraded_listener: bool,
     ) -> Result<PersistedTransition, RuntimeError> {
-        let mut inner = self.shared.inner.lock().await;
-        Self::ensure_available(&inner)?;
-        if inner.provisional.is_some() {
-            return Err(RuntimeError::Invariant(
-                "a sync runtime transition is already in progress".into(),
-            ));
-        }
-        let reuse_active_hub = !allow_degraded_listener
-            && matches!(spec, RuntimeSpec::HomeHub { .. })
-            && inner.active.as_ref().is_some_and(|active| {
-                active.spec.role() == SyncRole::HomeHub
-                    && active.hub.as_ref().is_some_and(HubRuntime::is_running)
-            });
+        // Phase one only inspects the generation we intend to replace. Binding
+        // and worker construction happen without the lifecycle mutex.
+        let (id, reuse_active_hub, observed_version) = {
+            let mut inner = self.shared.inner.lock().await;
+            Self::ensure_available(&inner)?;
+            if inner.provisional.is_some() {
+                return Err(RuntimeError::Invariant(
+                    "a sync runtime transition is already in progress".into(),
+                ));
+            }
+            let reuse_active_hub = !allow_degraded_listener
+                && matches!(spec, RuntimeSpec::HomeHub { .. })
+                && inner.active.as_ref().is_some_and(|active| {
+                    active.spec.role() == SyncRole::HomeHub
+                        && active.hub.as_ref().is_some_and(HubRuntime::is_running)
+                });
+            let id = inner.next_transition_id;
+            inner.next_transition_id = inner.next_transition_id.wrapping_add(1).max(1);
+            (
+                id,
+                reuse_active_hub,
+                inner
+                    .active
+                    .as_ref()
+                    .map(|active| active.spec.role_version()),
+            )
+        };
         let (hub, listener_error) =
             if matches!(spec, RuntimeSpec::HomeHub { .. }) && !reuse_active_hub {
                 match self.prepare_hub(&spec).await {
@@ -479,8 +523,49 @@ impl RuntimeSet {
         } else {
             Some(self.prepare_outbox(&spec)?)
         };
-        let id = inner.next_transition_id;
-        inner.next_transition_id = inner.next_transition_id.wrapping_add(1).max(1);
+        // Phase two validates that shutdown or another owner did not change the
+        // runtime while slow resources were being prepared.
+        let mut inner = self.shared.inner.lock().await;
+        if let Err(error) = Self::ensure_available(&inner) {
+            drop(inner);
+            ProvisionalRuntime {
+                id,
+                spec,
+                hub,
+                outbox,
+                reuse_active_hub,
+                allow_degraded_listener,
+                listener_error,
+                worker_quiesced: false,
+            }
+            .stop()
+            .await;
+            return Err(error);
+        }
+        if inner.provisional.is_some()
+            || inner
+                .active
+                .as_ref()
+                .map(|active| active.spec.role_version())
+                != observed_version
+        {
+            drop(inner);
+            ProvisionalRuntime {
+                id,
+                spec,
+                hub,
+                outbox,
+                reuse_active_hub,
+                allow_degraded_listener,
+                listener_error,
+                worker_quiesced: false,
+            }
+            .stop()
+            .await;
+            return Err(RuntimeError::Invariant(
+                "runtime changed while preparing its transition".into(),
+            ));
+        }
         inner.provisional = Some(ProvisionalRuntime {
             id,
             spec,
@@ -497,24 +582,36 @@ impl RuntimeSet {
         })
     }
 
-    pub async fn quiesce_current_worker(
+    pub(super) async fn quiesce_current_worker(
         &self,
         transition: RuntimeTransition,
     ) -> Result<(), RuntimeError> {
-        let mut inner = self.shared.inner.lock().await;
-        Self::ensure_available(&inner)?;
-        Self::provisional(&inner, transition)?;
-        let outbox = inner
-            .active
-            .as_mut()
-            .and_then(|active| active.outbox.take());
+        let outbox = {
+            let mut inner = self.shared.inner.lock().await;
+            Self::ensure_available(&inner)?;
+            Self::provisional(&inner, transition)?;
+            let outbox = inner
+                .active
+                .as_mut()
+                .and_then(|active| active.outbox.take());
+            if outbox.is_some() {
+                Self::provisional_mut(&mut inner, transition)?.worker_quiesced = true;
+            }
+            outbox
+        };
         if let Some(outbox) = outbox {
-            let provisional = inner.provisional.as_mut().ok_or_else(|| {
-                RuntimeError::Invariant("validated provisional runtime disappeared".into())
-            })?;
-            provisional.worker_quiesced = true;
+            #[cfg(test)]
+            self.pause_quiesce_before_join().await;
             outbox.stop().await;
         }
+        #[cfg(test)]
+        if self.shared.fail_next_quiesce.swap(false, Ordering::SeqCst) {
+            return Err(RuntimeError::Invariant(
+                "injected worker quiescence failure".into(),
+            ));
+        }
+        let inner = self.shared.inner.lock().await;
+        Self::ensure_available(&inner)?;
         let provisional = Self::provisional(&inner, transition)?;
         if provisional.spec.role() == SyncRole::HomeHub {
             let hub = if provisional.reuse_active_hub {
@@ -530,7 +627,7 @@ impl RuntimeSet {
         Ok(())
     }
 
-    pub async fn validate_transition(
+    pub(super) async fn validate_transition(
         &self,
         transition: RuntimeTransition,
     ) -> Result<(), RuntimeError> {
@@ -540,26 +637,31 @@ impl RuntimeSet {
         Self::validate_provisional_listener(&inner, provisional)
     }
 
-    pub async fn abort_transition(
+    pub(super) async fn abort_transition(
         &self,
         transition: RuntimeTransition,
     ) -> Result<(), RuntimeError> {
-        let mut inner = self.shared.inner.lock().await;
-        let provisional = Self::take_provisional(&mut inner, transition)?;
-        let restore_spec = provisional.worker_quiesced.then(|| {
-            inner
-                .active
-                .as_ref()
-                .map(|active| active.spec.clone())
-                .ok_or_else(|| RuntimeError::Invariant("quiesced runtime disappeared".into()))
-        });
+        let (provisional, restore_spec) = {
+            let mut inner = self.shared.inner.lock().await;
+            let provisional = Self::take_provisional(&mut inner, transition)?;
+            let restore_spec = provisional.worker_quiesced.then(|| {
+                inner
+                    .active
+                    .as_ref()
+                    .map(|active| active.spec.clone())
+                    .ok_or_else(|| RuntimeError::Invariant("quiesced runtime disappeared".into()))
+            });
+            (provisional, restore_spec)
+        };
         provisional.stop().await;
         if let Some(restore_spec) = restore_spec.transpose()? {
             let outbox = self.prepare_outbox(&restore_spec)?.activate()?;
+            let mut inner = self.shared.inner.lock().await;
             let active = inner.active.as_mut().ok_or_else(|| {
                 RuntimeError::Invariant("runtime disappeared during abort".into())
             })?;
             if active.spec != restore_spec || active.outbox.is_some() {
+                drop(inner);
                 outbox.stop().await;
                 return Err(RuntimeError::Invariant(
                     "runtime changed while aborting its transition".into(),
@@ -570,14 +672,17 @@ impl RuntimeSet {
         Ok(())
     }
 
-    pub async fn commit_transition(
+    pub(super) async fn commit_transition(
         &self,
         transition: RuntimeTransition,
     ) -> Result<ActivationOutcome, RuntimeError> {
-        let mut inner = self.shared.inner.lock().await;
-        Self::ensure_available(&inner)?;
-        let mut provisional = Self::take_provisional(&mut inner, transition)?;
-        let mut previous = inner.active.take();
+        let (mut provisional, mut previous) = {
+            let mut inner = self.shared.inner.lock().await;
+            Self::ensure_available(&inner)?;
+            let provisional = Self::take_provisional(&mut inner, transition)?;
+            let previous = inner.active.take();
+            (provisional, previous)
+        };
         let mut hub = if provisional.spec.role() == SyncRole::HomeHub {
             if provisional.reuse_active_hub {
                 previous.as_mut().and_then(|runtime| runtime.hub.take())
@@ -612,23 +717,39 @@ impl RuntimeSet {
             Some(result) => Some(result?),
             None => None,
         };
-        inner.active = Some(ActiveRuntime {
+        let role_version = provisional.spec.role_version();
+        let active = ActiveRuntime {
             spec: provisional.spec,
             hub,
             outbox,
             hub_reachable: false,
             listener_error: listener_error.clone(),
-        });
+        };
+        {
+            let mut inner = self.shared.inner.lock().await;
+            Self::ensure_available(&inner)?;
+            if inner.active.is_some() || inner.provisional.is_some() {
+                drop(inner);
+                active.stop().await?;
+                return Err(RuntimeError::Invariant(
+                    "runtime changed while activating its transition".into(),
+                ));
+            }
+            inner.active = Some(active);
+        }
         if let Some(previous) = previous {
             previous.stop().await?;
         }
         Ok(match listener_error {
-            Some(listener_error) => ActivationOutcome::Degraded { listener_error },
-            None => ActivationOutcome::Healthy,
+            Some(listener_error) => ActivationOutcome::Degraded {
+                role_version,
+                listener_error,
+            },
+            None => ActivationOutcome::Healthy { role_version },
         })
     }
 
-    pub async fn snapshot(&self) -> RuntimeSnapshot {
+    pub(super) async fn snapshot(&self) -> RuntimeSnapshot {
         let inner = self.shared.inner.lock().await;
         let Some(active) = inner.active.as_ref() else {
             return RuntimeSnapshot {
@@ -644,7 +765,7 @@ impl RuntimeSet {
             .or_else(|| active.hub.as_ref().and_then(HubRuntime::liveness_error));
         RuntimeSnapshot {
             role: Some(active.spec.role()),
-            role_epoch: Some(active.spec.role_epoch()),
+            role_version: Some(active.spec.role_version()),
             hub_listener_running: active.hub.as_ref().is_some_and(HubRuntime::is_running),
             outbox_worker_running: active
                 .outbox
@@ -658,26 +779,31 @@ impl RuntimeSet {
         }
     }
 
-    pub async fn observe_reachability(&self, role_epoch: u64, reachable: bool) -> bool {
+    pub(super) async fn observe_reachability(
+        &self,
+        role_version: RoleVersion,
+        reachable: bool,
+    ) -> bool {
         let mut inner = self.shared.inner.lock().await;
         let Some(active) = inner.active.as_mut() else {
             return false;
         };
-        if active.spec.role_epoch() != role_epoch {
+        if active.spec.role_version() != role_version {
             return false;
         }
         active.hub_reachable = reachable;
         true
     }
 
-    pub async fn shutdown(&self) -> Result<(), RuntimeError> {
-        let mut inner = self.shared.inner.lock().await;
-        if inner.shut_down {
-            return Ok(());
-        }
-        inner.shut_down = true;
-        let mut provisional = inner.provisional.take();
-        let mut active = inner.active.take();
+    pub(super) async fn shutdown(&self) -> Result<(), RuntimeError> {
+        let (mut provisional, mut active) = {
+            let mut inner = self.shared.inner.lock().await;
+            if inner.shut_down {
+                return Ok(());
+            }
+            inner.shut_down = true;
+            (inner.provisional.take(), inner.active.take())
+        };
         if let Some(provisional) = provisional.as_mut() {
             provisional.request_stop();
         }
@@ -694,12 +820,14 @@ impl RuntimeSet {
         } else {
             Ok(())
         };
-        inner.lease.take();
+        self.shared.inner.lock().await.lease.take();
         result
     }
 
     #[cfg(test)]
-    pub fn install_shutdown_pause(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+    pub(super) fn install_shutdown_pause(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
         let entered = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         *self.shared.shutdown_pause.lock().unwrap() = Some(ShutdownPause {
@@ -707,6 +835,38 @@ impl RuntimeSet {
             release: release.clone(),
         });
         (entered, release)
+    }
+
+    #[cfg(test)]
+    pub(super) fn fail_next_quiesce(&self) {
+        self.shared.fail_next_quiesce.store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_quiesce_pause(
+        &self,
+    ) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.shared.quiesce_pause.lock().unwrap() = Some(ShutdownPause {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    async fn pause_quiesce_before_join(&self) {
+        let pause = self
+            .shared
+            .quiesce_pause
+            .lock()
+            .ok()
+            .and_then(|mut pause| pause.take());
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     #[cfg(test)]
@@ -724,39 +884,67 @@ impl RuntimeSet {
     }
 
     #[cfg(test)]
-    pub async fn terminate_provisional_listener(&self) -> Result<(), RuntimeError> {
-        let mut inner = self.shared.inner.lock().await;
-        let provisional = inner
-            .provisional
-            .as_mut()
-            .ok_or_else(|| RuntimeError::Invariant("provisional runtime is missing".into()))?;
-        let hub = provisional
-            .hub
-            .as_mut()
-            .ok_or_else(|| RuntimeError::Invariant("provisional listener is missing".into()))?;
-        if let Some(shutdown) = hub.shutdown.take() {
+    pub(super) async fn terminate_provisional_listener(&self) -> Result<(), RuntimeError> {
+        let shutdown = {
+            let mut inner = self.shared.inner.lock().await;
+            inner
+                .provisional
+                .as_mut()
+                .and_then(|runtime| runtime.hub.as_mut())
+                .ok_or_else(|| RuntimeError::Invariant("provisional listener is missing".into()))?
+                .shutdown
+                .take()
+        };
+        if let Some(shutdown) = shutdown {
             let _ = shutdown.send(());
         }
-        wait_for_listener_exit(hub).await;
+        self.wait_for_listener_exit(true).await;
         Ok(())
     }
 
     #[cfg(test)]
-    pub async fn terminate_active_listener(&self) -> Result<(), RuntimeError> {
-        let mut inner = self.shared.inner.lock().await;
-        let active = inner
-            .active
-            .as_mut()
-            .ok_or_else(|| RuntimeError::Invariant("active runtime is missing".into()))?;
-        let hub = active
-            .hub
-            .as_mut()
-            .ok_or_else(|| RuntimeError::Invariant("active listener is missing".into()))?;
-        if let Some(shutdown) = hub.shutdown.take() {
+    pub(super) async fn terminate_active_listener(&self) -> Result<(), RuntimeError> {
+        let shutdown = {
+            let mut inner = self.shared.inner.lock().await;
+            inner
+                .active
+                .as_mut()
+                .and_then(|runtime| runtime.hub.as_mut())
+                .ok_or_else(|| RuntimeError::Invariant("active listener is missing".into()))?
+                .shutdown
+                .take()
+        };
+        if let Some(shutdown) = shutdown {
             let _ = shutdown.send(());
         }
-        wait_for_listener_exit(hub).await;
+        self.wait_for_listener_exit(false).await;
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn wait_for_listener_exit(&self, provisional: bool) {
+        for _ in 0..100 {
+            let running = {
+                let inner = self.shared.inner.lock().await;
+                if provisional {
+                    inner
+                        .provisional
+                        .as_ref()
+                        .and_then(|runtime| runtime.hub.as_ref())
+                        .is_some_and(HubRuntime::is_running)
+                } else {
+                    inner
+                        .active
+                        .as_ref()
+                        .and_then(|runtime| runtime.hub.as_ref())
+                        .is_some_and(HubRuntime::is_running)
+                }
+            };
+            if !running {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 
     fn ensure_available(inner: &RuntimeInner) -> Result<(), RuntimeError> {
@@ -776,6 +964,17 @@ impl RuntimeSet {
         inner
             .provisional
             .as_ref()
+            .filter(|runtime| runtime.id == transition.id)
+            .ok_or_else(|| RuntimeError::Invariant("runtime transition is no longer active".into()))
+    }
+
+    fn provisional_mut(
+        inner: &mut RuntimeInner,
+        transition: RuntimeTransition,
+    ) -> Result<&mut ProvisionalRuntime, RuntimeError> {
+        inner
+            .provisional
+            .as_mut()
             .filter(|runtime| runtime.id == transition.id)
             .ok_or_else(|| RuntimeError::Invariant("runtime transition is no longer active".into()))
     }
@@ -843,7 +1042,7 @@ impl RuntimeSet {
         };
         let worker = OutboxWorker::new(self.shared.state.db_path().to_path_buf(), destination)
             .with_payload_uploads(upload_recording_payloads)
-            .with_role_epoch(spec.role_epoch());
+            .with_role_epoch(spec.role_version().value());
         let (start, start_receiver) = oneshot::channel();
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
@@ -896,7 +1095,7 @@ impl RuntimeSet {
         let failure = Arc::new(StdMutex::new(None));
         let task_failure = Arc::clone(&failure);
         let state = self.shared.state.clone();
-        let epoch = *role_epoch;
+        let role_version = RoleVersion::new(*role_epoch);
         let task = tokio::spawn(async move {
             let result = server
                 .serve_with_shutdown(listener, async move {
@@ -911,8 +1110,8 @@ impl RuntimeSet {
                 if let Ok(mut failure) = task_failure.lock() {
                     *failure = Some(message.clone());
                 }
-                if let Err(error) = state.record_error(epoch, Some(&message)) {
-                    tracing::warn!(%error, role_epoch = epoch, "failed to record Home Hub listener failure");
+                if let Err(error) = state.record_error(role_version.value(), Some(&message)) {
+                    tracing::warn!(%error, role_version = role_version.value(), "failed to record Home Hub listener failure");
                 }
             }
             result
@@ -928,15 +1127,5 @@ impl RuntimeSet {
             return Err(RuntimeError::Listener(error));
         }
         Ok(runtime)
-    }
-}
-
-#[cfg(test)]
-async fn wait_for_listener_exit(hub: &HubRuntime) {
-    for _ in 0..100 {
-        if !hub.is_running() {
-            return;
-        }
-        tokio::task::yield_now().await;
     }
 }

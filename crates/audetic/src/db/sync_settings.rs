@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use audetic_core::sync::{CacheLevel, HubConnection, HubId, SyncRole};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use std::str::FromStr;
 
@@ -40,12 +40,6 @@ pub struct SyncSettingsRepository;
 impl SyncSettingsRepository {
     /// Read settings, materializing the singleton default on first access.
     pub fn get(conn: &Connection) -> Result<SyncSettings> {
-        conn.execute(
-            "INSERT OR IGNORE INTO sync_settings (singleton) VALUES (1)",
-            [],
-        )
-        .context("Failed to initialize sync settings")?;
-
         let row = conn
             .query_row(
                 "SELECT role, device_name, hub_url, hub_id, hub_owner_login,
@@ -71,7 +65,19 @@ impl SyncSettingsRepository {
                     ))
                 },
             )
+            .optional()
             .context("Failed to read sync settings")?;
+        let row = match row {
+            Some(row) => row,
+            None => {
+                conn.execute(
+                    "INSERT OR IGNORE INTO sync_settings (singleton) VALUES (1)",
+                    [],
+                )
+                .context("Failed to initialize sync settings")?;
+                return Self::get(conn);
+            }
+        };
 
         let role = parse_value::<SyncRole>(&row.0, "role")?;
         let hub = match (row.2, row.3, row.4) {
