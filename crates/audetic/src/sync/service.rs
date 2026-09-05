@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use super::client::NetworkHubAdapter;
 use super::protocol::HUB_LISTENER_ADDRESS;
+use super::runtime::RuntimeDependencies;
 use super::shared_library::SharedLibrary;
 use super::tailscale::{SystemCommandRunner, Tailscale, TailscaleControl};
 use super::transition::RoleCoordinator;
@@ -62,8 +63,29 @@ impl SyncService {
         hub_capabilities: HubCapabilities,
         hub_bind_address: SocketAddr,
     ) -> Self {
-        let coordinator =
-            RoleCoordinator::new(db_path, tailscale, hub_capabilities, hub_bind_address);
+        Self::with_runtime_dependencies(
+            db_path,
+            tailscale,
+            hub_capabilities,
+            hub_bind_address,
+            RuntimeDependencies::default(),
+        )
+    }
+
+    pub(crate) fn with_runtime_dependencies(
+        db_path: PathBuf,
+        tailscale: Arc<dyn TailscaleControl>,
+        hub_capabilities: HubCapabilities,
+        hub_bind_address: SocketAddr,
+        runtime_dependencies: RuntimeDependencies,
+    ) -> Self {
+        let coordinator = RoleCoordinator::new(
+            db_path,
+            tailscale,
+            hub_capabilities,
+            hub_bind_address,
+            runtime_dependencies,
+        );
         let library = SharedLibrary::new(coordinator.clone());
         Self {
             coordinator,

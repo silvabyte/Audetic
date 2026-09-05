@@ -18,7 +18,8 @@ use crate::db::sync_settings::SyncSettings;
 
 use super::client::canonicalize_base_url;
 use super::runtime::{
-    ActivationOutcome, RoleVersion, RuntimeError, RuntimeSet, RuntimeSpec, RuntimeTransition,
+    ActivationOutcome, RoleVersion, RuntimeDependencies, RuntimeError, RuntimeSet, RuntimeSpec,
+    RuntimeTransition,
 };
 use super::serve::{AppliedServe, HomeHubNetwork, RemovedServe, ServeError, ServeManager};
 use super::state::HomeHubCommit;
@@ -302,10 +303,16 @@ impl RoleCoordinator {
         tailscale: Arc<dyn TailscaleControl>,
         hub_capabilities: HubCapabilities,
         hub_bind_address: SocketAddr,
+        runtime_dependencies: RuntimeDependencies,
     ) -> Self {
         let state = InstallationState::new(db_path);
         let serve = ServeManager::new(tailscale);
-        let runtime = RuntimeSet::new(state.clone(), hub_capabilities.clone(), hub_bind_address);
+        let runtime = RuntimeSet::new(
+            state.clone(),
+            hub_capabilities.clone(),
+            hub_bind_address,
+            runtime_dependencies,
+        );
         Self {
             state,
             runtime,

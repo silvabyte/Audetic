@@ -8,17 +8,76 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use std::fs::{File, OpenOptions};
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use super::clock::{SyncClock, SystemSyncClock};
 use super::library::HubLibrary;
+use super::observer::{NoopWorkerObserver, WorkerEvent, WorkerObserver};
 use super::outbox::{OutboxDestination, OutboxWorker};
 use super::server::{HubServer, HubServerConfig};
 use super::state::InstallationState;
 use super::transport::HubCapabilities;
+
+pub(crate) type HubListenerFuture =
+    Pin<Box<dyn Future<Output = Result<(), super::server::HubServerError>> + Send + 'static>>;
+
+#[async_trait::async_trait]
+pub(crate) trait HubRuntimeLauncher: Send + Sync {
+    async fn launch(
+        &self,
+        server: HubServer,
+        bind_address: SocketAddr,
+        shutdown: oneshot::Receiver<()>,
+    ) -> Result<HubListenerFuture, RuntimeError>;
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct TcpHubRuntimeLauncher;
+
+#[async_trait::async_trait]
+impl HubRuntimeLauncher for TcpHubRuntimeLauncher {
+    async fn launch(
+        &self,
+        server: HubServer,
+        bind_address: SocketAddr,
+        shutdown: oneshot::Receiver<()>,
+    ) -> Result<HubListenerFuture, RuntimeError> {
+        if !bind_address.ip().is_loopback() {
+            return Err(RuntimeError::Listener(format!(
+                "non-loopback bind address {bind_address}"
+            )));
+        }
+        let listener = tokio::net::TcpListener::bind(bind_address)
+            .await
+            .map_err(|error| RuntimeError::Listener(error.to_string()))?;
+        Ok(Box::pin(server.serve_with_shutdown(listener, async move {
+            let _ = shutdown.await;
+        })))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RuntimeDependencies {
+    pub launcher: Arc<dyn HubRuntimeLauncher>,
+    pub clock: Arc<dyn SyncClock>,
+    pub observer: Arc<dyn WorkerObserver>,
+}
+
+impl Default for RuntimeDependencies {
+    fn default() -> Self {
+        Self {
+            launcher: Arc::new(TcpHubRuntimeLauncher),
+            clock: Arc::new(SystemSyncClock),
+            observer: Arc::new(NoopWorkerObserver),
+        }
+    }
+}
 
 /// Opaque identity for one committed role generation. Runtime observations can
 /// only be applied with a token issued for that generation.
@@ -441,6 +500,7 @@ struct RuntimeShared {
     state: InstallationState,
     hub_capabilities: HubCapabilities,
     hub_bind_address: SocketAddr,
+    dependencies: RuntimeDependencies,
     inner: Mutex<RuntimeInner>,
     #[cfg(test)]
     shutdown_pause: StdMutex<Option<ShutdownPause>>,
@@ -468,12 +528,14 @@ impl RuntimeSet {
         state: InstallationState,
         hub_capabilities: HubCapabilities,
         hub_bind_address: SocketAddr,
+        dependencies: RuntimeDependencies,
     ) -> Self {
         Self {
             shared: Arc::new(RuntimeShared {
                 state,
                 hub_capabilities,
                 hub_bind_address,
+                dependencies,
                 inner: Mutex::new(RuntimeInner {
                     lease: None,
                     active: None,
@@ -1119,7 +1181,9 @@ impl RuntimeSet {
         };
         let worker = OutboxWorker::new(self.shared.state.db_path().to_path_buf(), destination)
             .with_payload_uploads(upload_recording_payloads)
-            .with_role_epoch(spec.role_version().value());
+            .with_role_epoch(spec.role_version().value())
+            .with_clock(Arc::clone(&self.shared.dependencies.clock))
+            .with_observer(Arc::clone(&self.shared.dependencies.observer));
         let (start, start_receiver) = oneshot::channel();
         let cancellation = CancellationToken::new();
         let worker_cancellation = cancellation.clone();
@@ -1150,15 +1214,6 @@ impl RuntimeSet {
                 "only a Home Hub can prepare a listener".into(),
             ));
         };
-        if !self.shared.hub_bind_address.ip().is_loopback() {
-            return Err(RuntimeError::Listener(format!(
-                "non-loopback bind address {}",
-                self.shared.hub_bind_address
-            )));
-        }
-        let listener = tokio::net::TcpListener::bind(self.shared.hub_bind_address)
-            .await
-            .map_err(|error| RuntimeError::Listener(error.to_string()))?;
         let mut config = HubServerConfig::new(*hub_id, owner_login)
             .map_err(|error| RuntimeError::Listener(error.to_string()))?
             .with_library(HubLibrary::new(self.shared.state.db_path().to_path_buf()));
@@ -1167,18 +1222,23 @@ impl RuntimeSet {
         }
         let server = HubServer::new(config);
         let (shutdown, receiver) = oneshot::channel();
+        let listener = self
+            .shared
+            .dependencies
+            .launcher
+            .launch(server, self.shared.hub_bind_address, receiver)
+            .await?;
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let failure = Arc::new(StdMutex::new(None));
         let task_failure = Arc::clone(&failure);
         let state = self.shared.state.clone();
+        let observer = Arc::clone(&self.shared.dependencies.observer);
         let role_version = RoleVersion::new(*role_epoch);
         let task = tokio::spawn(async move {
-            let result = server
-                .serve_with_shutdown(listener, async move {
-                    let _ = receiver.await;
-                })
-                .await;
+            observer.observe(WorkerEvent::ListenerStarted);
+            let result = listener.await;
+            observer.observe(WorkerEvent::ListenerStopped);
             if !task_cancellation.is_cancelled() {
                 let message = match &result {
                     Ok(()) => "Home Hub listener terminated unexpectedly".to_owned(),

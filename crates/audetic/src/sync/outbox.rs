@@ -8,7 +8,9 @@ use std::time::Duration;
 
 use crate::db::sync_outbox::{OutboxBlob, OutboxItem, SyncOutboxRepository};
 
+use super::clock::{SyncClock, SystemSyncClock};
 use super::library::HubLibrary;
+use super::observer::{NoopWorkerObserver, WorkerEvent, WorkerObserver};
 use super::protocol::{SnapshotBatch, SnapshotDisposition};
 use super::transport::{BlobUpload, HubTransferError, ReplicationTransport};
 
@@ -20,14 +22,13 @@ const MAX_RETRY_DELAY_SECONDS: i64 = 300;
 const MAX_RETRY_AFTER_SECONDS: i64 = 60 * 60;
 
 type RetryJitter = fn(&OutboxItem) -> u64;
-type SchedulingClock = fn() -> chrono::DateTime<chrono::Utc>;
-
 pub struct OutboxWorker {
     db_path: PathBuf,
     destination: OutboxDestination,
     worker_id: String,
     retry_jitter: RetryJitter,
-    scheduling_clock: SchedulingClock,
+    clock: Arc<dyn SyncClock>,
+    observer: Arc<dyn WorkerObserver>,
     upload_recording_payloads: bool,
     role_epoch: u64,
 }
@@ -56,7 +57,8 @@ impl OutboxWorker {
             destination,
             worker_id: format!("outbox-{}", uuid::Uuid::new_v4()),
             retry_jitter: record_retry_jitter,
-            scheduling_clock: chrono::Utc::now,
+            clock: Arc::new(SystemSyncClock),
+            observer: Arc::new(NoopWorkerObserver),
             upload_recording_payloads: true,
             role_epoch: 0,
         }
@@ -79,17 +81,35 @@ impl OutboxWorker {
     }
 
     #[cfg(test)]
-    fn with_scheduling_clock(mut self, scheduling_clock: SchedulingClock) -> Self {
-        self.scheduling_clock = scheduling_clock;
+    fn with_scheduling_clock(
+        self,
+        scheduling_clock: fn() -> chrono::DateTime<chrono::Utc>,
+    ) -> Self {
+        self.with_clock(Arc::new(TestSchedulingClock(scheduling_clock)))
+    }
+
+    pub(crate) fn with_clock(mut self, clock: Arc<dyn SyncClock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub(crate) fn with_observer(mut self, observer: Arc<dyn WorkerObserver>) -> Self {
+        self.observer = observer;
         self
     }
 
     pub async fn run(self, cancellation: CancellationToken) {
+        self.observer.observe(WorkerEvent::OutboxStarted {
+            role_epoch: self.role_epoch,
+        });
         let mut backfill_cursor = crate::db::BackfillCursor::default();
         loop {
             if cancellation.is_cancelled() {
                 break;
             }
+            self.observer.observe(WorkerEvent::OutboxCycleStarted {
+                role_epoch: self.role_epoch,
+            });
             let db_path = self.db_path.clone();
             let role = self.destination.role();
             let role_epoch = self.role_epoch;
@@ -122,10 +142,12 @@ impl OutboxWorker {
                 break;
             }
             let _ = self.process_once_cancellable(&cancellation).await;
-            tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(1)) => {}
-                _ = cancellation.cancelled() => break,
-            }
+            self.observer.observe(WorkerEvent::OutboxCycleFinished {
+                role_epoch: self.role_epoch,
+            });
+            self.clock
+                .sleep(Duration::from_secs(1), &cancellation)
+                .await;
         }
         match crate::db::open_db_at(&self.db_path) {
             Ok(connection) => {
@@ -139,6 +161,9 @@ impl OutboxWorker {
             }
             Err(error) => tracing::warn!(%error, "failed to open database while stopping outbox"),
         }
+        self.observer.observe(WorkerEvent::OutboxStopped {
+            role_epoch: self.role_epoch,
+        });
     }
 
     pub async fn process_once(&self) -> Result<usize> {
@@ -155,7 +180,7 @@ impl OutboxWorker {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
-        let now = (self.scheduling_clock)();
+        let now = self.clock.now();
         let lease_expiry = now + chrono::Duration::seconds(30);
         let mut connection = crate::db::open_db_at(&self.db_path)?;
         let items = SyncOutboxRepository::claim_items(
@@ -211,7 +236,7 @@ impl OutboxWorker {
                                 result.message.as_deref().unwrap_or("snapshot rejected"),
                             )?,
                             None => {
-                                let scheduling_now = (self.scheduling_clock)();
+                                let scheduling_now = self.clock.now();
                                 mark_retry(
                                     &connection,
                                     self.role_epoch,
@@ -226,7 +251,7 @@ impl OutboxWorker {
                     }
                 }
                 Err(error) if error.is_retryable() => {
-                    let scheduling_now = (self.scheduling_clock)();
+                    let scheduling_now = self.clock.now();
                     let retry_after = error.retry_after();
                     let message = error.to_string();
                     for item in &items {
@@ -338,7 +363,7 @@ impl OutboxWorker {
                     SyncOutboxRepository::mark_blob_accepted(&connection, self.role_epoch, blob)?;
                 }
                 Err(error) if error.is_retryable() => {
-                    let scheduling_now = (self.scheduling_clock)();
+                    let scheduling_now = self.clock.now();
                     mark_blob_retry(
                         &connection,
                         self.role_epoch,
@@ -360,6 +385,24 @@ impl OutboxWorker {
             }
         }
         Ok(Some(items.len() + blobs.len()))
+    }
+}
+
+#[cfg(test)]
+struct TestSchedulingClock(fn() -> chrono::DateTime<chrono::Utc>);
+
+#[cfg(test)]
+#[async_trait::async_trait]
+impl SyncClock for TestSchedulingClock {
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        (self.0)()
+    }
+
+    async fn sleep(&self, duration: Duration, cancellation: &CancellationToken) {
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => {}
+            _ = cancellation.cancelled() => {}
+        }
     }
 }
 
