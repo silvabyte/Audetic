@@ -1,34 +1,41 @@
 use async_trait::async_trait;
 use audetic_core::sync::{HubCandidate, HubConnection, HubId, RecordId};
-use futures_util::StreamExt;
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt};
+use http::header::{ACCEPT_RANGES, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RETRY_AFTER};
+use http::{HeaderMap, HeaderName, HeaderValue};
 use reqwest::Url;
 use thiserror::Error;
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use super::protocol::{
     hub_blob_path, hub_payload_path, DictationPage, HubApiError, HubInfo, MeetingPage,
     MeetingTitlePatch, RecordKind, SharedMeeting, SnapshotBatch, SnapshotBatchResponse,
     HUB_API_MOUNT_PATH, HUB_DICTATIONS_PATH, HUB_ID_HEADER, HUB_INFO_PATH, HUB_MEETINGS_PATH,
-    HUB_SNAPSHOTS_PATH, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, TAILSCALE_HTTPS_PORT,
+    HUB_SNAPSHOTS_PATH, MAX_BLOB_BYTES, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER,
+    TAILSCALE_HTTPS_PORT,
 };
 use super::transport::{
-    BlobUpload, DiscoveryFailure, DiscoveryOutcome, HubProbe, HubTransferError, RemoteLibrary,
-    RemotePayloadSource, ReplicationTransport, StreamingPayloadResponse,
+    BlobUpload, DiscoveryFailure, DiscoveryOutcome, HubProbe, HubTransferError, PayloadBody,
+    PayloadContentRange, PayloadMetadata, RemoteDictationLibrary, RemoteLibraryMutations,
+    RemoteMeetingLibrary, RemotePayloadSource, ReplicationTransport, StreamingPayloadResponse,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransportResponse {
     pub status: u16,
-    pub headers: BTreeMap<String, String>,
+    pub headers: HeaderMap,
     pub body: Vec<u8>,
 }
 
 pub struct StreamingTransportResponse {
     pub status: u16,
-    pub headers: BTreeMap<String, String>,
+    pub headers: HeaderMap,
     pub body: super::transport::PayloadBody,
 }
 
@@ -88,16 +95,7 @@ pub trait HubTransport: Clone + Send + Sync + 'static {
         &self,
         url: Url,
         headers: BTreeMap<String, String>,
-    ) -> Result<StreamingTransportResponse, String> {
-        let response = self.get(url, headers).await?;
-        Ok(StreamingTransportResponse {
-            status: response.status,
-            headers: response.headers,
-            body: Box::pin(futures_util::stream::once(async move {
-                Ok(bytes::Bytes::from(response.body))
-            })),
-        })
-    }
+    ) -> Result<StreamingTransportResponse, String>;
 }
 
 #[derive(Clone, Debug)]
@@ -128,16 +126,7 @@ impl HubTransport for ReqwestHubTransport {
         }
         let response = request.send().await.map_err(|error| error.to_string())?;
         let status = response.status().as_u16();
-        let headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
-            })
-            .collect();
+        let headers = response_headers_from_reqwest(response.headers());
         let body = response
             .bytes()
             .await
@@ -243,16 +232,7 @@ impl HubTransport for ReqwestHubTransport {
         }
         let response = request.send().await.map_err(|error| error.to_string())?;
         let status = response.status().as_u16();
-        let headers = response
-            .headers()
-            .iter()
-            .filter_map(|(name, value)| {
-                value
-                    .to_str()
-                    .ok()
-                    .map(|value| (name.as_str().to_owned(), value.to_owned()))
-            })
-            .collect();
+        let headers = response_headers_from_reqwest(response.headers());
         let body = response
             .bytes_stream()
             .map(|chunk| chunk.map_err(|error| HubTransferError::Transport(error.to_string())));
@@ -266,16 +246,7 @@ impl HubTransport for ReqwestHubTransport {
 
 async fn response_from_reqwest(response: reqwest::Response) -> Result<TransportResponse, String> {
     let status = response.status().as_u16();
-    let headers = response
-        .headers()
-        .iter()
-        .filter_map(|(name, value)| {
-            value
-                .to_str()
-                .ok()
-                .map(|value| (name.as_str().to_owned(), value.to_owned()))
-        })
-        .collect();
+    let headers = response_headers_from_reqwest(response.headers());
     let body = response
         .bytes()
         .await
@@ -286,6 +257,20 @@ async fn response_from_reqwest(response: reqwest::Response) -> Result<TransportR
         headers,
         body,
     })
+}
+
+fn response_headers_from_reqwest(headers: &reqwest::header::HeaderMap) -> HeaderMap {
+    let mut converted = HeaderMap::new();
+    for name in headers.keys() {
+        let name = HeaderName::from_bytes(name.as_str().as_bytes())
+            .expect("reqwest only exposes valid header names");
+        for value in headers.get_all(name.as_str()).iter() {
+            let value = HeaderValue::from_bytes(value.as_bytes())
+                .expect("reqwest only exposes valid header values");
+            converted.append(name.clone(), value);
+        }
+    }
+    converted
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -309,15 +294,23 @@ pub enum HubClientError {
     #[error("Home Hub transport failed: {0}")]
     Transport(String),
     #[error("Home Hub returned HTTP {status}: {message}")]
-    Http { status: u16, message: String },
+    Http {
+        status: u16,
+        message: String,
+        retry_after: Option<String>,
+    },
     #[error("Home Hub returned malformed discovery JSON: {0}")]
     InvalidInfo(#[from] serde_json::Error),
     #[error("Home Hub response omitted {HUB_ID_HEADER}")]
     MissingHubIdHeader,
+    #[error("Home Hub response repeated {HUB_ID_HEADER}")]
+    DuplicateHubIdHeader,
     #[error("Home Hub returned an invalid Hub ID in {0}")]
     InvalidHubId(&'static str),
     #[error("Home Hub response body and header identify different hubs")]
     InconsistentHubId,
+    #[error("Home Hub returned invalid payload metadata: {0}")]
+    InvalidPayloadMetadata(String),
     #[error("expected Home Hub {expected}, but reached {actual}")]
     WrongHubId { expected: HubId, actual: HubId },
     #[error("expected Tailscale owner {expected:?}, but hub belongs to {actual:?}")]
@@ -330,7 +323,15 @@ impl From<HubClientError> for HubTransferError {
     fn from(error: HubClientError) -> Self {
         match error {
             HubClientError::Transport(message) => Self::Transport(message),
-            HubClientError::Http { status, message } => Self::Http { status, message },
+            HubClientError::Http {
+                status,
+                message,
+                retry_after,
+            } => Self::Http {
+                status,
+                message,
+                retry_after,
+            },
             error => Self::NeedsAttention(error.to_string()),
         }
     }
@@ -394,19 +395,14 @@ impl<T: HubTransport> HubClient<T> {
             .get(url, headers)
             .await
             .map_err(HubClientError::Transport)?;
+        if let Some(expected) = expectation.hub_id {
+            verify_expected_hub_id(&response.headers, expected)?;
+        }
         if !(200..300).contains(&response.status) {
             return Err(http_error(response));
         }
 
-        let header_hub_id = response
-            .headers
-            .get(HUB_ID_HEADER)
-            .ok_or(HubClientError::MissingHubIdHeader)
-            .and_then(|value| {
-                value
-                    .parse::<HubId>()
-                    .map_err(|_| HubClientError::InvalidHubId(HUB_ID_HEADER))
-            })?;
+        let header_hub_id = response_hub_id(&response.headers)?;
         let info: HubInfo = serde_json::from_slice(&response.body)?;
         let body_hub_id = info.hub_id;
         if header_hub_id != body_hub_id {
@@ -687,10 +683,21 @@ impl<T: HubTransport> HubClient<T> {
             .await
             .map_err(HubClientError::Transport)?;
         verify_streaming_hub_response(&response, hub_id)?;
+        let metadata = payload_metadata(response.status, &response.headers, range)?;
+        let expected_length = metadata
+            .content_range
+            .as_ref()
+            .and_then(PayloadContentRange::byte_length)
+            .or(metadata.content_length);
+        let maximum_length = expected_length.unwrap_or(MAX_BLOB_BYTES);
         Ok(StreamingPayloadResponse {
             status: response.status,
-            headers: response.headers,
-            body: response.body,
+            metadata,
+            body: Box::pin(ValidatedPayloadBody::new(
+                response.body,
+                maximum_length,
+                expected_length,
+            )),
         })
     }
 }
@@ -752,7 +759,7 @@ impl<T: HubTransport> ReplicationTransport for HubClient<T> {
 }
 
 #[async_trait]
-impl<T: HubTransport> RemoteLibrary for HubClient<T> {
+impl<T: HubTransport> RemoteDictationLibrary for HubClient<T> {
     async fn page_dictations(
         &self,
         hub: &HubConnection,
@@ -767,7 +774,10 @@ impl<T: HubTransport> RemoteLibrary for HubClient<T> {
             .await
             .map_err(HubTransferError::from)
     }
+}
 
+#[async_trait]
+impl<T: HubTransport> RemoteMeetingLibrary for HubClient<T> {
     async fn page_meetings(
         &self,
         hub: &HubConnection,
@@ -791,7 +801,10 @@ impl<T: HubTransport> RemoteLibrary for HubClient<T> {
             .await
             .map_err(HubTransferError::from)
     }
+}
 
+#[async_trait]
+impl<T: HubTransport> RemoteLibraryMutations for HubClient<T> {
     async fn update_meeting_title(
         &self,
         hub: &HubConnection,
@@ -905,7 +918,7 @@ impl ReplicationTransport for NetworkHubAdapter {
 }
 
 #[async_trait]
-impl RemoteLibrary for NetworkHubAdapter {
+impl RemoteDictationLibrary for NetworkHubAdapter {
     async fn page_dictations(
         &self,
         hub: &HubConnection,
@@ -915,10 +928,21 @@ impl RemoteLibrary for NetworkHubAdapter {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<DictationPage, HubTransferError> {
-        RemoteLibrary::page_dictations(&self.client(hub)?, hub, query, from, to, cursor, limit)
-            .await
+        RemoteDictationLibrary::page_dictations(
+            &self.client(hub)?,
+            hub,
+            query,
+            from,
+            to,
+            cursor,
+            limit,
+        )
+        .await
     }
+}
 
+#[async_trait]
+impl RemoteMeetingLibrary for NetworkHubAdapter {
     async fn page_meetings(
         &self,
         hub: &HubConnection,
@@ -926,7 +950,7 @@ impl RemoteLibrary for NetworkHubAdapter {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<MeetingPage, HubTransferError> {
-        RemoteLibrary::page_meetings(&self.client(hub)?, hub, query, cursor, limit).await
+        RemoteMeetingLibrary::page_meetings(&self.client(hub)?, hub, query, cursor, limit).await
     }
 
     async fn meeting(
@@ -934,16 +958,19 @@ impl RemoteLibrary for NetworkHubAdapter {
         hub: &HubConnection,
         id: RecordId,
     ) -> Result<Option<SharedMeeting>, HubTransferError> {
-        RemoteLibrary::meeting(&self.client(hub)?, hub, id).await
+        RemoteMeetingLibrary::meeting(&self.client(hub)?, hub, id).await
     }
+}
 
+#[async_trait]
+impl RemoteLibraryMutations for NetworkHubAdapter {
     async fn update_meeting_title(
         &self,
         hub: &HubConnection,
         id: RecordId,
         patch: MeetingTitlePatch,
     ) -> Result<SharedMeeting, HubTransferError> {
-        RemoteLibrary::update_meeting_title(&self.client(hub)?, hub, id, patch).await
+        RemoteLibraryMutations::update_meeting_title(&self.client(hub)?, hub, id, patch).await
     }
 
     async fn delete_record(
@@ -952,7 +979,7 @@ impl RemoteLibrary for NetworkHubAdapter {
         id: RecordId,
         kind: RecordKind,
     ) -> Result<(), HubTransferError> {
-        RemoteLibrary::delete_record(&self.client(hub)?, hub, id, kind).await
+        RemoteLibraryMutations::delete_record(&self.client(hub)?, hub, id, kind).await
     }
 }
 
@@ -983,32 +1010,376 @@ fn verify_hub_response(
     response: &TransportResponse,
     expected: HubId,
 ) -> Result<(), HubClientError> {
-    let actual = response
-        .headers
-        .get(HUB_ID_HEADER)
-        .ok_or(HubClientError::MissingHubIdHeader)?
-        .parse::<HubId>()
-        .map_err(|_| HubClientError::InvalidHubId(HUB_ID_HEADER))?;
-    if actual != expected {
-        return Err(HubClientError::WrongHubId { expected, actual });
-    }
-    Ok(())
+    verify_expected_hub_id(&response.headers, expected)
 }
 
 fn verify_streaming_hub_response(
     response: &StreamingTransportResponse,
     expected: HubId,
 ) -> Result<(), HubClientError> {
-    let actual = response
-        .headers
-        .get(HUB_ID_HEADER)
-        .ok_or(HubClientError::MissingHubIdHeader)?
-        .parse::<HubId>()
-        .map_err(|_| HubClientError::InvalidHubId(HUB_ID_HEADER))?;
+    verify_expected_hub_id(&response.headers, expected)
+}
+
+fn verify_expected_hub_id(headers: &HeaderMap, expected: HubId) -> Result<(), HubClientError> {
+    let actual = response_hub_id(headers)?;
     if actual != expected {
         return Err(HubClientError::WrongHubId { expected, actual });
     }
     Ok(())
+}
+
+fn response_hub_id(headers: &HeaderMap) -> Result<HubId, HubClientError> {
+    let mut values = headers.get_all(HUB_ID_HEADER).iter();
+    let value = values.next().ok_or(HubClientError::MissingHubIdHeader)?;
+    if values.next().is_some() {
+        return Err(HubClientError::DuplicateHubIdHeader);
+    }
+    value
+        .to_str()
+        .map_err(|_| HubClientError::InvalidHubId(HUB_ID_HEADER))?
+        .parse::<HubId>()
+        .map_err(|_| HubClientError::InvalidHubId(HUB_ID_HEADER))
+}
+
+fn payload_metadata(
+    status: u16,
+    headers: &HeaderMap,
+    requested_range: Option<&str>,
+) -> Result<PayloadMetadata, HubClientError> {
+    let content_type = unique_header(headers, &CONTENT_TYPE)?
+        .map(|value| {
+            let text = value
+                .to_str()
+                .map_err(|_| invalid_payload_metadata("Content-Type is not valid visible text"))?;
+            if text.trim().is_empty() {
+                return Err(invalid_payload_metadata("Content-Type is empty"));
+            }
+            Ok(value.clone())
+        })
+        .transpose()?;
+    let content_length = unique_header(headers, &CONTENT_LENGTH)?
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| invalid_payload_metadata("Content-Length is not valid text"))?
+                .parse::<u64>()
+                .map_err(|_| invalid_payload_metadata("Content-Length is not an unsigned integer"))
+        })
+        .transpose()?;
+    let content_range = unique_header(headers, &CONTENT_RANGE)?
+        .map(parse_content_range)
+        .transpose()?;
+    let accept_ranges = unique_header(headers, &ACCEPT_RANGES)?
+        .map(|value| {
+            let text = value
+                .to_str()
+                .map_err(|_| invalid_payload_metadata("Accept-Ranges is not valid text"))?;
+            if !text.eq_ignore_ascii_case("bytes") {
+                return Err(invalid_payload_metadata(
+                    "Accept-Ranges must contain the bytes range unit",
+                ));
+            }
+            Ok(value.clone())
+        })
+        .transpose()?;
+
+    if content_length.is_some_and(|length| length > MAX_BLOB_BYTES) {
+        return Err(invalid_payload_metadata(
+            "Content-Length is outside the supported payload size",
+        ));
+    }
+
+    match status {
+        200 => {
+            if content_range.is_some() {
+                return Err(invalid_payload_metadata(
+                    "a 200 payload response must not declare Content-Range",
+                ));
+            }
+            if content_length == Some(0) {
+                return Err(invalid_payload_metadata(
+                    "Content-Length is outside the supported payload size",
+                ));
+            }
+        }
+        206 => {
+            let range = content_range.as_ref().ok_or_else(|| {
+                invalid_payload_metadata("a 206 payload response requires Content-Range")
+            })?;
+            let PayloadContentRange::Bytes {
+                start,
+                end,
+                complete_length,
+            } = range
+            else {
+                return Err(invalid_payload_metadata(
+                    "a 206 payload response requires a satisfied Content-Range",
+                ));
+            };
+            if *complete_length == 0
+                || *complete_length > MAX_BLOB_BYTES
+                || start > end
+                || end >= complete_length
+            {
+                return Err(invalid_payload_metadata(
+                    "Content-Range is outside the supported payload size",
+                ));
+            }
+            if content_length.is_some_and(|length| Some(length) != range.byte_length()) {
+                return Err(invalid_payload_metadata(
+                    "Content-Length does not match Content-Range",
+                ));
+            }
+            let requested = requested_range
+                .ok_or_else(|| invalid_payload_metadata("unsolicited partial payload response"))?;
+            validate_response_range(requested, range)?;
+        }
+        416 => {
+            parse_requested_range(requested_range.ok_or_else(|| {
+                invalid_payload_metadata("unsolicited unsatisfied-range response")
+            })?)?;
+            match content_range
+                .as_ref()
+                .ok_or_else(|| invalid_payload_metadata("a 416 response requires Content-Range"))?
+            {
+                PayloadContentRange::Unsatisfied { complete_length }
+                    if *complete_length > 0 && *complete_length <= MAX_BLOB_BYTES => {}
+                PayloadContentRange::Unsatisfied { .. } => {
+                    return Err(invalid_payload_metadata(
+                        "unsatisfied Content-Range exceeds the supported payload size",
+                    ));
+                }
+                PayloadContentRange::Bytes { .. } => {
+                    return Err(invalid_payload_metadata(
+                        "a 416 response cannot contain a satisfied Content-Range",
+                    ));
+                }
+            }
+        }
+        _ => {
+            if content_range.is_some() {
+                return Err(invalid_payload_metadata(
+                    "Content-Range is only valid for HTTP 206 or 416 payload responses",
+                ));
+            }
+        }
+    }
+
+    Ok(PayloadMetadata {
+        content_type,
+        content_length,
+        content_range,
+        accept_ranges,
+    })
+}
+
+fn unique_header<'a>(
+    headers: &'a HeaderMap,
+    name: &HeaderName,
+) -> Result<Option<&'a HeaderValue>, HubClientError> {
+    let mut values = headers.get_all(name).iter();
+    let value = values.next();
+    if values.next().is_some() {
+        return Err(invalid_payload_metadata(&format!(
+            "{} must not be repeated",
+            name.as_str()
+        )));
+    }
+    Ok(value)
+}
+
+fn parse_content_range(value: &HeaderValue) -> Result<PayloadContentRange, HubClientError> {
+    let value = value
+        .to_str()
+        .map_err(|_| invalid_payload_metadata("Content-Range is not valid text"))?
+        .trim();
+    let (unit, value) = value
+        .split_once(' ')
+        .ok_or_else(|| invalid_payload_metadata("Content-Range is malformed"))?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Err(invalid_payload_metadata(
+            "Content-Range must use the bytes range unit",
+        ));
+    }
+    let (bounds, complete_length) = value
+        .split_once('/')
+        .ok_or_else(|| invalid_payload_metadata("Content-Range is malformed"))?;
+    let complete_length = complete_length
+        .parse()
+        .map_err(|_| invalid_payload_metadata("Content-Range length is malformed"))?;
+    if bounds == "*" {
+        return Ok(PayloadContentRange::Unsatisfied { complete_length });
+    }
+    let (start, end) = bounds
+        .split_once('-')
+        .ok_or_else(|| invalid_payload_metadata("Content-Range is malformed"))?;
+    Ok(PayloadContentRange::Bytes {
+        start: start
+            .parse()
+            .map_err(|_| invalid_payload_metadata("Content-Range start is malformed"))?,
+        end: end
+            .parse()
+            .map_err(|_| invalid_payload_metadata("Content-Range end is malformed"))?,
+        complete_length,
+    })
+}
+
+enum RequestedRange {
+    Closed { start: u64, end: u64 },
+    From(u64),
+    Suffix(u64),
+}
+
+fn validate_response_range(
+    requested: &str,
+    response: &PayloadContentRange,
+) -> Result<(), HubClientError> {
+    let PayloadContentRange::Bytes {
+        start,
+        end,
+        complete_length,
+    } = response
+    else {
+        return Err(invalid_payload_metadata(
+            "requested range was not satisfied",
+        ));
+    };
+    let requested = parse_requested_range(requested)?;
+    let matches = match requested {
+        RequestedRange::Closed {
+            start: requested_start,
+            end: requested_end,
+        } => *start == requested_start && *end <= requested_end,
+        RequestedRange::From(requested_start) => *start == requested_start,
+        RequestedRange::Suffix(length) => {
+            *end + 1 == *complete_length
+                && response.byte_length() == Some(length.min(*complete_length))
+        }
+    };
+    if matches {
+        Ok(())
+    } else {
+        Err(invalid_payload_metadata(
+            "Content-Range does not satisfy the requested byte range",
+        ))
+    }
+}
+
+fn parse_requested_range(value: &str) -> Result<RequestedRange, HubClientError> {
+    let (unit, value) = value
+        .trim()
+        .split_once('=')
+        .ok_or_else(|| invalid_payload_metadata("Range is malformed"))?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return Err(invalid_payload_metadata(
+            "Range must use the bytes range unit",
+        ));
+    }
+    if value.contains(',') {
+        return Err(invalid_payload_metadata(
+            "multipart byte ranges are not supported",
+        ));
+    }
+    let (start, end) = value
+        .split_once('-')
+        .ok_or_else(|| invalid_payload_metadata("Range is malformed"))?;
+    match (start.is_empty(), end.is_empty()) {
+        (false, false) => {
+            let start = start
+                .parse::<u64>()
+                .map_err(|_| invalid_payload_metadata("Range start is malformed"))?;
+            let end = end
+                .parse::<u64>()
+                .map_err(|_| invalid_payload_metadata("Range end is malformed"))?;
+            if start > end {
+                return Err(invalid_payload_metadata("Range start exceeds its end"));
+            }
+            Ok(RequestedRange::Closed { start, end })
+        }
+        (false, true) => start
+            .parse::<u64>()
+            .map(RequestedRange::From)
+            .map_err(|_| invalid_payload_metadata("Range start is malformed")),
+        (true, false) => {
+            let length = end
+                .parse::<u64>()
+                .map_err(|_| invalid_payload_metadata("Range suffix is malformed"))?;
+            if length == 0 {
+                return Err(invalid_payload_metadata("Range suffix must be non-zero"));
+            }
+            Ok(RequestedRange::Suffix(length))
+        }
+        (true, true) => Err(invalid_payload_metadata("Range is empty")),
+    }
+}
+
+fn invalid_payload_metadata(message: &str) -> HubClientError {
+    HubClientError::InvalidPayloadMetadata(message.to_owned())
+}
+
+struct ValidatedPayloadBody {
+    inner: PayloadBody,
+    maximum_length: u64,
+    expected_length: Option<u64>,
+    received: u64,
+    finished: bool,
+}
+
+impl ValidatedPayloadBody {
+    fn new(inner: PayloadBody, maximum_length: u64, expected_length: Option<u64>) -> Self {
+        Self {
+            inner,
+            maximum_length,
+            expected_length,
+            received: 0,
+            finished: false,
+        }
+    }
+}
+
+impl Stream for ValidatedPayloadBody {
+    type Item = Result<Bytes, HubTransferError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.finished {
+            return Poll::Ready(None);
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                let received = self.received.saturating_add(chunk.len() as u64);
+                if received > self.maximum_length {
+                    self.finished = true;
+                    self.inner = Box::pin(futures_util::stream::empty());
+                    return Poll::Ready(Some(Err(HubTransferError::Transport(format!(
+                        "Home Hub payload exceeded its allowed {maximum} bytes",
+                        maximum = self.maximum_length
+                    )))));
+                }
+                self.received = received;
+                Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(error))) => {
+                self.finished = true;
+                Poll::Ready(Some(Err(error)))
+            }
+            Poll::Ready(None) => {
+                self.finished = true;
+                if self
+                    .expected_length
+                    .is_some_and(|expected| expected != self.received)
+                {
+                    Poll::Ready(Some(Err(HubTransferError::Transport(format!(
+                        "Home Hub payload ended after {received} bytes; expected {expected}",
+                        received = self.received,
+                        expected = self.expected_length.expect("checked as present")
+                    )))))
+                } else {
+                    Poll::Ready(None)
+                }
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }
 
 pub fn canonicalize_base_url(input: &str) -> Result<Url, HubClientError> {
@@ -1102,7 +1473,17 @@ fn http_error(response: TransportResponse) -> HubClientError {
     HubClientError::Http {
         status: response.status,
         message,
+        retry_after: retry_after(&response.headers),
     }
+}
+
+fn retry_after(headers: &HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(RETRY_AFTER).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    value.to_str().ok().map(str::to_owned)
 }
 
 #[cfg(test)]
@@ -1114,6 +1495,7 @@ mod tests {
     };
     use futures_util::TryStreamExt;
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     #[derive(Clone)]
@@ -1210,6 +1592,83 @@ mod tests {
             let body = std::fs::read(path).map_err(|error| error.to_string())?;
             self.respond("PUT", url, headers, body)
         }
+
+        async fn get_stream(
+            &self,
+            url: Url,
+            headers: BTreeMap<String, String>,
+        ) -> Result<StreamingTransportResponse, String> {
+            let response = self.respond("GET_STREAM", url, headers, Vec::new())?;
+            Ok(StreamingTransportResponse {
+                status: response.status,
+                headers: response.headers,
+                body: Box::pin(futures_util::stream::once(async move {
+                    Ok(Bytes::from(response.body))
+                })),
+            })
+        }
+    }
+
+    struct ObservedBody {
+        polls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+        sent: bool,
+    }
+
+    impl Stream for ObservedBody {
+        type Item = Result<Bytes, HubTransferError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.sent {
+                Poll::Pending
+            } else {
+                self.sent = true;
+                Poll::Ready(Some(Ok(Bytes::from_static(b"data"))))
+            }
+        }
+    }
+
+    impl Drop for ObservedBody {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[derive(Clone)]
+    struct ObservedStreamingTransport {
+        hub_id: HubId,
+        polls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl HubTransport for ObservedStreamingTransport {
+        async fn get(
+            &self,
+            _url: Url,
+            _headers: BTreeMap<String, String>,
+        ) -> Result<TransportResponse, String> {
+            Err("buffered GET must not be used for payloads".to_owned())
+        }
+
+        async fn get_stream(
+            &self,
+            _url: Url,
+            _headers: BTreeMap<String, String>,
+        ) -> Result<StreamingTransportResponse, String> {
+            let mut headers = hub_headers(self.hub_id);
+            headers.insert(CONTENT_LENGTH, HeaderValue::from_static("4"));
+            Ok(StreamingTransportResponse {
+                status: 200,
+                headers,
+                body: Box::pin(ObservedBody {
+                    polls: Arc::clone(&self.polls),
+                    dropped: Arc::clone(&self.dropped),
+                    sent: false,
+                }),
+            })
+        }
     }
 
     use uuid::Uuid;
@@ -1221,7 +1680,7 @@ mod tests {
     fn info_response(hub_id: HubId, owner: &str) -> TransportResponse {
         TransportResponse {
             status: 200,
-            headers: BTreeMap::from([(HUB_ID_HEADER.to_owned(), hub_id.to_string())]),
+            headers: hub_headers(hub_id),
             body: serde_json::to_vec(&HubInfo {
                 hub_id,
                 owner_login: owner.to_owned(),
@@ -1236,9 +1695,18 @@ mod tests {
     fn hub_response(hub_id: HubId, status: u16, body: Vec<u8>) -> TransportResponse {
         TransportResponse {
             status,
-            headers: BTreeMap::from([(HUB_ID_HEADER.to_owned(), hub_id.to_string())]),
+            headers: hub_headers(hub_id),
             body,
         }
+    }
+
+    fn hub_headers(hub_id: HubId) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HUB_ID_HEADER,
+            HeaderValue::from_str(&hub_id.to_string()).unwrap(),
+        );
+        headers
     }
 
     fn connection(hub_id: HubId) -> HubConnection {
@@ -1328,12 +1796,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expected_hub_identity_is_verified_even_on_error_responses() {
+        let expected = hub_id();
+        let actual = hub_id();
+        let client = HubClient::with_transport(
+            "https://hub.example.ts.net/audetic/",
+            FakeTransport::with_responses(vec![hub_response(actual, 503, b"offline".to_vec())]),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            client
+                .handshake(HandshakeExpectation {
+                    hub_id: Some(expected),
+                    owner_login: Some("owner@example.com"),
+                })
+                .await,
+            Err(HubClientError::WrongHubId {
+                expected: expected_id,
+                actual: actual_id,
+            }) if expected_id == expected && actual_id == actual
+        ));
+    }
+
+    #[tokio::test]
     async fn handshake_rejects_header_body_hub_disagreement_and_owner_normalization() {
         let body_hub = hub_id();
         let mut inconsistent = info_response(body_hub, "Alice@Example.com");
-        inconsistent
-            .headers
-            .insert(HUB_ID_HEADER.to_owned(), hub_id().to_string());
+        inconsistent.headers.insert(
+            HUB_ID_HEADER,
+            HeaderValue::from_str(&hub_id().to_string()).unwrap(),
+        );
         let client = HubClient::with_transport(
             "https://hub.example.ts.net/audetic/",
             FakeTransport::with_responses(vec![inconsistent]),
@@ -1366,7 +1859,7 @@ mod tests {
         let transport = FakeTransport::with_responses(vec![
             TransportResponse {
                 status: 403,
-                headers: BTreeMap::new(),
+                headers: HeaderMap::new(),
                 body: b"wrong owner".to_vec(),
             },
             info_response(hub_id, "owner@example.com"),
@@ -1492,7 +1985,7 @@ mod tests {
         let hub = connection(hub_id);
         let client = HubClient::with_transport(&hub.base_url, transport.clone()).unwrap();
 
-        RemoteLibrary::page_dictations(
+        RemoteDictationLibrary::page_dictations(
             &client,
             &hub,
             Some("needle"),
@@ -1503,7 +1996,7 @@ mod tests {
         )
         .await
         .unwrap();
-        RemoteLibrary::delete_record(&client, &hub, RecordId::new(), RecordKind::Meeting)
+        RemoteLibraryMutations::delete_record(&client, &hub, RecordId::new(), RecordKind::Meeting)
             .await
             .unwrap();
 
@@ -1519,12 +2012,18 @@ mod tests {
     async fn payload_capability_forwards_range_and_returns_transport_neutral_stream() {
         let hub_id = hub_id();
         let mut response = hub_response(hub_id, 206, b"2345".to_vec());
-        response.headers.extend([
-            ("content-type".to_owned(), "audio/wav".to_owned()),
-            ("content-length".to_owned(), "4".to_owned()),
-            ("content-range".to_owned(), "bytes 2-5/10".to_owned()),
-            ("accept-ranges".to_owned(), "bytes".to_owned()),
-        ]);
+        response
+            .headers
+            .insert(CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+        response
+            .headers
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("4"));
+        response
+            .headers
+            .insert(CONTENT_RANGE, HeaderValue::from_static("bytes 2-5/10"));
+        response
+            .headers
+            .insert(ACCEPT_RANGES, HeaderValue::from_static("bytes"));
         let transport = FakeTransport::with_responses(vec![response]);
         let hub = connection(hub_id);
         let client = HubClient::with_transport(&hub.base_url, transport.clone()).unwrap();
@@ -1539,7 +2038,14 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(streamed.status, 206);
-        assert_eq!(streamed.headers["content-range"], "bytes 2-5/10");
+        assert_eq!(
+            streamed.metadata.content_range,
+            Some(PayloadContentRange::Bytes {
+                start: 2,
+                end: 5,
+                complete_length: 10,
+            })
+        );
         let body = streamed
             .body
             .try_fold(Vec::new(), |mut body, chunk| async move {
@@ -1554,6 +2060,198 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn payload_rejects_duplicate_or_malformed_hub_identity_before_forwarding() {
+        for malformed in [false, true] {
+            let hub_id = hub_id();
+            let mut response = hub_response(hub_id, 200, b"payload".to_vec());
+            response
+                .headers
+                .insert(CONTENT_LENGTH, HeaderValue::from_static("7"));
+            if malformed {
+                response.headers.insert(
+                    HUB_ID_HEADER,
+                    HeaderValue::from_bytes(&[0xff]).expect("opaque header value"),
+                );
+            } else {
+                response.headers.append(
+                    HUB_ID_HEADER,
+                    HeaderValue::from_str(&hub_id.to_string()).unwrap(),
+                );
+            }
+            let hub = connection(hub_id);
+            let client = HubClient::with_transport(
+                &hub.base_url,
+                FakeTransport::with_responses(vec![response]),
+            )
+            .unwrap();
+
+            let error = client
+                .stream_payload(hub_id, RecordKind::Dictation, RecordId::new(), None)
+                .await
+                .err()
+                .expect("invalid identity must reject the response");
+
+            if malformed {
+                assert!(matches!(error, HubClientError::InvalidHubId(_)));
+            } else {
+                assert!(matches!(error, HubClientError::DuplicateHubIdHeader));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn payload_metadata_must_match_the_requested_range_before_forwarding() {
+        let hub_id = hub_id();
+        let mut response = hub_response(hub_id, 206, b"2345".to_vec());
+        response
+            .headers
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("5"));
+        response
+            .headers
+            .insert(CONTENT_RANGE, HeaderValue::from_static("bytes 2-5/10"));
+        let hub = connection(hub_id);
+        let client =
+            HubClient::with_transport(&hub.base_url, FakeTransport::with_responses(vec![response]))
+                .unwrap();
+
+        assert!(matches!(
+            client
+                .stream_payload(
+                    hub_id,
+                    RecordKind::Dictation,
+                    RecordId::new(),
+                    Some("bytes=2-5")
+                )
+                .await,
+            Err(HubClientError::InvalidPayloadMetadata(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn payload_stream_preserves_unsatisfied_range_response_metadata() {
+        let hub_id = hub_id();
+        let mut response = hub_response(hub_id, 416, b"range rejected".to_vec());
+        response
+            .headers
+            .insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+        response
+            .headers
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("14"));
+        response
+            .headers
+            .insert(CONTENT_RANGE, HeaderValue::from_static("bytes */10"));
+        let hub = connection(hub_id);
+        let client =
+            HubClient::with_transport(&hub.base_url, FakeTransport::with_responses(vec![response]))
+                .unwrap();
+
+        let streamed = client
+            .stream_payload(
+                hub_id,
+                RecordKind::Dictation,
+                RecordId::new(),
+                Some("bytes=20-30"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(streamed.status, 416);
+        assert_eq!(
+            streamed.metadata.content_range,
+            Some(PayloadContentRange::Unsatisfied {
+                complete_length: 10
+            })
+        );
+        assert_eq!(
+            streamed.body.try_collect::<Vec<_>>().await.unwrap(),
+            vec![Bytes::from_static(b"range rejected")]
+        );
+    }
+
+    #[tokio::test]
+    async fn payload_stream_enforces_declared_length_without_buffering() {
+        let hub_id = hub_id();
+        let mut response = hub_response(hub_id, 200, b"12345".to_vec());
+        response
+            .headers
+            .insert(CONTENT_LENGTH, HeaderValue::from_static("4"));
+        let hub = connection(hub_id);
+        let client =
+            HubClient::with_transport(&hub.base_url, FakeTransport::with_responses(vec![response]))
+                .unwrap();
+
+        let stream = client
+            .stream_payload(hub_id, RecordKind::Dictation, RecordId::new(), None)
+            .await
+            .unwrap();
+        let error = stream.body.try_collect::<Vec<_>>().await.unwrap_err();
+
+        assert!(error.to_string().contains("allowed 4 bytes"));
+    }
+
+    #[tokio::test]
+    async fn payload_stream_preserves_backpressure_and_drop_cancellation() {
+        let hub_id = hub_id();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let client = HubClient::with_transport(
+            &connection(hub_id).base_url,
+            ObservedStreamingTransport {
+                hub_id,
+                polls: Arc::clone(&polls),
+                dropped: Arc::clone(&dropped),
+            },
+        )
+        .unwrap();
+
+        let mut streamed = client
+            .stream_payload(hub_id, RecordKind::Dictation, RecordId::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(polls.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            streamed.body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"data")
+        );
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        drop(streamed);
+        assert!(dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn retry_after_and_rate_limit_status_survive_typed_error_conversion() {
+        let hub_id = hub_id();
+        let mut response = hub_response(
+            hub_id,
+            429,
+            br#"{"error":true,"code":"busy","message":"try later"}"#.to_vec(),
+        );
+        response
+            .headers
+            .insert(RETRY_AFTER, HeaderValue::from_static("30"));
+        let hub = connection(hub_id);
+        let client =
+            HubClient::with_transport(&hub.base_url, FakeTransport::with_responses(vec![response]))
+                .unwrap();
+
+        let error =
+            RemoteDictationLibrary::page_dictations(&client, &hub, None, None, None, None, 25)
+                .await
+                .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            HubTransferError::Http {
+                status: 429,
+                retry_after: Some(value),
+                ..
+            } if value == "30"
+        ));
+        assert!(error.is_retryable());
+    }
+
+    #[tokio::test]
     async fn capability_errors_keep_http_status_for_retry_classification() {
         let hub_id = hub_id();
         let transport = FakeTransport::with_responses(vec![hub_response(
@@ -1564,9 +2262,10 @@ mod tests {
         let hub = connection(hub_id);
         let client = HubClient::with_transport(&hub.base_url, transport).unwrap();
 
-        let error = RemoteLibrary::page_dictations(&client, &hub, None, None, None, None, 25)
-            .await
-            .unwrap_err();
+        let error =
+            RemoteDictationLibrary::page_dictations(&client, &hub, None, None, None, None, 25)
+                .await
+                .unwrap_err();
 
         assert!(matches!(&error, HubTransferError::Http { status: 503, .. }));
         assert!(error.is_retryable());

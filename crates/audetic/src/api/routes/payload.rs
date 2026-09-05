@@ -22,19 +22,17 @@ pub async fn serve(source: crate::sync::service::PayloadSource, request: Request
             let status =
                 StatusCode::from_u16(remote.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let mut response = Response::builder().status(status);
-            for name in [
-                header::CONTENT_TYPE,
-                header::CONTENT_LENGTH,
-                header::CONTENT_RANGE,
-                header::ACCEPT_RANGES,
-            ] {
-                if let Some(value) = remote
-                    .headers
-                    .get(name.as_str())
-                    .and_then(|value| HeaderValue::from_str(value).ok())
-                {
-                    response = response.header(name, value);
-                }
+            if let Some(value) = remote.metadata.content_type {
+                response = response.header(header::CONTENT_TYPE, value);
+            }
+            if let Some(value) = remote.metadata.content_length {
+                response = response.header(header::CONTENT_LENGTH, value);
+            }
+            if let Some(value) = remote.metadata.content_range {
+                response = response.header(header::CONTENT_RANGE, value.to_header_value());
+            }
+            if let Some(value) = remote.metadata.accept_ranges {
+                response = response.header(header::ACCEPT_RANGES, value);
             }
             response
                 .body(Body::from_stream(remote.body))
@@ -47,19 +45,22 @@ pub async fn serve(source: crate::sync::service::PayloadSource, request: Request
 mod tests {
     use super::*;
     use axum::body::to_bytes;
-    use std::collections::BTreeMap;
 
     #[tokio::test]
     async fn remote_payload_stream_preserves_range_response_metadata_and_bytes() {
         let source = crate::sync::service::PayloadSource::Remote(
             crate::sync::transport::StreamingPayloadResponse {
                 status: StatusCode::PARTIAL_CONTENT.as_u16(),
-                headers: BTreeMap::from([
-                    ("content-type".to_owned(), "audio/wav".to_owned()),
-                    ("content-length".to_owned(), "4".to_owned()),
-                    ("content-range".to_owned(), "bytes 2-5/10".to_owned()),
-                    ("accept-ranges".to_owned(), "bytes".to_owned()),
-                ]),
+                metadata: crate::sync::transport::PayloadMetadata {
+                    content_type: Some(HeaderValue::from_static("audio/wav")),
+                    content_length: Some(4),
+                    content_range: Some(crate::sync::transport::PayloadContentRange::Bytes {
+                        start: 2,
+                        end: 5,
+                        complete_length: 10,
+                    }),
+                    accept_ranges: Some(HeaderValue::from_static("bytes")),
+                },
                 body: Box::pin(futures_util::stream::once(async {
                     Ok(bytes::Bytes::from_static(b"2345"))
                 })),
@@ -73,6 +74,8 @@ mod tests {
         let response = serve(source, request).await;
 
         assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "audio/wav");
+        assert_eq!(response.headers()[header::CONTENT_LENGTH], "4");
         assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
         assert_eq!(response.headers()[header::ACCEPT_RANGES], "bytes");
         assert_eq!(

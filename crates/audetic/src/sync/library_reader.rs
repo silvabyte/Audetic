@@ -9,7 +9,7 @@ use crate::db::shared_library::SharedLibraryRepository;
 use crate::db::sync_outbox::SyncOutboxRepository;
 use crate::history::{HistoryEntry, HistorySource, SearchParams};
 
-use super::transport::RemoteLibrary;
+use super::transport::{RemoteDictationLibrary, RemoteMeetingLibrary};
 use crate::db::sync_settings::SyncSettings;
 
 pub struct LibraryReadResult {
@@ -20,7 +20,7 @@ pub struct LibraryReadResult {
 
 pub struct LibraryReader {
     db_path: PathBuf,
-    remote: Arc<dyn RemoteLibrary>,
+    remote: Arc<dyn RemoteDictationLibrary>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,10 +50,10 @@ pub struct LibraryMeeting {
 
 pub struct MeetingLibraryReader {
     db_path: PathBuf,
-    remote: Arc<dyn RemoteLibrary>,
+    remote: Arc<dyn RemoteMeetingLibrary>,
 }
 impl MeetingLibraryReader {
-    pub fn new(db_path: PathBuf, remote: Arc<dyn RemoteLibrary>) -> Self {
+    pub fn new(db_path: PathBuf, remote: Arc<dyn RemoteMeetingLibrary>) -> Self {
         Self { db_path, remote }
     }
     pub async fn read(
@@ -261,7 +261,7 @@ fn contains_case_insensitive(value: &str, query: &str) -> bool {
 }
 
 impl LibraryReader {
-    pub fn new(db_path: PathBuf, remote: Arc<dyn RemoteLibrary>) -> Self {
+    pub fn new(db_path: PathBuf, remote: Arc<dyn RemoteDictationLibrary>) -> Self {
         Self { db_path, remote }
     }
 
@@ -428,8 +428,10 @@ fn shared_entry(
 mod tests {
     use super::*;
     use crate::db::{VoiceToTextData, Workflow, WorkflowData, WorkflowType};
-    use crate::sync::protocol::{DictationPayload, DictationSnapshot, RecordKind};
-    use crate::sync::transport::HubTransferError;
+    use crate::sync::protocol::{
+        DictationPage, DictationPayload, DictationSnapshot, MeetingPage, RecordKind, SharedMeeting,
+    };
+    use crate::sync::transport::{HubTransferError, RemoteDictationLibrary, RemoteMeetingLibrary};
     use async_trait::async_trait;
     use audetic_core::sync::{CacheLevel, HubConnection, HubId, SyncRole};
 
@@ -452,14 +454,49 @@ mod tests {
     }
 
     struct OfflineHub;
-    impl RemoteLibrary for OfflineHub {}
+
+    #[async_trait]
+    impl RemoteDictationLibrary for OfflineHub {
+        async fn page_dictations(
+            &self,
+            _hub: &HubConnection,
+            _query: Option<&str>,
+            _from: Option<&str>,
+            _to: Option<&str>,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> std::result::Result<DictationPage, HubTransferError> {
+            Err(HubTransferError::Retryable("hub offline".to_owned()))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteMeetingLibrary for OfflineHub {
+        async fn page_meetings(
+            &self,
+            _hub: &HubConnection,
+            _query: Option<&str>,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> std::result::Result<MeetingPage, HubTransferError> {
+            Err(HubTransferError::Retryable("hub offline".to_owned()))
+        }
+
+        async fn meeting(
+            &self,
+            _hub: &HubConnection,
+            _id: RecordId,
+        ) -> std::result::Result<Option<SharedMeeting>, HubTransferError> {
+            Err(HubTransferError::Retryable("hub offline".to_owned()))
+        }
+    }
 
     struct LocalHub {
         library: super::super::library::HubLibrary,
     }
 
     #[async_trait]
-    impl RemoteLibrary for LocalHub {
+    impl RemoteDictationLibrary for LocalHub {
         async fn page_dictations(
             &self,
             _hub: &HubConnection,

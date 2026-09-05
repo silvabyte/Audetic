@@ -365,6 +365,35 @@ mod tests {
         started: Arc<Notify>,
     }
 
+    struct RateLimitedHub;
+
+    #[async_trait]
+    impl ReplicationTransport for RateLimitedHub {
+        async fn upload_snapshots(
+            &self,
+            _hub: &HubConnection,
+            _batch: SnapshotBatch,
+        ) -> std::result::Result<SnapshotBatchResponse, HubTransferError> {
+            Err(HubTransferError::Http {
+                status: 429,
+                message: "try later".to_owned(),
+                retry_after: Some("30".to_owned()),
+            })
+        }
+
+        async fn upload_blob(
+            &self,
+            _hub: &HubConnection,
+            _blob: BlobUpload,
+        ) -> std::result::Result<(), HubTransferError> {
+            Err(HubTransferError::Http {
+                status: 429,
+                message: "try later".to_owned(),
+                retry_after: Some("30".to_owned()),
+            })
+        }
+    }
+
     #[async_trait]
     impl ReplicationTransport for BlockingHub {
         async fn upload_snapshots(
@@ -373,6 +402,14 @@ mod tests {
             _batch: SnapshotBatch,
         ) -> std::result::Result<SnapshotBatchResponse, HubTransferError> {
             self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn upload_blob(
+            &self,
+            _hub: &HubConnection,
+            _blob: BlobUpload,
+        ) -> std::result::Result<(), HubTransferError> {
             std::future::pending().await
         }
     }
@@ -719,6 +756,63 @@ mod tests {
             )
             .unwrap();
         assert_eq!(state, ("pending".into(), None));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_outbox_work_remains_pending_for_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("device.db");
+        let conn = crate::db::migrate_db_at(&db_path).unwrap();
+        let hub = HubConnection {
+            base_url: "https://hub.example.ts.net:8443/audetic/".into(),
+            hub_id: audetic_core::sync::HubId::new(),
+            owner_login: "owner@example.com".into(),
+        };
+        crate::db::sync_settings::SyncSettingsRepository::save(
+            &conn,
+            &crate::db::sync_settings::SyncSettings {
+                role: SyncRole::ConnectedDevice,
+                hub: Some(hub.clone()),
+                upload_recording_payloads: false,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        crate::db::insert_workflow(
+            &conn,
+            &Workflow::new(
+                WorkflowType::VoiceToText,
+                WorkflowData::VoiceToText(VoiceToTextData {
+                    text: "retry me".into(),
+                    audio_path: "/missing".into(),
+                }),
+            ),
+        )
+        .unwrap();
+        drop(conn);
+
+        let worker = OutboxWorker::new(
+            db_path.clone(),
+            OutboxDestination::Remote {
+                hub,
+                replication: Arc::new(RateLimitedHub),
+            },
+        )
+        .with_payload_uploads(false)
+        .with_retry_jitter(|_| 0);
+        assert_eq!(worker.process_once().await.unwrap(), 1);
+
+        let conn = crate::db::open_db_at(&db_path).unwrap();
+        let state: (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state,next_attempt_at,last_error FROM sync_outbox_items",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state.0, "pending");
+        assert!(state.1.is_some());
+        assert!(state.2.is_some_and(|error| error.contains("HTTP 429")));
     }
 
     #[test]

@@ -174,12 +174,17 @@ mod tests {
     use semver::Version;
     use tower::ServiceExt;
 
+    use crate::sync::protocol::{
+        DictationPage, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting, SnapshotBatch,
+        SnapshotBatchResponse,
+    };
     use crate::sync::tailscale::{
         MappingState, ServeAssessment, TailscaleControl, TailscaleError, TailscaleStatus,
     };
     use crate::sync::transport::{
-        DiscoveryOutcome, HubProbe, HubTransferError, RemoteLibrary, RemotePayloadSource,
-        ReplicationTransport,
+        BlobUpload, DiscoveryOutcome, HubCapabilities, HubProbe, HubTransferError,
+        RemoteDictationLibrary, RemoteLibraryMutations, RemoteMeetingLibrary, RemotePayloadSource,
+        ReplicationTransport, StreamingPayloadResponse,
     };
 
     struct FakeTailscale;
@@ -248,13 +253,99 @@ mod tests {
     }
 
     struct UnusedReplication;
-    impl ReplicationTransport for UnusedReplication {}
+
+    #[async_trait]
+    impl ReplicationTransport for UnusedReplication {
+        async fn upload_snapshots(
+            &self,
+            _hub: &HubConnection,
+            _batch: SnapshotBatch,
+        ) -> Result<SnapshotBatchResponse, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+
+        async fn upload_blob(
+            &self,
+            _hub: &HubConnection,
+            _blob: BlobUpload,
+        ) -> Result<(), HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
 
     struct UnusedRemoteLibrary;
-    impl RemoteLibrary for UnusedRemoteLibrary {}
+
+    #[async_trait]
+    impl RemoteDictationLibrary for UnusedRemoteLibrary {
+        async fn page_dictations(
+            &self,
+            _hub: &HubConnection,
+            _query: Option<&str>,
+            _from: Option<&str>,
+            _to: Option<&str>,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<DictationPage, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteMeetingLibrary for UnusedRemoteLibrary {
+        async fn page_meetings(
+            &self,
+            _hub: &HubConnection,
+            _query: Option<&str>,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<MeetingPage, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+
+        async fn meeting(
+            &self,
+            _hub: &HubConnection,
+            _id: audetic_core::sync::RecordId,
+        ) -> Result<Option<SharedMeeting>, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteLibraryMutations for UnusedRemoteLibrary {
+        async fn update_meeting_title(
+            &self,
+            _hub: &HubConnection,
+            _id: audetic_core::sync::RecordId,
+            _patch: MeetingTitlePatch,
+        ) -> Result<SharedMeeting, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+
+        async fn delete_record(
+            &self,
+            _hub: &HubConnection,
+            _id: audetic_core::sync::RecordId,
+            _kind: RecordKind,
+        ) -> Result<(), HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
 
     struct UnusedRemotePayloads;
-    impl RemotePayloadSource for UnusedRemotePayloads {}
+
+    #[async_trait]
+    impl RemotePayloadSource for UnusedRemotePayloads {
+        async fn stream_payload(
+            &self,
+            _hub: &HubConnection,
+            _id: audetic_core::sync::RecordId,
+            _kind: RecordKind,
+            _range: Option<&str>,
+        ) -> Result<StreamingPayloadResponse, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
 
     fn test_router() -> (Router, tempfile::TempDir, HubConnection) {
         let temp = tempfile::tempdir().unwrap();
@@ -265,13 +356,19 @@ mod tests {
             hub_id: HubId::new(),
             owner_login: "owner@example.com".into(),
         };
+        let library = Arc::new(UnusedRemoteLibrary);
+        let capabilities = HubCapabilities::for_test(
+            Arc::new(FakeHubs { hub: hub.clone() }),
+            Arc::new(UnusedReplication),
+            library.clone(),
+            library.clone(),
+            library,
+            Arc::new(UnusedRemotePayloads),
+        );
         let service = Arc::new(SyncService::with_dependencies(
             path,
             Arc::new(FakeTailscale),
-            Arc::new(FakeHubs { hub: hub.clone() }),
-            Arc::new(UnusedReplication),
-            Arc::new(UnusedRemoteLibrary),
-            Arc::new(UnusedRemotePayloads),
+            capabilities,
             "127.0.0.1:0".parse().unwrap(),
         ));
         (router(SyncApiState::new(service)), temp, hub)

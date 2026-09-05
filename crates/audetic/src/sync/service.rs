@@ -29,10 +29,7 @@ use super::tailscale::{
     MappingState, ServeAssessment, SystemCommandRunner, Tailscale, TailscaleControl,
     TailscaleError, TailscaleStatus,
 };
-use super::transport::{
-    DiscoveryOutcome, HubProbe, RemoteLibrary, RemotePayloadSource, ReplicationTransport,
-    StreamingPayloadResponse,
-};
+use super::transport::{DiscoveryOutcome, HubCapabilities, StreamingPayloadResponse};
 
 pub enum PayloadSource {
     Local(crate::db::shared_library::LibraryBlobRecord),
@@ -113,10 +110,7 @@ struct PreparedOutboxRuntime {
 pub struct SyncService {
     db_path: PathBuf,
     tailscale: Arc<dyn TailscaleControl>,
-    probe: Arc<dyn HubProbe>,
-    replication: Arc<dyn ReplicationTransport>,
-    remote_library: Arc<dyn RemoteLibrary>,
-    remote_payloads: Arc<dyn RemotePayloadSource>,
+    hub_capabilities: HubCapabilities,
     hub_bind_address: SocketAddr,
     transition: Mutex<()>,
     hub_runtime: Mutex<Option<HubRuntime>>,
@@ -131,14 +125,10 @@ impl SyncService {
     }
 
     pub fn production(db_path: PathBuf) -> Self {
-        let network = Arc::new(NetworkHubAdapter::default());
         Self::with_dependencies(
             db_path,
             Arc::new(Tailscale::new(SystemCommandRunner)),
-            network.clone(),
-            network.clone(),
-            network.clone(),
-            network,
+            HubCapabilities::from_adapter(NetworkHubAdapter::default()),
             HUB_LISTENER_ADDRESS
                 .parse()
                 .expect("valid listener address"),
@@ -148,19 +138,13 @@ impl SyncService {
     pub fn with_dependencies(
         db_path: PathBuf,
         tailscale: Arc<dyn TailscaleControl>,
-        probe: Arc<dyn HubProbe>,
-        replication: Arc<dyn ReplicationTransport>,
-        remote_library: Arc<dyn RemoteLibrary>,
-        remote_payloads: Arc<dyn RemotePayloadSource>,
+        hub_capabilities: HubCapabilities,
         hub_bind_address: SocketAddr,
     ) -> Self {
         Self {
             db_path,
             tailscale,
-            probe,
-            replication,
-            remote_library,
-            remote_payloads,
+            hub_capabilities,
             hub_bind_address,
             transition: Mutex::new(()),
             hub_runtime: Mutex::new(None),
@@ -206,7 +190,7 @@ impl SyncService {
         let (_, settings) = self.load()?;
         let result = super::library_reader::LibraryReader::new(
             self.db_path.clone(),
-            Arc::clone(&self.remote_library),
+            self.hub_capabilities.dictations(),
         )
         .read(&settings, params)
         .await
@@ -255,7 +239,7 @@ impl SyncService {
         let (_, settings) = self.load()?;
         let result = super::library_reader::MeetingLibraryReader::new(
             self.db_path.clone(),
-            Arc::clone(&self.remote_library),
+            self.hub_capabilities.meetings(),
         )
         .read(&settings, query, offset, limit)
         .await
@@ -314,7 +298,8 @@ impl SyncService {
                 .map_err(SyncServiceError::Persistence)?
                 .ok_or_else(|| SyncServiceError::InvalidRequest("meeting not found".into())),
             SyncRole::ConnectedDevice => self
-                .remote_library
+                .hub_capabilities
+                .mutations()
                 .update_meeting_title(settings.hub.as_ref().expect("connected hub"), id, patch)
                 .await
                 .map_err(|error| SyncServiceError::HubVerification(error.to_string())),
@@ -337,7 +322,8 @@ impl SyncService {
                 .map(|_| ())
                 .map_err(|error| SyncServiceError::Persistence(anyhow::anyhow!(error))),
             SyncRole::ConnectedDevice => self
-                .remote_library
+                .hub_capabilities
+                .mutations()
                 .delete_record(settings.hub.as_ref().expect("connected hub"), id, kind)
                 .await
                 .map_err(|error| SyncServiceError::HubVerification(error.to_string())),
@@ -359,7 +345,8 @@ impl SyncService {
                 .map(|value| value.map(PayloadSource::Local))
                 .map_err(SyncServiceError::Persistence),
             SyncRole::ConnectedDevice => self
-                .remote_payloads
+                .hub_capabilities
+                .payloads()
                 .stream_payload(
                     settings.hub.as_ref().expect("connected hub"),
                     id,
@@ -471,21 +458,25 @@ impl SyncService {
             .discoverable_peers()
             .map(|peer| peer.audetic_base_url())
             .collect();
-        let (discovered_hubs, discovery_failures) =
-            match self.probe.discover(candidates, &status.owner_login).await {
-                DiscoveryOutcome::None { failures } => (
-                    Vec::new(),
-                    failures
-                        .into_iter()
-                        .map(|failure| SyncDiscoveryFailure {
-                            candidate: failure.candidate,
-                            reason: failure.reason,
-                        })
-                        .collect(),
-                ),
-                DiscoveryOutcome::One(candidate) => (vec![candidate], Vec::new()),
-                DiscoveryOutcome::Multiple(candidates) => (candidates, Vec::new()),
-            };
+        let (discovered_hubs, discovery_failures) = match self
+            .hub_capabilities
+            .probe()
+            .discover(candidates, &status.owner_login)
+            .await
+        {
+            DiscoveryOutcome::None { failures } => (
+                Vec::new(),
+                failures
+                    .into_iter()
+                    .map(|failure| SyncDiscoveryFailure {
+                        candidate: failure.candidate,
+                        reason: failure.reason,
+                    })
+                    .collect(),
+            ),
+            DiscoveryOutcome::One(candidate) => (vec![candidate], Vec::new()),
+            DiscoveryOutcome::Multiple(candidates) => (candidates, Vec::new()),
+        };
 
         Ok(SyncSetupResult {
             status: self.status_unlocked().await?,
@@ -768,12 +759,16 @@ impl SyncService {
             hub_id,
             owner_login: owner_login.to_owned(),
         };
-        self.probe.handshake(&connection).await.map_err(|error| {
-            (
-                SyncServiceError::HubVerification(error.to_string()),
-                mapping_created,
-            )
-        })?;
+        self.hub_capabilities
+            .probe()
+            .handshake(&connection)
+            .await
+            .map_err(|error| {
+                (
+                    SyncServiceError::HubVerification(error.to_string()),
+                    mapping_created,
+                )
+            })?;
         Ok(mapping_created)
     }
 
@@ -800,7 +795,8 @@ impl SyncService {
             )));
         }
         let candidate = self
-            .probe
+            .hub_capabilities
+            .probe()
             .handshake(&requested_hub)
             .await
             .map_err(|error| SyncServiceError::HubVerification(error.to_string()))?;
@@ -925,7 +921,8 @@ impl SyncService {
             hub_id,
             owner_login: owner_login.to_owned(),
         };
-        self.probe
+        self.hub_capabilities
+            .probe()
             .handshake(&connection)
             .await
             .map_err(|error| SyncServiceError::HubVerification(error.to_string()))?;
@@ -942,7 +939,8 @@ impl SyncService {
                 "persisted Connected Device role has no Home Hub"
             ))
         })?;
-        self.probe
+        self.hub_capabilities
+            .probe()
             .handshake(hub)
             .await
             .map_err(|error| SyncServiceError::HubVerification(error.to_string()))?;
@@ -1144,7 +1142,7 @@ impl SyncService {
                         "Connected Device outbox has no Home Hub"
                     ))
                 })?,
-                replication: Arc::clone(&self.replication),
+                replication: self.hub_capabilities.replication(),
             },
             SyncRole::Standalone => {
                 return Err(SyncServiceError::InvalidRequest(
@@ -1424,10 +1422,14 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use crate::sync::protocol::{
-        Snapshot, SnapshotBatch, SnapshotBatchResponse, SnapshotDisposition, SnapshotResult,
+        DictationPage, MeetingPage, MeetingTitlePatch, SharedMeeting, Snapshot, SnapshotBatch,
+        SnapshotBatchResponse, SnapshotDisposition, SnapshotResult,
     };
     use crate::sync::tailscale::ServeAssessment;
-    use crate::sync::transport::{BlobUpload, HubTransferError};
+    use crate::sync::transport::{
+        BlobUpload, HubProbe, HubTransferError, RemoteDictationLibrary, RemoteLibraryMutations,
+        RemoteMeetingLibrary, RemotePayloadSource, ReplicationTransport,
+    };
 
     struct FakeTailscale {
         mapping: StdMutex<MappingState>,
@@ -1582,10 +1584,90 @@ mod tests {
     }
 
     struct UnusedRemoteLibrary;
-    impl RemoteLibrary for UnusedRemoteLibrary {}
+
+    #[async_trait]
+    impl RemoteDictationLibrary for UnusedRemoteLibrary {
+        async fn page_dictations(
+            &self,
+            _hub: &HubConnection,
+            _query: Option<&str>,
+            _from: Option<&str>,
+            _to: Option<&str>,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<DictationPage, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteMeetingLibrary for UnusedRemoteLibrary {
+        async fn page_meetings(
+            &self,
+            _hub: &HubConnection,
+            _query: Option<&str>,
+            _cursor: Option<&str>,
+            _limit: usize,
+        ) -> Result<MeetingPage, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+
+        async fn meeting(
+            &self,
+            _hub: &HubConnection,
+            _id: RecordId,
+        ) -> Result<Option<SharedMeeting>, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
+
+    #[async_trait]
+    impl RemoteLibraryMutations for UnusedRemoteLibrary {
+        async fn update_meeting_title(
+            &self,
+            _hub: &HubConnection,
+            _id: RecordId,
+            _patch: MeetingTitlePatch,
+        ) -> Result<SharedMeeting, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+
+        async fn delete_record(
+            &self,
+            _hub: &HubConnection,
+            _id: RecordId,
+            _kind: RecordKind,
+        ) -> Result<(), HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
 
     struct UnusedRemotePayloads;
-    impl RemotePayloadSource for UnusedRemotePayloads {}
+
+    #[async_trait]
+    impl RemotePayloadSource for UnusedRemotePayloads {
+        async fn stream_payload(
+            &self,
+            _hub: &HubConnection,
+            _id: RecordId,
+            _kind: RecordKind,
+            _range: Option<&str>,
+        ) -> Result<StreamingPayloadResponse, HubTransferError> {
+            Err(HubTransferError::Retryable("unused".to_owned()))
+        }
+    }
+
+    fn test_capabilities(hubs: Arc<FakeHubs>) -> HubCapabilities {
+        let unused_library = Arc::new(UnusedRemoteLibrary);
+        HubCapabilities::for_test(
+            hubs.clone(),
+            hubs,
+            unused_library.clone(),
+            unused_library.clone(),
+            unused_library,
+            Arc::new(UnusedRemotePayloads),
+        )
+    }
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -1604,10 +1686,7 @@ mod tests {
         let service = SyncService::with_dependencies(
             path.clone(),
             tailscale.clone(),
-            hubs.clone(),
-            hubs.clone(),
-            Arc::new(UnusedRemoteLibrary),
-            Arc::new(UnusedRemotePayloads),
+            test_capabilities(hubs.clone()),
             "127.0.0.1:0".parse().unwrap(),
         );
         Fixture {
@@ -2297,10 +2376,7 @@ mod tests {
         let restarted = SyncService::with_dependencies(
             fixture.path.clone(),
             fixture.tailscale.clone(),
-            fixture.hubs.clone(),
-            fixture.hubs.clone(),
-            Arc::new(UnusedRemoteLibrary),
-            Arc::new(UnusedRemotePayloads),
+            test_capabilities(fixture.hubs.clone()),
             "127.0.0.1:0".parse().unwrap(),
         );
         let status = restarted.initialize().await.unwrap();
