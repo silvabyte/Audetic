@@ -32,6 +32,11 @@ pub const API_PREFIX: &str = "/api";
 pub mod paths {
     pub const VERSION: &str = "/version";
     pub const TOGGLE: &str = "/toggle";
+    pub const RECORDING_STATUS: &str = "/status";
+    pub const MEETINGS_START: &str = "/meetings/start";
+    pub const MEETINGS_STOP: &str = "/meetings/stop";
+    pub const MEETINGS_CANCEL: &str = "/meetings/cancel";
+    pub const MEETINGS_STATUS: &str = "/meetings/status";
     pub const MEETINGS_TOGGLE: &str = "/meetings/toggle";
     pub const MEETINGS_IMPORT: &str = "/meetings/import";
     pub const AGENT_PROFILES: &str = "/agent-profiles";

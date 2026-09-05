@@ -20,7 +20,7 @@ use super::capture_recovery::{start_capture_with_retries, CaptureRecovery};
 use super::input_device::{
     ActiveInput, CaptureBackend, CpalCaptureBackend, InputDataCallback, InputErrorCallback,
 };
-use super::resample::{push_mono_f32, resample_mono_f32};
+use super::resample::{push_mono_f32, resample_mono_f32, sample_levels};
 use super::stream_event::{CaptureSource, StreamDeath, StreamEventSink, StreamGeneration};
 
 pub(crate) trait MonotonicClock: Send + Sync {
@@ -58,6 +58,7 @@ struct ActiveSegment {
 struct ClosedSegment {
     native_samples: Vec<f32>,
     native_sample_rate: u32,
+    generation: StreamGeneration,
     first_sample_at: Option<Duration>,
     ended_at: Duration,
     death_started_at: Option<Duration>,
@@ -188,6 +189,13 @@ impl MicAudioSource {
                 "Meeting microphone stream died while its Segment was starting"
             ));
         }
+        info!(
+            event = "capture_segment_opened",
+            source = "meeting_microphone",
+            stream_generation = generation.0,
+            native_sample_rate_hz = input.native_sample_rate(),
+            "Capture Segment opened"
+        );
         Ok(ActiveSegment {
             input,
             native_samples,
@@ -236,9 +244,12 @@ impl MicAudioSource {
         let fill_samples = usize::try_from(fill_samples).context("Silence Fill is too long")?;
         self.canonical_samples
             .resize(self.canonical_samples.len() + fill_samples, 0.0);
-        debug!(
-            "Inserted {} samples of meeting microphone Silence Fill for {:?}",
-            fill_samples, elapsed
+        info!(
+            event = "capture_silence_fill",
+            source = "meeting_microphone",
+            canonical_samples = fill_samples,
+            gap_milliseconds = elapsed.as_millis(),
+            "Capture Silence Fill inserted"
         );
         Ok(())
     }
@@ -265,6 +276,7 @@ impl MicAudioSource {
             self.append_silence_fill_between(gap_before, first_sample_at)
                 .context("Failed to align meeting microphone Segment")?;
         }
+        let (native_rms, native_peak) = sample_levels(&segment.native_samples);
         let canonical = resample_mono_f32(
             &segment.native_samples,
             segment.native_sample_rate,
@@ -272,12 +284,17 @@ impl MicAudioSource {
         )
         .context("Failed to normalize meeting microphone Segment")?;
         self.captured_audio |= !canonical.is_empty();
-        debug!(
-            "Closed meeting microphone Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
-            segment.native_samples.len(),
-            segment.native_sample_rate,
-            canonical.len(),
-            self.target_sample_rate
+        info!(
+            event = "capture_segment_closed",
+            source = "meeting_microphone",
+            stream_generation = segment.generation.0,
+            native_samples = segment.native_samples.len(),
+            native_rms,
+            native_peak,
+            native_sample_rate_hz = segment.native_sample_rate,
+            canonical_samples = canonical.len(),
+            canonical_sample_rate_hz = self.target_sample_rate,
+            "Capture Segment closed"
         );
         self.canonical_samples.extend(canonical);
         Ok(())
@@ -301,6 +318,7 @@ impl MicAudioSource {
             return Ok(Some(ClosedSegment {
                 native_samples: native,
                 native_sample_rate,
+                generation: segment.generation,
                 first_sample_at: None,
                 ended_at,
                 death_started_at,
@@ -323,6 +341,7 @@ impl MicAudioSource {
         Ok(Some(ClosedSegment {
             native_samples: native,
             native_sample_rate,
+            generation: segment.generation,
             first_sample_at: Some(first_sample_at),
             ended_at: first_sample_at.saturating_add(
                 Self::duration_for_frames(native_len, native_sample_rate)

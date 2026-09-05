@@ -32,6 +32,7 @@ See the [Configuration Guide](./configuration.md#provider-cli-helpers) for detai
 ### Development
 
 - [**Adding Providers**](./adding-providers/README.md) - Step-by-step guide for adding new transcription providers
+- [CoreAudio device churn proof](./coreaudio-device-churn-proof.md) - Manual macOS hot-swap verification harness
 
 Audetic includes a Makefile for common development tasks:
 

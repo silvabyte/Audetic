@@ -11,7 +11,7 @@ use super::capture_recovery::{start_capture_with_retries, CaptureRecovery};
 use super::input_device::{
     ActiveInput, CaptureBackend, CpalCaptureBackend, InputDataCallback, InputErrorCallback,
 };
-use super::resample::{push_mono_f32, resample_mono_f32};
+use super::resample::{push_mono_f32, resample_mono_f32, sample_levels};
 use super::stream_event::{CaptureSource, StreamDeath, StreamEventSink, StreamGeneration};
 
 /// Target sample rate the VTT pipeline (Whisper) expects. The device may
@@ -253,6 +253,13 @@ impl AudioStreamManager {
             .backend
             .start_default_input(on_data, on_error)
             .context("Failed to start Segment from current Default Input")?;
+        info!(
+            event = "capture_segment_opened",
+            source = "dictation",
+            stream_generation = generation.0,
+            native_sample_rate_hz = input.native_sample_rate(),
+            "Capture Segment opened"
+        );
         *self.stream_generation.lock().unwrap() = generation;
         Ok(ActiveSegment {
             input,
@@ -267,17 +274,24 @@ impl AudioStreamManager {
         };
 
         let native_sample_rate = segment.input.native_sample_rate();
+        let generation = segment.generation;
         drop(segment.input);
         let native = std::mem::take(&mut *segment.native_samples.lock().unwrap());
+        let (native_rms, native_peak) = sample_levels(&native);
         let canonical = resample_mono_f32(&native, native_sample_rate, TARGET_SAMPLE_RATE)
             .context("Failed to normalize audio Segment")?;
 
-        debug!(
-            "Closed Segment: {} native @ {} Hz -> {} canonical @ {} Hz",
-            native.len(),
-            native_sample_rate,
-            canonical.len(),
-            TARGET_SAMPLE_RATE
+        info!(
+            event = "capture_segment_closed",
+            source = "dictation",
+            stream_generation = generation.0,
+            native_samples = native.len(),
+            native_rms,
+            native_peak,
+            native_sample_rate_hz = native_sample_rate,
+            canonical_samples = canonical.len(),
+            canonical_sample_rate_hz = TARGET_SAMPLE_RATE,
+            "Capture Segment closed"
         );
         self.canonical_samples.lock().unwrap().extend(canonical);
         Ok(true)
