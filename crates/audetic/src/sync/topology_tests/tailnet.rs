@@ -2,16 +2,20 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{HeaderValue, Method, Request, Response};
 use axum::Router;
-use futures_util::{StreamExt, TryStreamExt};
+use bytes::Bytes;
+use futures_util::{Stream, StreamExt, TryStreamExt};
 use reqwest::Url;
 use semver::Version;
 use tokio::sync::Notify;
 use tower::ServiceExt;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 
 use crate::sync::client::{HubTransport, StreamingTransportResponse, TransportResponse};
 use crate::sync::identity::TAILSCALE_USER_LOGIN_HEADER;
@@ -23,12 +27,16 @@ use crate::sync::tailscale::{
 };
 use crate::sync::transport::HubTransferError;
 
+use super::watchdog;
+
 #[derive(Clone)]
 pub(super) struct FaultGate {
     entered: Arc<Notify>,
     is_entered: Arc<AtomicBool>,
     release: Arc<Notify>,
     is_released: Arc<AtomicBool>,
+    cancelled: Arc<Notify>,
+    is_cancelled: Arc<AtomicBool>,
 }
 
 impl FaultGate {
@@ -38,18 +46,51 @@ impl FaultGate {
             is_entered: Arc::new(AtomicBool::new(false)),
             release: Arc::new(Notify::new()),
             is_released: Arc::new(AtomicBool::new(false)),
+            cancelled: Arc::new(Notify::new()),
+            is_cancelled: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub(super) async fn wait_entered(&self) {
-        while !self.is_entered.load(Ordering::Acquire) {
-            self.entered.notified().await;
-        }
+        watchdog("waiting for a fault gate to be entered", async {
+            while !self.is_entered.load(Ordering::Acquire) {
+                self.entered.notified().await;
+            }
+        })
+        .await;
+    }
+
+    pub(super) async fn wait_cancelled(&self) {
+        watchdog("waiting for a gated stream to be cancelled", async {
+            while !self.is_cancelled.load(Ordering::Acquire) {
+                self.cancelled.notified().await;
+            }
+        })
+        .await;
     }
 
     pub(super) fn release(&self) {
         self.is_released.store(true, Ordering::Release);
         self.release.notify_waiters();
+    }
+
+    fn enter(&self) {
+        self.is_entered.store(true, Ordering::Release);
+        self.entered.notify_waiters();
+    }
+
+    async fn wait_released(&self) {
+        watchdog("waiting for a fault gate release", async {
+            while !self.is_released.load(Ordering::Acquire) {
+                self.release.notified().await;
+            }
+        })
+        .await;
+    }
+
+    fn cancelled(&self) {
+        self.is_cancelled.store(true, Ordering::Release);
+        self.cancelled.notify_waiters();
     }
 }
 
@@ -58,6 +99,8 @@ pub(super) enum OperationFault {
     FailBeforeDispatch(&'static str),
     LoseResponseAfterDispatch(&'static str),
     HoldBeforeDispatch(FaultGate),
+    HoldRequestBodyAfterFirstChunk(FaultGate),
+    HoldResponseBodyAfterFirstChunk(FaultGate),
     TruncateRequestBody(usize),
     CorruptRequestBody,
     TruncateResponseBody(usize),
@@ -65,6 +108,70 @@ pub(super) enum OperationFault {
     OverrideIdentity(Option<String>),
     OverrideProtocol(Option<String>),
     FunnelRequest,
+}
+
+struct GatedBodyStream<E> {
+    inner: Pin<Box<dyn Stream<Item = Result<Bytes, E>> + Send>>,
+    gate: FaultGate,
+    yielded_first: bool,
+    completed: bool,
+    release_wait: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
+}
+
+impl<E> GatedBodyStream<E> {
+    fn new(stream: impl Stream<Item = Result<Bytes, E>> + Send + 'static, gate: FaultGate) -> Self {
+        Self {
+            inner: Box::pin(stream),
+            gate,
+            yielded_first: false,
+            completed: false,
+            release_wait: None,
+        }
+    }
+}
+
+impl<E> Stream for GatedBodyStream<E> {
+    type Item = Result<Bytes, E>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.yielded_first && !self.gate.is_released.load(Ordering::Acquire) {
+            self.gate.enter();
+            if self.release_wait.is_none() {
+                let gate = self.gate.clone();
+                self.release_wait = Some(Box::pin(async move { gate.wait_released().await }));
+            }
+            if self
+                .release_wait
+                .as_mut()
+                .expect("release wait was installed")
+                .as_mut()
+                .poll(cx)
+                .is_pending()
+            {
+                return Poll::Pending;
+            }
+            self.release_wait = None;
+        }
+        match self.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(item)) => {
+                self.yielded_first = true;
+                Poll::Ready(Some(item))
+            }
+            Poll::Ready(None) => {
+                self.completed = true;
+                Poll::Ready(None)
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl<E> Drop for GatedBodyStream<E> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.gate.cancelled();
+        }
+    }
 }
 
 struct ScriptedFault {
@@ -125,6 +232,19 @@ impl FakeTailnet {
         TailnetTransport {
             tailnet: self.clone(),
             source: source.to_owned(),
+            untrusted_identity_header: None,
+        }
+    }
+
+    pub(super) fn spoofing_transport(
+        &self,
+        source: &str,
+        claimed_identity: &str,
+    ) -> TailnetTransport {
+        TailnetTransport {
+            tailnet: self.clone(),
+            source: source.to_owned(),
+            untrusted_identity_header: Some(claimed_identity.to_owned()),
         }
     }
 
@@ -267,28 +387,33 @@ impl FakeTailnet {
         match &fault {
             Some(OperationFault::FailBeforeDispatch(message)) => return Err((*message).into()),
             Some(OperationFault::HoldBeforeDispatch(gate)) => {
-                gate.is_entered.store(true, Ordering::Release);
-                gate.entered.notify_waiters();
-                while !gate.is_released.load(Ordering::Acquire) {
-                    gate.release.notified().await;
-                }
+                gate.enter();
+                gate.wait_released().await;
             }
             _ => {}
         }
 
-        if let Some(OperationFault::TruncateRequestBody(limit)) = fault.as_ref() {
-            let limit = *limit;
-            body = Body::from_stream(body.into_data_stream().scan(0usize, move |seen, item| {
-                let output = item.ok().and_then(|chunk| {
-                    let remaining = limit.saturating_sub(*seen);
-                    *seen += chunk.len().min(remaining);
-                    (remaining > 0)
-                        .then(|| Ok::<_, std::io::Error>(chunk.slice(..chunk.len().min(remaining))))
-                });
-                std::future::ready(output)
-            }));
-        } else if matches!(fault, Some(OperationFault::CorruptRequestBody)) {
-            body = corrupt_body(body);
+        match fault.as_ref() {
+            Some(OperationFault::TruncateRequestBody(limit)) => {
+                let limit = *limit;
+                body =
+                    Body::from_stream(body.into_data_stream().scan(0usize, move |seen, item| {
+                        let output = item.ok().and_then(|chunk| {
+                            let remaining = limit.saturating_sub(*seen);
+                            *seen += chunk.len().min(remaining);
+                            (remaining > 0).then(|| {
+                                Ok::<_, std::io::Error>(chunk.slice(..chunk.len().min(remaining)))
+                            })
+                        });
+                        std::future::ready(output)
+                    }));
+            }
+            Some(OperationFault::CorruptRequestBody) => body = corrupt_body(body),
+            Some(OperationFault::HoldRequestBodyAfterFirstChunk(gate)) => {
+                body =
+                    Body::from_stream(GatedBodyStream::new(body.into_data_stream(), gate.clone()));
+            }
+            _ => {}
         }
 
         let target_state = self.node(&target);
@@ -367,6 +492,13 @@ impl FakeTailnet {
                 let (parts, body) = response.into_parts();
                 Response::from_parts(parts, corrupt_body(body))
             }
+            Some(OperationFault::HoldResponseBodyAfterFirstChunk(gate)) => {
+                let (parts, body) = response.into_parts();
+                Response::from_parts(
+                    parts,
+                    Body::from_stream(GatedBodyStream::new(body.into_data_stream(), gate)),
+                )
+            }
             _ => response,
         })
     }
@@ -391,6 +523,7 @@ fn corrupt_body(body: Body) -> Body {
 pub(super) struct TailnetTransport {
     tailnet: FakeTailnet,
     source: String,
+    untrusted_identity_header: Option<String>,
 }
 
 impl TailnetTransport {
@@ -398,9 +531,15 @@ impl TailnetTransport {
         &self,
         method: Method,
         url: Url,
-        headers: BTreeMap<String, String>,
+        mut headers: BTreeMap<String, String>,
         body: Body,
     ) -> Result<TransportResponse, String> {
+        if let Some(identity) = &self.untrusted_identity_header {
+            headers.insert(TAILSCALE_USER_LOGIN_HEADER.into(), identity.clone());
+        }
+        // The request-side header is untrusted application input. FakeTailnet
+        // strips it and injects identity from the source node, matching the
+        // trusted reverse-proxy boundary used by the real deployment.
         let response = self
             .tailnet
             .dispatch(&self.source, method, url, headers, body)

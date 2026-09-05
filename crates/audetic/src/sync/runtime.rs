@@ -1236,9 +1236,13 @@ impl RuntimeSet {
         let observer = Arc::clone(&self.shared.dependencies.observer);
         let role_version = RoleVersion::new(*role_epoch);
         let task = tokio::spawn(async move {
-            observer.observe(WorkerEvent::ListenerStarted);
+            observer.observe(WorkerEvent::ListenerStarted {
+                role_epoch: role_version.value(),
+            });
             let result = listener.await;
-            observer.observe(WorkerEvent::ListenerStopped);
+            observer.observe(WorkerEvent::ListenerStopped {
+                role_epoch: role_version.value(),
+            });
             if !task_cancellation.is_cancelled() {
                 let message = match &result {
                     Ok(()) => "Home Hub listener terminated unexpectedly".to_owned(),

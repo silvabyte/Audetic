@@ -8,6 +8,8 @@ use std::time::Duration;
 use crate::sync::clock::SyncClock;
 use crate::sync::observer::{WorkerEvent, WorkerObserver};
 
+use super::watchdog;
+
 struct Sleeper {
     deadline: chrono::DateTime<chrono::Utc>,
     wake: oneshot::Sender<()>,
@@ -57,18 +59,21 @@ impl ManualClock {
     }
 
     pub(super) async fn wait_for_sleepers(&self, minimum: usize) {
-        loop {
-            let notified = self.registered.notified();
-            let ready = {
-                let mut state = self.state.lock().unwrap();
-                state.sleepers.retain(|sleeper| !sleeper.wake.is_closed());
-                state.sleepers.len() >= minimum
-            };
-            if ready {
-                return;
+        watchdog("waiting for manual-clock sleepers", async {
+            loop {
+                let notified = self.registered.notified();
+                let ready = {
+                    let mut state = self.state.lock().unwrap();
+                    state.sleepers.retain(|sleeper| !sleeper.wake.is_closed());
+                    state.sleepers.len() >= minimum
+                };
+                if ready {
+                    return;
+                }
+                notified.await;
             }
-            notified.await;
-        }
+        })
+        .await;
     }
 }
 
@@ -105,23 +110,33 @@ impl WorkerProbe {
         self.events.lock().unwrap().clone()
     }
 
-    pub(super) fn finished_cycles(&self) -> usize {
+    pub(super) fn successful_cycles(&self, role_epoch: u64) -> usize {
         self.events
             .lock()
             .unwrap()
             .iter()
-            .filter(|event| matches!(event, WorkerEvent::OutboxCycleFinished { .. }))
+            .filter(|event| {
+                matches!(
+                    event,
+                    WorkerEvent::OutboxCycleSucceeded {
+                        role_epoch: event_epoch
+                    } if *event_epoch == role_epoch
+                )
+            })
             .count()
     }
 
     pub(super) async fn wait_for(&self, predicate: impl Fn(&[WorkerEvent]) -> bool) {
-        loop {
-            let notified = self.changed.notified();
-            if predicate(&self.events.lock().unwrap()) {
-                return;
+        watchdog("waiting for worker event", async {
+            loop {
+                let notified = self.changed.notified();
+                if predicate(&self.events.lock().unwrap()) {
+                    return;
+                }
+                notified.await;
             }
-            notified.await;
-        }
+        })
+        .await;
     }
 }
 

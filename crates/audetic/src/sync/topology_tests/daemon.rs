@@ -1,6 +1,5 @@
-use async_trait::async_trait;
 use audetic_core::sync::{
-    CacheLevel, HubCandidate, HubConnection, RecordId, SyncRole, SyncSetupRequest, SyncSetupResult,
+    CacheLevel, HubConnection, RecordId, SyncRole, SyncSetupRequest, SyncSetupResult,
 };
 use fs2::FileExt;
 
@@ -9,145 +8,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::db::{VoiceToTextData, Workflow, WorkflowData, WorkflowType};
-use crate::sync::client::{discover_hubs, HubClient};
-use crate::sync::protocol::{
-    DictationPage, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting, SnapshotBatch,
-    SnapshotBatchResponse,
-};
+use crate::sync::client::{HubClient, NetworkHubAdapter};
 use crate::sync::runtime::RuntimeDependencies;
-use crate::sync::transport::{
-    BlobUpload, DiscoveryOutcome, HubCapabilities, HubProbe, HubTransferError,
-    RemoteDictationLibrary, RemoteLibraryMutations, RemoteMeetingLibrary, RemotePayloadSource,
-    ReplicationTransport, StreamingPayloadResponse,
-};
+use crate::sync::transport::HubCapabilities;
 use crate::sync::SyncService;
 
 use super::clock::{ManualClock, WorkerProbe};
 use super::tailnet::{FakeTailnet, TailnetTransport};
-
-#[derive(Clone)]
-struct TailnetHubAdapter {
-    transport: TailnetTransport,
-}
-
-impl TailnetHubAdapter {
-    fn client(&self, hub: &HubConnection) -> Result<HubClient<TailnetTransport>, HubTransferError> {
-        HubClient::with_transport(&hub.base_url, self.transport.clone()).map_err(Into::into)
-    }
-}
-
-#[async_trait]
-impl HubProbe for TailnetHubAdapter {
-    async fn handshake(&self, hub: &HubConnection) -> Result<HubCandidate, HubTransferError> {
-        HubProbe::handshake(&self.client(hub)?, hub).await
-    }
-
-    async fn discover(
-        &self,
-        candidates: Vec<String>,
-        expected_owner_login: &str,
-    ) -> DiscoveryOutcome {
-        discover_hubs(self.transport.clone(), candidates, expected_owner_login).await
-    }
-}
-
-#[async_trait]
-impl ReplicationTransport for TailnetHubAdapter {
-    async fn upload_snapshots(
-        &self,
-        hub: &HubConnection,
-        batch: SnapshotBatch,
-    ) -> Result<SnapshotBatchResponse, HubTransferError> {
-        ReplicationTransport::upload_snapshots(&self.client(hub)?, hub, batch).await
-    }
-
-    async fn upload_blob(
-        &self,
-        hub: &HubConnection,
-        blob: BlobUpload,
-    ) -> Result<(), HubTransferError> {
-        ReplicationTransport::upload_blob(&self.client(hub)?, hub, blob).await
-    }
-}
-
-#[async_trait]
-impl RemoteDictationLibrary for TailnetHubAdapter {
-    async fn page_dictations(
-        &self,
-        hub: &HubConnection,
-        query: Option<&str>,
-        from: Option<&str>,
-        to: Option<&str>,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<DictationPage, HubTransferError> {
-        RemoteDictationLibrary::page_dictations(
-            &self.client(hub)?,
-            hub,
-            query,
-            from,
-            to,
-            cursor,
-            limit,
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl RemoteMeetingLibrary for TailnetHubAdapter {
-    async fn page_meetings(
-        &self,
-        hub: &HubConnection,
-        query: Option<&str>,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<MeetingPage, HubTransferError> {
-        RemoteMeetingLibrary::page_meetings(&self.client(hub)?, hub, query, cursor, limit).await
-    }
-
-    async fn meeting(
-        &self,
-        hub: &HubConnection,
-        id: RecordId,
-    ) -> Result<Option<SharedMeeting>, HubTransferError> {
-        RemoteMeetingLibrary::meeting(&self.client(hub)?, hub, id).await
-    }
-}
-
-#[async_trait]
-impl RemoteLibraryMutations for TailnetHubAdapter {
-    async fn update_meeting_title(
-        &self,
-        hub: &HubConnection,
-        id: RecordId,
-        patch: MeetingTitlePatch,
-    ) -> Result<SharedMeeting, HubTransferError> {
-        RemoteLibraryMutations::update_meeting_title(&self.client(hub)?, hub, id, patch).await
-    }
-
-    async fn delete_record(
-        &self,
-        hub: &HubConnection,
-        id: RecordId,
-        kind: RecordKind,
-    ) -> Result<(), HubTransferError> {
-        RemoteLibraryMutations::delete_record(&self.client(hub)?, hub, id, kind).await
-    }
-}
-
-#[async_trait]
-impl RemotePayloadSource for TailnetHubAdapter {
-    async fn stream_payload(
-        &self,
-        hub: &HubConnection,
-        id: RecordId,
-        kind: RecordKind,
-        range: Option<&str>,
-    ) -> Result<StreamingPayloadResponse, HubTransferError> {
-        RemotePayloadSource::stream_payload(&self.client(hub)?, hub, id, kind, range).await
-    }
-}
 
 pub(super) struct HomeHubTopology {
     _root: tempfile::TempDir,
@@ -216,9 +83,7 @@ impl TestDaemon {
         clock: &Arc<ManualClock>,
         probe: &Arc<WorkerProbe>,
     ) -> SyncService {
-        let adapter = TailnetHubAdapter {
-            transport: tailnet.transport(name),
-        };
+        let adapter = NetworkHubAdapter::from_transport(tailnet.transport(name));
         SyncService::with_runtime_dependencies(
             db_path.to_path_buf(),
             tailnet.tailscale(name),
@@ -317,13 +182,26 @@ impl TestDaemon {
         crate::db::open_db_at(&self.db_path).unwrap()
     }
 
+    pub(super) fn role_epoch(&self) -> u64 {
+        self.connection()
+            .query_row(
+                "SELECT role_epoch FROM sync_settings WHERE singleton=1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     pub(super) async fn wait_for_cycle(&self) {
+        let role_epoch = self.role_epoch();
         self.probe
             .wait_for(|events| {
                 events.iter().any(|event| {
                     matches!(
                         event,
-                        crate::sync::observer::WorkerEvent::OutboxCycleFinished { .. }
+                        crate::sync::observer::WorkerEvent::OutboxCycleSucceeded {
+                            role_epoch: event_epoch
+                        } if *event_epoch == role_epoch
                     )
                 })
             })
@@ -335,31 +213,87 @@ impl TestDaemon {
     }
 
     pub(super) async fn drive_cycle_by(&self, duration: Duration) {
-        let before = self.probe.finished_cycles();
+        self.drive_cycle_with_result(duration, true).await;
+    }
+
+    pub(super) async fn drive_failed_cycle(&self) {
+        self.drive_cycle_with_result(Duration::from_secs(2), false)
+            .await;
+    }
+
+    pub(super) async fn drive_failed_cycle_by(&self, duration: Duration) {
+        self.drive_cycle_with_result(duration, false).await;
+    }
+
+    pub(super) async fn begin_cycle_by(&self, duration: Duration) {
+        self.clock.wait_for_sleepers(1).await;
+        self.clock.advance(duration);
+    }
+
+    async fn drive_cycle_with_result(&self, duration: Duration, success: bool) {
+        let role_epoch = self.role_epoch();
+        let before = self.probe.successful_cycles(role_epoch);
+        let failed_before = self
+            .probe
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::sync::observer::WorkerEvent::OutboxCycleFailed {
+                        role_epoch: event_epoch,
+                        ..
+                    } if *event_epoch == role_epoch
+                )
+            })
+            .count();
         self.clock.wait_for_sleepers(1).await;
         self.clock.advance(duration);
         self.probe
             .wait_for(|events| {
-                events
-                    .iter()
-                    .filter(|event| {
-                        matches!(
-                            event,
-                            crate::sync::observer::WorkerEvent::OutboxCycleFinished { .. }
-                        )
-                    })
-                    .count()
-                    > before
+                if success {
+                    events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event,
+                                crate::sync::observer::WorkerEvent::OutboxCycleSucceeded {
+                                    role_epoch: event_epoch
+                                } if *event_epoch == role_epoch
+                            )
+                        })
+                        .count()
+                        > before
+                } else {
+                    events
+                        .iter()
+                        .filter(|event| {
+                            matches!(
+                                event,
+                                crate::sync::observer::WorkerEvent::OutboxCycleFailed {
+                                    role_epoch: event_epoch,
+                                    ..
+                                } if *event_epoch == role_epoch
+                            )
+                        })
+                        .count()
+                        > failed_before
+                }
             })
             .await;
     }
 
     pub(super) async fn restart(&mut self) {
+        let role_epoch = self.role_epoch();
         let listener_stops = self
             .probe
             .events()
             .iter()
-            .filter(|event| matches!(event, crate::sync::observer::WorkerEvent::ListenerStopped))
+            .filter(|event| {
+                matches!(event, crate::sync::observer::WorkerEvent::ListenerStopped {
+                    role_epoch: event_epoch
+                } if *event_epoch == role_epoch)
+            })
             .count();
         let worker_stops = self
             .probe
@@ -368,10 +302,72 @@ impl TestDaemon {
             .filter(|event| {
                 matches!(
                     event,
-                    crate::sync::observer::WorkerEvent::OutboxStopped { .. }
+                    crate::sync::observer::WorkerEvent::OutboxStopped {
+                        role_epoch: event_epoch
+                    } if *event_epoch == role_epoch
                 )
             })
             .count();
+        self.shutdown_for_restart().await;
+        self.reconstruct().await;
+        let role = self.service().status().await.unwrap().role;
+        let events = self.probe.events();
+        if role == SyncRole::HomeHub {
+            assert_eq!(self.tailnet.published_router_count(&self.name), 1);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::sync::observer::WorkerEvent::ListenerStopped {
+                            role_epoch: event_epoch
+                        } if *event_epoch == role_epoch
+                    ))
+                    .count(),
+                listener_stops + 1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::sync::observer::WorkerEvent::ListenerStarted {
+                            role_epoch: event_epoch
+                        } if *event_epoch == role_epoch
+                    ))
+                    .count(),
+                2
+            );
+        }
+        if role != SyncRole::Standalone {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::sync::observer::WorkerEvent::OutboxStopped {
+                            role_epoch: event_epoch
+                        } if *event_epoch == role_epoch
+                    ))
+                    .count(),
+                worker_stops + 1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::sync::observer::WorkerEvent::OutboxStarted {
+                            role_epoch: event_epoch
+                        } if *event_epoch == role_epoch
+                    ))
+                    .count(),
+                2
+            );
+        }
+    }
+
+    pub(super) async fn shutdown_for_restart(&mut self) {
         let old = self.service.take().unwrap();
         old.shutdown().await.unwrap();
         drop(old);
@@ -384,6 +380,9 @@ impl TestDaemon {
             .try_lock_exclusive()
             .expect("shutdown must release the process ownership lease");
         lease.unlock().unwrap();
+    }
+
+    pub(super) async fn reconstruct(&mut self) {
         let service = Self::make_service(
             &self.name,
             &self.db_path,
@@ -393,34 +392,6 @@ impl TestDaemon {
         );
         service.initialize().await.unwrap();
         self.service = Some(service);
-        let role = self.service().status().await.unwrap().role;
-        if role == SyncRole::HomeHub {
-            assert_eq!(self.tailnet.published_router_count(&self.name), 1);
-            assert!(
-                self.probe
-                    .events()
-                    .iter()
-                    .filter(|event| matches!(
-                        event,
-                        crate::sync::observer::WorkerEvent::ListenerStopped
-                    ))
-                    .count()
-                    > listener_stops
-            );
-        }
-        if role != SyncRole::Standalone {
-            assert!(
-                self.probe
-                    .events()
-                    .iter()
-                    .filter(|event| matches!(
-                        event,
-                        crate::sync::observer::WorkerEvent::OutboxStopped { .. }
-                    ))
-                    .count()
-                    > worker_stops
-            );
-        }
     }
 
     pub(super) fn direct_client(&self, target: &str) -> HubClient<TailnetTransport> {

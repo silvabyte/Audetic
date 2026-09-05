@@ -845,12 +845,12 @@ impl<T: HubTransport> RemotePayloadSource for HubClient<T> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct NetworkHubAdapter {
-    transport: Result<ReqwestHubTransport, String>,
+#[derive(Clone)]
+pub struct NetworkHubAdapter<T = ReqwestHubTransport> {
+    transport: Result<T, String>,
 }
 
-impl Default for NetworkHubAdapter {
+impl Default for NetworkHubAdapter<ReqwestHubTransport> {
     fn default() -> Self {
         Self {
             transport: ReqwestHubTransport::new().map_err(|error| error.to_string()),
@@ -858,11 +858,16 @@ impl Default for NetworkHubAdapter {
     }
 }
 
-impl NetworkHubAdapter {
-    fn client(
-        &self,
-        hub: &HubConnection,
-    ) -> Result<HubClient<ReqwestHubTransport>, HubTransferError> {
+impl<T: HubTransport> NetworkHubAdapter<T> {
+    /// Builds the production capability adapter over an alternate final-mile
+    /// transport. Tests use this to preserve all production capability wiring.
+    pub fn from_transport(transport: T) -> Self {
+        Self {
+            transport: Ok(transport),
+        }
+    }
+
+    fn client(&self, hub: &HubConnection) -> Result<HubClient<T>, HubTransferError> {
         let transport = self
             .transport
             .as_ref()
@@ -873,7 +878,7 @@ impl NetworkHubAdapter {
 }
 
 #[async_trait]
-impl HubProbe for NetworkHubAdapter {
+impl<T: HubTransport> HubProbe for NetworkHubAdapter<T> {
     async fn handshake(&self, hub: &HubConnection) -> Result<HubCandidate, HubTransferError> {
         HubProbe::handshake(&self.client(hub)?, hub).await
     }
@@ -898,7 +903,7 @@ impl HubProbe for NetworkHubAdapter {
 }
 
 #[async_trait]
-impl ReplicationTransport for NetworkHubAdapter {
+impl<T: HubTransport> ReplicationTransport for NetworkHubAdapter<T> {
     async fn upload_snapshots(
         &self,
         hub: &HubConnection,
@@ -917,7 +922,7 @@ impl ReplicationTransport for NetworkHubAdapter {
 }
 
 #[async_trait]
-impl RemoteDictationLibrary for NetworkHubAdapter {
+impl<T: HubTransport> RemoteDictationLibrary for NetworkHubAdapter<T> {
     async fn page_dictations(
         &self,
         hub: &HubConnection,
@@ -941,7 +946,7 @@ impl RemoteDictationLibrary for NetworkHubAdapter {
 }
 
 #[async_trait]
-impl RemoteMeetingLibrary for NetworkHubAdapter {
+impl<T: HubTransport> RemoteMeetingLibrary for NetworkHubAdapter<T> {
     async fn page_meetings(
         &self,
         hub: &HubConnection,
@@ -962,7 +967,7 @@ impl RemoteMeetingLibrary for NetworkHubAdapter {
 }
 
 #[async_trait]
-impl RemoteLibraryMutations for NetworkHubAdapter {
+impl<T: HubTransport> RemoteLibraryMutations for NetworkHubAdapter<T> {
     async fn update_meeting_title(
         &self,
         hub: &HubConnection,
@@ -983,7 +988,7 @@ impl RemoteLibraryMutations for NetworkHubAdapter {
 }
 
 #[async_trait]
-impl RemotePayloadSource for NetworkHubAdapter {
+impl<T: HubTransport> RemotePayloadSource for NetworkHubAdapter<T> {
     async fn stream_payload(
         &self,
         hub: &HubConnection,

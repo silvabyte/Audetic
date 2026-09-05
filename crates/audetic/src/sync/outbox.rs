@@ -41,6 +41,11 @@ pub enum OutboxDestination {
     },
 }
 
+struct CycleResult {
+    processed: usize,
+    failure: Option<String>,
+}
+
 impl OutboxDestination {
     const fn role(&self) -> SyncRole {
         match self {
@@ -130,21 +135,50 @@ impl OutboxWorker {
                 });
                 (cursor_for_batch, result)
             });
+            let mut cycle_error = None;
             match backfill.await {
                 Ok((cursor, Ok(_))) => backfill_cursor = cursor,
                 Ok((cursor, Err(error))) => {
                     backfill_cursor = cursor;
                     tracing::warn!(%error, "Shared Library backfill batch failed");
+                    cycle_error = Some(format!("Shared Library backfill batch failed: {error}"));
                 }
-                Err(error) => tracing::warn!(%error, "Shared Library backfill task failed"),
+                Err(error) => {
+                    tracing::warn!(%error, "Shared Library backfill task failed");
+                    cycle_error = Some(format!("Shared Library backfill task failed: {error}"));
+                }
             }
             if cancellation.is_cancelled() {
                 break;
             }
-            let _ = self.process_once_cancellable(&cancellation).await;
-            self.observer.observe(WorkerEvent::OutboxCycleFinished {
-                role_epoch: self.role_epoch,
-            });
+            match self.process_once_cancellable(&cancellation).await {
+                Ok(Some(result)) => {
+                    if cycle_error.is_none() {
+                        cycle_error = result.failure;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    if cycle_error.is_none() {
+                        cycle_error = Some(error.to_string());
+                    }
+                }
+            }
+            if cancellation.is_cancelled() {
+                break;
+            }
+            match cycle_error {
+                Some(error) => {
+                    tracing::warn!(%error, role_epoch = self.role_epoch, "sync outbox cycle failed");
+                    self.observer.observe(WorkerEvent::OutboxCycleFailed {
+                        role_epoch: self.role_epoch,
+                        error,
+                    });
+                }
+                None => self.observer.observe(WorkerEvent::OutboxCycleSucceeded {
+                    role_epoch: self.role_epoch,
+                }),
+            }
             self.clock
                 .sleep(Duration::from_secs(1), &cancellation)
                 .await;
@@ -170,19 +204,20 @@ impl OutboxWorker {
         Ok(self
             .process_once_cancellable(&CancellationToken::new())
             .await?
-            .unwrap_or(0))
+            .map_or(0, |result| result.processed))
     }
 
     async fn process_once_cancellable(
         &self,
         cancellation: &CancellationToken,
-    ) -> Result<Option<usize>> {
+    ) -> Result<Option<CycleResult>> {
         if cancellation.is_cancelled() {
             return Ok(None);
         }
         let now = self.clock.now();
         let lease_expiry = now + chrono::Duration::seconds(30);
         let mut connection = crate::db::open_db_at(&self.db_path)?;
+        let mut cycle_failure = None;
         let items = SyncOutboxRepository::claim_items(
             &mut connection,
             self.role_epoch,
@@ -229,13 +264,24 @@ impl OutboxWorker {
                                     result.authoritative_revision.unwrap_or(0),
                                 )?;
                             }
-                            Some(result) => SyncOutboxRepository::mark_needs_attention(
-                                &connection,
-                                self.role_epoch,
-                                item,
-                                result.message.as_deref().unwrap_or("snapshot rejected"),
-                            )?,
+                            Some(result) => {
+                                cycle_failure.get_or_insert_with(|| {
+                                    result
+                                        .message
+                                        .clone()
+                                        .unwrap_or_else(|| "snapshot rejected".into())
+                                });
+                                SyncOutboxRepository::mark_needs_attention(
+                                    &connection,
+                                    self.role_epoch,
+                                    item,
+                                    result.message.as_deref().unwrap_or("snapshot rejected"),
+                                )?;
+                            }
                             None => {
+                                cycle_failure.get_or_insert_with(|| {
+                                    "Home Hub omitted the snapshot result".into()
+                                });
                                 let scheduling_now = self.clock.now();
                                 mark_retry(
                                     &connection,
@@ -251,6 +297,7 @@ impl OutboxWorker {
                     }
                 }
                 Err(error) if error.is_retryable() => {
+                    cycle_failure.get_or_insert_with(|| error.to_string());
                     let scheduling_now = self.clock.now();
                     let retry_after = error.retry_after();
                     let message = error.to_string();
@@ -271,6 +318,7 @@ impl OutboxWorker {
                 }
                 Err(error) => {
                     let error = error.to_string();
+                    cycle_failure.get_or_insert_with(|| error.clone());
                     for item in &items {
                         if cancellation.is_cancelled() {
                             return Ok(None);
@@ -312,6 +360,9 @@ impl OutboxWorker {
                 .filter(|metadata| metadata.is_file())
                 .map(|metadata| metadata.len());
             if staged_size != Some(blob.byte_size) {
+                cycle_failure.get_or_insert_with(|| {
+                    "staged Recording Payload is missing or has the wrong size".into()
+                });
                 SyncOutboxRepository::mark_blob_needs_attention(
                     &connection,
                     self.role_epoch,
@@ -363,6 +414,7 @@ impl OutboxWorker {
                     SyncOutboxRepository::mark_blob_accepted(&connection, self.role_epoch, blob)?;
                 }
                 Err(error) if error.is_retryable() => {
+                    cycle_failure.get_or_insert_with(|| error.to_string());
                     let scheduling_now = self.clock.now();
                     mark_blob_retry(
                         &connection,
@@ -375,6 +427,7 @@ impl OutboxWorker {
                     )?;
                 }
                 Err(error) => {
+                    cycle_failure.get_or_insert_with(|| error.to_string());
                     SyncOutboxRepository::mark_blob_needs_attention(
                         &connection,
                         self.role_epoch,
@@ -384,7 +437,10 @@ impl OutboxWorker {
                 }
             }
         }
-        Ok(Some(items.len() + blobs.len()))
+        Ok(Some(CycleResult {
+            processed: items.len() + blobs.len(),
+            failure: cycle_failure,
+        }))
     }
 }
 

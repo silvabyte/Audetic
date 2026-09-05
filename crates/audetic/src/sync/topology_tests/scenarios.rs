@@ -35,6 +35,22 @@ async fn slice_1_activation_discovery_fail_closed_and_restart_reconstructs_one_r
     assert!(wrong_login.discovered_hubs.is_empty());
     assert!(!wrong_login.discovery_failures.is_empty());
 
+    let spoofing_client = crate::sync::client::HubClient::with_transport(
+        &connection.base_url,
+        topology
+            .tailnet
+            .spoofing_transport("outsider", "Alice@Example.com"),
+    )
+    .unwrap();
+    assert!(spoofing_client
+        .handshake(HandshakeExpectation::default())
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("403"));
+    // This proves the application-side trust model only. Real Tailscale must
+    // still be smoke-tested to ensure its trusted proxy overwrites identity.
+
     topology.tailnet.add_node("tagged", "Alice@Example.com");
     topology.tailnet.set_tagged("tagged", true);
     topology.tailnet.add_node("offline", "Alice@Example.com");
@@ -137,7 +153,10 @@ async fn slice_1_activation_discovery_fail_closed_and_restart_reconstructs_one_r
 
     hub.restart().await;
     assert_eq!(topology.tailnet.published_router_count("hub"), 1);
-    assert!(hub.probe.events().contains(&WorkerEvent::ListenerStopped));
+    assert!(hub.probe.events().iter().any(|event| matches!(
+        event,
+        WorkerEvent::ListenerStopped { role_epoch } if *role_epoch == hub.role_epoch()
+    )));
     assert!(hub
         .probe
         .events()
@@ -149,7 +168,7 @@ async fn slice_1_activation_discovery_fail_closed_and_restart_reconstructs_one_r
 async fn slice_4_payload_staging_integrity_ranges_retries_and_cancellation() {
     let topology = HomeHubTopology::new();
     let hub = topology.daemon("hub", "owner@example.com");
-    let device = topology.daemon("device", "owner@example.com");
+    let mut device = topology.daemon("device", "owner@example.com");
     hub.start().await;
     device.start().await;
     let hub_connection = hub.activate_hub(true).await;
@@ -258,7 +277,10 @@ async fn slice_4_payload_staging_integrity_ranges_retries_and_cancellation() {
         &routed_payload_path,
         OperationFault::CorruptResponseBody,
     );
-    let corrupted = client
+    // Playback does not perform an end-to-end digest check. Same-length
+    // download integrity is the HTTPS/Tailscale transport boundary; the Hub
+    // still authoritatively verifies checksums on upload.
+    let transport_mutated_without_digest_guarantee = client
         .stream_payload(
             hub_connection.hub_id,
             crate::sync::protocol::RecordKind::Dictation,
@@ -267,7 +289,11 @@ async fn slice_4_payload_staging_integrity_ranges_retries_and_cancellation() {
         )
         .await
         .unwrap();
-    let corrupt_chunks: Vec<_> = corrupted.body.try_collect().await.unwrap();
+    let corrupt_chunks: Vec<_> = transport_mutated_without_digest_guarantee
+        .body
+        .try_collect()
+        .await
+        .unwrap();
     assert_ne!(corrupt_chunks.concat(), payload);
 
     let request_file = device.root.join("integrity.wav");
@@ -313,7 +339,7 @@ async fn slice_4_payload_staging_integrity_ranges_retries_and_cancellation() {
         &format!("/audetic/v1/blobs/{retry_checksum}"),
         OperationFault::FailBeforeDispatch("upload interrupted"),
     );
-    device.drive_cycle().await;
+    device.drive_failed_cycle().await;
     assert_eq!(
         device
             .connection()
@@ -330,6 +356,120 @@ async fn slice_4_payload_staging_integrity_ranges_retries_and_cancellation() {
         .head_blob(hub_connection.hub_id, &retry_checksum)
         .await
         .unwrap());
+
+    let large_payload = vec![b'x'; 32 * 1024];
+    let (_local_id, cancelled_upload_id) =
+        device.insert_dictation("cancelled upload", Some(&large_payload));
+    let cancelled_checksum: String = device
+        .connection()
+        .query_row(
+            "SELECT checksum FROM sync_outbox_blobs WHERE record_id=?1",
+            [cancelled_upload_id.to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let upload_gate = super::FaultGate::new();
+    topology.tailnet.fault(
+        "device",
+        "hub",
+        Method::PUT,
+        &format!("/audetic/v1/blobs/{cancelled_checksum}"),
+        OperationFault::HoldRequestBodyAfterFirstChunk(upload_gate.clone()),
+    );
+    let role_epoch = device.role_epoch();
+    let successful_before_restart = device.probe.successful_cycles(role_epoch);
+    device.begin_cycle_by(Duration::from_secs(2)).await;
+    upload_gate.wait_entered().await;
+    let temp_root = hub.root.join("sync/blobs/.tmp");
+    assert!(std::fs::read_dir(&temp_root).unwrap().next().is_some());
+    device.shutdown_for_restart().await;
+    upload_gate.wait_cancelled().await;
+    assert!(std::fs::read_dir(&temp_root).unwrap().next().is_none());
+    assert_eq!(
+        device
+            .connection()
+            .query_row(
+                "SELECT state,lease_owner FROM sync_outbox_blobs WHERE record_id=?1",
+                [cancelled_upload_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap(),
+        ("pending".into(), None)
+    );
+    device.reconstruct().await;
+    device
+        .probe
+        .wait_for(|events| {
+            events
+                .iter()
+                .filter(|event| {
+                    matches!(
+                        event,
+                        WorkerEvent::OutboxCycleSucceeded {
+                            role_epoch: event_epoch
+                        } if *event_epoch == role_epoch
+                    )
+                })
+                .count()
+                > successful_before_restart
+        })
+        .await;
+    let lifecycle = device.probe.events();
+    assert_eq!(
+        lifecycle
+            .iter()
+            .filter(|event| matches!(
+                event,
+                WorkerEvent::OutboxStarted {
+                    role_epoch: event_epoch
+                } if *event_epoch == role_epoch
+            ))
+            .count(),
+        2
+    );
+    assert_eq!(
+        lifecycle
+            .iter()
+            .filter(|event| matches!(
+                event,
+                WorkerEvent::OutboxStopped {
+                    role_epoch: event_epoch
+                } if *event_epoch == role_epoch
+            ))
+            .count(),
+        1
+    );
+    assert!(client
+        .head_blob(hub_connection.hub_id, &cancelled_checksum)
+        .await
+        .unwrap());
+
+    let response_gate = super::FaultGate::new();
+    topology.tailnet.fault(
+        "device",
+        "hub",
+        Method::GET,
+        &routed_payload_path,
+        OperationFault::HoldResponseBodyAfterFirstChunk(response_gate.clone()),
+    );
+    let held_response = client
+        .stream_payload(
+            hub_connection.hub_id,
+            crate::sync::protocol::RecordKind::Dictation,
+            record_id,
+            None,
+        )
+        .await
+        .unwrap();
+    let response_consumer =
+        tokio::spawn(async move { held_response.body.try_collect::<Vec<_>>().await });
+    response_gate.wait_entered().await;
+    response_consumer.abort();
+    assert!(matches!(
+        super::watchdog("joining cancelled payload consumer", response_consumer).await,
+        Err(error) if error.is_cancelled()
+    ));
+    response_gate.wait_cancelled().await;
 
     let gate = super::FaultGate::new();
     topology.tailnet.fault(
@@ -353,7 +493,10 @@ async fn slice_4_payload_staging_integrity_ranges_retries_and_cancellation() {
     });
     gate.wait_entered().await;
     cancelled.abort();
-    assert!(matches!(cancelled.await, Err(error) if error.is_cancelled()));
+    assert!(matches!(
+        super::watchdog("joining pre-dispatch cancellation", cancelled).await,
+        Err(error) if error.is_cancelled()
+    ));
     gate.release();
 }
 
@@ -361,7 +504,7 @@ async fn slice_4_payload_staging_integrity_ranges_retries_and_cancellation() {
 async fn slice_2_partitioned_creation_and_lost_response_converge_idempotently() {
     let topology = HomeHubTopology::new();
     let hub = topology.daemon("hub", "owner@example.com");
-    let device = topology.daemon("device", "owner@example.com");
+    let mut device = topology.daemon("device", "owner@example.com");
     hub.start().await;
     device.start().await;
     let hub_connection = hub.activate_hub(false).await;
@@ -371,7 +514,7 @@ async fn slice_2_partitioned_creation_and_lost_response_converge_idempotently() 
 
     topology.tailnet.partition("device", "hub");
     let (_, record_id) = device.insert_dictation("offline dictation", None);
-    device.drive_cycle().await;
+    device.drive_failed_cycle().await;
 
     let local = device
         .service()
@@ -401,7 +544,7 @@ async fn slice_2_partitioned_creation_and_lost_response_converge_idempotently() 
         "/audetic/v1/snapshots",
         OperationFault::LoseResponseAfterDispatch("response lost after commit"),
     );
-    device.drive_cycle_by(Duration::from_secs(301)).await;
+    device.drive_failed_cycle_by(Duration::from_secs(301)).await;
     let hub_db = hub.connection();
     assert_eq!(
         hub_db
@@ -418,6 +561,19 @@ async fn slice_2_partitioned_creation_and_lost_response_converge_idempotently() 
         1
     );
     drop(hub_db);
+
+    assert_eq!(
+        device
+            .connection()
+            .query_row(
+                "SELECT state,lease_owner FROM sync_outbox_items WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .unwrap(),
+        ("pending".into(), None)
+    );
+    device.restart().await;
 
     device.drive_cycle_by(Duration::from_secs(301)).await;
     let hub_db = hub.connection();
