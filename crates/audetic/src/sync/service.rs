@@ -32,6 +32,7 @@ use super::transport::{DiscoveryOutcome, HubCapabilities, StreamingPayloadRespon
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TransitionCheckpoint {
+    RestorePrepared,
     Prepared,
     Verified,
     Quiesced,
@@ -158,6 +159,13 @@ impl SyncService {
     /// Reconstruct the persisted role. Network/listener failures are recorded
     /// as degraded status and deliberately do not fail daemon startup.
     pub async fn initialize(&self) -> Result<SyncStatus, SyncServiceError> {
+        let service = self.clone();
+        tokio::spawn(async move { service.initialize_owned().await })
+            .await
+            .map_err(|error| SyncServiceError::RuntimeTask(error.to_string()))?
+    }
+
+    async fn initialize_owned(&self) -> Result<SyncStatus, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
         self.runtime
@@ -180,6 +188,8 @@ impl SyncService {
             .await
             .map_err(map_runtime_error)?;
         let transition = persisted.transition;
+        self.transition_checkpoint(TransitionCheckpoint::RestorePrepared)
+            .await;
         let startup_error = match installation.settings.role {
             SyncRole::Standalone => None,
             SyncRole::HomeHub => match persisted.listener_error {
@@ -624,10 +634,15 @@ impl SyncService {
     }
 
     pub async fn shutdown(&self) -> Result<(), SyncServiceError> {
+        let service = self.clone();
+        tokio::spawn(async move { service.shutdown_owned().await })
+            .await
+            .map_err(|error| SyncServiceError::RuntimeTask(error.to_string()))?
+    }
+
+    async fn shutdown_owned(&self) -> Result<(), SyncServiceError> {
         let _transition = self.transition.lock().await;
-        if self.shut_down.swap(true, Ordering::SeqCst) {
-            return Ok(());
-        }
+        self.shut_down.store(true, Ordering::SeqCst);
         self.runtime.shutdown().await.map_err(map_runtime_error)
     }
 
@@ -773,6 +788,11 @@ impl SyncService {
         self.transition_checkpoint(TransitionCheckpoint::Quiesced)
             .await;
         let ownership = expected_ownership();
+        if let Err(error) = self.validate_runtime(runtime_transition).await {
+            return Err(self
+                .rollback_home_transition(runtime_transition, mapping_created, error)
+                .await);
+        }
         let effects = match self.state.commit_home_hub(
             installation.role_epoch,
             HomeHubCommit {
@@ -1163,6 +1183,16 @@ impl SyncService {
             .map_err(map_runtime_error)
     }
 
+    async fn validate_runtime(
+        &self,
+        transition: RuntimeTransition,
+    ) -> Result<(), SyncServiceError> {
+        self.runtime
+            .validate_transition(transition)
+            .await
+            .map_err(map_runtime_error)
+    }
+
     async fn seal_runtime_transition(
         &self,
         transition: RuntimeTransition,
@@ -1200,8 +1230,11 @@ impl SyncService {
                 .transition_pause
                 .lock()
                 .ok()
-                .and_then(|pause| pause.clone())
-                .filter(|pause| pause.checkpoint == checkpoint);
+                .and_then(|mut configured| {
+                    (configured.as_ref().map(|pause| pause.checkpoint) == Some(checkpoint))
+                        .then(|| configured.take())
+                        .flatten()
+                });
             if let Some(pause) = pause {
                 pause.entered.notify_one();
                 pause.release.notified().await;
@@ -2980,6 +3013,126 @@ mod tests {
         assert_eq!(runtime.role, Some(SyncRole::Standalone));
         assert!(!runtime.transition_in_progress);
         fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn listener_termination_after_quiescence_rolls_back_promotion() {
+        let fixture = fixture();
+        fixture.service.initialize().await.unwrap();
+        let (entered, release) = pause_at(&fixture.service, TransitionCheckpoint::Quiesced);
+        let service = fixture.service.clone();
+        let caller =
+            tokio::spawn(async move { service.configure(request(SyncRole::HomeHub)).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("promotion did not quiesce its prior worker");
+        fixture
+            .service
+            .runtime
+            .terminate_provisional_listener()
+            .await
+            .unwrap();
+        release.notify_one();
+
+        let error = caller.await.unwrap().unwrap_err();
+
+        assert!(matches!(error, SyncServiceError::Listener(_)));
+        let installation = fixture.service.state.load().unwrap();
+        assert_eq!(installation.settings.role, SyncRole::Standalone);
+        assert_eq!(
+            *fixture.tailscale.mapping.lock().unwrap(),
+            MappingState::Vacant
+        );
+        let runtime = fixture.service.runtime.snapshot().await;
+        assert_eq!(runtime.role, Some(SyncRole::Standalone));
+        assert!(!runtime.transition_in_progress);
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_failed_initialize_cleans_provisional_runtime_and_process_lease() {
+        let fixture = fixture();
+        fixture
+            .service
+            .configure(connected_request(HubId::new()))
+            .await
+            .unwrap();
+        fixture.service.shutdown().await.unwrap();
+        let connection = crate::db::open_db_at(&fixture.path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER reject_initialize_health
+                 BEFORE UPDATE OF last_contact_at,last_error ON sync_settings
+                 BEGIN SELECT RAISE(ABORT, 'simulated initialize health failure'); END;",
+            )
+            .unwrap();
+        drop(connection);
+        let restarted = SyncService::with_dependencies(
+            fixture.path.clone(),
+            fixture.tailscale.clone(),
+            test_capabilities(fixture.hubs.clone()),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let (entered, release) = pause_at(&restarted, TransitionCheckpoint::RestorePrepared);
+        let service = restarted.clone();
+        let caller = tokio::spawn(async move { service.initialize().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("initialize did not prepare the persisted runtime");
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.notify_one();
+
+        for _ in 0..100 {
+            let runtime = restarted.runtime.snapshot().await;
+            if !runtime.transition_in_progress && !runtime.ownership_held {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let runtime = restarted.runtime.snapshot().await;
+        assert!(!runtime.transition_in_progress);
+        assert!(!runtime.ownership_held);
+        let connection = crate::db::open_db_at(&fixture.path).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER reject_initialize_health")
+            .unwrap();
+        drop(connection);
+        let status = restarted.initialize().await.unwrap();
+        assert_eq!(status.role, SyncRole::ConnectedDevice);
+        restarted.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_shutdown_is_resumed_and_releases_process_ownership() {
+        let fixture = fixture();
+        fixture
+            .service
+            .configure(connected_request(HubId::new()))
+            .await
+            .unwrap();
+        let (entered, release) = fixture.service.runtime.install_shutdown_pause();
+        let service = fixture.service.clone();
+        let caller = tokio::spawn(async move { service.shutdown().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+            .await
+            .expect("shutdown did not reach runtime task joins");
+
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        release.notify_one();
+        fixture.service.shutdown().await.unwrap();
+
+        let second = SyncService::with_dependencies(
+            fixture.path.clone(),
+            fixture.tailscale.clone(),
+            test_capabilities(fixture.hubs.clone()),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        let status = second.initialize().await.unwrap();
+        assert_eq!(status.role, SyncRole::ConnectedDevice);
+        second.shutdown().await.unwrap();
     }
 
     #[tokio::test]

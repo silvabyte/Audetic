@@ -165,11 +165,15 @@ impl HubRuntime {
             .or_else(|| Some("Home Hub listener terminated unexpectedly".into()))
     }
 
-    async fn stop(mut self) -> Result<(), RuntimeError> {
+    fn request_stop(&mut self) {
         self.cancellation.cancel();
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
+    }
+
+    async fn stop(mut self) -> Result<(), RuntimeError> {
+        self.request_stop();
         let Some(task) = self.task.take() else {
             return Ok(());
         };
@@ -199,8 +203,12 @@ struct OutboxRuntime {
 }
 
 impl OutboxRuntime {
-    async fn stop(mut self) {
+    fn request_stop(&self) {
         self.cancellation.cancel();
+    }
+
+    async fn stop(mut self) {
+        self.request_stop();
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
@@ -242,9 +250,16 @@ impl PreparedOutbox {
     }
 
     async fn stop(mut self) {
-        self.start.take();
+        self.request_stop();
         if let Some(runtime) = self.runtime.take() {
             runtime.stop().await;
+        }
+    }
+
+    fn request_stop(&mut self) {
+        self.start.take();
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.request_stop();
         }
     }
 }
@@ -267,6 +282,15 @@ struct ActiveRuntime {
 }
 
 impl ActiveRuntime {
+    fn request_stop(&mut self) {
+        if let Some(outbox) = self.outbox.as_ref() {
+            outbox.request_stop();
+        }
+        if let Some(hub) = self.hub.as_mut() {
+            hub.request_stop();
+        }
+    }
+
     async fn stop(mut self) -> Result<(), RuntimeError> {
         if let Some(outbox) = self.outbox.take() {
             outbox.stop().await;
@@ -290,6 +314,15 @@ struct ProvisionalRuntime {
 }
 
 impl ProvisionalRuntime {
+    fn request_stop(&mut self) {
+        if let Some(outbox) = self.outbox.as_mut() {
+            outbox.request_stop();
+        }
+        if let Some(hub) = self.hub.as_mut() {
+            hub.request_stop();
+        }
+    }
+
     async fn stop(mut self) {
         if let Some(outbox) = self.outbox.take() {
             outbox.stop().await;
@@ -313,6 +346,15 @@ struct RuntimeShared {
     hub_capabilities: HubCapabilities,
     hub_bind_address: SocketAddr,
     inner: Mutex<RuntimeInner>,
+    #[cfg(test)]
+    shutdown_pause: StdMutex<Option<ShutdownPause>>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ShutdownPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 /// Owns the process lease plus every active and provisional sync resource.
@@ -339,6 +381,8 @@ impl RuntimeSet {
                     next_transition_id: 1,
                     shut_down: false,
                 }),
+                #[cfg(test)]
+                shutdown_pause: StdMutex::new(None),
             }),
         }
     }
@@ -472,6 +516,16 @@ impl RuntimeSet {
         Ok(())
     }
 
+    pub async fn validate_transition(
+        &self,
+        transition: RuntimeTransition,
+    ) -> Result<(), RuntimeError> {
+        let inner = self.shared.inner.lock().await;
+        Self::ensure_available(&inner)?;
+        let provisional = Self::provisional(&inner, transition)?;
+        Self::validate_provisional_listener(&inner, provisional)
+    }
+
     pub async fn abort_transition(
         &self,
         transition: RuntimeTransition,
@@ -508,13 +562,13 @@ impl RuntimeSet {
     ) -> Result<ActivationOutcome, RuntimeError> {
         let mut inner = self.shared.inner.lock().await;
         Self::ensure_available(&inner)?;
+        {
+            let provisional = Self::provisional(&inner, transition)?;
+            Self::validate_provisional_listener(&inner, provisional)?;
+        }
         let mut provisional = Self::take_provisional(&mut inner, transition)?;
-        let outbox = match provisional.outbox.take().map(PreparedOutbox::activate) {
-            Some(result) => Some(result?),
-            None => None,
-        };
         let mut previous = inner.active.take();
-        let hub = if provisional.spec.role() == SyncRole::HomeHub {
+        let mut hub = if provisional.spec.role() == SyncRole::HomeHub {
             if provisional.reuse_active_hub {
                 previous.as_mut().and_then(|runtime| runtime.hub.take())
             } else {
@@ -523,26 +577,53 @@ impl RuntimeSet {
         } else {
             None
         };
+        let candidate_error = hub.as_ref().and_then(HubRuntime::liveness_error);
+        if provisional.spec.role() == SyncRole::HomeHub
+            && candidate_error.is_some()
+            && !provisional.allow_degraded_listener
+        {
+            let error = RuntimeError::Listener(
+                candidate_error
+                    .unwrap_or_else(|| "Home Hub listener terminated before activation".into()),
+            );
+            if provisional.reuse_active_hub {
+                if let Some(previous) = previous.as_mut() {
+                    previous.hub = hub.take();
+                }
+            } else {
+                provisional.hub = hub.take();
+            }
+            let restore_spec = provisional.worker_quiesced.then(|| {
+                previous
+                    .as_ref()
+                    .map(|active| active.spec.clone())
+                    .ok_or_else(|| RuntimeError::Invariant("quiesced runtime disappeared".into()))
+            });
+            inner.active = previous;
+            provisional.stop().await;
+            if let Some(restore_spec) = restore_spec.transpose()? {
+                let outbox = self.prepare_outbox(&restore_spec)?.activate()?;
+                let active = inner.active.as_mut().ok_or_else(|| {
+                    RuntimeError::Invariant("runtime disappeared during activation rollback".into())
+                })?;
+                active.outbox = Some(outbox);
+            }
+            return Err(error);
+        }
+        if provisional.allow_degraded_listener && candidate_error.is_some() {
+            if let Some(hub) = hub.take() {
+                let _ = hub.stop().await;
+            }
+        }
         let listener_error = if provisional.spec.role() == SyncRole::HomeHub {
-            provisional
-                .listener_error
-                .clone()
-                .or_else(|| hub.as_ref().and_then(HubRuntime::liveness_error))
+            provisional.listener_error.clone().or(candidate_error)
         } else {
             None
         };
-        if provisional.spec.role() == SyncRole::HomeHub
-            && hub.is_none()
-            && !provisional.allow_degraded_listener
-        {
-            inner.active = previous;
-            if let Some(outbox) = outbox {
-                outbox.stop().await;
-            }
-            return Err(RuntimeError::Listener(
-                "prepared Home Hub listener disappeared".into(),
-            ));
-        }
+        let outbox = match provisional.outbox.take().map(PreparedOutbox::activate) {
+            Some(result) => Some(result?),
+            None => None,
+        };
         inner.active = Some(ActiveRuntime {
             spec: provisional.spec,
             hub,
@@ -604,8 +685,16 @@ impl RuntimeSet {
             return Ok(());
         }
         inner.shut_down = true;
-        let provisional = inner.provisional.take();
-        let active = inner.active.take();
+        let mut provisional = inner.provisional.take();
+        let mut active = inner.active.take();
+        if let Some(provisional) = provisional.as_mut() {
+            provisional.request_stop();
+        }
+        if let Some(active) = active.as_mut() {
+            active.request_stop();
+        }
+        #[cfg(test)]
+        self.pause_shutdown_before_task_joins().await;
         if let Some(provisional) = provisional {
             provisional.stop().await;
         }
@@ -616,6 +705,31 @@ impl RuntimeSet {
         };
         inner.lease.take();
         result
+    }
+
+    #[cfg(test)]
+    pub fn install_shutdown_pause(&self) -> (Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>) {
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *self.shared.shutdown_pause.lock().unwrap() = Some(ShutdownPause {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        (entered, release)
+    }
+
+    #[cfg(test)]
+    async fn pause_shutdown_before_task_joins(&self) {
+        let pause = self
+            .shared
+            .shutdown_pause
+            .lock()
+            .ok()
+            .and_then(|mut pause| pause.take());
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     #[cfg(test)]
@@ -688,6 +802,26 @@ impl RuntimeSet {
             .provisional
             .take()
             .ok_or_else(|| RuntimeError::Invariant("provisional runtime is missing".into()))
+    }
+
+    fn validate_provisional_listener(
+        inner: &RuntimeInner,
+        provisional: &ProvisionalRuntime,
+    ) -> Result<(), RuntimeError> {
+        if provisional.spec.role() != SyncRole::HomeHub || provisional.allow_degraded_listener {
+            return Ok(());
+        }
+        let hub = if provisional.reuse_active_hub {
+            inner.active.as_ref().and_then(|active| active.hub.as_ref())
+        } else {
+            provisional.hub.as_ref()
+        }
+        .ok_or_else(|| RuntimeError::Listener("prepared listener is missing".into()))?;
+        if let Some(error) = hub.liveness_error() {
+            Err(RuntimeError::Listener(error))
+        } else {
+            Ok(())
+        }
     }
 
     fn prepare_outbox(&self, spec: &RuntimeSpec) -> Result<PreparedOutbox, RuntimeError> {
