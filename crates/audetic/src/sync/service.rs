@@ -1,8 +1,7 @@
 use anyhow::Context;
-use async_trait::async_trait;
 use audetic_core::sync::{
-    HubCandidate, HubConnection, RecordId, ServeMappingState, SyncDiscoveryFailure,
-    SyncNetworkAssessment, SyncRole, SyncSetupRequest, SyncSetupResult, SyncStatus,
+    HubConnection, RecordId, ServeMappingState, SyncDiscoveryFailure, SyncNetworkAssessment,
+    SyncRole, SyncSetupRequest, SyncSetupResult, SyncStatus,
 };
 use thiserror::Error;
 use tokio::sync::{oneshot, Mutex, RwLock};
@@ -14,21 +13,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::db::sync_identity::{SyncIdentity, SyncIdentityRepository};
-use crate::db::sync_outbox::OutboxBlob;
 use crate::db::sync_serve::{SyncServeOwnership, SyncServeRepository};
 use crate::db::sync_settings::{SyncSettings, SyncSettingsRepository};
 use crate::sync::is_exact_audetic_serve_ownership;
 
-use super::client::{
-    canonicalize_base_url, discover_hubs, DiscoveryOutcome, HandshakeExpectation, HubClient,
-    ReqwestHubTransport,
-};
+use super::client::{canonicalize_base_url, NetworkHubAdapter};
 use super::library::HubLibrary;
-use super::outbox::OutboxWorker;
-use super::protocol::{
-    DictationPage, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting, SnapshotBatch,
-    SnapshotBatchResponse,
-};
+use super::outbox::{OutboxDestination, OutboxWorker};
+use super::protocol::{MeetingTitlePatch, RecordKind, SharedMeeting};
 use super::protocol::{
     HUB_API_MOUNT_PATH, HUB_LISTENER_ADDRESS, HUB_LOOPBACK_BASE_URL, TAILSCALE_HTTPS_PORT,
 };
@@ -37,273 +29,14 @@ use super::tailscale::{
     MappingState, ServeAssessment, SystemCommandRunner, Tailscale, TailscaleControl,
     TailscaleError, TailscaleStatus,
 };
-
-#[async_trait]
-pub trait HubAccess: Send + Sync {
-    async fn handshake(&self, hub: &HubConnection) -> Result<HubCandidate, String>;
-    async fn discover(
-        &self,
-        candidates: Vec<String>,
-        expected_owner_login: &str,
-    ) -> DiscoveryOutcome;
-
-    async fn upload_snapshots(
-        &self,
-        _hub: &HubConnection,
-        _batch: SnapshotBatch,
-    ) -> Result<SnapshotBatchResponse, HubTransferError> {
-        Err(HubTransferError::NeedsAttention(
-            "snapshot upload is unavailable".to_owned(),
-        ))
-    }
-
-    async fn page_dictations(
-        &self,
-        _hub: &HubConnection,
-        _query: Option<&str>,
-        _from: Option<&str>,
-        _to: Option<&str>,
-        _cursor: Option<&str>,
-        _limit: usize,
-    ) -> Result<DictationPage, HubTransferError> {
-        Err(HubTransferError::Retryable(
-            "Home Hub is unavailable".to_owned(),
-        ))
-    }
-
-    async fn page_meetings(
-        &self,
-        _hub: &HubConnection,
-        _query: Option<&str>,
-        _cursor: Option<&str>,
-        _limit: usize,
-    ) -> Result<MeetingPage, HubTransferError> {
-        Err(HubTransferError::Retryable(
-            "Home Hub is unavailable".into(),
-        ))
-    }
-    async fn meeting(
-        &self,
-        _hub: &HubConnection,
-        _id: RecordId,
-    ) -> Result<Option<SharedMeeting>, HubTransferError> {
-        Err(HubTransferError::Retryable(
-            "Home Hub is unavailable".into(),
-        ))
-    }
-    async fn update_meeting_title(
-        &self,
-        _hub: &HubConnection,
-        _id: RecordId,
-        _patch: MeetingTitlePatch,
-    ) -> Result<SharedMeeting, HubTransferError> {
-        Err(HubTransferError::Retryable(
-            "Home Hub is unavailable".into(),
-        ))
-    }
-    async fn delete_record(
-        &self,
-        _hub: &HubConnection,
-        _id: RecordId,
-        _kind: RecordKind,
-    ) -> Result<(), HubTransferError> {
-        Err(HubTransferError::Retryable(
-            "Home Hub is unavailable".into(),
-        ))
-    }
-
-    async fn upload_blob(
-        &self,
-        _hub: &HubConnection,
-        _blob: &OutboxBlob,
-    ) -> Result<(), HubTransferError> {
-        Err(HubTransferError::NeedsAttention(
-            "Recording Payload upload is unavailable".into(),
-        ))
-    }
-
-    async fn stream_payload(
-        &self,
-        _hub: &HubConnection,
-        _id: RecordId,
-        _kind: RecordKind,
-        _range: Option<&str>,
-    ) -> Result<super::client::StreamingPayloadResponse, HubTransferError> {
-        Err(HubTransferError::Retryable(
-            "Home Hub Recording Payload is unavailable".into(),
-        ))
-    }
-}
+use super::transport::{
+    DiscoveryOutcome, HubProbe, RemoteLibrary, RemotePayloadSource, ReplicationTransport,
+    StreamingPayloadResponse,
+};
 
 pub enum PayloadSource {
     Local(crate::db::shared_library::LibraryBlobRecord),
-    Remote(super::client::StreamingPayloadResponse),
-}
-
-#[derive(Clone, Debug, Error)]
-pub enum HubTransferError {
-    #[error("{0}")]
-    Retryable(String),
-    #[error("{0}")]
-    NeedsAttention(String),
-}
-
-#[derive(Default)]
-struct NetworkHubAccess;
-
-#[async_trait]
-impl HubAccess for NetworkHubAccess {
-    async fn handshake(&self, hub: &HubConnection) -> Result<HubCandidate, String> {
-        HubClient::new(&hub.base_url)
-            .map_err(|error| error.to_string())?
-            .handshake(HandshakeExpectation {
-                hub_id: Some(hub.hub_id),
-                owner_login: Some(&hub.owner_login),
-            })
-            .await
-            .map_err(|error| error.to_string())
-    }
-
-    async fn discover(
-        &self,
-        candidates: Vec<String>,
-        expected_owner_login: &str,
-    ) -> DiscoveryOutcome {
-        let transport = match ReqwestHubTransport::new() {
-            Ok(transport) => transport,
-            Err(error) => {
-                return DiscoveryOutcome::None {
-                    failures: vec![super::client::DiscoveryFailure {
-                        candidate: "Tailscale peers".to_owned(),
-                        reason: error.to_string(),
-                    }],
-                };
-            }
-        };
-        discover_hubs(transport, candidates, expected_owner_login).await
-    }
-
-    async fn upload_snapshots(
-        &self,
-        hub: &HubConnection,
-        batch: SnapshotBatch,
-    ) -> Result<SnapshotBatchResponse, HubTransferError> {
-        let client = HubClient::new(&hub.base_url)
-            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?;
-        client
-            .upload_snapshots(hub.hub_id, &batch)
-            .await
-            .map_err(classify_client_error)
-    }
-
-    async fn page_dictations(
-        &self,
-        hub: &HubConnection,
-        query: Option<&str>,
-        from: Option<&str>,
-        to: Option<&str>,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<DictationPage, HubTransferError> {
-        let client = HubClient::new(&hub.base_url)
-            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?;
-        client
-            .page_dictations(hub.hub_id, query, from, to, cursor, limit)
-            .await
-            .map_err(classify_client_error)
-    }
-
-    async fn page_meetings(
-        &self,
-        hub: &HubConnection,
-        query: Option<&str>,
-        cursor: Option<&str>,
-        limit: usize,
-    ) -> Result<MeetingPage, HubTransferError> {
-        HubClient::new(&hub.base_url)
-            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
-            .page_meetings(hub.hub_id, query, cursor, limit)
-            .await
-            .map_err(classify_client_error)
-    }
-    async fn meeting(
-        &self,
-        hub: &HubConnection,
-        id: RecordId,
-    ) -> Result<Option<SharedMeeting>, HubTransferError> {
-        HubClient::new(&hub.base_url)
-            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
-            .meeting(hub.hub_id, id)
-            .await
-            .map_err(classify_client_error)
-    }
-    async fn update_meeting_title(
-        &self,
-        hub: &HubConnection,
-        id: RecordId,
-        patch: MeetingTitlePatch,
-    ) -> Result<SharedMeeting, HubTransferError> {
-        HubClient::new(&hub.base_url)
-            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
-            .update_meeting_title(hub.hub_id, id, &patch)
-            .await
-            .map_err(classify_client_error)
-    }
-    async fn delete_record(
-        &self,
-        hub: &HubConnection,
-        id: RecordId,
-        kind: RecordKind,
-    ) -> Result<(), HubTransferError> {
-        HubClient::new(&hub.base_url)
-            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
-            .delete_record(hub.hub_id, id, kind)
-            .await
-            .map_err(classify_client_error)
-    }
-
-    async fn upload_blob(
-        &self,
-        hub: &HubConnection,
-        blob: &OutboxBlob,
-    ) -> Result<(), HubTransferError> {
-        HubClient::new(&hub.base_url)
-            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
-            .upload_blob(
-                hub.hub_id,
-                &blob.checksum,
-                &blob.staged_path,
-                blob.byte_size,
-                &blob.media_type,
-            )
-            .await
-            .map_err(classify_client_error)
-    }
-
-    async fn stream_payload(
-        &self,
-        hub: &HubConnection,
-        id: RecordId,
-        kind: RecordKind,
-        range: Option<&str>,
-    ) -> Result<super::client::StreamingPayloadResponse, HubTransferError> {
-        HubClient::new(&hub.base_url)
-            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
-            .stream_payload(hub.hub_id, kind, id, range)
-            .await
-            .map_err(classify_client_error)
-    }
-}
-
-fn classify_client_error(error: super::client::HubClientError) -> HubTransferError {
-    use super::client::HubClientError;
-    match &error {
-        HubClientError::Transport(_) => HubTransferError::Retryable(error.to_string()),
-        HubClientError::Http { status, .. } if *status >= 500 => {
-            HubTransferError::Retryable(error.to_string())
-        }
-        _ => HubTransferError::NeedsAttention(error.to_string()),
-    }
+    Remote(StreamingPayloadResponse),
 }
 
 #[derive(Debug, Error)]
@@ -380,7 +113,10 @@ struct PreparedOutboxRuntime {
 pub struct SyncService {
     db_path: PathBuf,
     tailscale: Arc<dyn TailscaleControl>,
-    hubs: Arc<dyn HubAccess>,
+    probe: Arc<dyn HubProbe>,
+    replication: Arc<dyn ReplicationTransport>,
+    remote_library: Arc<dyn RemoteLibrary>,
+    remote_payloads: Arc<dyn RemotePayloadSource>,
     hub_bind_address: SocketAddr,
     transition: Mutex<()>,
     hub_runtime: Mutex<Option<HubRuntime>>,
@@ -395,10 +131,14 @@ impl SyncService {
     }
 
     pub fn production(db_path: PathBuf) -> Self {
+        let network = Arc::new(NetworkHubAdapter::default());
         Self::with_dependencies(
             db_path,
             Arc::new(Tailscale::new(SystemCommandRunner)),
-            Arc::new(NetworkHubAccess),
+            network.clone(),
+            network.clone(),
+            network.clone(),
+            network,
             HUB_LISTENER_ADDRESS
                 .parse()
                 .expect("valid listener address"),
@@ -408,13 +148,19 @@ impl SyncService {
     pub fn with_dependencies(
         db_path: PathBuf,
         tailscale: Arc<dyn TailscaleControl>,
-        hubs: Arc<dyn HubAccess>,
+        probe: Arc<dyn HubProbe>,
+        replication: Arc<dyn ReplicationTransport>,
+        remote_library: Arc<dyn RemoteLibrary>,
+        remote_payloads: Arc<dyn RemotePayloadSource>,
         hub_bind_address: SocketAddr,
     ) -> Self {
         Self {
             db_path,
             tailscale,
-            hubs,
+            probe,
+            replication,
+            remote_library,
+            remote_payloads,
             hub_bind_address,
             transition: Mutex::new(()),
             hub_runtime: Mutex::new(None),
@@ -458,11 +204,13 @@ impl SyncService {
     ) -> Result<Vec<crate::history::HistoryEntry>, SyncServiceError> {
         let _transition = self.transition.lock().await;
         let (_, settings) = self.load()?;
-        let result =
-            super::library_reader::LibraryReader::new(self.db_path.clone(), Arc::clone(&self.hubs))
-                .read(&settings, params)
-                .await
-                .map_err(SyncServiceError::Persistence)?;
+        let result = super::library_reader::LibraryReader::new(
+            self.db_path.clone(),
+            Arc::clone(&self.remote_library),
+        )
+        .read(&settings, params)
+        .await
+        .map_err(SyncServiceError::Persistence)?;
         *self.hub_reachable.write().await = result.hub_reachable;
         if settings.role != SyncRole::Standalone {
             let mut contact = settings;
@@ -507,7 +255,7 @@ impl SyncService {
         let (_, settings) = self.load()?;
         let result = super::library_reader::MeetingLibraryReader::new(
             self.db_path.clone(),
-            Arc::clone(&self.hubs),
+            Arc::clone(&self.remote_library),
         )
         .read(&settings, query, offset, limit)
         .await
@@ -566,7 +314,7 @@ impl SyncService {
                 .map_err(SyncServiceError::Persistence)?
                 .ok_or_else(|| SyncServiceError::InvalidRequest("meeting not found".into())),
             SyncRole::ConnectedDevice => self
-                .hubs
+                .remote_library
                 .update_meeting_title(settings.hub.as_ref().expect("connected hub"), id, patch)
                 .await
                 .map_err(|error| SyncServiceError::HubVerification(error.to_string())),
@@ -589,7 +337,7 @@ impl SyncService {
                 .map(|_| ())
                 .map_err(|error| SyncServiceError::Persistence(anyhow::anyhow!(error))),
             SyncRole::ConnectedDevice => self
-                .hubs
+                .remote_library
                 .delete_record(settings.hub.as_ref().expect("connected hub"), id, kind)
                 .await
                 .map_err(|error| SyncServiceError::HubVerification(error.to_string())),
@@ -611,7 +359,7 @@ impl SyncService {
                 .map(|value| value.map(PayloadSource::Local))
                 .map_err(SyncServiceError::Persistence),
             SyncRole::ConnectedDevice => self
-                .hubs
+                .remote_payloads
                 .stream_payload(
                     settings.hub.as_ref().expect("connected hub"),
                     id,
@@ -724,7 +472,7 @@ impl SyncService {
             .map(|peer| peer.audetic_base_url())
             .collect();
         let (discovered_hubs, discovery_failures) =
-            match self.hubs.discover(candidates, &status.owner_login).await {
+            match self.probe.discover(candidates, &status.owner_login).await {
                 DiscoveryOutcome::None { failures } => (
                     Vec::new(),
                     failures
@@ -1020,10 +768,12 @@ impl SyncService {
             hub_id,
             owner_login: owner_login.to_owned(),
         };
-        self.hubs
-            .handshake(&connection)
-            .await
-            .map_err(|error| (SyncServiceError::HubVerification(error), mapping_created))?;
+        self.probe.handshake(&connection).await.map_err(|error| {
+            (
+                SyncServiceError::HubVerification(error.to_string()),
+                mapping_created,
+            )
+        })?;
         Ok(mapping_created)
     }
 
@@ -1050,10 +800,10 @@ impl SyncService {
             )));
         }
         let candidate = self
-            .hubs
+            .probe
             .handshake(&requested_hub)
             .await
-            .map_err(SyncServiceError::HubVerification)?;
+            .map_err(|error| SyncServiceError::HubVerification(error.to_string()))?;
         if candidate.connection.hub_id != requested_hub.hub_id
             || candidate.connection.owner_login != requested_hub.owner_login
         {
@@ -1175,10 +925,10 @@ impl SyncService {
             hub_id,
             owner_login: owner_login.to_owned(),
         };
-        self.hubs
+        self.probe
             .handshake(&connection)
             .await
-            .map_err(SyncServiceError::HubVerification)?;
+            .map_err(|error| SyncServiceError::HubVerification(error.to_string()))?;
         *self.hub_reachable.write().await = true;
         Ok(())
     }
@@ -1192,10 +942,10 @@ impl SyncService {
                 "persisted Connected Device role has no Home Hub"
             ))
         })?;
-        self.hubs
+        self.probe
             .handshake(hub)
             .await
-            .map_err(SyncServiceError::HubVerification)?;
+            .map_err(|error| SyncServiceError::HubVerification(error.to_string()))?;
         *self.hub_reachable.write().await = true;
         Ok(())
     }
@@ -1386,13 +1136,24 @@ impl SyncService {
         &self,
         settings: &SyncSettings,
     ) -> Result<PreparedOutboxRuntime, SyncServiceError> {
-        let worker = OutboxWorker::new(
-            self.db_path.clone(),
-            settings.role,
-            settings.hub.clone(),
-            Arc::clone(&self.hubs),
-        )
-        .with_payload_uploads(settings.upload_recording_payloads);
+        let destination = match settings.role {
+            SyncRole::HomeHub => OutboxDestination::Local(HubLibrary::new(self.db_path.clone())),
+            SyncRole::ConnectedDevice => OutboxDestination::Remote {
+                hub: settings.hub.clone().ok_or_else(|| {
+                    SyncServiceError::Persistence(anyhow::anyhow!(
+                        "Connected Device outbox has no Home Hub"
+                    ))
+                })?,
+                replication: Arc::clone(&self.replication),
+            },
+            SyncRole::Standalone => {
+                return Err(SyncServiceError::InvalidRequest(
+                    "Standalone has no outbox destination".to_owned(),
+                ))
+            }
+        };
+        let worker = OutboxWorker::new(self.db_path.clone(), destination)
+            .with_payload_uploads(settings.upload_recording_payloads);
         let (start, start_receiver) = oneshot::channel();
         let cancellation = tokio_util::sync::CancellationToken::new();
         let worker_cancellation = cancellation.clone();
@@ -1657,12 +1418,16 @@ fn now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use audetic_core::sync::{CacheLevel, DeviceId, HubId};
+    use async_trait::async_trait;
+    use audetic_core::sync::{CacheLevel, DeviceId, HubCandidate, HubId};
     use semver::Version;
     use std::sync::Mutex as StdMutex;
 
-    use crate::sync::protocol::{Snapshot, SnapshotDisposition, SnapshotResult};
+    use crate::sync::protocol::{
+        Snapshot, SnapshotBatch, SnapshotBatchResponse, SnapshotDisposition, SnapshotResult,
+    };
     use crate::sync::tailscale::ServeAssessment;
+    use crate::sync::transport::{BlobUpload, HubTransferError};
 
     struct FakeTailscale {
         mapping: StdMutex<MappingState>,
@@ -1748,10 +1513,10 @@ mod tests {
     }
 
     #[async_trait]
-    impl HubAccess for FakeHubs {
-        async fn handshake(&self, hub: &HubConnection) -> Result<HubCandidate, String> {
+    impl HubProbe for FakeHubs {
+        async fn handshake(&self, hub: &HubConnection) -> Result<HubCandidate, HubTransferError> {
             if self.fail.load(Ordering::SeqCst) {
-                Err("hub offline".into())
+                Err(HubTransferError::Transport("hub offline".into()))
             } else {
                 Ok(HubCandidate {
                     connection: hub.clone(),
@@ -1768,7 +1533,10 @@ mod tests {
         ) -> DiscoveryOutcome {
             DiscoveryOutcome::None { failures: vec![] }
         }
+    }
 
+    #[async_trait]
+    impl ReplicationTransport for FakeHubs {
         async fn upload_snapshots(
             &self,
             hub: &HubConnection,
@@ -1799,7 +1567,7 @@ mod tests {
         async fn upload_blob(
             &self,
             hub: &HubConnection,
-            blob: &OutboxBlob,
+            blob: BlobUpload,
         ) -> Result<(), HubTransferError> {
             if self.fail.load(Ordering::SeqCst) {
                 return Err(HubTransferError::Retryable("hub offline".into()));
@@ -1812,6 +1580,12 @@ mod tests {
             Ok(())
         }
     }
+
+    struct UnusedRemoteLibrary;
+    impl RemoteLibrary for UnusedRemoteLibrary {}
+
+    struct UnusedRemotePayloads;
+    impl RemotePayloadSource for UnusedRemotePayloads {}
 
     struct Fixture {
         _temp: tempfile::TempDir,
@@ -1831,6 +1605,9 @@ mod tests {
             path.clone(),
             tailscale.clone(),
             hubs.clone(),
+            hubs.clone(),
+            Arc::new(UnusedRemoteLibrary),
+            Arc::new(UnusedRemotePayloads),
             "127.0.0.1:0".parse().unwrap(),
         );
         Fixture {
@@ -2521,6 +2298,9 @@ mod tests {
             fixture.path.clone(),
             fixture.tailscale.clone(),
             fixture.hubs.clone(),
+            fixture.hubs.clone(),
+            Arc::new(UnusedRemoteLibrary),
+            Arc::new(UnusedRemotePayloads),
             "127.0.0.1:0".parse().unwrap(),
         );
         let status = restarted.initialize().await.unwrap();

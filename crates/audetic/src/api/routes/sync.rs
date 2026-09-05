@@ -174,9 +174,12 @@ mod tests {
     use semver::Version;
     use tower::ServiceExt;
 
-    use crate::sync::client::DiscoveryOutcome;
     use crate::sync::tailscale::{
         MappingState, ServeAssessment, TailscaleControl, TailscaleError, TailscaleStatus,
+    };
+    use crate::sync::transport::{
+        DiscoveryOutcome, HubProbe, HubTransferError, RemoteLibrary, RemotePayloadSource,
+        ReplicationTransport,
     };
 
     struct FakeTailscale;
@@ -222,8 +225,8 @@ mod tests {
     }
 
     #[async_trait]
-    impl crate::sync::HubAccess for FakeHubs {
-        async fn handshake(&self, hub: &HubConnection) -> Result<HubCandidate, String> {
+    impl HubProbe for FakeHubs {
+        async fn handshake(&self, hub: &HubConnection) -> Result<HubCandidate, HubTransferError> {
             Ok(HubCandidate {
                 connection: hub.clone(),
                 device_name: Some("Home".into()),
@@ -244,6 +247,15 @@ mod tests {
         }
     }
 
+    struct UnusedReplication;
+    impl ReplicationTransport for UnusedReplication {}
+
+    struct UnusedRemoteLibrary;
+    impl RemoteLibrary for UnusedRemoteLibrary {}
+
+    struct UnusedRemotePayloads;
+    impl RemotePayloadSource for UnusedRemotePayloads {}
+
     fn test_router() -> (Router, tempfile::TempDir, HubConnection) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("audetic.db");
@@ -257,6 +269,9 @@ mod tests {
             path,
             Arc::new(FakeTailscale),
             Arc::new(FakeHubs { hub: hub.clone() }),
+            Arc::new(UnusedReplication),
+            Arc::new(UnusedRemoteLibrary),
+            Arc::new(UnusedRemotePayloads),
             "127.0.0.1:0".parse().unwrap(),
         ));
         (router(SyncApiState::new(service)), temp, hub)

@@ -10,7 +10,7 @@ use crate::db::sync_outbox::{OutboxBlob, OutboxItem, SyncOutboxRepository};
 
 use super::library::HubLibrary;
 use super::protocol::{SnapshotBatch, SnapshotDisposition};
-use super::service::{HubAccess, HubTransferError};
+use super::transport::{BlobUpload, HubTransferError, ReplicationTransport};
 
 pub const OUTBOX_BATCH_SIZE: usize = 25;
 const MAX_RETRY_DELAY_SECONDS: i64 = 300;
@@ -19,28 +19,34 @@ type RetryJitter = fn(&OutboxItem) -> u64;
 
 pub struct OutboxWorker {
     db_path: PathBuf,
-    role: SyncRole,
-    hub: Option<HubConnection>,
-    remote: Arc<dyn HubAccess>,
-    local_hub: HubLibrary,
+    destination: OutboxDestination,
     worker_id: String,
     retry_jitter: RetryJitter,
     upload_recording_payloads: bool,
 }
 
+pub enum OutboxDestination {
+    Local(HubLibrary),
+    Remote {
+        hub: HubConnection,
+        replication: Arc<dyn ReplicationTransport>,
+    },
+}
+
+impl OutboxDestination {
+    const fn role(&self) -> SyncRole {
+        match self {
+            Self::Local(_) => SyncRole::HomeHub,
+            Self::Remote { .. } => SyncRole::ConnectedDevice,
+        }
+    }
+}
+
 impl OutboxWorker {
-    pub fn new(
-        db_path: PathBuf,
-        role: SyncRole,
-        hub: Option<HubConnection>,
-        remote: Arc<dyn HubAccess>,
-    ) -> Self {
+    pub fn new(db_path: PathBuf, destination: OutboxDestination) -> Self {
         Self {
-            local_hub: HubLibrary::new(db_path.clone()),
             db_path,
-            role,
-            hub,
-            remote,
+            destination,
             worker_id: format!("outbox-{}", uuid::Uuid::new_v4()),
             retry_jitter: record_retry_jitter,
             upload_recording_payloads: true,
@@ -65,7 +71,7 @@ impl OutboxWorker {
                 break;
             }
             let db_path = self.db_path.clone();
-            let role = self.role;
+            let role = self.destination.role();
             let upload_recording_payloads = self.upload_recording_payloads;
             let cancel_backfill = cancellation.clone();
             let mut cursor_for_batch = backfill_cursor.clone();
@@ -142,23 +148,17 @@ impl OutboxWorker {
             let batch = SnapshotBatch {
                 snapshots: items.iter().map(|item| item.snapshot.clone()).collect(),
             };
-            let response = match self.role {
-                SyncRole::HomeHub => self
-                    .local_hub
+            let response = match &self.destination {
+                OutboxDestination::Local(library) => library
                     .apply_snapshots(batch.snapshots)
                     .map_err(|error| HubTransferError::Retryable(error.to_string())),
-                SyncRole::ConnectedDevice => {
-                    let hub = self
-                        .hub
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("missing Home Hub"))?;
+                OutboxDestination::Remote { hub, replication } => {
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => return Ok(None),
-                        response = self.remote.upload_snapshots(hub, batch) => response,
+                        response = replication.upload_snapshots(hub, batch) => response,
                     }
                 }
-                SyncRole::Standalone => return Ok(Some(0)),
             };
             match response {
                 Ok(response) => {
@@ -192,7 +192,8 @@ impl OutboxWorker {
                         }
                     }
                 }
-                Err(HubTransferError::Retryable(error)) => {
+                Err(error) if error.is_retryable() => {
+                    let error = error.to_string();
                     for item in &items {
                         if cancellation.is_cancelled() {
                             return Ok(None);
@@ -200,7 +201,8 @@ impl OutboxWorker {
                         mark_retry(&connection, item, &error, (self.retry_jitter)(item))?;
                     }
                 }
-                Err(HubTransferError::NeedsAttention(error)) => {
+                Err(error) => {
+                    let error = error.to_string();
                     for item in &items {
                         if cancellation.is_cancelled() {
                             return Ok(None);
@@ -246,11 +248,11 @@ impl OutboxWorker {
                 )?;
                 continue;
             }
-            let uploaded = match self.role {
-                SyncRole::HomeHub => tokio::select! {
+            let uploaded = match &self.destination {
+                OutboxDestination::Local(library) => tokio::select! {
                     biased;
                     _ = cancellation.cancelled() => return Ok(None),
-                    uploaded = self.local_hub.accept_blob_file(
+                    uploaded = library.accept_blob_file(
                         &blob.staged_path,
                         &blob.checksum,
                         blob.byte_size,
@@ -266,28 +268,39 @@ impl OutboxWorker {
                         }
                     }),
                 },
-                SyncRole::ConnectedDevice => {
-                    let hub = self
-                        .hub
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("missing Home Hub"))?;
+                OutboxDestination::Remote { hub, replication } => {
+                    let upload = BlobUpload {
+                        record_id: blob.record_id,
+                        checksum: blob.checksum.clone(),
+                        source_path: blob.staged_path.clone(),
+                        byte_size: blob.byte_size,
+                        media_type: blob.media_type.clone(),
+                    };
                     tokio::select! {
                         biased;
                         _ = cancellation.cancelled() => return Ok(None),
-                        uploaded = self.remote.upload_blob(hub, blob) => uploaded,
+                        uploaded = replication.upload_blob(hub, upload) => uploaded,
                     }
                 }
-                SyncRole::Standalone => return Ok(Some(items.len())),
             };
             match uploaded {
                 Ok(()) => {
                     SyncOutboxRepository::mark_blob_accepted(&connection, blob)?;
                 }
-                Err(HubTransferError::Retryable(error)) => {
-                    mark_blob_retry(&connection, blob, &error, blob_retry_jitter(blob))?;
+                Err(error) if error.is_retryable() => {
+                    mark_blob_retry(
+                        &connection,
+                        blob,
+                        &error.to_string(),
+                        blob_retry_jitter(blob),
+                    )?;
                 }
-                Err(HubTransferError::NeedsAttention(error)) => {
-                    SyncOutboxRepository::mark_blob_needs_attention(&connection, blob, &error)?;
+                Err(error) => {
+                    SyncOutboxRepository::mark_blob_needs_attention(
+                        &connection,
+                        blob,
+                        &error.to_string(),
+                    )?;
                 }
             }
         }
@@ -340,43 +353,9 @@ fn blob_retry_jitter(blob: &OutboxBlob) -> u64 {
 mod tests {
     use super::*;
     use crate::db::{VoiceToTextData, Workflow, WorkflowData, WorkflowType};
-    use crate::sync::client::DiscoveryOutcome;
-    use crate::sync::protocol::{DictationPage, SnapshotBatchResponse};
+    use crate::sync::protocol::SnapshotBatchResponse;
     use async_trait::async_trait;
-    use audetic_core::sync::{HubCandidate, HubConnection};
     use tokio::sync::Notify;
-
-    struct UnusedRemote;
-    #[async_trait]
-    impl HubAccess for UnusedRemote {
-        async fn handshake(
-            &self,
-            _hub: &HubConnection,
-        ) -> std::result::Result<HubCandidate, String> {
-            unreachable!()
-        }
-        async fn discover(&self, _candidates: Vec<String>, _owner: &str) -> DiscoveryOutcome {
-            unreachable!()
-        }
-        async fn upload_snapshots(
-            &self,
-            _hub: &HubConnection,
-            _batch: SnapshotBatch,
-        ) -> std::result::Result<SnapshotBatchResponse, HubTransferError> {
-            unreachable!()
-        }
-        async fn page_dictations(
-            &self,
-            _hub: &HubConnection,
-            _query: Option<&str>,
-            _from: Option<&str>,
-            _to: Option<&str>,
-            _cursor: Option<&str>,
-            _limit: usize,
-        ) -> std::result::Result<DictationPage, HubTransferError> {
-            unreachable!()
-        }
-    }
 
     struct LoopbackHub {
         library: HubLibrary,
@@ -387,18 +366,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl HubAccess for BlockingHub {
-        async fn handshake(
-            &self,
-            _hub: &HubConnection,
-        ) -> std::result::Result<HubCandidate, String> {
-            unreachable!()
-        }
-
-        async fn discover(&self, _candidates: Vec<String>, _owner: &str) -> DiscoveryOutcome {
-            unreachable!()
-        }
-
+    impl ReplicationTransport for BlockingHub {
         async fn upload_snapshots(
             &self,
             _hub: &HubConnection,
@@ -407,33 +375,10 @@ mod tests {
             self.started.notify_one();
             std::future::pending().await
         }
-
-        async fn page_dictations(
-            &self,
-            _hub: &HubConnection,
-            _query: Option<&str>,
-            _from: Option<&str>,
-            _to: Option<&str>,
-            _cursor: Option<&str>,
-            _limit: usize,
-        ) -> std::result::Result<DictationPage, HubTransferError> {
-            unreachable!()
-        }
     }
 
     #[async_trait]
-    impl HubAccess for LoopbackHub {
-        async fn handshake(
-            &self,
-            _hub: &HubConnection,
-        ) -> std::result::Result<HubCandidate, String> {
-            unreachable!()
-        }
-
-        async fn discover(&self, _candidates: Vec<String>, _owner: &str) -> DiscoveryOutcome {
-            unreachable!()
-        }
-
+    impl ReplicationTransport for LoopbackHub {
         async fn upload_snapshots(
             &self,
             _hub: &HubConnection,
@@ -447,11 +392,11 @@ mod tests {
         async fn upload_blob(
             &self,
             _hub: &HubConnection,
-            blob: &OutboxBlob,
+            blob: BlobUpload,
         ) -> std::result::Result<(), HubTransferError> {
             self.library
                 .accept_blob_file(
-                    &blob.staged_path,
+                    &blob.source_path,
                     &blob.checksum,
                     blob.byte_size,
                     &blob.media_type,
@@ -459,18 +404,6 @@ mod tests {
                 .await
                 .map(|_| ())
                 .map_err(|error| HubTransferError::Retryable(error.to_string()))
-        }
-
-        async fn page_dictations(
-            &self,
-            _hub: &HubConnection,
-            _query: Option<&str>,
-            _from: Option<&str>,
-            _to: Option<&str>,
-            _cursor: Option<&str>,
-            _limit: usize,
-        ) -> std::result::Result<DictationPage, HubTransferError> {
-            unreachable!()
         }
     }
 
@@ -506,9 +439,7 @@ mod tests {
 
         let worker = OutboxWorker::new(
             path.clone(),
-            SyncRole::HomeHub,
-            None,
-            Arc::new(UnusedRemote),
+            OutboxDestination::Local(HubLibrary::new(path.clone())),
         );
         assert_eq!(worker.process_once().await.unwrap(), 1);
         let conn = crate::db::open_db_at(&path).unwrap();
@@ -567,9 +498,7 @@ mod tests {
 
         let worker = OutboxWorker::new(
             path.clone(),
-            SyncRole::HomeHub,
-            None,
-            Arc::new(UnusedRemote),
+            OutboxDestination::Local(HubLibrary::new(path.clone())),
         );
         assert_eq!(worker.process_once().await.unwrap(), 2);
         assert!(!std::path::Path::new(&staged).exists());
@@ -626,9 +555,7 @@ mod tests {
 
         let worker = OutboxWorker::new(
             path.clone(),
-            SyncRole::HomeHub,
-            None,
-            Arc::new(UnusedRemote),
+            OutboxDestination::Local(HubLibrary::new(path.clone())),
         );
         assert_eq!(worker.process_once().await.unwrap(), 2);
         let conn = crate::db::open_db_at(&path).unwrap();
@@ -697,11 +624,12 @@ mod tests {
 
         let worker = OutboxWorker::new(
             source_db.clone(),
-            SyncRole::ConnectedDevice,
-            Some(hub),
-            Arc::new(LoopbackHub {
-                library: HubLibrary::new(hub_db.clone()),
-            }),
+            OutboxDestination::Remote {
+                hub,
+                replication: Arc::new(LoopbackHub {
+                    library: HubLibrary::new(hub_db.clone()),
+                }),
+            },
         );
         assert_eq!(worker.process_once().await.unwrap(), 2);
         let source = crate::db::open_db_at(&source_db).unwrap();
@@ -761,11 +689,12 @@ mod tests {
         let started = Arc::new(Notify::new());
         let worker = OutboxWorker::new(
             db_path.clone(),
-            SyncRole::ConnectedDevice,
-            Some(hub),
-            Arc::new(BlockingHub {
-                started: Arc::clone(&started),
-            }),
+            OutboxDestination::Remote {
+                hub,
+                replication: Arc::new(BlockingHub {
+                    started: Arc::clone(&started),
+                }),
+            },
         )
         .with_payload_uploads(false);
         let cancellation = CancellationToken::new();
@@ -810,9 +739,7 @@ mod tests {
 
         let worker = OutboxWorker::new(
             PathBuf::from("unused"),
-            SyncRole::HomeHub,
-            None,
-            Arc::new(UnusedRemote),
+            OutboxDestination::Local(HubLibrary::new(PathBuf::from("unused"))),
         )
         .with_retry_jitter(fixed);
         let item = OutboxItem {

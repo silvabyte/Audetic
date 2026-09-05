@@ -10,8 +10,9 @@ pub mod protocol;
 pub mod server;
 pub mod service;
 pub mod tailscale;
+pub mod transport;
 
-pub use service::{HubAccess, SyncService, SyncServiceError};
+pub use service::{SyncService, SyncServiceError};
 
 use crate::db::sync_serve::SyncServeOwnership;
 

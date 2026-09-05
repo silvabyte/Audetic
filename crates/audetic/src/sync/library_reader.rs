@@ -9,7 +9,7 @@ use crate::db::shared_library::SharedLibraryRepository;
 use crate::db::sync_outbox::SyncOutboxRepository;
 use crate::history::{HistoryEntry, HistorySource, SearchParams};
 
-use super::service::HubAccess;
+use super::transport::RemoteLibrary;
 use crate::db::sync_settings::SyncSettings;
 
 pub struct LibraryReadResult {
@@ -20,7 +20,7 @@ pub struct LibraryReadResult {
 
 pub struct LibraryReader {
     db_path: PathBuf,
-    hubs: Arc<dyn HubAccess>,
+    remote: Arc<dyn RemoteLibrary>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,11 +50,11 @@ pub struct LibraryMeeting {
 
 pub struct MeetingLibraryReader {
     db_path: PathBuf,
-    hubs: Arc<dyn HubAccess>,
+    remote: Arc<dyn RemoteLibrary>,
 }
 impl MeetingLibraryReader {
-    pub fn new(db_path: PathBuf, hubs: Arc<dyn HubAccess>) -> Self {
-        Self { db_path, hubs }
+    pub fn new(db_path: PathBuf, remote: Arc<dyn RemoteLibrary>) -> Self {
+        Self { db_path, remote }
     }
     pub async fn read(
         &self,
@@ -109,7 +109,7 @@ impl MeetingLibraryReader {
                 let mut failure = None;
                 loop {
                     match self
-                        .hubs
+                        .remote
                         .page_meetings(
                             hub,
                             query,
@@ -261,8 +261,8 @@ fn contains_case_insensitive(value: &str, query: &str) -> bool {
 }
 
 impl LibraryReader {
-    pub fn new(db_path: PathBuf, hubs: Arc<dyn HubAccess>) -> Self {
-        Self { db_path, hubs }
+    pub fn new(db_path: PathBuf, remote: Arc<dyn RemoteLibrary>) -> Self {
+        Self { db_path, remote }
     }
 
     pub async fn read(
@@ -328,7 +328,7 @@ impl LibraryReader {
                 loop {
                     let page_limit = fetch.saturating_sub(fetched_from_hub).clamp(1, 100);
                     match self
-                        .hubs
+                        .remote
                         .page_dictations(
                             hub,
                             params.query.as_deref(),
@@ -428,13 +428,10 @@ fn shared_entry(
 mod tests {
     use super::*;
     use crate::db::{VoiceToTextData, Workflow, WorkflowData, WorkflowType};
-    use crate::sync::client::DiscoveryOutcome;
-    use crate::sync::protocol::{
-        DictationPayload, DictationSnapshot, RecordKind, SnapshotBatch, SnapshotBatchResponse,
-    };
-    use crate::sync::service::HubTransferError;
+    use crate::sync::protocol::{DictationPayload, DictationSnapshot, RecordKind};
+    use crate::sync::transport::HubTransferError;
     use async_trait::async_trait;
-    use audetic_core::sync::{CacheLevel, HubCandidate, HubConnection, HubId, SyncRole};
+    use audetic_core::sync::{CacheLevel, HubConnection, HubId, SyncRole};
 
     #[test]
     fn local_payload_failure_is_visible_until_the_hub_has_an_available_blob() {
@@ -455,48 +452,14 @@ mod tests {
     }
 
     struct OfflineHub;
-
-    #[async_trait]
-    impl HubAccess for OfflineHub {
-        async fn handshake(
-            &self,
-            _hub: &HubConnection,
-        ) -> std::result::Result<HubCandidate, String> {
-            Err("offline".into())
-        }
-        async fn discover(&self, _candidates: Vec<String>, _owner: &str) -> DiscoveryOutcome {
-            DiscoveryOutcome::None { failures: vec![] }
-        }
-        async fn upload_snapshots(
-            &self,
-            _hub: &HubConnection,
-            _batch: SnapshotBatch,
-        ) -> std::result::Result<SnapshotBatchResponse, HubTransferError> {
-            Err(HubTransferError::Retryable("offline".into()))
-        }
-    }
+    impl RemoteLibrary for OfflineHub {}
 
     struct LocalHub {
         library: super::super::library::HubLibrary,
     }
 
     #[async_trait]
-    impl HubAccess for LocalHub {
-        async fn handshake(
-            &self,
-            hub: &HubConnection,
-        ) -> std::result::Result<HubCandidate, String> {
-            Ok(HubCandidate {
-                connection: hub.clone(),
-                device_name: Some("Hub".into()),
-                protocol_version: 1,
-            })
-        }
-
-        async fn discover(&self, _candidates: Vec<String>, _owner: &str) -> DiscoveryOutcome {
-            unreachable!()
-        }
-
+    impl RemoteLibrary for LocalHub {
         async fn page_dictations(
             &self,
             _hub: &HubConnection,
