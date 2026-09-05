@@ -325,7 +325,7 @@ fn persisted_exact_serve_ownership(db_path: &Path) -> Result<bool> {
     let ownership = crate::db::sync_serve::SyncServeRepository::get_if_available(&connection)?;
     Ok(ownership
         .as_ref()
-        .is_some_and(crate::sync::is_exact_audetic_serve_ownership))
+        .is_some_and(crate::sync::serve::is_exact_ownership))
 }
 
 /// Run removal through the same adapter used by Home Hub role transitions.
@@ -336,16 +336,15 @@ pub(crate) fn cleanup_audetic_serve_if_planned(planned: bool) {
     if !planned {
         return;
     }
-    let tailscale =
-        crate::sync::tailscale::Tailscale::new(crate::sync::tailscale::SystemCommandRunner);
-    print_serve_cleanup_outcome(cleanup_audetic_serve_with(&tailscale));
+    let serve = crate::sync::serve::ServeManager::new(std::sync::Arc::new(
+        crate::sync::tailscale::Tailscale::new(crate::sync::tailscale::SystemCommandRunner),
+    ));
+    print_serve_cleanup_outcome(cleanup_audetic_serve_with(&serve));
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn cleanup_audetic_serve_with(
-    tailscale: &dyn crate::sync::tailscale::TailscaleControl,
-) -> ServeCleanupOutcome {
-    match tailscale.remove_audetic_serve() {
+fn cleanup_audetic_serve_with(serve: &crate::sync::serve::ServeManager) -> ServeCleanupOutcome {
+    match serve.remove_planned_blocking() {
         Ok(true) => ServeCleanupOutcome::Removed,
         Ok(false) => ServeCleanupOutcome::AlreadyAbsentOrChanged,
         Err(error) => ServeCleanupOutcome::ManualRequired(error.to_string()),
@@ -576,6 +575,7 @@ mod tests {
     use super::*;
     use std::cell::Cell;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     use crate::db::sync_serve::{SyncServeOwnership, SyncServeRepository};
     use crate::sync::tailscale::{
@@ -841,24 +841,26 @@ mod tests {
 
     #[test]
     fn cleanup_uses_injected_adapter_and_reports_manual_exact_command_when_unavailable() {
-        let removed = FakeTailscale {
+        let removed = Arc::new(FakeTailscale {
             remove_calls: AtomicUsize::new(0),
             remove_result: Ok(true),
-        };
+        });
+        let removed_serve = crate::sync::serve::ServeManager::new(removed.clone());
         assert_eq!(
-            cleanup_audetic_serve_with(&removed),
+            cleanup_audetic_serve_with(&removed_serve),
             ServeCleanupOutcome::Removed
         );
         assert_eq!(removed.remove_calls.load(Ordering::SeqCst), 1);
 
-        let unavailable = FakeTailscale {
+        let unavailable = Arc::new(FakeTailscale {
             remove_calls: AtomicUsize::new(0),
             remove_result: Err(TailscaleError::Execute(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "tailscale unavailable",
             ))),
-        };
-        let outcome = cleanup_audetic_serve_with(&unavailable);
+        });
+        let unavailable_serve = crate::sync::serve::ServeManager::new(unavailable.clone());
+        let outcome = cleanup_audetic_serve_with(&unavailable_serve);
         assert!(matches!(outcome, ServeCleanupOutcome::ManualRequired(_)));
         assert_eq!(unavailable.remove_calls.load(Ordering::SeqCst), 1);
         assert_eq!(

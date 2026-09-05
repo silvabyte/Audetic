@@ -187,7 +187,7 @@ impl<R: CommandRunner> Tailscale<R> {
     }
 }
 
-/// Narrow command boundary used by `SyncService` and replaced by fakes in tests.
+/// Narrow command boundary owned by `ServeManager` and replaced by fakes in tests.
 pub trait TailscaleControl: Send + Sync {
     fn status(&self) -> Result<TailscaleStatus, TailscaleError>;
     fn serve_assessment(&self) -> Result<ServeAssessment, TailscaleError>;
