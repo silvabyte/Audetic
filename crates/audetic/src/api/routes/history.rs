@@ -5,12 +5,15 @@ use crate::history::{self, HistoryEntry, SearchParams};
 use audetic_core::sync::RecordId;
 use axum::{
     extract::{Path, Query, State},
-    response::Json,
+    http::header,
+    response::{IntoResponse, Json, Response},
     routing::get,
     Router,
 };
 use serde::Deserialize;
 use std::sync::Arc;
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 use utoipa::IntoParams;
 
 #[derive(Clone, Default)]
@@ -38,7 +41,77 @@ pub fn router(service: Option<Arc<crate::sync::SyncService>>) -> Router {
     Router::new()
         .route("/", get(list_history))
         .route("/:id", get(get_history_by_id))
+        .route("/:id/audio", get(history_audio))
         .with_state(HistoryApiState { service })
+}
+
+#[utoipa::path(
+    get,
+    path = "/history/{id}/audio",
+    tag = "history",
+    params(("id" = String, Path, description = "Stable transcription UUID")),
+    responses(
+        (status = 200, description = "Recording Payload bytes"),
+        (status = 206, description = "Recording Payload byte range"),
+        (status = 404, description = "Recording Payload unavailable")
+    )
+)]
+pub async fn history_audio(
+    State(state): State<HistoryApiState>,
+    Path(id): Path<RecordId>,
+    request: axum::extract::Request,
+) -> Response {
+    let db_path = state
+        .service
+        .as_ref()
+        .map(|service| service.db_path().to_path_buf())
+        .or_else(|| crate::global::db_file().ok());
+    if let Some(db_path) = db_path {
+        let local =
+            tokio::task::spawn_blocking(move || -> anyhow::Result<Option<std::path::PathBuf>> {
+                let conn = crate::db::open_db_at(&db_path)?;
+                let workflow = crate::db::get_workflow_by_sync_id(&conn, id)?;
+                let Some(workflow) = workflow else {
+                    return Ok(None);
+                };
+                match workflow.data {
+                    crate::db::WorkflowData::VoiceToText(data) => {
+                        crate::sync::payload::resolve_operational_audio(std::path::Path::new(
+                            &data.audio_path,
+                        ))
+                        .map_err(Into::into)
+                    }
+                }
+            })
+            .await;
+        if let Ok(Ok(Some(path))) = local {
+            return ServeFile::new(path)
+                .oneshot(request)
+                .await
+                .map(IntoResponse::into_response)
+                .unwrap_or_else(|_| axum::http::StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    }
+    let Some(service) = state.service else {
+        return axum::http::StatusCode::NOT_FOUND.into_response();
+    };
+    let range = request
+        .headers()
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    match service
+        .payload(
+            id,
+            crate::sync::protocol::RecordKind::Dictation,
+            range.as_deref(),
+        )
+        .await
+    {
+        Ok(Some(source)) => super::payload::serve(source, request).await,
+        Ok(None) => axum::http::StatusCode::NOT_FOUND.into_response(),
+        Err(_) => axum::http::StatusCode::BAD_GATEWAY.into_response(),
+    }
 }
 
 /// List transcription history.
@@ -102,4 +175,81 @@ pub async fn get_history_by_id(
     .ok_or_else(|| ApiError::not_found(format!("Transcription {} not found", id)))?;
 
     Ok(Json(entry))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use sha2::{Digest, Sha256};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn audio_proxy_falls_back_to_verified_hub_association_and_preserves_range() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("audetic.db");
+        let conn = crate::db::migrate_db_at(&db_path).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO sync_settings(singleton) VALUES(1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sync_settings SET role='home_hub' WHERE singleton=1",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let library = crate::sync::library::HubLibrary::new(db_path.clone());
+        let record_id = RecordId::new();
+        let bytes = b"0123456789";
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        library
+            .apply_snapshots(vec![crate::sync::protocol::DictationSnapshot {
+                kind: crate::sync::protocol::RecordKind::Dictation,
+                schema_version: 1,
+                record_id,
+                origin_device_id: audetic_core::sync::DeviceId::new(),
+                local_version: 1,
+                created_at: "2026-09-04T10:00:00Z".into(),
+                updated_at: "2026-09-04T10:00:00Z".into(),
+                payload: crate::sync::protocol::DictationPayload {
+                    text: "remote audio".into(),
+                    recording_payload: crate::sync::protocol::RecordingPayloadDescriptor::pending(
+                        checksum.clone(),
+                        bytes.len() as u64,
+                        "audio/wav".into(),
+                    ),
+                },
+            }])
+            .unwrap();
+        library
+            .accept_blob_stream(
+                &checksum,
+                bytes.len() as u64,
+                "audio/wav",
+                futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                    bytes,
+                ))]),
+            )
+            .await
+            .unwrap();
+        let service = Arc::new(crate::sync::SyncService::production(db_path));
+        let response = router(Some(service))
+            .oneshot(
+                Request::get(format!("/{record_id}/audio"))
+                    .header(header::RANGE, "bytes=2-5")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(response.headers()[header::CONTENT_RANGE], "bytes 2-5/10");
+        assert_eq!(
+            to_bytes(response.into_body(), usize::MAX).await.unwrap(),
+            "2345"
+        );
+    }
 }

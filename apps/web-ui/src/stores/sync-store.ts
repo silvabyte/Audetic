@@ -24,6 +24,7 @@ type SyncOperation =
   | "previewing_home_hub"
   | "activating_home_hub"
   | "connecting"
+  | "updating_payload_policy"
   | "retrying"
   | "demoting";
 
@@ -146,6 +147,37 @@ export class SyncStore {
       requestFor("standalone", preferences, null, false),
       "demoting",
     );
+  }
+
+  async updateRecordingPayloadPolicy(enabled: boolean): Promise<boolean> {
+    const status = this.status;
+    if (!status || status.role === "standalone") return false;
+    runInAction(() => {
+      this.operation = "updating_payload_policy";
+      this.actionError = null;
+    });
+    try {
+      const { data, error } = await daemon.PUT("/sync/payload-policy", {
+        body: { upload_recording_payloads: enabled },
+      });
+      if (error || !data) throw new Error(formatError(error ?? "empty response"));
+      runInAction(() => {
+        if (this.status) {
+          this.status = {
+            ...this.status,
+            upload_recording_payloads: data.upload_recording_payloads,
+          };
+        }
+        this.operation = null;
+      });
+      return true;
+    } catch (error) {
+      runInAction(() => {
+        this.operation = null;
+        this.actionError = error instanceof Error ? error.message : String(error);
+      });
+      return false;
+    }
   }
 
   async retryPending(): Promise<void> {

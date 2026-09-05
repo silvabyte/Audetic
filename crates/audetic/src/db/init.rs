@@ -5,7 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-const LATEST_SCHEMA_VERSION: i64 = 5;
+const LATEST_SCHEMA_VERSION: i64 = 7;
 
 /// Open the application database and run pending migrations.
 ///
@@ -146,6 +146,18 @@ fn apply_pending_migrations(conn: &Connection) -> Result<()> {
         5,
         "meeting_artifact_shared_library",
         migrate_meeting_artifact_shared_library,
+    )?;
+    apply_migration(
+        conn,
+        6,
+        "recording_payload_sync",
+        migrate_recording_payload_sync,
+    )?;
+    apply_migration(
+        conn,
+        7,
+        "payload_staging_failures",
+        migrate_payload_staging_failures,
     )?;
     Ok(())
 }
@@ -785,6 +797,132 @@ fn migrate_meeting_artifact_shared_library(conn: &Connection) -> Result<()> {
          DROP TABLE shared_library_changes_v4;
          CREATE INDEX idx_shared_library_changes_record ON shared_library_changes(record_id,cursor);"
     ).context("Failed to install meeting Shared Library schema")?;
+    Ok(())
+}
+
+fn migrate_recording_payload_sync(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE sync_outbox_blobs (
+            record_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting')),
+            checksum TEXT,
+            staged_path TEXT,
+            byte_size INTEGER,
+            media_type TEXT,
+            payload_role TEXT NOT NULL DEFAULT 'recording' CHECK(payload_role = 'recording'),
+            availability TEXT NOT NULL CHECK(availability IN ('pending','available','unavailable','needs_attention')),
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','uploading','synced','needs_attention')),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(record_id,payload_role),
+            CHECK(
+                (availability = 'unavailable' AND checksum IS NULL AND staged_path IS NULL
+                    AND byte_size IS NULL AND media_type IS NULL AND state = 'synced')
+                OR
+                (availability != 'unavailable' AND checksum IS NOT NULL AND byte_size IS NOT NULL
+                    AND byte_size > 0 AND media_type IS NOT NULL)
+            )
+        );
+        CREATE INDEX idx_sync_outbox_blobs_claim
+            ON sync_outbox_blobs(state,next_attempt_at,lease_expires_at,created_at);
+        CREATE INDEX idx_sync_outbox_blobs_checksum
+            ON sync_outbox_blobs(checksum,state);
+
+        CREATE TABLE library_blobs (
+            checksum TEXT PRIMARY KEY,
+            canonical_path TEXT NOT NULL UNIQUE,
+            byte_size INTEGER NOT NULL CHECK(byte_size > 0),
+            media_type TEXT NOT NULL,
+            verified INTEGER NOT NULL DEFAULT 1 CHECK(verified IN (0,1)),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE library_record_blobs (
+            record_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting')),
+            checksum TEXT,
+            byte_size INTEGER,
+            media_type TEXT,
+            payload_role TEXT NOT NULL DEFAULT 'recording' CHECK(payload_role = 'recording'),
+            availability TEXT NOT NULL CHECK(availability IN ('pending','available','unavailable','needs_attention')),
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(record_id,payload_role),
+            FOREIGN KEY(record_id) REFERENCES shared_record_index(record_id) ON DELETE CASCADE,
+            CHECK(
+                (availability = 'unavailable' AND checksum IS NULL AND byte_size IS NULL AND media_type IS NULL)
+                OR
+                (availability != 'unavailable' AND checksum IS NOT NULL AND byte_size IS NOT NULL
+                    AND byte_size > 0 AND media_type IS NOT NULL)
+            )
+        );
+        CREATE INDEX idx_library_record_blobs_checksum
+            ON library_record_blobs(checksum,availability);
+
+        ALTER TABLE shared_library_changes RENAME TO shared_library_changes_v5;
+        CREATE TABLE shared_library_changes(
+            cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL CHECK(operation IN ('upsert','delete','payload_availability')),
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting','artifact')),
+            record_id TEXT NOT NULL,
+            authoritative_revision INTEGER NOT NULL,
+            change_json TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT INTO shared_library_changes SELECT * FROM shared_library_changes_v5;
+        DROP TABLE shared_library_changes_v5;
+        CREATE INDEX idx_shared_library_changes_record
+            ON shared_library_changes(record_id,cursor);",
+    )
+    .context("Failed to install Recording Payload schema")?;
+    Ok(())
+}
+
+fn migrate_payload_staging_failures(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "ALTER TABLE sync_outbox_blobs RENAME TO sync_outbox_blobs_v6;
+         CREATE TABLE sync_outbox_blobs (
+            record_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK(kind IN ('dictation','meeting')),
+            checksum TEXT,
+            staged_path TEXT,
+            byte_size INTEGER,
+            media_type TEXT,
+            payload_role TEXT NOT NULL DEFAULT 'recording' CHECK(payload_role = 'recording'),
+            availability TEXT NOT NULL CHECK(availability IN ('pending','available','unavailable','needs_attention')),
+            state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','uploading','synced','needs_attention')),
+            attempts INTEGER NOT NULL DEFAULT 0 CHECK(attempts >= 0),
+            lease_owner TEXT,
+            lease_expires_at TEXT,
+            next_attempt_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(record_id,payload_role),
+            CHECK(
+                (availability = 'unavailable' AND checksum IS NULL AND staged_path IS NULL
+                    AND byte_size IS NULL AND media_type IS NULL AND state = 'synced')
+                OR
+                (availability = 'needs_attention' AND checksum IS NULL AND staged_path IS NULL
+                    AND byte_size IS NULL AND media_type IS NULL AND state = 'needs_attention')
+                OR
+                (availability != 'unavailable' AND checksum IS NOT NULL AND byte_size IS NOT NULL
+                    AND byte_size > 0 AND media_type IS NOT NULL)
+            )
+         );
+         INSERT INTO sync_outbox_blobs SELECT * FROM sync_outbox_blobs_v6;
+         DROP TABLE sync_outbox_blobs_v6;
+         CREATE INDEX idx_sync_outbox_blobs_claim
+             ON sync_outbox_blobs(state,next_attempt_at,lease_expires_at,created_at);
+         CREATE INDEX idx_sync_outbox_blobs_checksum
+             ON sync_outbox_blobs(checksum,state);",
+    )
+    .context("Failed to allow payload staging failures without fabricated blob metadata")?;
     Ok(())
 }
 

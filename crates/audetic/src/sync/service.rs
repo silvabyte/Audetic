@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use crate::db::sync_identity::{SyncIdentity, SyncIdentityRepository};
+use crate::db::sync_outbox::OutboxBlob;
 use crate::db::sync_serve::{SyncServeOwnership, SyncServeRepository};
 use crate::db::sync_settings::{SyncSettings, SyncSettingsRepository};
 use crate::sync::is_exact_audetic_serve_ownership;
@@ -110,6 +111,33 @@ pub trait HubAccess: Send + Sync {
             "Home Hub is unavailable".into(),
         ))
     }
+
+    async fn upload_blob(
+        &self,
+        _hub: &HubConnection,
+        _blob: &OutboxBlob,
+    ) -> Result<(), HubTransferError> {
+        Err(HubTransferError::NeedsAttention(
+            "Recording Payload upload is unavailable".into(),
+        ))
+    }
+
+    async fn stream_payload(
+        &self,
+        _hub: &HubConnection,
+        _id: RecordId,
+        _kind: RecordKind,
+        _range: Option<&str>,
+    ) -> Result<super::client::StreamingPayloadResponse, HubTransferError> {
+        Err(HubTransferError::Retryable(
+            "Home Hub Recording Payload is unavailable".into(),
+        ))
+    }
+}
+
+pub enum PayloadSource {
+    Local(crate::db::shared_library::LibraryBlobRecord),
+    Remote(super::client::StreamingPayloadResponse),
 }
 
 #[derive(Clone, Debug, Error)]
@@ -233,6 +261,38 @@ impl HubAccess for NetworkHubAccess {
             .await
             .map_err(classify_client_error)
     }
+
+    async fn upload_blob(
+        &self,
+        hub: &HubConnection,
+        blob: &OutboxBlob,
+    ) -> Result<(), HubTransferError> {
+        HubClient::new(&hub.base_url)
+            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
+            .upload_blob(
+                hub.hub_id,
+                &blob.checksum,
+                &blob.staged_path,
+                blob.byte_size,
+                &blob.media_type,
+            )
+            .await
+            .map_err(classify_client_error)
+    }
+
+    async fn stream_payload(
+        &self,
+        hub: &HubConnection,
+        id: RecordId,
+        kind: RecordKind,
+        range: Option<&str>,
+    ) -> Result<super::client::StreamingPayloadResponse, HubTransferError> {
+        HubClient::new(&hub.base_url)
+            .map_err(|error| HubTransferError::NeedsAttention(error.to_string()))?
+            .stream_payload(hub.hub_id, kind, id, range)
+            .await
+            .map_err(classify_client_error)
+    }
 }
 
 fn classify_client_error(error: super::client::HubClientError) -> HubTransferError {
@@ -303,7 +363,7 @@ struct HubRuntime {
 }
 
 struct OutboxRuntime {
-    shutdown: oneshot::Sender<()>,
+    cancellation: tokio_util::sync::CancellationToken,
     task: JoinHandle<()>,
 }
 
@@ -536,15 +596,122 @@ impl SyncService {
         }
     }
 
+    pub async fn payload(
+        &self,
+        id: RecordId,
+        kind: RecordKind,
+        range: Option<&str>,
+    ) -> Result<Option<PayloadSource>, SyncServiceError> {
+        let _transition = self.transition.lock().await;
+        let (_, settings) = self.load()?;
+        match settings.role {
+            SyncRole::Standalone => Ok(None),
+            SyncRole::HomeHub => HubLibrary::new(self.db_path.clone())
+                .payload(id, kind)
+                .map(|value| value.map(PayloadSource::Local))
+                .map_err(SyncServiceError::Persistence),
+            SyncRole::ConnectedDevice => self
+                .hubs
+                .stream_payload(
+                    settings.hub.as_ref().expect("connected hub"),
+                    id,
+                    kind,
+                    range,
+                )
+                .await
+                .map(|value| Some(PayloadSource::Remote(value)))
+                .map_err(|error| SyncServiceError::HubVerification(error.to_string())),
+        }
+    }
+
     pub async fn retry(&self) -> Result<u64, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
-        let connection = crate::db::open_db_at(&self.db_path)
+        let (_, settings) = self.load()?;
+        let prepared = if settings.role == SyncRole::Standalone {
+            None
+        } else {
+            Some(self.prepare_dictation_transfer(&settings).await?)
+        };
+        if prepared.is_some() {
+            self.stop_outbox_runtime().await;
+        }
+        let result = crate::db::open_db_at(&self.db_path)
             .context("opening sync database")
-            .map_err(SyncServiceError::Persistence)?;
-        crate::db::sync_outbox::SyncOutboxRepository::retry_all(&connection)
-            .map(|count| count as u64)
-            .map_err(SyncServiceError::Persistence)
+            .and_then(|connection| {
+                crate::db::sync_outbox::SyncOutboxRepository::retry_all(&connection)
+                    .map(|count| count as u64)
+            })
+            .map_err(SyncServiceError::Persistence);
+        if let Some(prepared) = prepared {
+            self.activate_prepared_outbox(prepared).await;
+        }
+        result
+    }
+
+    pub async fn update_recording_payload_policy(
+        &self,
+        enabled: bool,
+    ) -> Result<bool, SyncServiceError> {
+        let _transition = self.transition.lock().await;
+        self.ensure_running()?;
+        let (_, mut settings) = self.load()?;
+        if settings.role == SyncRole::Standalone {
+            return Err(SyncServiceError::InvalidRequest(
+                "Recording Payload upload policy requires an active Shared Library role".into(),
+            ));
+        }
+        if settings.upload_recording_payloads == enabled {
+            return Ok(enabled);
+        }
+
+        let previous_settings = settings.clone();
+        let prepared = self
+            .prepare_dictation_transfer(&SyncSettings {
+                upload_recording_payloads: enabled,
+                ..settings.clone()
+            })
+            .await?;
+        self.stop_outbox_runtime().await;
+        settings.upload_recording_payloads = enabled;
+        let persistence = (|| -> Result<(), SyncServiceError> {
+            let mut connection = crate::db::open_db_at(&self.db_path)
+                .context("opening sync database")
+                .map_err(SyncServiceError::Persistence)?;
+            let transaction = connection
+                .transaction()
+                .context("starting Recording Payload policy transaction")
+                .map_err(SyncServiceError::Persistence)?;
+            SyncSettingsRepository::save(&transaction, &settings)
+                .map_err(SyncServiceError::Persistence)?;
+            if !enabled {
+                crate::db::sync_outbox::SyncOutboxRepository::pause_blob_uploads(&transaction)
+                    .map_err(SyncServiceError::Persistence)?;
+            } else {
+                crate::db::sync_outbox::SyncOutboxRepository::reset_restageable_for_backfill(
+                    &transaction,
+                )
+                .map_err(SyncServiceError::Persistence)?;
+            }
+            transaction
+                .commit()
+                .context("committing Recording Payload policy")
+                .map_err(SyncServiceError::Persistence)
+        })();
+        if let Err(error) = persistence {
+            self.cancel_prepared_outbox(prepared).await;
+            return Err(
+                match self.restore_outbox_runtime(&previous_settings).await {
+                    Ok(()) => error,
+                    Err(rollback) => SyncServiceError::Rollback {
+                        source_error: error.to_string(),
+                        rollback_error: rollback.to_string(),
+                    },
+                },
+            );
+        }
+        self.activate_prepared_outbox(prepared).await;
+        Ok(enabled)
     }
 
     pub async fn discover(&self) -> Result<SyncSetupResult, SyncServiceError> {
@@ -587,7 +754,15 @@ impl SyncService {
     ) -> Result<SyncSetupResult, SyncServiceError> {
         let _transition = self.transition.lock().await;
         self.ensure_running()?;
-        let (_, current) = self.load()?;
+        let (identity, current) = self.load()?;
+        if current.role != SyncRole::Standalone
+            && request.role != SyncRole::Standalone
+            && request.upload_recording_payloads != current.upload_recording_payloads
+        {
+            return Err(SyncServiceError::InvalidRequest(
+                "Recording Payload upload policy for an active Shared Library role must be changed with PUT /sync/payload-policy".into(),
+            ));
+        }
         let serve_preview =
             (request.role == SyncRole::HomeHub).then(|| self.tailscale.serve_preview());
 
@@ -609,7 +784,8 @@ impl SyncService {
                         serve_preview,
                     });
                 }
-                self.configure_home_hub(request, current).await?;
+                self.configure_home_hub(request, current, identity.device_id)
+                    .await?;
             }
             SyncRole::ConnectedDevice => {
                 if current.role == SyncRole::HomeHub {
@@ -617,7 +793,8 @@ impl SyncService {
                         "demote the Home Hub to Standalone before connecting to another hub".into(),
                     ));
                 }
-                self.configure_connected_device(request).await?;
+                self.configure_connected_device(request, current, identity.device_id)
+                    .await?;
             }
         }
 
@@ -663,12 +840,26 @@ impl SyncService {
         }
 
         let ownership = self.load_ownership()?;
+        if current.role != SyncRole::Standalone {
+            self.stop_outbox_runtime().await;
+        }
         let removed_mapping = if current.role == SyncRole::HomeHub {
             if ownership
                 .as_ref()
                 .is_some_and(is_exact_audetic_serve_ownership)
             {
-                self.tailscale_remove().await?
+                match self.tailscale_remove().await {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        return Err(match self.restore_outbox_runtime(&current).await {
+                            Ok(()) => error,
+                            Err(rollback) => SyncServiceError::Rollback {
+                                source_error: error.to_string(),
+                                rollback_error: rollback.to_string(),
+                            },
+                        });
+                    }
+                }
             } else {
                 false
             }
@@ -678,20 +869,27 @@ impl SyncService {
 
         let settings = settings_from_request(request, None);
         if let Err(error) = self.commit_settings_and_ownership(&settings, None, true) {
+            let mut rollback_errors = Vec::new();
             if removed_mapping {
                 if let Err(rollback) = self.tailscale_apply().await {
-                    return Err(SyncServiceError::Rollback {
-                        source_error: error.to_string(),
-                        rollback_error: rollback.to_string(),
-                    });
+                    rollback_errors.push(rollback.to_string());
                 }
             }
-            return Err(error);
+            if let Err(rollback) = self.restore_outbox_runtime(&current).await {
+                rollback_errors.push(rollback.to_string());
+            }
+            return Err(if rollback_errors.is_empty() {
+                error
+            } else {
+                SyncServiceError::Rollback {
+                    source_error: error.to_string(),
+                    rollback_error: rollback_errors.join("; "),
+                }
+            });
         }
         if current.role == SyncRole::HomeHub {
             self.stop_hub_runtime().await?;
         }
-        self.stop_outbox_runtime().await;
         *self.hub_reachable.write().await = false;
         Ok(())
     }
@@ -700,6 +898,7 @@ impl SyncService {
         &self,
         request: SyncSetupRequest,
         current: SyncSettings,
+        local_device_id: audetic_core::sync::DeviceId,
     ) -> Result<(), SyncServiceError> {
         if request.hub.is_some() {
             return Err(SyncServiceError::InvalidRequest(
@@ -758,17 +957,27 @@ impl SyncService {
                     .await)
             }
         };
-        if let Err(error) = self.commit_home_hub(&settings, hub_id, &owner_login) {
-            return Err(self
-                .rollback_home_hub_activation(
-                    Some(prepared),
-                    runtime_was_running,
-                    was_reachable,
-                    mapping_created,
-                    error,
-                )
-                .await);
-        }
+        let obsolete_staged_paths = match self.commit_home_hub(
+            &settings,
+            hub_id,
+            &owner_login,
+            local_device_id,
+            current.role == SyncRole::Standalone,
+        ) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return Err(self
+                    .rollback_home_hub_activation(
+                        Some(prepared),
+                        runtime_was_running,
+                        was_reachable,
+                        mapping_created,
+                        error,
+                    )
+                    .await)
+            }
+        };
+        self.reclaim_obsolete_staged_paths(&obsolete_staged_paths, "Home Hub activation");
         self.activate_prepared_outbox(prepared).await;
         *self.hub_reachable.write().await = true;
         Ok(())
@@ -821,6 +1030,8 @@ impl SyncService {
     async fn configure_connected_device(
         &self,
         request: SyncSetupRequest,
+        current: SyncSettings,
+        local_device_id: audetic_core::sync::DeviceId,
     ) -> Result<(), SyncServiceError> {
         let mut requested_hub = request.hub.clone().ok_or_else(|| {
             SyncServiceError::InvalidRequest(
@@ -853,16 +1064,75 @@ impl SyncService {
         let mut settings = settings_from_request(request, Some(candidate.connection));
         settings.last_contact_at = Some(now());
         settings.last_error = None;
+        let destination_changed = current.role == SyncRole::Standalone
+            || (current.role == SyncRole::ConnectedDevice
+                && current.hub.as_ref().map(|hub| hub.hub_id)
+                    != settings.hub.as_ref().map(|hub| hub.hub_id));
         let was_reachable = *self.hub_reachable.read().await;
+        let runtime_was_running = self
+            .outbox_runtime
+            .lock()
+            .await
+            .as_ref()
+            .is_some_and(|runtime| !runtime.task.is_finished());
         let prepared = self.prepare_dictation_transfer(&settings).await?;
-        if let Err(error) = self.commit_connected_device(&settings) {
-            self.cancel_prepared_outbox(prepared).await;
-            *self.hub_reachable.write().await = was_reachable;
-            return Err(error);
+        if current.role != SyncRole::Standalone {
+            self.stop_outbox_runtime().await;
         }
+        let obsolete_staged_paths =
+            match self.commit_connected_device(&settings, local_device_id, destination_changed) {
+                Ok(paths) => paths,
+                Err(error) => {
+                    self.cancel_prepared_outbox(prepared).await;
+                    *self.hub_reachable.write().await = was_reachable;
+                    return Err(if runtime_was_running {
+                        match self.restore_outbox_runtime(&current).await {
+                            Ok(()) => error,
+                            Err(rollback) => SyncServiceError::Rollback {
+                                source_error: error.to_string(),
+                                rollback_error: rollback.to_string(),
+                            },
+                        }
+                    } else {
+                        error
+                    });
+                }
+            };
+        self.reclaim_obsolete_staged_paths(&obsolete_staged_paths, "Connected Device activation");
         self.activate_prepared_outbox(prepared).await;
         *self.hub_reachable.write().await = true;
         Ok(())
+    }
+
+    fn commit_connected_device(
+        &self,
+        settings: &SyncSettings,
+        local_device_id: audetic_core::sync::DeviceId,
+        destination_changed: bool,
+    ) -> Result<Vec<std::path::PathBuf>, SyncServiceError> {
+        let mut conn = crate::db::open_db_at(&self.db_path)
+            .context("opening sync database")
+            .map_err(SyncServiceError::Persistence)?;
+        let transaction = conn
+            .transaction()
+            .context("starting Connected Device settings transaction")
+            .map_err(SyncServiceError::Persistence)?;
+        SyncSettingsRepository::save(&transaction, settings)
+            .map_err(SyncServiceError::Persistence)?;
+        let obsolete_staged_paths = if destination_changed {
+            crate::db::sync_outbox::SyncOutboxRepository::reset_for_new_destination(
+                &transaction,
+                local_device_id,
+            )
+            .map_err(SyncServiceError::Persistence)?
+        } else {
+            Vec::new()
+        };
+        transaction
+            .commit()
+            .context("committing Connected Device settings transaction")
+            .map_err(SyncServiceError::Persistence)?;
+        Ok(obsolete_staged_paths)
     }
 
     async fn reconstruct_home_hub(
@@ -957,6 +1227,9 @@ impl SyncService {
         let (pending_items, outbox_error) =
             crate::db::sync_outbox::SyncOutboxRepository::counts(&connection)
                 .map_err(SyncServiceError::Persistence)?;
+        let pending_bytes =
+            crate::db::sync_outbox::SyncOutboxRepository::pending_bytes(&connection)
+                .map_err(SyncServiceError::Persistence)?;
         Ok(SyncStatus {
             device_id: identity.device_id,
             role: settings.role,
@@ -966,7 +1239,7 @@ impl SyncService {
             hub_reachable: reachable,
             last_contact_at: settings.last_contact_at,
             pending_items,
-            pending_bytes: 0,
+            pending_bytes,
             last_error: outbox_error.or(settings.last_error),
             upload_recording_payloads: settings.upload_recording_payloads,
             cache_level: settings.cache_level,
@@ -1104,13 +1377,6 @@ impl SyncService {
         &self,
         settings: &SyncSettings,
     ) -> Result<(), SyncServiceError> {
-        let connection = crate::db::open_db_at(&self.db_path)
-            .context("opening sync database")
-            .map_err(SyncServiceError::Persistence)?;
-        crate::db::backfill_visible_dictations(&connection, settings.role)
-            .map_err(SyncServiceError::Persistence)?;
-        crate::db::backfill_visible_meetings(&connection, settings.role)
-            .map_err(SyncServiceError::Persistence)?;
         let prepared = self.prepare_dictation_transfer(settings).await?;
         self.activate_prepared_outbox(prepared).await;
         Ok(())
@@ -1125,17 +1391,19 @@ impl SyncService {
             settings.role,
             settings.hub.clone(),
             Arc::clone(&self.hubs),
-        );
+        )
+        .with_payload_uploads(settings.upload_recording_payloads);
         let (start, start_receiver) = oneshot::channel();
-        let (shutdown, receiver) = oneshot::channel();
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
         let task = tokio::spawn(async move {
             if start_receiver.await.is_ok() {
-                worker.run(receiver).await;
+                worker.run(worker_cancellation).await;
             }
         });
         Ok(PreparedOutboxRuntime {
             start,
-            runtime: OutboxRuntime { shutdown, task },
+            runtime: OutboxRuntime { cancellation, task },
         })
     }
 
@@ -1149,8 +1417,20 @@ impl SyncService {
     async fn cancel_prepared_outbox(&self, prepared: PreparedOutboxRuntime) {
         let PreparedOutboxRuntime { start, runtime } = prepared;
         drop(start);
-        let _ = runtime.shutdown.send(());
+        runtime.cancellation.cancel();
         let _ = runtime.task.await;
+    }
+
+    async fn restore_outbox_runtime(
+        &self,
+        settings: &SyncSettings,
+    ) -> Result<(), SyncServiceError> {
+        if settings.role == SyncRole::Standalone {
+            return Ok(());
+        }
+        let prepared = self.prepare_dictation_transfer(settings).await?;
+        self.activate_prepared_outbox(prepared).await;
+        Ok(())
     }
 
     async fn rollback_home_hub_activation(
@@ -1190,7 +1470,7 @@ impl SyncService {
         let Some(runtime) = self.outbox_runtime.lock().await.take() else {
             return;
         };
-        let _ = runtime.shutdown.send(());
+        runtime.cancellation.cancel();
         let _ = runtime.task.await;
     }
 
@@ -1223,7 +1503,9 @@ impl SyncService {
         settings: &SyncSettings,
         hub_id: audetic_core::sync::HubId,
         owner_login: &str,
-    ) -> Result<(), SyncServiceError> {
+        local_device_id: audetic_core::sync::DeviceId,
+        reset_destination: bool,
+    ) -> Result<Vec<std::path::PathBuf>, SyncServiceError> {
         let mut conn = crate::db::open_db_at(&self.db_path)
             .context("opening sync database")
             .map_err(SyncServiceError::Persistence)?;
@@ -1237,34 +1519,41 @@ impl SyncService {
             .map_err(SyncServiceError::Persistence)?;
         SyncServeRepository::save(&transaction, &expected_ownership())
             .map_err(SyncServiceError::Persistence)?;
-        crate::db::backfill_visible_dictations_in_transaction(&transaction, settings.role)
-            .map_err(SyncServiceError::Persistence)?;
-        crate::db::backfill_visible_meetings_in_transaction(&transaction, settings.role)
-            .map_err(SyncServiceError::Persistence)?;
+        let obsolete_staged_paths = if reset_destination {
+            crate::db::sync_outbox::SyncOutboxRepository::reset_for_new_destination(
+                &transaction,
+                local_device_id,
+            )
+            .map_err(SyncServiceError::Persistence)?
+        } else {
+            Vec::new()
+        };
         transaction
             .commit()
             .context("committing Home Hub settings transaction")
-            .map_err(SyncServiceError::Persistence)
+            .map_err(SyncServiceError::Persistence)?;
+        Ok(obsolete_staged_paths)
     }
 
-    fn commit_connected_device(&self, settings: &SyncSettings) -> Result<(), SyncServiceError> {
-        let mut conn = crate::db::open_db_at(&self.db_path)
-            .context("opening sync database")
-            .map_err(SyncServiceError::Persistence)?;
-        let transaction = conn
-            .transaction()
-            .context("starting Connected Device settings transaction")
-            .map_err(SyncServiceError::Persistence)?;
-        SyncSettingsRepository::save(&transaction, settings)
-            .map_err(SyncServiceError::Persistence)?;
-        crate::db::backfill_visible_dictations_in_transaction(&transaction, settings.role)
-            .map_err(SyncServiceError::Persistence)?;
-        crate::db::backfill_visible_meetings_in_transaction(&transaction, settings.role)
-            .map_err(SyncServiceError::Persistence)?;
-        transaction
-            .commit()
-            .context("committing Connected Device settings transaction")
-            .map_err(SyncServiceError::Persistence)
+    fn reclaim_obsolete_staged_paths(&self, paths: &[std::path::PathBuf], activation: &str) {
+        if paths.is_empty() {
+            return;
+        }
+        match crate::db::open_db_at(&self.db_path).context("opening sync database") {
+            Ok(connection) => {
+                if let Err(error) =
+                    crate::db::sync_outbox::SyncOutboxRepository::reclaim_staged_paths(
+                        &connection,
+                        paths,
+                    )
+                {
+                    tracing::warn!(%error, %activation, "failed to reclaim obsolete Recording Payload staging after activation");
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, %activation, "failed to open database for staging cleanup after activation");
+            }
+        }
     }
 
     fn commit_settings_and_ownership(
@@ -1372,6 +1661,7 @@ mod tests {
     use semver::Version;
     use std::sync::Mutex as StdMutex;
 
+    use crate::sync::protocol::{Snapshot, SnapshotDisposition, SnapshotResult};
     use crate::sync::tailscale::ServeAssessment;
 
     struct FakeTailscale {
@@ -1452,6 +1742,9 @@ mod tests {
     #[derive(Default)]
     struct FakeHubs {
         fail: AtomicBool,
+        blob_upload_calls: std::sync::atomic::AtomicUsize,
+        snapshot_uploads: StdMutex<Vec<(HubId, Vec<RecordId>)>>,
+        blob_uploads: StdMutex<Vec<(HubId, RecordId)>>,
     }
 
     #[async_trait]
@@ -1474,6 +1767,49 @@ mod tests {
             _expected_owner_login: &str,
         ) -> DiscoveryOutcome {
             DiscoveryOutcome::None { failures: vec![] }
+        }
+
+        async fn upload_snapshots(
+            &self,
+            hub: &HubConnection,
+            batch: SnapshotBatch,
+        ) -> Result<SnapshotBatchResponse, HubTransferError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(HubTransferError::Retryable("hub offline".into()));
+            }
+            self.snapshot_uploads.lock().unwrap().push((
+                hub.hub_id,
+                batch.snapshots.iter().map(Snapshot::record_id).collect(),
+            ));
+            Ok(SnapshotBatchResponse {
+                results: batch
+                    .snapshots
+                    .into_iter()
+                    .map(|snapshot| SnapshotResult {
+                        record_id: snapshot.record_id(),
+                        disposition: SnapshotDisposition::Accepted,
+                        authoritative_revision: Some(1),
+                        error_code: None,
+                        message: None,
+                    })
+                    .collect(),
+            })
+        }
+
+        async fn upload_blob(
+            &self,
+            hub: &HubConnection,
+            blob: &OutboxBlob,
+        ) -> Result<(), HubTransferError> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err(HubTransferError::Retryable("hub offline".into()));
+            }
+            self.blob_upload_calls.fetch_add(1, Ordering::SeqCst);
+            self.blob_uploads
+                .lock()
+                .unwrap()
+                .push((hub.hub_id, blob.record_id));
+            Ok(())
         }
     }
 
@@ -1640,31 +1976,115 @@ mod tests {
         .unwrap()
     }
 
+    fn seed_accepted_dictation(
+        fixture: &Fixture,
+        hub: HubConnection,
+        source_name: &str,
+        retain_staged_payload: bool,
+    ) -> (RecordId, PathBuf, PathBuf) {
+        let source = fixture.path.parent().unwrap().join(source_name);
+        std::fs::write(&source, b"accepted by the old hub").unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        SyncSettingsRepository::save(
+            &conn,
+            &SyncSettings {
+                role: SyncRole::ConnectedDevice,
+                hub: Some(hub),
+                upload_recording_payloads: true,
+                ..SyncSettings::default()
+            },
+        )
+        .unwrap();
+        let (_, record_id) = crate::db::insert_workflow_record(
+            &conn,
+            &crate::db::Workflow::new(
+                crate::db::WorkflowType::VoiceToText,
+                crate::db::WorkflowData::VoiceToText(crate::db::VoiceToTextData {
+                    text: "accepted metadata".into(),
+                    audio_path: source.to_string_lossy().into_owned(),
+                }),
+            ),
+        )
+        .unwrap();
+        let staged: String = conn
+            .query_row(
+                "SELECT staged_path FROM sync_outbox_blobs WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE sync_outbox_items SET state='synced',accepted_hub_revision=9 WHERE record_id=?1",
+            [record_id.to_string()],
+        )
+        .unwrap();
+        if retain_staged_payload {
+            conn.execute(
+                "UPDATE sync_outbox_blobs SET state='synced',availability='available'
+                 WHERE record_id=?1",
+                [record_id.to_string()],
+            )
+            .unwrap();
+        } else {
+            conn.execute(
+                "UPDATE sync_outbox_blobs SET state='synced',availability='available',staged_path=NULL
+                 WHERE record_id=?1",
+                [record_id.to_string()],
+            )
+            .unwrap();
+            std::fs::remove_file(&staged).unwrap();
+        }
+        (record_id, source, staged.into())
+    }
+
+    async fn wait_for_uploads(fixture: &Fixture, hub_id: HubId, record_id: RecordId) {
+        for _ in 0..100 {
+            let metadata_uploaded = fixture
+                .hubs
+                .snapshot_uploads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(hub, records)| *hub == hub_id && records.contains(&record_id));
+            let blob_uploaded = fixture
+                .hubs
+                .blob_uploads
+                .lock()
+                .unwrap()
+                .contains(&(hub_id, record_id));
+            if metadata_uploaded && blob_uploaded {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("record was not fully uploaded to the new hub");
+    }
+
     #[tokio::test]
-    async fn home_hub_backfill_failure_rolls_back_role_listener_mapping_and_worker() {
+    async fn home_hub_activation_commits_before_historical_backfill_failures() {
         let fixture = fixture();
         insert_dictation_with_invalid_backfill_timestamp(&fixture.path);
 
-        let error = fixture
+        let result = fixture
             .service
             .configure(request(SyncRole::HomeHub))
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, SyncServiceError::Persistence(_)));
+        assert_eq!(result.status.role, SyncRole::HomeHub);
         let conn = crate::db::open_db_at(&fixture.path).unwrap();
         assert_eq!(
             SyncSettingsRepository::get(&conn).unwrap().role,
-            SyncRole::Standalone
+            SyncRole::HomeHub
         );
-        assert!(SyncServeRepository::get(&conn).unwrap().is_none());
-        assert_eq!(outbox_count(&conn), 0);
+        assert!(SyncServeRepository::get(&conn).unwrap().is_some());
         assert_eq!(
             *fixture.tailscale.mapping.lock().unwrap(),
-            MappingState::Vacant
+            MappingState::OwnedByAudetic
         );
-        assert!(!fixture.service.hub_runtime_running().await);
-        assert!(fixture.service.outbox_runtime.lock().await.is_none());
+        assert!(fixture.service.hub_runtime_running().await);
+        assert!(fixture.service.outbox_runtime.lock().await.is_some());
+        fixture.service.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1704,25 +2124,386 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connected_device_backfill_failure_leaves_standalone_without_a_worker() {
+    async fn connected_device_activation_commits_before_historical_backfill_failures() {
         let fixture = fixture();
         insert_dictation_with_invalid_backfill_timestamp(&fixture.path);
 
-        let error = fixture
+        let result = fixture
             .service
             .configure(connected_request(HubId::new()))
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert!(matches!(error, SyncServiceError::Persistence(_)));
+        assert_eq!(result.status.role, SyncRole::ConnectedDevice);
         let conn = crate::db::open_db_at(&fixture.path).unwrap();
         assert_eq!(
             SyncSettingsRepository::get(&conn).unwrap().role,
-            SyncRole::Standalone
+            SyncRole::ConnectedDevice
         );
-        assert_eq!(outbox_count(&conn), 0);
-        assert!(fixture.service.outbox_runtime.lock().await.is_none());
-        assert!(!*fixture.service.hub_reachable.read().await);
+        assert!(fixture.service.outbox_runtime.lock().await.is_some());
+        assert!(*fixture.service.hub_reachable.read().await);
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconnecting_through_standalone_to_a_different_hub_requeues_only_local_records() {
+        let fixture = fixture();
+        let old_hub = connected_request(HubId::new()).hub.unwrap();
+        let (record_id, _source, _staged) =
+            seed_accepted_dictation(&fixture, old_hub, "switch.wav", false);
+        let foreign_id = RecordId::new();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        let snapshot_json: String = conn
+            .query_row(
+                "SELECT snapshot_json FROM sync_outbox_items WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut foreign: Snapshot = serde_json::from_str(&snapshot_json).unwrap();
+        let Snapshot::Dictation(foreign_snapshot) = &mut foreign else {
+            panic!("expected dictation snapshot");
+        };
+        foreign_snapshot.record_id = foreign_id;
+        foreign_snapshot.origin_device_id = DeviceId::new();
+        crate::db::sync_outbox::SyncOutboxRepository::enqueue_snapshot(&conn, &foreign).unwrap();
+        conn.execute(
+            "UPDATE sync_outbox_items SET state='synced',accepted_hub_revision=55
+             WHERE record_id=?1",
+            [foreign_id.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        fixture
+            .service
+            .configure(request(SyncRole::Standalone))
+            .await
+            .unwrap();
+
+        let new_hub_id = HubId::new();
+        let mut switch = connected_request(new_hub_id);
+        switch.upload_recording_payloads = true;
+        fixture.service.configure(switch).await.unwrap();
+        wait_for_uploads(&fixture, new_hub_id, record_id).await;
+
+        assert!(!fixture
+            .hubs
+            .snapshot_uploads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, records)| records.contains(&foreign_id)));
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        let foreign_state: (String, Option<u64>) = conn
+            .query_row(
+                "SELECT state,accepted_hub_revision FROM sync_outbox_items WHERE record_id=?1",
+                [foreign_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(foreign_state, ("synced".into(), Some(55)));
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn standalone_to_home_hub_with_payloads_enabled_restages_unavailable_payload() {
+        let fixture = fixture();
+        let source = fixture.path.parent().unwrap().join("reactivate.wav");
+        std::fs::write(&source, b"restage after reactivation").unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        SyncSettingsRepository::save(
+            &conn,
+            &SyncSettings {
+                role: SyncRole::ConnectedDevice,
+                hub: connected_request(HubId::new()).hub,
+                upload_recording_payloads: false,
+                ..SyncSettings::default()
+            },
+        )
+        .unwrap();
+        let (_, record_id) = crate::db::insert_workflow_record(
+            &conn,
+            &crate::db::Workflow::new(
+                crate::db::WorkflowType::VoiceToText,
+                crate::db::WorkflowData::VoiceToText(crate::db::VoiceToTextData {
+                    text: "accepted without its payload".into(),
+                    audio_path: source.to_string_lossy().into_owned(),
+                }),
+            ),
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sync_outbox_items SET state='synced',accepted_hub_revision=9
+             WHERE record_id=?1",
+            [record_id.to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state || ':' || availability FROM sync_outbox_blobs WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "synced:unavailable"
+        );
+        drop(conn);
+
+        fixture
+            .service
+            .configure(request(SyncRole::Standalone))
+            .await
+            .unwrap();
+        let mut reactivate = request(SyncRole::HomeHub);
+        reactivate.upload_recording_payloads = true;
+        fixture.service.configure(reactivate).await.unwrap();
+
+        for _ in 0..100 {
+            let conn = crate::db::open_db_at(&fixture.path).unwrap();
+            let state = conn
+                .query_row(
+                    "SELECT state || ':' || availability FROM sync_outbox_blobs
+                     WHERE record_id=?1",
+                    [record_id.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if state.as_deref() == Some("synced:available") {
+                fixture.service.shutdown().await.unwrap();
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("reactivation did not restage and accept the Recording Payload");
+    }
+
+    #[tokio::test]
+    async fn reconnecting_to_the_same_hub_preserves_accepted_outbox_state() {
+        let fixture = fixture();
+        let hub_id = HubId::new();
+        let hub = connected_request(hub_id).hub.unwrap();
+        let (record_id, _source, _staged) =
+            seed_accepted_dictation(&fixture, hub, "reconnect.wav", false);
+
+        let mut reconnect = connected_request(hub_id);
+        reconnect.upload_recording_payloads = true;
+        fixture.service.configure(reconnect).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        assert!(fixture.hubs.snapshot_uploads.lock().unwrap().is_empty());
+        assert!(fixture.hubs.blob_uploads.lock().unwrap().is_empty());
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        let state: (String, Option<u64>, String) = conn
+            .query_row(
+                "SELECT i.state,i.accepted_hub_revision,b.availability
+                 FROM sync_outbox_items i JOIN sync_outbox_blobs b USING(record_id,kind)
+                 WHERE i.record_id=?1",
+                [record_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, ("synced".into(), Some(9), "available".into()));
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changing_hub_requeues_the_existing_durable_stage_before_reclaiming_it() {
+        let fixture = fixture();
+        let old_hub = connected_request(HubId::new()).hub.unwrap();
+        let (record_id, source, staged) =
+            seed_accepted_dictation(&fixture, old_hub, "staged-only.wav", true);
+        std::fs::remove_file(source).unwrap();
+
+        let new_hub_id = HubId::new();
+        let mut switch = connected_request(new_hub_id);
+        switch.upload_recording_payloads = true;
+        fixture.service.configure(switch).await.unwrap();
+        wait_for_uploads(&fixture, new_hub_id, record_id).await;
+
+        assert!(!staged.exists());
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state || ':' || availability FROM sync_outbox_blobs WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "synced:available"
+        );
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changing_hub_marks_an_absent_payload_unavailable() {
+        let fixture = fixture();
+        let old_hub = connected_request(HubId::new()).hub.unwrap();
+        let (record_id, source, _staged) =
+            seed_accepted_dictation(&fixture, old_hub, "gone.wav", false);
+        std::fs::remove_file(source).unwrap();
+
+        let new_hub_id = HubId::new();
+        let mut switch = connected_request(new_hub_id);
+        switch.upload_recording_payloads = true;
+        fixture.service.configure(switch).await.unwrap();
+        for _ in 0..100 {
+            if fixture
+                .hubs
+                .snapshot_uploads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(hub, records)| *hub == new_hub_id && records.contains(&record_id))
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        assert!(!fixture
+            .hubs
+            .blob_uploads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(_, uploaded)| *uploaded == record_id));
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state || ':' || availability FROM sync_outbox_blobs WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "synced:unavailable"
+        );
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_hub_change_rolls_back_reset_and_restores_the_old_worker() {
+        let fixture = fixture();
+        let old_hub_id = HubId::new();
+        let old_hub = connected_request(old_hub_id).hub.unwrap();
+        let (record_id, _source, _staged) =
+            seed_accepted_dictation(&fixture, old_hub, "rollback-switch.wav", false);
+        fixture.service.initialize().await.unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_hub_reset BEFORE DELETE ON sync_outbox_items
+             BEGIN SELECT RAISE(ABORT, 'simulated Hub reset failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let mut switch = connected_request(HubId::new());
+        switch.upload_recording_payloads = true;
+        let error = fixture.service.configure(switch).await.unwrap_err();
+
+        assert!(matches!(error, SyncServiceError::Persistence(_)));
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        let settings = SyncSettingsRepository::get(&conn).unwrap();
+        assert_eq!(settings.hub.unwrap().hub_id, old_hub_id);
+        assert_eq!(
+            conn.query_row(
+                "SELECT state || ':' || accepted_hub_revision FROM sync_outbox_items
+                 WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "synced:9"
+        );
+        assert!(fixture.service.outbox_runtime.lock().await.is_some());
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn payload_policy_updates_offline_and_preserves_pending_staging() {
+        let fixture = fixture();
+        let source = fixture.path.parent().unwrap().join("policy.wav");
+        std::fs::write(&source, b"policy payload").unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        let (_, record_id) = crate::db::insert_workflow_record(
+            &conn,
+            &crate::db::Workflow::new(
+                crate::db::WorkflowType::VoiceToText,
+                crate::db::WorkflowData::VoiceToText(crate::db::VoiceToTextData {
+                    text: "policy backfill".into(),
+                    audio_path: source.to_string_lossy().into_owned(),
+                }),
+            ),
+        )
+        .unwrap();
+        drop(conn);
+        fixture
+            .service
+            .configure(connected_request(HubId::new()))
+            .await
+            .unwrap();
+        for _ in 0..50 {
+            let conn = crate::db::open_db_at(&fixture.path).unwrap();
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sync_outbox_blobs WHERE record_id=?1)",
+                    [record_id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if exists {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        fixture.tailscale.fail_status.store(true, Ordering::SeqCst);
+        fixture.hubs.fail.store(true, Ordering::SeqCst);
+        assert!(fixture
+            .service
+            .update_recording_payload_policy(true)
+            .await
+            .unwrap());
+        for _ in 0..50 {
+            let conn = crate::db::open_db_at(&fixture.path).unwrap();
+            let staged: Option<String> = conn
+                .query_row(
+                    "SELECT staged_path FROM sync_outbox_blobs WHERE record_id=?1",
+                    [record_id.to_string()],
+                    |row| row.get(0),
+                )
+                .ok();
+            if staged
+                .as_deref()
+                .is_some_and(|path| std::path::Path::new(path).is_file())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!fixture
+            .service
+            .update_recording_payload_policy(false)
+            .await
+            .unwrap());
+
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        let payload: (String, String, String) = conn
+            .query_row(
+                "SELECT availability,state,staged_path FROM sync_outbox_blobs WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(payload.0, "pending");
+        assert_eq!(payload.1, "pending");
+        assert!(std::path::Path::new(&payload.2).is_file());
+        assert!(
+            !SyncSettingsRepository::get(&conn)
+                .unwrap()
+                .upload_recording_payloads
+        );
+        fixture.service.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -1753,6 +2534,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_preserves_accepted_payload_and_does_not_reupload_it() {
+        let fixture = fixture();
+        let source = fixture.path.parent().unwrap().join("accepted.wav");
+        std::fs::write(&source, b"accepted payload").unwrap();
+        let hub = connected_request(HubId::new()).hub.unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        SyncSettingsRepository::save(
+            &conn,
+            &SyncSettings {
+                role: SyncRole::ConnectedDevice,
+                hub: Some(hub),
+                upload_recording_payloads: true,
+                ..SyncSettings::default()
+            },
+        )
+        .unwrap();
+        let (_, record_id) = crate::db::insert_workflow_record(
+            &conn,
+            &crate::db::Workflow::new(
+                crate::db::WorkflowType::VoiceToText,
+                crate::db::WorkflowData::VoiceToText(crate::db::VoiceToTextData {
+                    text: "already accepted".into(),
+                    audio_path: source.to_string_lossy().into_owned(),
+                }),
+            ),
+        )
+        .unwrap();
+        let staged: String = conn
+            .query_row(
+                "SELECT staged_path FROM sync_outbox_blobs WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE sync_outbox_items SET state='synced',accepted_hub_revision=9 WHERE record_id=?1",
+            [record_id.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE sync_outbox_blobs SET state='synced',availability='available' WHERE record_id=?1",
+            [record_id.to_string()],
+        )
+        .unwrap();
+        std::fs::remove_file(source).unwrap();
+        std::fs::remove_file(staged).unwrap();
+        drop(conn);
+
+        fixture.service.initialize().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        assert_eq!(fixture.hubs.blob_upload_calls.load(Ordering::SeqCst), 0);
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT state || ':' || availability FROM sync_outbox_blobs WHERE record_id=?1",
+                [record_id.to_string()],
+                |row| row.get::<_, String>(0),
+            )
+            .unwrap(),
+            "synced:available"
+        );
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn demotion_removes_only_the_exact_persisted_owned_mapping() {
         let fixture = fixture();
         fixture
@@ -1773,6 +2620,79 @@ mod tests {
             SyncSettingsRepository::get(&conn).unwrap().role,
             SyncRole::Standalone
         );
+    }
+
+    #[tokio::test]
+    async fn failed_demotion_restores_the_prior_connected_worker() {
+        let fixture = fixture();
+        fixture
+            .service
+            .configure(connected_request(HubId::new()))
+            .await
+            .unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_standalone_role
+             BEFORE UPDATE OF role ON sync_settings
+             WHEN NEW.role='standalone'
+             BEGIN SELECT RAISE(ABORT, 'simulated demotion commit failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = fixture
+            .service
+            .configure(request(SyncRole::Standalone))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SyncServiceError::Persistence(_)));
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        assert_eq!(
+            SyncSettingsRepository::get(&conn).unwrap().role,
+            SyncRole::ConnectedDevice
+        );
+        assert!(fixture.service.outbox_runtime.lock().await.is_some());
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_home_hub_demotion_restores_mapping_listener_and_worker() {
+        let fixture = fixture();
+        fixture
+            .service
+            .configure(request(SyncRole::HomeHub))
+            .await
+            .unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER reject_standalone_role
+             BEFORE UPDATE OF role ON sync_settings
+             WHEN NEW.role='standalone'
+             BEGIN SELECT RAISE(ABORT, 'simulated demotion commit failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let error = fixture
+            .service
+            .configure(request(SyncRole::Standalone))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, SyncServiceError::Persistence(_)));
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        assert_eq!(
+            SyncSettingsRepository::get(&conn).unwrap().role,
+            SyncRole::HomeHub
+        );
+        assert_eq!(
+            *fixture.tailscale.mapping.lock().unwrap(),
+            MappingState::OwnedByAudetic
+        );
+        assert!(fixture.service.hub_runtime_running().await);
+        assert!(fixture.service.outbox_runtime.lock().await.is_some());
+        fixture.service.shutdown().await.unwrap();
     }
 
     #[tokio::test]

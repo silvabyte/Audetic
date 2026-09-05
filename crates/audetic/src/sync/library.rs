@@ -5,12 +5,15 @@ use serde::{Deserialize, Serialize};
 
 use std::path::PathBuf;
 
-use crate::db::shared_library::{ApplySnapshotError, SharedLibraryRepository};
+use crate::db::shared_library::{ApplySnapshotError, LibraryBlobRecord, SharedLibraryRepository};
+
+use super::payload::{BlobStore, StoredBlob};
 
 use super::protocol::{
-    DictationPage, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting, Snapshot,
-    SnapshotBatchResponse, SnapshotDisposition, SnapshotResult, MAX_DICTATION_PAGE,
-    MAX_MEETING_PAGE, MAX_SNAPSHOT_BATCH,
+    is_canonical_sha256, DictationPage, MeetingPage, MeetingTitlePatch, RecordKind,
+    RecordingPayloadDescriptor, SharedMeeting, Snapshot, SnapshotBatchResponse,
+    SnapshotDisposition, SnapshotResult, MAX_BLOB_BYTES, MAX_DICTATION_PAGE, MAX_MEETING_PAGE,
+    MAX_SNAPSHOT_BATCH,
 };
 
 /// Authoritative validation/application boundary used by both the HTTP hub
@@ -18,11 +21,23 @@ use super::protocol::{
 #[derive(Clone, Debug)]
 pub struct HubLibrary {
     db_path: PathBuf,
+    blob_store: BlobStore,
 }
 
 impl HubLibrary {
     pub fn new(db_path: PathBuf) -> Self {
-        Self { db_path }
+        Self {
+            blob_store: BlobStore::for_db(&db_path),
+            db_path,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn with_blob_root(db_path: PathBuf, blob_root: PathBuf) -> Self {
+        Self {
+            db_path,
+            blob_store: BlobStore::new(blob_root),
+        }
     }
 
     pub fn apply_snapshots<T: Into<Snapshot>>(
@@ -160,6 +175,107 @@ impl HubLibrary {
             &chrono::Utc::now().to_rfc3339(),
         )
     }
+
+    pub fn has_blob(&self, checksum: &str) -> Result<bool> {
+        let connection = crate::db::open_db_at(&self.db_path)?;
+        Ok(
+            SharedLibraryRepository::has_verified_blob(&connection, checksum)?
+                && self.blob_store.contains(checksum)?,
+        )
+    }
+
+    pub async fn accept_blob_file(
+        &self,
+        source: &std::path::Path,
+        checksum: &str,
+        byte_size: u64,
+        media_type: &str,
+    ) -> Result<StoredBlob> {
+        self.require_payload_association(checksum, byte_size, media_type)?;
+        let stored = self
+            .blob_store
+            .put_file(source, checksum, byte_size, media_type)
+            .await?;
+        self.register_blob(&stored)?;
+        Ok(stored)
+    }
+
+    pub async fn accept_blob_stream<S, E>(
+        &self,
+        checksum: &str,
+        byte_size: u64,
+        media_type: &str,
+        stream: S,
+    ) -> Result<StoredBlob>
+    where
+        S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        self.require_payload_association(checksum, byte_size, media_type)?;
+        let stored = self
+            .blob_store
+            .put_stream(checksum, byte_size, media_type, stream)
+            .await?;
+        self.register_blob(&stored)?;
+        Ok(stored)
+    }
+
+    pub fn payload(
+        &self,
+        record_id: RecordId,
+        kind: RecordKind,
+    ) -> Result<Option<LibraryBlobRecord>> {
+        let connection = crate::db::open_db_at(&self.db_path)?;
+        let payload = SharedLibraryRepository::payload_blob(&connection, record_id, kind)?;
+        Ok(payload.filter(|blob| blob.canonical_path.is_file()))
+    }
+
+    fn require_payload_association(
+        &self,
+        checksum: &str,
+        byte_size: u64,
+        media_type: &str,
+    ) -> Result<()> {
+        let connection = crate::db::open_db_at(&self.db_path)?;
+        if !SharedLibraryRepository::has_payload_association(
+            &connection,
+            checksum,
+            byte_size,
+            media_type,
+        )? {
+            anyhow::bail!(
+                "no accepted record references this Recording Payload checksum and metadata"
+            );
+        }
+        Ok(())
+    }
+
+    fn register_blob(&self, stored: &StoredBlob) -> Result<()> {
+        let result = (|| {
+            let mut connection = crate::db::open_db_at(&self.db_path)?;
+            SharedLibraryRepository::register_verified_blob(
+                &mut connection,
+                &LibraryBlobRecord {
+                    checksum: stored.checksum.clone(),
+                    canonical_path: stored.path.clone(),
+                    byte_size: stored.byte_size,
+                    media_type: stored.media_type.clone(),
+                },
+            )
+        })();
+        if result.is_err() && stored.created {
+            match std::fs::remove_file(&stored.path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %stored.path.display(),
+                    %error,
+                    "failed to remove unregistered canonical Recording Payload"
+                ),
+            }
+        }
+        result.map(|_| ())
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -235,6 +351,9 @@ fn canonicalize_snapshot(mut snapshot: Snapshot) -> std::result::Result<Snapshot
         Snapshot::Dictation(value) if value.payload.text.trim().is_empty() => {
             return Err("dictation text must not be empty".to_owned())
         }
+        Snapshot::Dictation(value) => {
+            validate_payload_descriptor(&value.payload.recording_payload)?
+        }
         Snapshot::Meeting(value) => {
             if value.payload.status != "completed"
                 || value.payload.transcript_text.trim().is_empty()
@@ -243,6 +362,7 @@ fn canonicalize_snapshot(mut snapshot: Snapshot) -> std::result::Result<Snapshot
             }
             value.payload.completed_at = canonical_timestamp(&value.payload.completed_at)
                 .map_err(|_| "completed_at must be RFC 3339".to_owned())?;
+            validate_payload_descriptor(&value.payload.recording_payload)?;
         }
         Snapshot::Artifact(value) => {
             if value.payload.content_markdown.trim().is_empty() {
@@ -251,9 +371,51 @@ fn canonicalize_snapshot(mut snapshot: Snapshot) -> std::result::Result<Snapshot
             value.payload.completed_at = canonical_timestamp(&value.payload.completed_at)
                 .map_err(|_| "completed_at must be RFC 3339".to_owned())?;
         }
-        Snapshot::Dictation(_) => {}
     }
     Ok(snapshot)
+}
+
+fn validate_payload_descriptor(
+    descriptor: &RecordingPayloadDescriptor,
+) -> std::result::Result<(), String> {
+    use audetic_core::sync::PayloadAvailability;
+    match descriptor.availability {
+        PayloadAvailability::Unavailable => {
+            if descriptor.checksum.is_some()
+                || descriptor.byte_size.is_some()
+                || descriptor.media_type.is_some()
+            {
+                return Err("unavailable Recording Payload must not contain blob metadata".into());
+            }
+        }
+        PayloadAvailability::Pending | PayloadAvailability::Available => {
+            let checksum = descriptor
+                .checksum
+                .as_deref()
+                .ok_or_else(|| "Recording Payload checksum is required".to_owned())?;
+            if !is_canonical_sha256(checksum) {
+                return Err("Recording Payload checksum is not canonical SHA-256".into());
+            }
+            let size = descriptor
+                .byte_size
+                .ok_or_else(|| "Recording Payload byte size is required".to_owned())?;
+            if size == 0 || size > MAX_BLOB_BYTES {
+                return Err("Recording Payload byte size is outside the supported range".into());
+            }
+            let media_type = descriptor
+                .media_type
+                .as_deref()
+                .ok_or_else(|| "Recording Payload media type is required".to_owned())?;
+            if media_type.is_empty() || media_type.len() > 255 || media_type.contains(['\r', '\n'])
+            {
+                return Err("Recording Payload media type is invalid".into());
+            }
+        }
+        PayloadAvailability::NeedsAttention => {
+            return Err("origin snapshots cannot publish needs_attention payloads".into())
+        }
+    }
+    Ok(())
 }
 
 fn canonical_timestamp(value: &str) -> std::result::Result<String, String> {
@@ -302,8 +464,53 @@ mod tests {
             updated_at: format!("2026-09-04T{hour:02}:00:00+00:00"),
             payload: super::super::protocol::DictationPayload {
                 text: format!("record-{record}"),
+                recording_payload: Default::default(),
             },
         }
+    }
+
+    #[test]
+    fn failed_registration_removes_only_a_newly_created_canonical_blob() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("hub.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let library = HubLibrary::with_blob_root(db_path, temp.path().join("blobs"));
+        let path = temp.path().join("canonical");
+        std::fs::write(&path, b"orphan").unwrap();
+        let stored = StoredBlob {
+            checksum: "88f6811ab5d8fc6d92fd0c41b26910abf0f67eda743e9bd740329d26a2451a27".into(),
+            path: path.clone(),
+            byte_size: 6,
+            media_type: "audio/wav".into(),
+            created: true,
+        };
+
+        assert!(library.register_blob(&stored).is_err());
+        assert!(!path.exists());
+
+        std::fs::write(&path, b"shared").unwrap();
+        assert!(library
+            .register_blob(&StoredBlob {
+                created: false,
+                ..stored.clone()
+            })
+            .is_err());
+        assert!(path.exists());
+
+        let inaccessible_db = temp.path().join("database-directory");
+        std::fs::create_dir(&inaccessible_db).unwrap();
+        let inaccessible_library =
+            HubLibrary::with_blob_root(inaccessible_db, temp.path().join("other-blobs"));
+        let orphan = temp.path().join("open-failure-orphan");
+        std::fs::write(&orphan, b"orphan").unwrap();
+        assert!(inaccessible_library
+            .register_blob(&StoredBlob {
+                path: orphan.clone(),
+                created: true,
+                ..stored
+            })
+            .is_err());
+        assert!(!orphan.exists());
     }
 
     #[test]

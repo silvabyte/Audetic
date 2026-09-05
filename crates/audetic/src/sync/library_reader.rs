@@ -83,7 +83,8 @@ impl MeetingLibraryReader {
                 meeting.sync_id,
                 super::protocol::RecordKind::Meeting,
             )?;
-            entries.insert(meeting.sync_id, local_meeting(meeting, upload));
+            let payload = SyncOutboxRepository::payload_availability(&connection, meeting.sync_id)?;
+            entries.insert(meeting.sync_id, local_meeting(meeting, upload, payload));
         }
         let (reachable, error) = match settings.role {
             SyncRole::Standalone => (false, None),
@@ -177,7 +178,13 @@ pub struct LibraryReadResultMeetings {
 fn local_meeting(
     value: crate::db::meetings::MeetingRecord,
     upload_state: Option<UploadState>,
+    outbox_payload: Option<PayloadAvailability>,
 ) -> LibraryMeeting {
+    let operational_payload =
+        crate::sync::payload::resolve_operational_audio(std::path::Path::new(&value.audio_path))
+            .ok()
+            .flatten()
+            .is_some();
     LibraryMeeting {
         id: value.sync_id,
         local_id: Some(value.id),
@@ -195,10 +202,10 @@ fn local_meeting(
         error: value.error,
         created_at: value.created_at,
         upload_state,
-        payload_availability: if std::path::Path::new(&value.audio_path).exists() {
+        payload_availability: if operational_payload {
             PayloadAvailability::Available
         } else {
-            PayloadAvailability::Unavailable
+            outbox_payload.unwrap_or(PayloadAvailability::Unavailable)
         },
         source: "local",
         offline: false,
@@ -228,7 +235,7 @@ fn shared_meeting(
         error: None,
         created_at: value.created_at,
         upload_state: Some(UploadState::Synced),
-        payload_availability: PayloadAvailability::Unavailable,
+        payload_availability: value.recording_payload.availability,
         source: "shared",
         offline,
         read_only,
@@ -242,7 +249,8 @@ fn overlay_local_payload(
 ) -> LibraryMeeting {
     if let Some(local) = local {
         shared.local_id = local.local_id;
-        shared.payload_availability = local.payload_availability;
+        shared.payload_availability =
+            merge_payload_availability(local.payload_availability, shared.payload_availability);
         shared.upload_state = local.upload_state;
     }
     shared
@@ -278,6 +286,11 @@ impl LibraryReader {
         for workflow in local {
             let mut entry = HistoryEntry::from(workflow);
             entry.upload_state = SyncOutboxRepository::state_for(&connection, entry.id)?;
+            if entry.payload_availability == PayloadAvailability::Unavailable {
+                entry.payload_availability =
+                    SyncOutboxRepository::payload_availability(&connection, entry.id)?
+                        .unwrap_or(PayloadAvailability::Unavailable);
+            }
             entries.insert(entry.id, entry);
         }
 
@@ -292,7 +305,15 @@ impl LibraryReader {
                     None,
                     fetch,
                 )? {
-                    entries.insert(shared.record_id, shared_entry(shared, false, false));
+                    let id = shared.record_id;
+                    let mut entry = shared_entry(shared, false, false);
+                    if let Some(local) = entries.get(&id) {
+                        entry.payload_availability = merge_payload_availability(
+                            local.payload_availability,
+                            entry.payload_availability,
+                        );
+                    }
+                    entries.insert(id, entry);
                 }
                 (true, None)
             }
@@ -322,7 +343,15 @@ impl LibraryReader {
                             let page_len = page.items.len();
                             fetched_from_hub = fetched_from_hub.saturating_add(page_len);
                             for shared in page.items {
-                                entries.insert(shared.record_id, shared_entry(shared, false, true));
+                                let id = shared.record_id;
+                                let mut entry = shared_entry(shared, false, true);
+                                if let Some(local) = entries.get(&id) {
+                                    entry.payload_availability = merge_payload_availability(
+                                        local.payload_availability,
+                                        entry.payload_availability,
+                                    );
+                                }
+                                entries.insert(id, entry);
                             }
                             cursor = page.next_cursor;
                             if fetched_from_hub >= fetch || cursor.is_none() || page_len == 0 {
@@ -362,6 +391,21 @@ impl LibraryReader {
     }
 }
 
+fn merge_payload_availability(
+    local: PayloadAvailability,
+    shared: PayloadAvailability,
+) -> PayloadAvailability {
+    if shared == PayloadAvailability::Available || local == PayloadAvailability::Available {
+        PayloadAvailability::Available
+    } else if local == PayloadAvailability::NeedsAttention {
+        PayloadAvailability::NeedsAttention
+    } else if local == PayloadAvailability::Pending {
+        PayloadAvailability::Pending
+    } else {
+        shared
+    }
+}
+
 fn shared_entry(
     shared: super::protocol::SharedDictation,
     offline: bool,
@@ -374,7 +418,7 @@ fn shared_entry(
         origin_device_id: shared.origin_device_id,
         source: HistorySource::Shared,
         upload_state: Some(UploadState::Synced),
-        payload_availability: PayloadAvailability::Unavailable,
+        payload_availability: shared.recording_payload.availability,
         offline,
         read_only,
     }
@@ -391,6 +435,24 @@ mod tests {
     use crate::sync::service::HubTransferError;
     use async_trait::async_trait;
     use audetic_core::sync::{CacheLevel, HubCandidate, HubConnection, HubId, SyncRole};
+
+    #[test]
+    fn local_payload_failure_is_visible_until_the_hub_has_an_available_blob() {
+        assert_eq!(
+            merge_payload_availability(
+                PayloadAvailability::NeedsAttention,
+                PayloadAvailability::Pending,
+            ),
+            PayloadAvailability::NeedsAttention
+        );
+        assert_eq!(
+            merge_payload_availability(
+                PayloadAvailability::NeedsAttention,
+                PayloadAvailability::Available,
+            ),
+            PayloadAvailability::Available
+        );
+    }
 
     struct OfflineHub;
 
@@ -497,6 +559,7 @@ mod tests {
                 updated_at: local_created,
                 payload: DictationPayload {
                     text: "alpha local".into(),
+                    recording_payload: Default::default(),
                 },
             },
         )
@@ -513,6 +576,7 @@ mod tests {
                 updated_at: "2026-09-04T11:00:00Z".into(),
                 payload: DictationPayload {
                     text: "alpha remote".into(),
+                    recording_payload: Default::default(),
                 },
             },
         )
@@ -735,7 +799,10 @@ mod tests {
                     local_version: 1,
                     created_at: created_at.clone(),
                     updated_at: created_at,
-                    payload: DictationPayload { text: data.text },
+                    payload: DictationPayload {
+                        text: data.text,
+                        recording_payload: Default::default(),
+                    },
                 });
             }
         }
@@ -753,6 +820,7 @@ mod tests {
                 updated_at: format!("2026-09-05T{:02}:{:02}:00Z", index / 2, (index % 2) * 30),
                 payload: DictationPayload {
                     text: format!("remote-{index:02}"),
+                    recording_payload: Default::default(),
                 },
             })
             .collect();

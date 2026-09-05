@@ -7,6 +7,7 @@ pub mod logs;
 pub mod meeting_artifacts;
 pub mod meetings;
 pub mod models;
+pub(crate) mod payload;
 pub mod post_processing;
 pub mod provider;
 pub mod recording;

@@ -86,6 +86,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/history/{id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["history_audio"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/keybind": {
         parameters: {
             query?: never;
@@ -790,6 +806,22 @@ export interface paths {
         get?: never;
         put?: never;
         post: operations["discover_home_hubs"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/payload-policy": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["update_sync_payload_policy"];
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1623,6 +1655,12 @@ export interface components {
             serve_mapping?: null | components["schemas"]["ServeMappingState"];
             serve_preview: string;
         };
+        SyncPayloadPolicyRequest: {
+            upload_recording_payloads: boolean;
+        };
+        SyncPayloadPolicyResponse: {
+            upload_recording_payloads: boolean;
+        };
         SyncRetryResponse: {
             /** Format: int64 */
             retried_items: number;
@@ -1895,6 +1933,41 @@ export interface operations {
                 };
             };
             /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    history_audio: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Stable transcription UUID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recording Payload bytes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Recording Payload byte range */
+            206: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Recording Payload unavailable */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -3211,6 +3284,48 @@ export interface operations {
             };
             /** @description Tailscale or discovery transport is unavailable */
             503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+        };
+    };
+    update_sync_payload_policy: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SyncPayloadPolicyRequest"];
+            };
+        };
+        responses: {
+            /** @description Device-local Recording Payload upload policy updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SyncPayloadPolicyResponse"];
+                };
+            };
+            /** @description No Shared Library role is active */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorBody"];
+                };
+            };
+            /** @description The device-local policy could not be persisted */
+            500: {
                 headers: {
                     [name: string]: unknown;
                 };

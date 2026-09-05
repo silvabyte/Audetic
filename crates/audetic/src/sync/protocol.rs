@@ -1,4 +1,4 @@
-use audetic_core::sync::{DeviceId, HubId, RecordId};
+use audetic_core::sync::{DeviceId, HubId, PayloadAvailability, RecordId};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -16,9 +16,12 @@ pub const HUB_DICTATIONS_PATH: &str = "v1/dictations";
 pub const HUB_MEETINGS_ROUTE: &str = "/v1/meetings";
 pub const HUB_MEETINGS_PATH: &str = "v1/meetings";
 pub const HUB_ARTIFACTS_ROUTE: &str = "/v1/artifacts";
+pub const HUB_BLOBS_ROUTE: &str = "/v1/blobs/:sha256";
+pub const HUB_BLOBS_PATH: &str = "v1/blobs";
 pub const MAX_SNAPSHOT_BATCH: usize = 25;
 pub const MAX_DICTATION_PAGE: usize = 100;
 pub const MAX_MEETING_PAGE: usize = 100;
+pub const MAX_BLOB_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MIN_PROTOCOL_VERSION: u16 = 1;
@@ -36,8 +39,64 @@ pub enum RecordKind {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
+pub struct RecordingPayloadDescriptor {
+    pub checksum: Option<String>,
+    pub byte_size: Option<u64>,
+    pub media_type: Option<String>,
+    pub availability: PayloadAvailability,
+}
+
+impl RecordingPayloadDescriptor {
+    pub const fn unavailable() -> Self {
+        Self {
+            checksum: None,
+            byte_size: None,
+            media_type: None,
+            availability: PayloadAvailability::Unavailable,
+        }
+    }
+
+    pub fn pending(checksum: String, byte_size: u64, media_type: String) -> Self {
+        Self {
+            checksum: Some(checksum),
+            byte_size: Some(byte_size),
+            media_type: Some(media_type),
+            availability: PayloadAvailability::Pending,
+        }
+    }
+}
+
+impl Default for RecordingPayloadDescriptor {
+    fn default() -> Self {
+        Self::unavailable()
+    }
+}
+
+pub fn is_canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub fn hub_blob_path(checksum: &str) -> String {
+    format!("{HUB_BLOBS_PATH}/{checksum}")
+}
+
+pub fn hub_payload_path(kind: RecordKind, record_id: RecordId) -> String {
+    let records = match kind {
+        RecordKind::Dictation => "dictations",
+        RecordKind::Meeting => "meetings",
+        RecordKind::Artifact => "artifacts",
+    };
+    format!("v1/{records}/{record_id}/payload")
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
 pub struct DictationPayload {
     pub text: String,
+    #[serde(default)]
+    pub recording_payload: RecordingPayloadDescriptor,
 }
 
 /// Portable origin snapshot. It intentionally contains no local row ID or
@@ -65,6 +124,8 @@ pub struct MeetingPayload {
     pub duration_seconds: u64,
     pub status: String,
     pub completed_at: String,
+    #[serde(default)]
+    pub recording_payload: RecordingPayloadDescriptor,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -136,6 +197,14 @@ impl Snapshot {
             Self::Artifact(value) => value.local_version,
         }
     }
+
+    pub const fn origin_device_id(&self) -> DeviceId {
+        match self {
+            Self::Dictation(value) => value.origin_device_id,
+            Self::Meeting(value) => value.origin_device_id,
+            Self::Artifact(value) => value.origin_device_id,
+        }
+    }
 }
 
 impl From<DictationSnapshot> for Snapshot {
@@ -191,6 +260,7 @@ pub struct SharedDictation {
     pub updated_at: String,
     pub local_version: u64,
     pub authoritative_revision: u64,
+    pub recording_payload: RecordingPayloadDescriptor,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize, ToSchema)]
@@ -216,6 +286,7 @@ pub struct SharedMeeting {
     pub completed_at: String,
     pub local_version: u64,
     pub authoritative_revision: u64,
+    pub recording_payload: RecordingPayloadDescriptor,
     pub artifacts: Vec<SharedArtifact>,
 }
 
@@ -255,6 +326,7 @@ pub struct MeetingTitlePatch {
 pub enum ChangeOperation {
     Upsert,
     Delete,
+    PayloadAvailability,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, ToSchema)]
@@ -369,6 +441,7 @@ mod tests {
             updated_at: "2026-09-04T10:00:00Z".into(),
             payload: DictationPayload {
                 text: "hello".into(),
+                recording_payload: Default::default(),
             },
         };
         let json = serde_json::to_value(snapshot).unwrap();
@@ -399,6 +472,7 @@ mod tests {
                 duration_seconds: 60,
                 status: "completed".into(),
                 completed_at: "2026-09-04T10:01:00Z".into(),
+                recording_payload: Default::default(),
             },
         };
         let artifact = CompletedArtifactSnapshot {

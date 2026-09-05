@@ -242,6 +242,18 @@ pub struct SyncSetupResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+pub struct SyncPayloadPolicyRequest {
+    pub upload_recording_payloads: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+pub struct SyncPayloadPolicyResponse {
+    pub upload_recording_payloads: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 pub struct SyncStatus {
     pub device_id: DeviceId,
     pub role: SyncRole,

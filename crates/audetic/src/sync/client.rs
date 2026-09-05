@@ -4,13 +4,14 @@ use reqwest::Url;
 use thiserror::Error;
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::time::Duration;
 
 use super::protocol::{
-    DictationPage, HubApiError, HubInfo, MeetingPage, MeetingTitlePatch, RecordKind, SharedMeeting,
-    SnapshotBatch, SnapshotBatchResponse, HUB_API_MOUNT_PATH, HUB_DICTATIONS_PATH, HUB_ID_HEADER,
-    HUB_INFO_PATH, HUB_MEETINGS_PATH, HUB_SNAPSHOTS_PATH, PROTOCOL_VERSION,
-    PROTOCOL_VERSION_HEADER, TAILSCALE_HTTPS_PORT,
+    hub_blob_path, hub_payload_path, DictationPage, HubApiError, HubInfo, MeetingPage,
+    MeetingTitlePatch, RecordKind, SharedMeeting, SnapshotBatch, SnapshotBatchResponse,
+    HUB_API_MOUNT_PATH, HUB_DICTATIONS_PATH, HUB_ID_HEADER, HUB_INFO_PATH, HUB_MEETINGS_PATH,
+    HUB_SNAPSHOTS_PATH, PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, TAILSCALE_HTTPS_PORT,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -52,6 +53,25 @@ pub trait HubTransport: Clone + Send + Sync + 'static {
     ) -> Result<TransportResponse, String> {
         Err("DELETE is not implemented by this transport".into())
     }
+
+    async fn head(
+        &self,
+        _url: Url,
+        _headers: BTreeMap<String, String>,
+    ) -> Result<TransportResponse, String> {
+        Err("HEAD is not implemented by this transport".into())
+    }
+
+    async fn put_file(
+        &self,
+        _url: Url,
+        _headers: BTreeMap<String, String>,
+        _path: &Path,
+        _byte_size: u64,
+        _media_type: &str,
+    ) -> Result<TransportResponse, String> {
+        Err("streaming PUT is not implemented by this transport".into())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -63,7 +83,7 @@ impl ReqwestHubTransport {
     pub fn new() -> Result<Self, reqwest::Error> {
         reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(3))
-            .timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(10 * 60))
             .build()
             .map(|client| Self { client })
     }
@@ -149,6 +169,51 @@ impl HubTransport for ReqwestHubTransport {
         }
         response_from_reqwest(request.send().await.map_err(|error| error.to_string())?).await
     }
+
+    async fn head(
+        &self,
+        url: Url,
+        headers: BTreeMap<String, String>,
+    ) -> Result<TransportResponse, String> {
+        let mut request = self.client.head(url);
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        response_from_reqwest(request.send().await.map_err(|error| error.to_string())?).await
+    }
+
+    async fn put_file(
+        &self,
+        url: Url,
+        headers: BTreeMap<String, String>,
+        path: &Path,
+        byte_size: u64,
+        media_type: &str,
+    ) -> Result<TransportResponse, String> {
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|error| error.to_string())?;
+        let stream = tokio_util::io::ReaderStream::new(file);
+        let mut request = self
+            .client
+            .put(url)
+            .header("content-type", media_type)
+            .header("content-length", byte_size)
+            .body(reqwest::Body::wrap_stream(stream));
+        for (name, value) in headers {
+            request = request.header(name, value);
+        }
+        response_from_reqwest(request.send().await.map_err(|error| error.to_string())?).await
+    }
+}
+
+pub struct StreamingPayloadResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub content_length: Option<String>,
+    pub content_range: Option<String>,
+    pub accept_ranges: Option<String>,
+    pub response: reqwest::Response,
 }
 
 async fn response_from_reqwest(response: reqwest::Response) -> Result<TransportResponse, String> {
@@ -237,6 +302,47 @@ impl HubClient<ReqwestHubTransport> {
         let transport = ReqwestHubTransport::new()
             .map_err(|error| HubClientError::Transport(error.to_string()))?;
         Self::with_transport(base_url, transport)
+    }
+
+    pub async fn stream_payload(
+        &self,
+        hub_id: HubId,
+        kind: RecordKind,
+        record_id: RecordId,
+        range: Option<&str>,
+    ) -> Result<StreamingPayloadResponse, HubClientError> {
+        let url = self
+            .base_url
+            .join(&hub_payload_path(kind, record_id))
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        let mut request = self.transport.client.get(url);
+        for (name, value) in protocol_headers(hub_id) {
+            request = request.header(name, value);
+        }
+        if let Some(range) = range {
+            request = request.header("range", range);
+        }
+        let response = request
+            .send()
+            .await
+            .map_err(|error| HubClientError::Transport(error.to_string()))?;
+        verify_reqwest_hub_response(&response, hub_id)?;
+        let status = response.status().as_u16();
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        Ok(StreamingPayloadResponse {
+            status,
+            content_type: header("content-type"),
+            content_length: header("content-length"),
+            content_range: header("content-range"),
+            accept_ranges: header("accept-ranges"),
+            response,
+        })
     }
 }
 
@@ -348,6 +454,48 @@ impl<T: HubTransport> HubClient<T> {
             return Err(http_error(response));
         }
         serde_json::from_slice(&response.body).map_err(HubClientError::InvalidInfo)
+    }
+
+    pub async fn upload_blob(
+        &self,
+        hub_id: HubId,
+        checksum: &str,
+        path: &Path,
+        byte_size: u64,
+        media_type: &str,
+    ) -> Result<(), HubClientError> {
+        let url = self
+            .base_url
+            .join(&hub_blob_path(checksum))
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        let response = self
+            .transport
+            .put_file(url, protocol_headers(hub_id), path, byte_size, media_type)
+            .await
+            .map_err(HubClientError::Transport)?;
+        verify_hub_response(&response, hub_id)?;
+        if !(200..300).contains(&response.status) {
+            return Err(http_error(response));
+        }
+        Ok(())
+    }
+
+    pub async fn head_blob(&self, hub_id: HubId, checksum: &str) -> Result<bool, HubClientError> {
+        let url = self
+            .base_url
+            .join(&hub_blob_path(checksum))
+            .map_err(|error| HubClientError::InvalidBaseUrl(error.to_string()))?;
+        let response = self
+            .transport
+            .head(url, protocol_headers(hub_id))
+            .await
+            .map_err(HubClientError::Transport)?;
+        verify_hub_response(&response, hub_id)?;
+        match response.status {
+            200..=299 => Ok(true),
+            404 => Ok(false),
+            _ => Err(http_error(response)),
+        }
     }
 
     pub async fn page_dictations(
@@ -522,6 +670,24 @@ fn verify_hub_response(
         .headers
         .get(HUB_ID_HEADER)
         .ok_or(HubClientError::MissingHubIdHeader)?
+        .parse::<HubId>()
+        .map_err(|_| HubClientError::InvalidHubId(HUB_ID_HEADER))?;
+    if actual != expected {
+        return Err(HubClientError::WrongHubId { expected, actual });
+    }
+    Ok(())
+}
+
+fn verify_reqwest_hub_response(
+    response: &reqwest::Response,
+    expected: HubId,
+) -> Result<(), HubClientError> {
+    let actual = response
+        .headers()
+        .get(HUB_ID_HEADER)
+        .ok_or(HubClientError::MissingHubIdHeader)?
+        .to_str()
+        .map_err(|_| HubClientError::InvalidHubId(HUB_ID_HEADER))?
         .parse::<HubId>()
         .map_err(|_| HubClientError::InvalidHubId(HUB_ID_HEADER))?;
     if actual != expected {

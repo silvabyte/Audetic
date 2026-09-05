@@ -1073,20 +1073,45 @@ pub async fn meeting_audio(
     State(state): State<MeetingState>,
     request: axum::extract::Request,
 ) -> Response {
-    let (local_id, record_id) = match resolve_local_meeting(&state.services.db_path, &id) {
+    let record_id = match parse_record_id(&id) {
         Ok(value) => value,
         Err(error) => return error.into_response(),
     };
     let db_path = state.services.db_path.clone();
     let lookup = tokio::task::spawn_blocking(move || {
         let conn = crate::db::open_db_at(&db_path)?;
-        crate::db::meetings::MeetingRepository::get(&conn, local_id)
+        crate::db::meetings::MeetingRepository::get_by_sync_id(&conn, record_id)
     })
     .await;
 
     let meeting = match lookup {
         Ok(Ok(Some(m))) => m,
-        Ok(Ok(None)) => return audio_not_found(record_id),
+        Ok(Ok(None)) => {
+            let Some(sync) = &state.sync else {
+                return audio_not_found(record_id);
+            };
+            let range = request
+                .headers()
+                .get(axum::http::header::RANGE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            return match sync
+                .payload(
+                    record_id,
+                    crate::sync::protocol::RecordKind::Meeting,
+                    range.as_deref(),
+                )
+                .await
+            {
+                Ok(Some(source)) => super::payload::serve(source, request).await,
+                Ok(None) => audio_not_found(record_id),
+                Err(error) => (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"success":false,"message":error.to_string()})),
+                )
+                    .into_response(),
+            };
+        }
         Ok(Err(e)) => {
             error!("Failed to load meeting {} for audio: {}", id, e);
             return (
@@ -1116,6 +1141,29 @@ pub async fn meeting_audio(
         if mp3.exists() {
             mp3
         } else {
+            if let Some(sync) = &state.sync {
+                let range = request
+                    .headers()
+                    .get(axum::http::header::RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                return match sync
+                    .payload(
+                        record_id,
+                        crate::sync::protocol::RecordKind::Meeting,
+                        range.as_deref(),
+                    )
+                    .await
+                {
+                    Ok(Some(source)) => super::payload::serve(source, request).await,
+                    Ok(None) => audio_not_found(record_id),
+                    Err(error) => (
+                        StatusCode::BAD_GATEWAY,
+                        Json(json!({"success":false,"message":error.to_string()})),
+                    )
+                        .into_response(),
+                };
+            }
             return audio_not_found(record_id);
         }
     };

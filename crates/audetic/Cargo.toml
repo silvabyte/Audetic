@@ -23,7 +23,7 @@ audetic-core = { path = "../audetic-core", features = ["schema"] }
 
 # Async runtime
 tokio = { version = "1.35", features = ["full", "test-util"] }
-tokio-util = { version = "0.7", features = ["io"] }
+tokio-util = { version = "0.7", features = ["io", "rt"] }
 
 # Async trait support
 async-trait = "0.1"
@@ -75,6 +75,9 @@ regex = "1.10"
 # `POST /api/meetings/import`.
 axum = { version = "0.7", features = ["multipart"] }
 http = "1"
+http-body-util = "0.1"
+bytes = "1"
+futures-util = "0.3"
 # `util` provides `ServiceExt::oneshot`, used to drive `ServeFile` from the
 # meeting-audio handler. 0.5 unifies with the tower that tower-http pulls in.
 tower = { version = "0.5", features = ["util"] }

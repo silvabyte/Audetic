@@ -193,6 +193,7 @@ export function SharedLibraryCard() {
                       role={status.role}
                       hubName={status.hub?.base_url ?? status.network.dns_name ?? null}
                       setupCommand={sync.setupCommand}
+                      uploadRecordingPayloads={status.upload_recording_payloads}
                     />
                   )}
                 </>
@@ -491,7 +492,7 @@ function DiscoveryResults({
   );
 }
 
-function ActiveRoleActions({ role, hubName, setupCommand }: { role: Exclude<SyncRole, "standalone">; hubName: string | null; setupCommand: string | null }) {
+function ActiveRoleActions({ role, hubName, setupCommand, uploadRecordingPayloads }: { role: Exclude<SyncRole, "standalone">; hubName: string | null; setupCommand: string | null; uploadRecordingPayloads: boolean }) {
   const store = useStore();
   const [demoteOpen, setDemoteOpen] = useState(false);
 
@@ -507,12 +508,33 @@ function ActiveRoleActions({ role, hubName, setupCommand }: { role: Exclude<Sync
     toast.success("This device is now Standalone");
   }
 
+  async function updatePayloadPolicy(enabled: boolean): Promise<void> {
+    const result = await store.sync.updateRecordingPayloadPolicy(enabled);
+    if (!result) {
+      toast.error("Couldn't update recording payload uploads", {
+        description: store.sync.actionError ?? undefined,
+      });
+      return;
+    }
+    toast.success(enabled ? "Recording payload uploads enabled" : "Recording payload uploads disabled");
+  }
+
   return (
     <Observer>
       {() => {
         const busy = store.sync.operation !== null;
         return (
           <div className="space-y-3 border-t pt-4">
+            <div className="rounded-lg border bg-muted/10 p-3">
+              <SwitchRow
+                id="active-sync-recording-payloads"
+                label="Upload recording payloads"
+                description="Upload available audio from this device. Enabling backfills audio still on disk; disabling cancels pending audio uploads."
+                checked={uploadRecordingPayloads}
+                onCheckedChange={(enabled) => void updatePayloadPolicy(enabled)}
+                disabled={busy}
+              />
+            </div>
             <div className="flex flex-col gap-3 rounded-lg border bg-muted/10 p-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="min-w-0">
                 <div className="flex items-center gap-2 text-sm font-medium">

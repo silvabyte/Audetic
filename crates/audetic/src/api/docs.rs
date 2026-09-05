@@ -32,6 +32,7 @@ use super::routes::{
         // History
         history::list_history,
         history::get_history_by_id,
+        history::history_audio,
         // Keybind
         keybind::get_status,
         keybind::install_keybind,
@@ -94,6 +95,7 @@ use super::routes::{
         sync::get_status,
         sync::discover,
         sync::configure,
+        sync::update_payload_policy,
         sync::retry,
     ),
     components(schemas(
@@ -198,6 +200,8 @@ use super::routes::{
         audetic_core::sync::SyncNetworkAssessment,
         audetic_core::sync::SyncSetupRequest,
         audetic_core::sync::SyncSetupResult,
+        audetic_core::sync::SyncPayloadPolicyRequest,
+        audetic_core::sync::SyncPayloadPolicyResponse,
         audetic_core::sync::SyncStatus,
         audetic_core::sync::RecordId,
         audetic_core::sync::UploadState,
@@ -287,6 +291,7 @@ mod tests {
             paths::SYNC_STATUS,
             paths::SYNC_DISCOVER,
             paths::SYNC_CONFIGURE,
+            paths::SYNC_PAYLOAD_POLICY,
             paths::SYNC_RETRY,
             paths::SYSTEM_RESTART,
             paths::KEYBIND_STATUS,

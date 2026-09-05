@@ -140,7 +140,10 @@ fn isolated_origins_with_colliding_integer_ids_remain_distinct_by_uuid() {
                 local_version: stored.sync_version,
                 created_at: created_at.clone(),
                 updated_at: created_at,
-                payload: DictationPayload { text: data.text },
+                payload: DictationPayload {
+                    text: data.text,
+                    recording_payload: Default::default(),
+                },
             },
         )
         .unwrap();

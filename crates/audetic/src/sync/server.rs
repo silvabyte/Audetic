@@ -1,9 +1,9 @@
 use audetic_core::sync::HubId;
 use axum::extract::{DefaultBodyLimit, Path, Query, Request, State};
-use axum::http::{header::ORIGIN, HeaderMap, HeaderValue, StatusCode};
+use axum::http::{header, header::ORIGIN, HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use thiserror::Error;
@@ -13,14 +13,17 @@ use utoipa::OpenApi;
 use std::future::Future;
 use std::io;
 use std::sync::Arc;
+use tower::ServiceExt;
+use tower_http::services::ServeFile;
 
 use super::identity::{parse_stored_tailscale_login, parse_tailscale_login, LoginParseError};
 use super::library::HubLibrary;
 use super::protocol::{
-    DictationPage, HubApiError, HubInfo, MeetingPage, MeetingTitlePatch, ProtocolRange, RecordKind,
-    SharedMeeting, SnapshotBatch, SnapshotBatchResponse, HUB_DICTATIONS_ROUTE, HUB_ID_HEADER,
-    HUB_INFO_ROUTE, HUB_MEETINGS_ROUTE, HUB_SNAPSHOTS_ROUTE, MAX_DICTATION_PAGE, MAX_MEETING_PAGE,
-    PROTOCOL_VERSION, PROTOCOL_VERSION_HEADER, TAILSCALE_FUNNEL_REQUEST_HEADER,
+    is_canonical_sha256, DictationPage, HubApiError, HubInfo, MeetingPage, MeetingTitlePatch,
+    ProtocolRange, RecordKind, SharedMeeting, SnapshotBatch, SnapshotBatchResponse,
+    HUB_BLOBS_ROUTE, HUB_DICTATIONS_ROUTE, HUB_ID_HEADER, HUB_INFO_ROUTE, HUB_MEETINGS_ROUTE,
+    HUB_SNAPSHOTS_ROUTE, MAX_BLOB_BYTES, MAX_DICTATION_PAGE, MAX_MEETING_PAGE, PROTOCOL_VERSION,
+    PROTOCOL_VERSION_HEADER, TAILSCALE_FUNNEL_REQUEST_HEADER,
 };
 
 #[derive(Clone, Debug)]
@@ -78,6 +81,7 @@ impl HubServer {
         Router::new()
             .route(HUB_INFO_ROUTE, get(info))
             .route(HUB_SNAPSHOTS_ROUTE, post(apply_snapshots))
+            .route(HUB_BLOBS_ROUTE, put(upload_blob).head(head_blob))
             .route(HUB_DICTATIONS_ROUTE, get(page_dictations))
             .route(HUB_MEETINGS_ROUTE, get(page_meetings))
             .route(
@@ -87,6 +91,11 @@ impl HubServer {
                     .delete(delete_meeting),
             )
             .route("/v1/dictations/:sync_id", delete(delete_dictation))
+            .route(
+                "/v1/dictations/:sync_id/payload",
+                get(get_dictation_payload),
+            )
+            .route("/v1/meetings/:sync_id/payload", get(get_meeting_payload))
             .route("/v1/artifacts/:sync_id", delete(delete_artifact))
             .layer(DefaultBodyLimit::max(1024 * 1024))
             .layer(middleware::from_fn_with_state(
@@ -178,6 +187,213 @@ async fn apply_snapshots(
         )
             .into_response(),
     }
+}
+
+#[utoipa::path(
+    put,
+    path = "/v1/blobs/{sha256}",
+    tag = "hub_payloads",
+    params(("sha256" = String, Path, description = "Lowercase SHA-256 checksum")),
+    responses(
+        (status = 201, description = "Blob verified and atomically stored"),
+        (status = 204, description = "Identical blob was already stored"),
+        (status = 400, description = "Invalid checksum, media type, or body size", body = HubApiError),
+        (status = 409, description = "No accepted record references this checksum", body = HubApiError),
+        (status = 413, description = "Blob exceeds the bounded upload limit", body = HubApiError),
+    )
+)]
+async fn upload_blob(
+    State(state): State<Arc<HubServerConfig>>,
+    Path(sha256): Path<String>,
+    request: Request,
+) -> Response {
+    let Some(library) = &state.library else {
+        return library_unavailable();
+    };
+    if !is_canonical_sha256(&sha256) {
+        return hub_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_checksum",
+            "checksum is not canonical SHA-256",
+        );
+    }
+    let Some(byte_size) = exactly_one_header(request.headers(), header::CONTENT_LENGTH)
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return hub_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_size",
+            "one valid Content-Length header is required",
+        );
+    };
+    if byte_size == 0 || byte_size > MAX_BLOB_BYTES {
+        return hub_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            "Recording Payload size is outside the supported range",
+        );
+    }
+    let Some(media_type) = exactly_one_header(request.headers(), header::CONTENT_TYPE) else {
+        return hub_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_media_type",
+            "one valid Content-Type header is required",
+        );
+    };
+    let existed = match library.has_blob(&sha256) {
+        Ok(value) => value,
+        Err(error) => {
+            return hub_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                &error.to_string(),
+            )
+        }
+    };
+    let stream = http_body_util::BodyExt::into_data_stream(request.into_body());
+    match library
+        .accept_blob_stream(&sha256, byte_size, &media_type, stream)
+        .await
+    {
+        Ok(_) if existed => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => StatusCode::CREATED.into_response(),
+        Err(error) if error.to_string().contains("no accepted record") => hub_error(
+            StatusCode::CONFLICT,
+            "association_required",
+            &error.to_string(),
+        ),
+        Err(error) if error.to_string().contains("exceeds") => hub_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "payload_too_large",
+            &error.to_string(),
+        ),
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("blob verification failed") {
+                hub_error(
+                    StatusCode::BAD_REQUEST,
+                    "blob_verification_failed",
+                    &message,
+                )
+            } else {
+                hub_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", &message)
+            }
+        }
+    }
+}
+
+#[utoipa::path(
+    head,
+    path = "/v1/blobs/{sha256}",
+    tag = "hub_payloads",
+    params(("sha256" = String, Path)),
+    responses((status = 200, description = "Verified blob is present"), (status = 404, description = "Blob is absent"))
+)]
+async fn head_blob(
+    State(state): State<Arc<HubServerConfig>>,
+    Path(sha256): Path<String>,
+) -> Response {
+    let Some(library) = &state.library else {
+        return library_unavailable();
+    };
+    match library.has_blob(&sha256) {
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(error) => hub_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_checksum",
+            &error.to_string(),
+        ),
+    }
+}
+
+#[utoipa::path(get,path="/v1/dictations/{sync_id}/payload",tag="hub_payloads",params(("sync_id"=String,Path)),responses((status=200,description="Associated Recording Payload bytes"),(status=206,description="Associated Recording Payload range"),(status=404,body=HubApiError)))]
+async fn get_dictation_payload(
+    State(state): State<Arc<HubServerConfig>>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response {
+    get_payload(state, id, RecordKind::Dictation, request).await
+}
+
+#[utoipa::path(get,path="/v1/meetings/{sync_id}/payload",tag="hub_payloads",params(("sync_id"=String,Path)),responses((status=200,description="Associated Recording Payload bytes"),(status=206,description="Associated Recording Payload range"),(status=404,body=HubApiError)))]
+async fn get_meeting_payload(
+    State(state): State<Arc<HubServerConfig>>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Response {
+    get_payload(state, id, RecordKind::Meeting, request).await
+}
+
+async fn get_payload(
+    state: Arc<HubServerConfig>,
+    id: String,
+    kind: RecordKind,
+    request: Request,
+) -> Response {
+    let Some(library) = &state.library else {
+        return library_unavailable();
+    };
+    let Ok(record_id) = id.parse() else {
+        return hub_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_record_id",
+            "record UUID is malformed",
+        );
+    };
+    let payload = match library.payload(record_id, kind) {
+        Ok(Some(payload)) => payload,
+        Ok(None) => {
+            return hub_error(
+                StatusCode::NOT_FOUND,
+                "payload_not_found",
+                "record has no available Recording Payload",
+            )
+        }
+        Err(error) => {
+            return hub_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "storage_error",
+                &error.to_string(),
+            )
+        }
+    };
+    match ServeFile::new(payload.canonical_path)
+        .oneshot(request)
+        .await
+    {
+        Ok(mut response) => {
+            if let Ok(value) = HeaderValue::from_str(&payload.media_type) {
+                response.headers_mut().insert(header::CONTENT_TYPE, value);
+            }
+            response.into_response()
+        }
+        Err(error) => hub_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "storage_error",
+            &error.to_string(),
+        ),
+    }
+}
+
+fn exactly_one_header(headers: &HeaderMap, name: header::HeaderName) -> Option<String> {
+    let values = headers.get_all(name).iter().collect::<Vec<_>>();
+    let [value] = values.as_slice() else {
+        return None;
+    };
+    value.to_str().ok().map(str::to_owned)
+}
+
+fn library_unavailable() -> Response {
+    hub_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "library_unavailable",
+        "Shared Library is not active",
+    )
+}
+
+fn hub_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (status, Json(HubApiError::new(code, message))).into_response()
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
@@ -571,7 +787,7 @@ fn insert_hub_id(headers: &mut HeaderMap, hub_id: HubId) {
     servers(
         (url = "http://127.0.0.1:3738", description = "Loopback listener behind Tailscale Serve"),
     ),
-    paths(info, apply_snapshots, page_dictations, page_meetings, get_meeting, update_meeting_title, delete_dictation, delete_meeting, delete_artifact),
+    paths(info, apply_snapshots, upload_blob, head_blob, page_dictations, page_meetings, get_meeting, update_meeting_title, delete_dictation, delete_meeting, delete_artifact, get_dictation_payload, get_meeting_payload),
     components(schemas(
         HubInfo, ProtocolRange, HubApiError, audetic_core::sync::HubId,
         audetic_core::sync::RecordId, audetic_core::sync::DeviceId,
@@ -584,11 +800,13 @@ fn insert_hub_id(headers: &mut HeaderMap, hub_id: HubId) {
         ,super::protocol::MeetingPayload, super::protocol::MeetingSnapshot,
         super::protocol::CompletedArtifactPayload, super::protocol::CompletedArtifactSnapshot,
         super::protocol::Snapshot, super::protocol::SharedMeeting, super::protocol::SharedArtifact,
-        super::protocol::MeetingPage, super::protocol::MeetingTitlePatch
+         super::protocol::MeetingPage, super::protocol::MeetingTitlePatch,
+         super::protocol::RecordingPayloadDescriptor, audetic_core::sync::PayloadAvailability
     )),
     tags(
         (name = "hub_discovery", description = "Home Hub discovery and compatibility"),
         (name = "hub_dictations", description = "Authoritative dictation text transfer and reads")
+        ,(name = "hub_payloads", description = "Checksum-addressed Recording Payload transfer and associated playback")
     ),
 )]
 pub struct HubApiDoc;
@@ -599,6 +817,7 @@ mod tests {
     use crate::sync::protocol::{DictationPayload, DictationSnapshot, RecordKind, SnapshotBatch};
     use axum::body::{to_bytes, Body};
     use axum::http::{Method, Request};
+    use sha2::{Digest, Sha256};
     use tower::ServiceExt;
     use uuid::Uuid;
 
@@ -808,6 +1027,7 @@ mod tests {
             updated_at: "2026-09-04T10:00:00Z".into(),
             payload: DictationPayload {
                 text: "from another device".into(),
+                recording_payload: Default::default(),
             },
         };
         let body = serde_json::to_vec(&SnapshotBatch {
@@ -865,6 +1085,236 @@ mod tests {
         );
     }
 
+    fn payload_request(method: Method, uri: &str, hub_id: HubId, body: Body) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(
+                super::super::identity::TAILSCALE_USER_LOGIN_HEADER,
+                "Alice@Example.com",
+            )
+            .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
+            .header(HUB_ID_HEADER, hub_id.to_string())
+            .body(body)
+            .unwrap()
+    }
+
+    fn server_with_payload_association(
+        temp: &tempfile::TempDir,
+        bytes: &[u8],
+    ) -> (HubServer, HubId, audetic_core::sync::RecordId, String) {
+        let db_path = temp.path().join("hub.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let blob_root = temp.path().join("canonical-blobs");
+        let library = HubLibrary::with_blob_root(db_path, blob_root);
+        let hub_id = hub_id();
+        let record_id = audetic_core::sync::RecordId::new();
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        library
+            .apply_snapshots(vec![DictationSnapshot {
+                kind: RecordKind::Dictation,
+                schema_version: 1,
+                record_id,
+                origin_device_id: audetic_core::sync::DeviceId::new(),
+                local_version: 1,
+                created_at: "2026-09-04T10:00:00Z".into(),
+                updated_at: "2026-09-04T10:00:00Z".into(),
+                payload: DictationPayload {
+                    text: "payload metadata".into(),
+                    recording_payload: super::super::protocol::RecordingPayloadDescriptor::pending(
+                        checksum.clone(),
+                        bytes.len() as u64,
+                        "audio/wav".into(),
+                    ),
+                },
+            }])
+            .unwrap();
+        let server = HubServer::new(
+            HubServerConfig::new(hub_id, "Alice@Example.com")
+                .unwrap()
+                .with_library(library),
+        );
+        (server, hub_id, record_id, checksum)
+    }
+
+    #[tokio::test]
+    async fn blob_put_is_atomic_verified_idempotent_and_only_associated_records_can_download() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"verified recording payload";
+        let (server, hub_id, record_id, checksum) = server_with_payload_association(&temp, bytes);
+        let uri = format!("/v1/blobs/{checksum}");
+        for expected in [StatusCode::CREATED, StatusCode::NO_CONTENT] {
+            let request = payload_request(Method::PUT, &uri, hub_id, Body::from(bytes.to_vec()));
+            let (mut parts, body) = request.into_parts();
+            parts.headers.insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&bytes.len().to_string()).unwrap(),
+            );
+            parts
+                .headers
+                .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+            let response = server
+                .router()
+                .oneshot(Request::from_parts(parts, body))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), expected);
+        }
+        let head = server
+            .router()
+            .oneshot(payload_request(Method::HEAD, &uri, hub_id, Body::empty()))
+            .await
+            .unwrap();
+        assert_eq!(head.status(), StatusCode::OK);
+        let payload = server
+            .router()
+            .oneshot(payload_request(
+                Method::GET,
+                &format!("/v1/dictations/{record_id}/payload"),
+                hub_id,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(payload.status(), StatusCode::OK);
+        assert_eq!(payload.headers()[header::CONTENT_TYPE], "audio/wav");
+        assert_eq!(
+            to_bytes(payload.into_body(), usize::MAX).await.unwrap(),
+            bytes.as_slice()
+        );
+
+        let available = server
+            .router()
+            .oneshot(payload_request(
+                Method::GET,
+                HUB_DICTATIONS_ROUTE,
+                hub_id,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        let page: super::super::protocol::DictationPage =
+            serde_json::from_slice(&to_bytes(available.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            page.items[0].recording_payload.availability,
+            audetic_core::sync::PayloadAvailability::Available
+        );
+
+        let ranged = server
+            .router()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("/v1/dictations/{record_id}/payload"))
+                    .header(
+                        super::super::identity::TAILSCALE_USER_LOGIN_HEADER,
+                        "Alice@Example.com",
+                    )
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
+                    .header(HUB_ID_HEADER, hub_id.to_string())
+                    .header(header::RANGE, "bytes=2-7")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ranged.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            to_bytes(ranged.into_body(), usize::MAX).await.unwrap(),
+            &bytes[2..=7]
+        );
+
+        let unauthenticated = server
+            .router()
+            .oneshot(
+                Request::get(format!("/v1/dictations/{record_id}/payload"))
+                    .header(PROTOCOL_VERSION_HEADER, PROTOCOL_VERSION.to_string())
+                    .header(HUB_ID_HEADER, hub_id.to_string())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthenticated.status(), StatusCode::FORBIDDEN);
+
+        let arbitrary = server
+            .router()
+            .oneshot(payload_request(
+                Method::GET,
+                &format!(
+                    "/v1/dictations/{}/payload",
+                    audetic_core::sync::RecordId::new()
+                ),
+                hub_id,
+                Body::empty(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(arbitrary.status(), StatusCode::NOT_FOUND);
+        let canonical = temp
+            .path()
+            .join("canonical-blobs")
+            .join(&checksum[..2])
+            .join(&checksum);
+        assert_eq!(std::fs::read(canonical).unwrap(), bytes);
+    }
+
+    #[tokio::test]
+    async fn checksum_mismatch_and_size_limit_leave_no_canonical_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let expected = b"expected";
+        let (server, hub_id, _record_id, checksum) =
+            server_with_payload_association(&temp, expected);
+        let request = payload_request(
+            Method::PUT,
+            &format!("/v1/blobs/{checksum}"),
+            hub_id,
+            Body::from(b"mismatch".to_vec()),
+        );
+        let (mut parts, body) = request.into_parts();
+        parts
+            .headers
+            .insert(header::CONTENT_LENGTH, HeaderValue::from_static("8"));
+        parts
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+        let response = server
+            .router()
+            .clone()
+            .oneshot(Request::from_parts(parts, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(!temp
+            .path()
+            .join("canonical-blobs")
+            .join(&checksum[..2])
+            .join(&checksum)
+            .exists());
+
+        let oversized = payload_request(
+            Method::PUT,
+            &format!("/v1/blobs/{checksum}"),
+            hub_id,
+            Body::empty(),
+        );
+        let (mut parts, body) = oversized.into_parts();
+        parts.headers.insert(
+            header::CONTENT_LENGTH,
+            HeaderValue::from_str(&(MAX_BLOB_BYTES + 1).to_string()).unwrap(),
+        );
+        parts
+            .headers
+            .insert(header::CONTENT_TYPE, HeaderValue::from_static("audio/wav"));
+        let response = server
+            .router()
+            .oneshot(Request::from_parts(parts, body))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
     #[tokio::test]
     async fn listener_refuses_non_loopback_bindings() {
         let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
@@ -883,7 +1333,7 @@ mod tests {
             document.servers.as_ref().unwrap()[0].url,
             super::super::protocol::HUB_LOOPBACK_BASE_URL
         );
-        assert_eq!(document.paths.paths.len(), 7);
+        assert_eq!(document.paths.paths.len(), 10);
         assert!(document.paths.paths.contains_key("/v1/info"));
         assert!(document.paths.paths.contains_key("/v1/snapshots"));
         assert!(document.paths.paths.contains_key("/v1/dictations"));
@@ -894,6 +1344,15 @@ mod tests {
         assert!(document.paths.paths.contains_key("/v1/meetings"));
         assert!(document.paths.paths.contains_key("/v1/meetings/{sync_id}"));
         assert!(document.paths.paths.contains_key("/v1/artifacts/{sync_id}"));
+        assert!(document.paths.paths.contains_key("/v1/blobs/{sha256}"));
+        assert!(document
+            .paths
+            .paths
+            .contains_key("/v1/dictations/{sync_id}/payload"));
+        assert!(document
+            .paths
+            .paths
+            .contains_key("/v1/meetings/{sync_id}/payload"));
         let operation = document
             .paths
             .paths

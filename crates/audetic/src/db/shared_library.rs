@@ -1,11 +1,12 @@
 use anyhow::{Context, Result};
-use audetic_core::sync::{DeviceId, RecordId};
+use audetic_core::sync::{DeviceId, PayloadAvailability, RecordId};
 use rusqlite::{params, Connection, OptionalExtension};
 use thiserror::Error;
 
 use crate::sync::protocol::{
     ChangeEnvelope, ChangeOperation, CompletedArtifactSnapshot, DictationSnapshot, MeetingSnapshot,
-    MeetingTitlePatch, RecordKind, SharedArtifact, SharedDictation, SharedMeeting, Snapshot,
+    MeetingTitlePatch, RecordKind, RecordingPayloadDescriptor, SharedArtifact, SharedDictation,
+    SharedMeeting, Snapshot,
 };
 
 #[derive(Debug, Error)]
@@ -32,6 +33,14 @@ pub enum ApplySnapshotError {
 pub struct ApplyResult {
     pub revision: u64,
     pub changed: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LibraryBlobRecord {
+    pub checksum: String,
+    pub canonical_path: std::path::PathBuf,
+    pub byte_size: u64,
+    pub media_type: String,
 }
 
 pub struct SharedLibraryRepository;
@@ -91,17 +100,22 @@ impl SharedLibraryRepository {
                     return Err(ApplySnapshotError::VersionConflict);
                 }
                 if snapshot.local_version == existing.local_version {
-                    if existing.text == snapshot.payload.text
+                    let metadata_matches = existing.text == snapshot.payload.text
                         && existing.origin_device_id == snapshot.origin_device_id
-                        && existing.updated_at == snapshot.updated_at
-                    {
+                        && existing.updated_at == snapshot.updated_at;
+                    if !metadata_matches {
+                        return Err(ApplySnapshotError::VersionConflict);
+                    }
+                    if payload_descriptors_match(
+                        &existing.recording_payload,
+                        &snapshot.payload.recording_payload,
+                    ) {
                         tx.commit().context("committing idempotent snapshot")?;
                         return Ok(ApplyResult {
                             revision: *revision,
                             changed: false,
                         });
                     }
-                    return Err(ApplySnapshotError::VersionConflict);
                 }
             }
         }
@@ -138,7 +152,16 @@ impl SharedLibraryRepository {
             ],
         )
         .context("upserting shared dictation")?;
-        let change = ChangeEnvelope::upsert(snapshot.clone(), revision);
+        upsert_payload_association(
+            &tx,
+            snapshot.record_id,
+            RecordKind::Dictation,
+            &snapshot.payload.recording_payload,
+        )?;
+        let mut accepted_snapshot = snapshot.clone();
+        accepted_snapshot.payload.recording_payload =
+            payload_descriptor_from(&tx, snapshot.record_id)?;
+        let change = ChangeEnvelope::upsert(accepted_snapshot, revision);
         let change_json = serde_json::to_string(&change).context("serializing library change")?;
         tx.execute(
             "INSERT INTO shared_library_changes
@@ -227,27 +250,28 @@ impl SharedLibraryRepository {
     }
 
     fn get_from(conn: &Connection, record_id: RecordId) -> Result<Option<SharedDictation>> {
-        conn.query_row(
-            "SELECT record_id, origin_device_id, text, source_created_at, source_updated_at,
+        let row = conn
+            .query_row(
+                "SELECT record_id, origin_device_id, text, source_created_at, source_updated_at,
                     local_version, authoritative_revision
              FROM shared_dictations WHERE record_id = ?1 AND deleted_at IS NULL",
-            [record_id.to_string()],
-            |row| {
-                let record: String = row.get(0)?;
-                let origin: String = row.get(1)?;
-                Ok((
-                    record,
-                    origin,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            },
-        )
-        .optional()?
-        .map(|row| {
+                [record_id.to_string()],
+                |row| {
+                    let record: String = row.get(0)?;
+                    let origin: String = row.get(1)?;
+                    Ok((
+                        record,
+                        origin,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        row.map(|row| {
             Ok(SharedDictation {
                 record_id: row.0.parse().map_err(anyhow::Error::msg)?,
                 origin_device_id: row.1.parse().map_err(anyhow::Error::msg)?,
@@ -256,6 +280,7 @@ impl SharedLibraryRepository {
                 updated_at: row.4,
                 local_version: row.5,
                 authoritative_revision: row.6,
+                recording_payload: payload_descriptor_from(conn, record_id)?,
             })
         })
         .transpose()
@@ -313,14 +338,16 @@ impl SharedLibraryRepository {
         })?;
         rows.map(|row| {
             let row = row?;
+            let record_id = row.0.parse().map_err(anyhow::Error::msg)?;
             Ok(SharedDictation {
-                record_id: row.0.parse().map_err(anyhow::Error::msg)?,
+                record_id,
                 origin_device_id: row.1.parse().map_err(anyhow::Error::msg)?,
                 text: row.2,
                 created_at: row.3,
                 updated_at: row.4,
                 local_version: row.5,
                 authoritative_revision: row.6,
+                recording_payload: payload_descriptor_from(conn, record_id)?,
             })
         })
         .collect()
@@ -358,17 +385,22 @@ impl SharedLibraryRepository {
                     return Err(ApplySnapshotError::VersionConflict);
                 }
                 if snapshot.local_version == current.local_version {
-                    if meeting_matches_snapshot(&current, snapshot)
+                    let metadata_matches = meeting_metadata_matches_snapshot(&current, snapshot)
                         || (hub_owns_meeting_title(&tx, snapshot.record_id)?
-                            && meeting_origin_content_matches_snapshot(&current, snapshot))
-                    {
+                            && meeting_origin_content_matches_snapshot(&current, snapshot));
+                    if !metadata_matches {
+                        return Err(ApplySnapshotError::VersionConflict);
+                    }
+                    if payload_descriptors_match(
+                        &current.recording_payload,
+                        &snapshot.payload.recording_payload,
+                    ) {
                         tx.commit()?;
                         return Ok(ApplyResult {
                             revision: *revision,
                             changed: false,
                         });
                     }
-                    return Err(ApplySnapshotError::VersionConflict);
                 }
                 if !meeting_origin_content_matches_snapshot(&current, snapshot) {
                     return Err(ApplySnapshotError::VersionConflict);
@@ -408,6 +440,15 @@ impl SharedLibraryRepository {
                 snapshot.payload.duration_seconds,snapshot.created_at,snapshot.updated_at,snapshot.payload.completed_at,
                 snapshot.local_version,revision],
         )?;
+        upsert_payload_association(
+            &tx,
+            snapshot.record_id,
+            RecordKind::Meeting,
+            &snapshot.payload.recording_payload,
+        )?;
+        let mut accepted_snapshot = snapshot.clone();
+        accepted_snapshot.payload.recording_payload =
+            payload_descriptor_from(&tx, snapshot.record_id)?;
         append_change(
             &tx,
             PendingChange {
@@ -415,7 +456,7 @@ impl SharedLibraryRepository {
                 record_id: snapshot.record_id,
                 origin: Some(snapshot.origin_device_id),
                 revision,
-                snapshot: Some(Snapshot::Meeting(snapshot.clone())),
+                snapshot: Some(Snapshot::Meeting(accepted_snapshot)),
                 operation: ChangeOperation::Upsert,
                 changed_at: &snapshot.updated_at,
             },
@@ -673,6 +714,158 @@ impl SharedLibraryRepository {
             changed: true,
         })
     }
+
+    pub fn has_verified_blob(conn: &Connection, checksum: &str) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_blobs WHERE checksum=?1 AND verified=1)",
+            [checksum],
+            |row| row.get(0),
+        )
+        .context("checking canonical blob presence")
+    }
+
+    pub fn has_verified_blob_size(
+        conn: &Connection,
+        checksum: &str,
+        byte_size: u64,
+    ) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_blobs
+             WHERE checksum=?1 AND byte_size=?2 AND verified=1)",
+            params![checksum, byte_size],
+            |row| row.get(0),
+        )
+        .context("checking canonical blob metadata")
+    }
+
+    pub fn has_payload_association(
+        conn: &Connection,
+        checksum: &str,
+        byte_size: u64,
+        media_type: &str,
+    ) -> Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM library_record_blobs r
+             INNER JOIN shared_record_index i ON i.record_id=r.record_id
+             WHERE r.checksum=?1 AND r.byte_size=?2 AND r.media_type=?3
+               AND i.deleted_at IS NULL)",
+            params![checksum, byte_size, media_type],
+            |row| row.get(0),
+        )
+        .context("checking payload association")
+    }
+
+    pub fn register_verified_blob(
+        conn: &mut Connection,
+        blob: &LibraryBlobRecord,
+    ) -> Result<usize> {
+        let tx = conn
+            .transaction()
+            .context("starting verified blob transaction")?;
+        if !Self::has_payload_association(&tx, &blob.checksum, blob.byte_size, &blob.media_type)? {
+            anyhow::bail!("no accepted record references this Recording Payload checksum");
+        }
+        tx.execute(
+            "INSERT INTO library_blobs(checksum,canonical_path,byte_size,media_type,verified)
+             VALUES(?1,?2,?3,?4,1)
+             ON CONFLICT(checksum) DO UPDATE SET canonical_path=excluded.canonical_path,
+                verified=1,updated_at=CURRENT_TIMESTAMP
+              WHERE library_blobs.byte_size=excluded.byte_size",
+            params![
+                blob.checksum,
+                blob.canonical_path.to_string_lossy(),
+                blob.byte_size,
+                blob.media_type
+            ],
+        )?;
+        let associations = {
+            let mut statement = tx.prepare(
+                "SELECT r.record_id,r.kind FROM library_record_blobs r
+                 INNER JOIN shared_record_index i ON i.record_id=r.record_id
+                 WHERE r.checksum=?1 AND r.byte_size=?2 AND r.availability!='available'
+                   AND i.deleted_at IS NULL
+                 ORDER BY r.record_id",
+            )?;
+            let rows = statement
+                .query_map(params![&blob.checksum, blob.byte_size], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            rows
+        };
+        for (record_id, kind) in &associations {
+            let record_id: RecordId = record_id.parse().map_err(anyhow::Error::msg)?;
+            let kind = super::sync_outbox::parse_kind(kind)?;
+            let revision: u64 = tx.query_row(
+                "SELECT authoritative_revision+1 FROM shared_record_index
+                 WHERE record_id=?1 AND deleted_at IS NULL",
+                [record_id.to_string()],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "UPDATE library_record_blobs SET availability='available',updated_at=CURRENT_TIMESTAMP
+                 WHERE record_id=?1 AND payload_role='recording'",
+                [record_id.to_string()],
+            )?;
+            tx.execute(
+                "UPDATE shared_record_index SET authoritative_revision=?2,updated_at=CURRENT_TIMESTAMP
+                 WHERE record_id=?1",
+                params![record_id.to_string(), revision],
+            )?;
+            match kind {
+                RecordKind::Dictation => tx.execute(
+                    "UPDATE shared_dictations SET authoritative_revision=?2 WHERE record_id=?1",
+                    params![record_id.to_string(), revision],
+                )?,
+                RecordKind::Meeting => tx.execute(
+                    "UPDATE shared_meetings SET authoritative_revision=?2 WHERE record_id=?1",
+                    params![record_id.to_string(), revision],
+                )?,
+                RecordKind::Artifact => 0,
+            };
+            let changed_at = chrono::Utc::now().to_rfc3339();
+            append_change(
+                &tx,
+                PendingChange {
+                    kind,
+                    record_id,
+                    origin: None,
+                    revision,
+                    snapshot: None,
+                    operation: ChangeOperation::PayloadAvailability,
+                    changed_at: &changed_at,
+                },
+            )?;
+        }
+        tx.commit()?;
+        Ok(associations.len())
+    }
+
+    pub fn payload_blob(
+        conn: &Connection,
+        record_id: RecordId,
+        kind: RecordKind,
+    ) -> Result<Option<LibraryBlobRecord>> {
+        conn.query_row(
+            "SELECT b.checksum,b.canonical_path,r.byte_size,r.media_type
+             FROM library_record_blobs r
+             INNER JOIN library_blobs b ON b.checksum=r.checksum AND b.verified=1
+             INNER JOIN shared_record_index i ON i.record_id=r.record_id AND i.deleted_at IS NULL
+             WHERE r.record_id=?1 AND r.kind=?2 AND r.payload_role='recording'
+               AND r.availability='available'",
+            params![record_id.to_string(), super::sync_outbox::kind_name(kind)],
+            |row| {
+                Ok(LibraryBlobRecord {
+                    checksum: row.get(0)?,
+                    canonical_path: row.get::<_, String>(1)?.into(),
+                    byte_size: row.get(2)?,
+                    media_type: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .context("resolving verified record payload")
+    }
 }
 
 struct PendingChange<'a> {
@@ -696,7 +889,7 @@ fn append_change(conn: &Connection, pending: PendingChange<'_>) -> Result<()> {
         snapshot: pending.snapshot,
         changed_at: pending.changed_at.to_owned(),
     };
-    conn.execute("INSERT INTO shared_library_changes(operation,kind,record_id,authoritative_revision,change_json) VALUES(?1,?2,?3,?4,?5)",params![match pending.operation { ChangeOperation::Upsert=>"upsert",ChangeOperation::Delete=>"delete"},crate::db::sync_outbox::kind_name(pending.kind),pending.record_id.to_string(),pending.revision,serde_json::to_string(&change)?])?;
+    conn.execute("INSERT INTO shared_library_changes(operation,kind,record_id,authoritative_revision,change_json) VALUES(?1,?2,?3,?4,?5)",params![match pending.operation { ChangeOperation::Upsert=>"upsert",ChangeOperation::Delete=>"delete",ChangeOperation::PayloadAvailability=>"payload_availability"},crate::db::sync_outbox::kind_name(pending.kind),pending.record_id.to_string(),pending.revision,serde_json::to_string(&change)?])?;
     Ok(())
 }
 
@@ -745,6 +938,7 @@ fn get_meeting_from(conn: &Connection, record_id: RecordId) -> Result<Option<Sha
             completed_at: row.completed_at,
             local_version: row.local_version,
             authoritative_revision: row.authoritative_revision,
+            recording_payload: payload_descriptor_from(conn, id)?,
             artifacts,
         })
     })
@@ -826,12 +1020,108 @@ fn list_artifacts_for_meeting_by_id(
         None => Ok(vec![]),
     }
 }
-fn meeting_matches_snapshot(current: &SharedMeeting, snapshot: &MeetingSnapshot) -> bool {
+fn meeting_metadata_matches_snapshot(current: &SharedMeeting, snapshot: &MeetingSnapshot) -> bool {
     meeting_origin_content_matches_snapshot(current, snapshot)
         && current.title == snapshot.payload.title
         && current.title_source == snapshot.payload.title_source
         && current.title_version == snapshot.payload.title_version
         && current.updated_at == snapshot.updated_at
+}
+
+fn payload_descriptors_match(
+    authoritative: &RecordingPayloadDescriptor,
+    incoming: &RecordingPayloadDescriptor,
+) -> bool {
+    authoritative.checksum == incoming.checksum
+        && authoritative.byte_size == incoming.byte_size
+        && authoritative.media_type == incoming.media_type
+        && (authoritative.availability == incoming.availability
+            || (authoritative.availability == PayloadAvailability::Available
+                && incoming.availability == PayloadAvailability::Pending))
+}
+
+fn upsert_payload_association(
+    conn: &Connection,
+    record_id: RecordId,
+    kind: RecordKind,
+    descriptor: &RecordingPayloadDescriptor,
+) -> Result<()> {
+    let kind = super::sync_outbox::kind_name(kind);
+    match descriptor.availability {
+        PayloadAvailability::Unavailable => {
+            conn.execute(
+                "INSERT INTO library_record_blobs(record_id,kind,availability)
+                 VALUES(?1,?2,'unavailable')
+                 ON CONFLICT(record_id,payload_role) DO UPDATE SET
+                    kind=excluded.kind,checksum=NULL,byte_size=NULL,media_type=NULL,
+                    availability='unavailable',updated_at=CURRENT_TIMESTAMP",
+                params![record_id.to_string(), kind],
+            )?;
+        }
+        _ => {
+            let checksum = descriptor
+                .checksum
+                .as_deref()
+                .context("payload checksum is missing")?;
+            let byte_size = descriptor
+                .byte_size
+                .context("payload byte size is missing")?;
+            let media_type = descriptor
+                .media_type
+                .as_deref()
+                .context("payload media type is missing")?;
+            let available =
+                SharedLibraryRepository::has_verified_blob_size(conn, checksum, byte_size)?;
+            conn.execute(
+                "INSERT INTO library_record_blobs(record_id,kind,checksum,byte_size,media_type,availability)
+                 VALUES(?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT(record_id,payload_role) DO UPDATE SET kind=excluded.kind,
+                    checksum=excluded.checksum,byte_size=excluded.byte_size,media_type=excluded.media_type,
+                    availability=CASE WHEN excluded.checksum=library_record_blobs.checksum
+                                           AND library_record_blobs.availability='available'
+                                      THEN 'available' ELSE excluded.availability END,
+                    updated_at=CURRENT_TIMESTAMP",
+                params![record_id.to_string(),kind,checksum,byte_size,media_type,if available {"available"} else {"pending"}],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn payload_descriptor_from(
+    conn: &Connection,
+    record_id: RecordId,
+) -> Result<RecordingPayloadDescriptor> {
+    let value = conn
+        .query_row(
+            "SELECT checksum,byte_size,media_type,availability FROM library_record_blobs
+         WHERE record_id=?1 AND payload_role='recording'",
+            [record_id.to_string()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<u64>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((checksum, byte_size, media_type, availability)) = value else {
+        return Ok(RecordingPayloadDescriptor::unavailable());
+    };
+    let availability = match availability.as_str() {
+        "pending" => PayloadAvailability::Pending,
+        "available" => PayloadAvailability::Available,
+        "needs_attention" => PayloadAvailability::NeedsAttention,
+        _ => PayloadAvailability::Unavailable,
+    };
+    Ok(RecordingPayloadDescriptor {
+        checksum,
+        byte_size,
+        media_type,
+        availability,
+    })
 }
 
 fn meeting_origin_content_matches_snapshot(
@@ -871,6 +1161,7 @@ mod tests {
     use crate::sync::protocol::{
         CompletedArtifactPayload, DictationPayload, MeetingPayload, RecordKind,
     };
+    use sha2::Digest;
 
     fn snapshot(record_id: RecordId, origin: DeviceId) -> DictationSnapshot {
         DictationSnapshot {
@@ -883,6 +1174,7 @@ mod tests {
             updated_at: "2026-09-04T10:00:00Z".into(),
             payload: DictationPayload {
                 text: "portable text".into(),
+                recording_payload: Default::default(),
             },
         }
     }
@@ -906,6 +1198,7 @@ mod tests {
                 duration_seconds: 60,
                 status: "completed".into(),
                 completed_at: "2026-09-04T10:01:00Z".into(),
+                recording_payload: Default::default(),
             },
         }
     }
@@ -985,6 +1278,121 @@ mod tests {
             SharedLibraryRepository::apply_snapshot(&mut conn, &changed_creation),
             Err(ApplySnapshotError::VersionConflict)
         ));
+    }
+
+    #[test]
+    fn same_version_payload_attachment_is_independent_and_becomes_authoritatively_available() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let record_id = RecordId::new();
+        let origin = DeviceId::new();
+        let initial = snapshot(record_id, origin);
+        assert_eq!(
+            SharedLibraryRepository::apply_snapshot(&mut conn, &initial)
+                .unwrap()
+                .revision,
+            1
+        );
+
+        let bytes = b"late payload";
+        let checksum = format!("{:x}", sha2::Sha256::digest(bytes));
+        let mut with_payload = initial;
+        with_payload.payload.recording_payload = RecordingPayloadDescriptor::pending(
+            checksum.clone(),
+            bytes.len() as u64,
+            "audio/wav".into(),
+        );
+        let attached = SharedLibraryRepository::apply_snapshot(&mut conn, &with_payload).unwrap();
+        assert!(attached.changed);
+        assert_eq!(attached.revision, 2);
+
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_path = temp.path().join(&checksum);
+        std::fs::write(&canonical_path, bytes).unwrap();
+        assert_eq!(
+            SharedLibraryRepository::register_verified_blob(
+                &mut conn,
+                &LibraryBlobRecord {
+                    checksum,
+                    canonical_path,
+                    byte_size: bytes.len() as u64,
+                    media_type: "audio/wav".into(),
+                },
+            )
+            .unwrap(),
+            1
+        );
+        let stored = SharedLibraryRepository::get(&conn, record_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.recording_payload.availability,
+            PayloadAvailability::Available
+        );
+        assert_eq!(stored.authoritative_revision, 3);
+        assert!(
+            !SharedLibraryRepository::apply_snapshot(&mut conn, &with_payload)
+                .unwrap()
+                .changed
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM shared_library_changes", [], |row| row
+                .get::<_, u64>(0))
+                .unwrap(),
+            3
+        );
+    }
+
+    #[test]
+    fn registering_shared_checksum_updates_only_live_associations() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let bytes = b"shared payload";
+        let checksum = format!("{:x}", sha2::Sha256::digest(bytes));
+        let origin = DeviceId::new();
+        let deleted_id = RecordId::new();
+        let live_id = RecordId::new();
+        for record_id in [deleted_id, live_id] {
+            let mut value = snapshot(record_id, origin);
+            value.payload.recording_payload = RecordingPayloadDescriptor::pending(
+                checksum.clone(),
+                bytes.len() as u64,
+                "audio/wav".into(),
+            );
+            SharedLibraryRepository::apply_snapshot(&mut conn, &value).unwrap();
+        }
+        SharedLibraryRepository::apply_delete(
+            &mut conn,
+            deleted_id,
+            RecordKind::Dictation,
+            "2026-09-04T11:00:00Z",
+        )
+        .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let canonical_path = temp.path().join(&checksum);
+        std::fs::write(&canonical_path, bytes).unwrap();
+
+        assert_eq!(
+            SharedLibraryRepository::register_verified_blob(
+                &mut conn,
+                &LibraryBlobRecord {
+                    checksum,
+                    canonical_path,
+                    byte_size: bytes.len() as u64,
+                    media_type: "audio/wav".into(),
+                },
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            SharedLibraryRepository::get(&conn, live_id)
+                .unwrap()
+                .unwrap()
+                .recording_payload
+                .availability,
+            PayloadAvailability::Available
+        );
     }
 
     #[test]
