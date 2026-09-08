@@ -732,12 +732,11 @@ impl LibraryCacheStore {
                 (source_hub_id,checksum,local_path,byte_size,media_type,verified,cleanup_pending)
              VALUES(?1,?2,?3,?4,?5,1,0)
              ON CONFLICT(source_hub_id,checksum) DO UPDATE SET
-                 local_path=excluded.local_path,byte_size=excluded.byte_size,
-                 media_type=excluded.media_type,verified=1,cleanup_pending=0,
-                 updated_at=CURRENT_TIMESTAMP
-             WHERE library_cache_blobs.byte_size=excluded.byte_size
-               AND library_cache_blobs.media_type=excluded.media_type
-               AND library_cache_blobs.local_path=excluded.local_path",
+                  local_path=excluded.local_path,byte_size=excluded.byte_size,
+                  media_type=excluded.media_type,verified=1,cleanup_pending=0,
+                  updated_at=CURRENT_TIMESTAMP
+              WHERE library_cache_blobs.byte_size=excluded.byte_size
+                AND library_cache_blobs.local_path=excluded.local_path",
             params![
                 blob.source_hub_id.to_string(),
                 blob.checksum,
@@ -2393,7 +2392,7 @@ mod tests {
                     1,
                     &checksum,
                     bytes.len() as u64,
-                    "audio/wav",
+                    "audio/mpeg",
                 )],
             ),
         )
@@ -2405,7 +2404,7 @@ mod tests {
                 checksum: checksum.clone(),
                 local_path: blob_path.clone(),
                 byte_size: bytes.len() as u64,
-                media_type: "audio/wav".into(),
+                media_type: "audio/mpeg".into(),
             },
         )
         .unwrap();

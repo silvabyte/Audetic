@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use audetic_core::sync::{CacheLevel, HubConnection, HubId, PayloadAvailability};
 use tokio_util::sync::CancellationToken;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -579,6 +580,7 @@ fn classify_payload_response(
 
 fn group_blob_claims(claims: Vec<CacheBlobClaim>) -> Result<Vec<BlobClaimGroup>> {
     let mut groups: Vec<BlobClaimGroup> = Vec::new();
+    let mut group_indexes: HashMap<String, usize> = HashMap::new();
     for claim in claims {
         if claim.descriptor.availability != PayloadAvailability::Available {
             bail!("cache blob claim is not available");
@@ -595,20 +597,19 @@ fn group_blob_claims(claims: Vec<CacheBlobClaim>) -> Result<Vec<BlobClaimGroup>>
             .descriptor
             .media_type
             .context("cache blob claim omitted its media type")?;
-        if groups
-            .iter()
-            .any(|group| group.checksum == checksum && group.byte_size != byte_size)
-        {
-            bail!("cache blob claims disagree on byte size for checksum {checksum}");
-        }
         let representative = PayloadRepresentative {
             record_id: claim.record_id,
             kind: claim.kind,
             media_type,
         };
-        if let Some(group) = groups.iter_mut().find(|group| group.checksum == checksum) {
+        if let Some(index) = group_indexes.get(&checksum).copied() {
+            let group = &mut groups[index];
+            if group.byte_size != byte_size {
+                bail!("cache blob claims disagree on byte size for checksum {checksum}");
+            }
             group.representatives.push(representative);
         } else {
+            group_indexes.insert(checksum.clone(), groups.len());
             groups.push(BlobClaimGroup {
                 checksum,
                 byte_size,

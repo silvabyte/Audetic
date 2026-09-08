@@ -438,20 +438,7 @@ impl CacheReplicaRuntime {
         self.cancellation.cancel();
     }
 
-    async fn stop(mut self) {
-        self.request_stop();
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-        if self.cleanup_on_stop {
-            if let Err(error) = CacheReplica::cleanup_cache_files(&self.db_path, self.source_hub_id)
-            {
-                tracing::warn!(%error, "final Library Cache replica cleanup failed");
-            }
-        }
-    }
-
-    async fn stop_with_diagnostic(mut self) -> Option<RuntimeCleanupDiagnostic> {
+    async fn stop(mut self) -> Result<(), RuntimeError> {
         self.request_stop();
         let mut failures = Vec::new();
         if let Some(task) = self.task.take() {
@@ -465,7 +452,21 @@ impl CacheReplicaRuntime {
                 failures.push(format!("final cleanup failed: {error}"));
             }
         }
-        (!failures.is_empty()).then(|| RuntimeCleanupDiagnostic::CacheReplica(failures.join("; ")))
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(RuntimeError::Invariant(format!(
+                "Library Cache replica stop failed: {}",
+                failures.join("; ")
+            )))
+        }
+    }
+
+    async fn stop_with_diagnostic(self) -> Option<RuntimeCleanupDiagnostic> {
+        self.stop()
+            .await
+            .err()
+            .map(|error| RuntimeCleanupDiagnostic::CacheReplica(error.to_string()))
     }
 
     fn abort(&mut self) {
@@ -506,7 +507,7 @@ impl PreparedCacheReplica {
     async fn stop(mut self) {
         self.request_stop();
         if let Some(runtime) = self.runtime.take() {
-            runtime.stop().await;
+            let _ = runtime.stop().await;
         }
     }
 
@@ -555,7 +556,7 @@ impl ActiveRuntime {
             outbox.stop().await;
         }
         if let Some(cache_replica) = self.cache_replica.take() {
-            cache_replica.stop().await;
+            cache_replica.stop().await?;
         }
         if let Some(hub) = self.hub.take() {
             hub.stop().await?;
@@ -618,7 +619,7 @@ impl ProvisionalRuntime {
             outbox.stop().await;
         }
         if let Some(cache_replica) = self.cache_replica.take() {
-            cache_replica.stop().await;
+            let _ = cache_replica.stop().await;
         }
         if let Some(hub) = self.hub.take() {
             let _ = hub.stop().await;
@@ -878,7 +879,7 @@ impl RuntimeSet {
             outbox.stop().await;
         }
         if let Some(cache_replica) = cache_replica {
-            cache_replica.stop().await;
+            cache_replica.stop().await?;
         }
         #[cfg(test)]
         if self.shared.fail_next_quiesce.swap(false, Ordering::SeqCst) {
@@ -955,7 +956,7 @@ impl RuntimeSet {
                     outbox.stop().await;
                 }
                 if let Some(cache_replica) = cache_replica.take() {
-                    cache_replica.stop().await;
+                    let _ = cache_replica.stop().await;
                 }
                 return Err(RuntimeError::Invariant(
                     "runtime changed while aborting its transition".into(),
