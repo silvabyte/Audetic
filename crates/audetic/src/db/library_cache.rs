@@ -3,6 +3,7 @@ use audetic_core::sync::{CacheLevel, HubId, PayloadAvailability, RecordId};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -139,8 +140,8 @@ impl VerifiedCacheBlob {
         Ok(Some(blob))
     }
 
-    pub(crate) fn has_metadata(&self, byte_size: u64, media_type: &str) -> bool {
-        self.byte_size == byte_size && self.media_type == media_type
+    pub(crate) fn has_byte_size(&self, byte_size: u64) -> bool {
+        self.byte_size == byte_size
     }
 
     pub(crate) fn verify(&self) -> Result<()> {
@@ -863,6 +864,24 @@ impl LibraryCacheStore {
             .context("starting transition to Live Only")?;
         ensure_source(&tx, source_hub_id)?;
         tx.execute(
+            "INSERT INTO library_cache_live_overlay
+                (source_hub_id,record_id,kind,authoritative_revision,deleted_at,change_cursor)
+             SELECT t.source_hub_id,t.record_id,t.kind,t.authoritative_revision,t.deleted_at,
+                    g.target_cursor
+             FROM library_cache_tombstones t
+             INNER JOIN library_cache_generations g
+               ON g.source_hub_id=t.source_hub_id AND g.generation_id=t.generation_id
+             WHERE t.source_hub_id=?1 AND g.active=1 AND g.complete=1
+             ON CONFLICT(source_hub_id,record_id) DO UPDATE SET
+                kind=excluded.kind,
+                authoritative_revision=excluded.authoritative_revision,
+                deleted_at=excluded.deleted_at,
+                change_cursor=excluded.change_cursor
+             WHERE excluded.authoritative_revision >
+                   library_cache_live_overlay.authoritative_revision",
+            [source_hub_id.to_string()],
+        )?;
+        tx.execute(
             "DELETE FROM library_cache_generations WHERE source_hub_id=?1",
             [source_hub_id.to_string()],
         )?;
@@ -996,6 +1015,74 @@ impl LibraryCacheStore {
         } else {
             Ok(())
         }
+    }
+
+    /// Remove crash leftovers that have neither a durable blob row nor a
+    /// generation claim. Claimed checksum paths remain available for restart
+    /// recovery before database registration.
+    pub fn remove_untracked_blob_files(
+        conn: &Connection,
+        db_path: &Path,
+        source_hub_id: HubId,
+    ) -> Result<()> {
+        let source = source_hub_id.to_string();
+        let retained = {
+            let mut statement = conn.prepare(
+                "SELECT checksum FROM library_cache_blobs WHERE source_hub_id=?1
+                 UNION
+                 SELECT checksum FROM library_cache_blob_refs WHERE source_hub_id=?1",
+            )?;
+            let checksums = statement
+                .query_map([&source], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<HashSet<_>, _>>()?;
+            checksums
+        };
+        let root = cache_blob_root(db_path).join(&source);
+        remove_cache_temp_directory(&root.join(".tmp"))?;
+        let prefixes = match std::fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("reading cache blob root {}", root.display()))
+            }
+        };
+        for prefix in prefixes {
+            let prefix = prefix.context("reading cache blob prefix entry")?;
+            if !prefix
+                .file_type()
+                .context("reading cache blob prefix type")?
+                .is_dir()
+            {
+                continue;
+            }
+            for entry in std::fs::read_dir(prefix.path())
+                .with_context(|| format!("reading cache blob prefix {}", prefix.path().display()))?
+            {
+                let entry = entry.context("reading cache blob entry")?;
+                if !entry
+                    .file_type()
+                    .context("reading cache blob file type")?
+                    .is_file()
+                {
+                    continue;
+                }
+                let Some(checksum) = entry.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                if !is_canonical_sha256(&checksum)
+                    || cache_blob_path_for_db(db_path, source_hub_id, &checksum)? != entry.path()
+                    || retained.contains(&checksum)
+                {
+                    continue;
+                }
+                std::fs::remove_file(entry.path()).with_context(|| {
+                    format!("removing untracked cache blob {}", entry.path().display())
+                })?;
+                sync_parent_directory(&entry.path())?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1387,11 +1474,10 @@ fn verify_generation_blobs(conn: &Connection, generation: &CacheGeneration) -> R
             "SELECT r.checksum,r.byte_size,r.media_type,b.local_path
              FROM library_cache_blob_refs r
              LEFT JOIN library_cache_blobs b
-               ON b.source_hub_id=r.source_hub_id
-              AND b.checksum=r.checksum
-              AND b.byte_size=r.byte_size
-              AND b.media_type=r.media_type
-              AND b.verified=1
+                ON b.source_hub_id=r.source_hub_id
+               AND b.checksum=r.checksum
+               AND b.byte_size=r.byte_size
+               AND b.verified=1
               AND b.cleanup_pending=0
              WHERE r.source_hub_id=?1 AND r.generation_id=?2
                AND r.availability='available'
@@ -1462,6 +1548,24 @@ fn enqueue_orphaned_blobs(conn: &Transaction<'_>) -> Result<()> {
         )?;
     }
     Ok(())
+}
+
+fn remove_cache_temp_directory(path: &Path) -> Result<()> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading cache temporary path {}", path.display()))
+        }
+    };
+    if metadata.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
+    .with_context(|| format!("removing cache temporary path {}", path.display()))?;
+    sync_parent_directory(path)
 }
 
 fn validate_blob_metadata(byte_size: u64, media_type: &str) -> Result<()> {
@@ -2368,7 +2472,7 @@ mod tests {
     }
 
     #[test]
-    fn full_audio_activation_requires_exact_verified_blob_metadata() {
+    fn full_audio_activation_requires_verified_blob_identity_size_and_bytes() {
         let temp = tempfile::tempdir().unwrap();
         let bytes = b"exact-cache-audio";
         let checksum = format!("{:x}", Sha256::digest(bytes));
@@ -2425,19 +2529,6 @@ mod tests {
             &path,
             bytes.len() as u64 + 1,
             "audio/wav",
-        );
-        assert!(
-            LibraryCacheStore::activate_complete_generation(&mut conn, source, generation).is_err()
-        );
-        conn.execute("DELETE FROM library_cache_blobs", []).unwrap();
-
-        insert_cache_blob_row(
-            &conn,
-            source,
-            &checksum,
-            &path,
-            bytes.len() as u64,
-            "audio/mpeg",
         );
         assert!(
             LibraryCacheStore::activate_complete_generation(&mut conn, source, generation).is_err()
@@ -3014,12 +3105,6 @@ mod tests {
         let source = HubId::new();
         let deleted_id = RecordId::new();
         let retained_id = RecordId::new();
-        LibraryCacheStore::apply_live_only_page(
-            &mut conn,
-            source,
-            &page(0, 1, vec![dictation_deletion(1, deleted_id, 1)]),
-        )
-        .unwrap();
         let generation = LibraryCacheStore::begin_generation(
             &mut conn,
             source,
@@ -3043,6 +3128,7 @@ mod tests {
         )
         .unwrap();
         LibraryCacheStore::activate_complete_generation(&mut conn, source, generation).unwrap();
+        assert!(!LibraryCacheStore::live_overlay_contains(&conn, source, deleted_id).unwrap());
         LibraryCacheStore::apply_live_only_page(
             &mut conn,
             source,

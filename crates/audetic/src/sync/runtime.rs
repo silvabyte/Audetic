@@ -428,6 +428,9 @@ impl Drop for PreparedOutbox {
 struct CacheReplicaRuntime {
     cancellation: CancellationToken,
     task: Option<JoinHandle<()>>,
+    db_path: PathBuf,
+    source_hub_id: HubId,
+    cleanup_on_stop: bool,
 }
 
 impl CacheReplicaRuntime {
@@ -440,14 +443,29 @@ impl CacheReplicaRuntime {
         if let Some(task) = self.task.take() {
             let _ = task.await;
         }
+        if self.cleanup_on_stop {
+            if let Err(error) = CacheReplica::cleanup_cache_files(&self.db_path, self.source_hub_id)
+            {
+                tracing::warn!(%error, "final Library Cache replica cleanup failed");
+            }
+        }
     }
 
     async fn stop_with_diagnostic(mut self) -> Option<RuntimeCleanupDiagnostic> {
         self.request_stop();
-        let task = self.task.take()?;
-        task.await.err().map(|error| {
-            RuntimeCleanupDiagnostic::CacheReplica(format!("worker task join failed: {error}"))
-        })
+        let mut failures = Vec::new();
+        if let Some(task) = self.task.take() {
+            if let Err(error) = task.await {
+                failures.push(format!("worker task join failed: {error}"));
+            }
+        }
+        if self.cleanup_on_stop {
+            if let Err(error) = CacheReplica::cleanup_cache_files(&self.db_path, self.source_hub_id)
+            {
+                failures.push(format!("final cleanup failed: {error}"));
+            }
+        }
+        (!failures.is_empty()).then(|| RuntimeCleanupDiagnostic::CacheReplica(failures.join("; ")))
     }
 
     fn abort(&mut self) {
@@ -475,9 +493,10 @@ struct PreparedCacheReplica {
 
 impl PreparedCacheReplica {
     fn activate(mut self) -> Result<CacheReplicaRuntime, RuntimeError> {
-        let runtime = self.runtime.take().ok_or_else(|| {
+        let mut runtime = self.runtime.take().ok_or_else(|| {
             RuntimeError::Invariant("prepared cache replica has no runtime".into())
         })?;
+        runtime.cleanup_on_stop = true;
         if let Some(start) = self.start.take() {
             let _ = start.send(());
         }
@@ -1378,8 +1397,10 @@ impl RuntimeSet {
         else {
             return Ok(None);
         };
+        let db_path = self.shared.state.db_path().to_path_buf();
+        let source_hub_id = hub.hub_id;
         let worker = CacheReplica::new(
-            self.shared.state.db_path().to_path_buf(),
+            db_path.clone(),
             hub.clone(),
             *cache_level,
             self.shared.hub_capabilities.changes(),
@@ -1401,6 +1422,9 @@ impl RuntimeSet {
             runtime: Some(CacheReplicaRuntime {
                 cancellation,
                 task: Some(task),
+                db_path,
+                source_hub_id,
+                cleanup_on_stop: false,
             }),
         }))
     }

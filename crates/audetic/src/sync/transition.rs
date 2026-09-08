@@ -3626,6 +3626,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connected_demotion_drains_cleanup_queued_after_cancellation() {
+        let fixture = fixture();
+        let source = HubId::new();
+        fixture
+            .service
+            .configure(connected_request(source))
+            .await
+            .unwrap();
+        let (entered, release) = fixture.service.coordinator.runtime.install_quiesce_pause();
+        let service = fixture.service.clone();
+        let demotion =
+            tokio::spawn(async move { service.configure(request(SyncRole::Standalone)).await });
+        entered.notified().await;
+
+        let checksum = "a".repeat(64);
+        let path =
+            crate::db::library_cache::cache_blob_path_for_db(&fixture.path, source, &checksum)
+                .unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"queued cleanup").unwrap();
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO library_cache_sources(source_hub_id) VALUES(?1)",
+            [source.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO library_cache_blobs
+                (source_hub_id,checksum,local_path,byte_size,media_type,verified,cleanup_pending)
+             VALUES(?1,?2,?3,14,'audio/wav',0,1)",
+            rusqlite::params![source.to_string(), checksum, path.to_string_lossy()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO library_cache_blob_cleanup(source_hub_id,checksum,local_path)
+             VALUES(?1,?2,?3)",
+            rusqlite::params![source.to_string(), checksum, path.to_string_lossy()],
+        )
+        .unwrap();
+        drop(conn);
+
+        release.notify_one();
+        demotion.await.unwrap().unwrap();
+
+        assert!(!path.exists());
+        let conn = crate::db::open_db_at(&fixture.path).unwrap();
+        let pending: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM library_cache_blob_cleanup",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pending, 0);
+        fixture.service.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn restart_reconstructs_the_current_home_hub_runtime() {
         let fixture = fixture();
         fixture

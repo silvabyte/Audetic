@@ -1,7 +1,7 @@
 //! Bounded, source-scoped Library Cache refresh worker.
 
 use anyhow::{anyhow, bail, Context, Result};
-use audetic_core::sync::{CacheLevel, HubConnection, PayloadAvailability};
+use audetic_core::sync::{CacheLevel, HubConnection, HubId, PayloadAvailability};
 use tokio_util::sync::CancellationToken;
 
 use std::path::PathBuf;
@@ -42,8 +42,14 @@ enum RefreshOutcome {
 struct BlobClaimGroup {
     checksum: String,
     byte_size: u64,
+    representatives: Vec<PayloadRepresentative>,
+}
+
+#[derive(Debug)]
+struct PayloadRepresentative {
+    record_id: audetic_core::sync::RecordId,
+    kind: RecordKind,
     media_type: String,
-    representatives: Vec<(audetic_core::sync::RecordId, RecordKind)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,8 +178,21 @@ impl CacheReplica {
     }
 
     fn process_pending_blob_cleanups(&self) -> Result<()> {
-        let mut connection = crate::db::open_db_at(&self.db_path)?;
-        LibraryCacheStore::process_pending_blob_cleanups(&mut connection)
+        Self::cleanup_cache_files(&self.db_path, self.hub.hub_id)
+    }
+
+    pub(crate) fn cleanup_cache_files(db_path: &std::path::Path, source: HubId) -> Result<()> {
+        let mut connection = crate::db::open_db_at(db_path)?;
+        let pending = LibraryCacheStore::process_pending_blob_cleanups(&mut connection);
+        let untracked =
+            LibraryCacheStore::remove_untracked_blob_files(&connection, db_path, source);
+        match (pending, untracked) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
+            (Err(pending), Err(untracked)) => {
+                bail!("pending cache cleanup failed: {pending}; untracked cache cleanup failed: {untracked}")
+            }
+        }
     }
 
     async fn refresh_live_only(&self, cancellation: &CancellationToken) -> Result<RefreshOutcome> {
@@ -410,7 +429,7 @@ impl CacheReplica {
         else {
             return Ok(false);
         };
-        Ok(blob.has_metadata(group.byte_size, &group.media_type) && blob.verify().is_ok())
+        Ok(blob.has_byte_size(group.byte_size) && blob.verify().is_ok())
     }
 
     fn recover_unregistered_blob(
@@ -418,12 +437,18 @@ impl CacheReplica {
         source: audetic_core::sync::HubId,
         group: &BlobClaimGroup,
     ) -> Result<Option<VerifiedCacheBlob>> {
+        let media_type = group
+            .representatives
+            .first()
+            .context("cache blob group has no representative")?
+            .media_type
+            .clone();
         let recovered = match VerifiedCacheBlob::recover_published_for_db(
             &self.db_path,
             source,
             group.checksum.clone(),
             group.byte_size,
-            group.media_type.clone(),
+            media_type,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -444,11 +469,16 @@ impl CacheReplica {
         group: &BlobClaimGroup,
         cancellation: &CancellationToken,
     ) -> Result<PayloadOutcome> {
-        for (record_id, kind) in &group.representatives {
+        for representative in &group.representatives {
             let response = tokio::select! {
                 biased;
                 _ = cancellation.cancelled() => return Ok(PayloadOutcome::Cancelled),
-                response = self.payloads.stream_payload(&self.hub, *record_id, *kind, None) => response,
+                response = self.payloads.stream_payload(
+                    &self.hub,
+                    representative.record_id,
+                    representative.kind,
+                    None,
+                ) => response,
             };
             let response = match response {
                 Ok(response) => response,
@@ -457,7 +487,8 @@ impl CacheReplica {
                 }) => continue,
                 Err(error) => return Err(anyhow!(error)),
             };
-            match classify_payload_response(&response, group)? {
+            match classify_payload_response(&response, group.byte_size, &representative.media_type)?
+            {
                 PayloadResponseDisposition::TryAnotherClaim => continue,
                 PayloadResponseDisposition::SnapshotAdvanced => {
                     return Ok(PayloadOutcome::SnapshotAdvanced)
@@ -475,7 +506,7 @@ impl CacheReplica {
                     source,
                     group.checksum.clone(),
                     group.byte_size,
-                    group.media_type.clone(),
+                    representative.media_type.clone(),
                     response.body,
                 ) => published,
             };
@@ -513,7 +544,8 @@ enum PayloadResponseDisposition {
 
 fn classify_payload_response(
     response: &StreamingPayloadResponse,
-    group: &BlobClaimGroup,
+    expected_byte_size: u64,
+    expected_media_type: &str,
 ) -> Result<PayloadResponseDisposition> {
     match response.status {
         200 => {}
@@ -529,7 +561,7 @@ fn classify_payload_response(
     if response
         .metadata
         .content_length
-        .is_some_and(|length| length != group.byte_size)
+        .is_some_and(|length| length != expected_byte_size)
     {
         return Ok(PayloadResponseDisposition::SnapshotAdvanced);
     }
@@ -539,7 +571,7 @@ fn classify_payload_response(
     let Ok(content_type) = content_type.to_str() else {
         return Ok(PayloadResponseDisposition::SnapshotAdvanced);
     };
-    if content_type != group.media_type {
+    if content_type != expected_media_type {
         return Ok(PayloadResponseDisposition::SnapshotAdvanced);
     }
     Ok(PayloadResponseDisposition::Stream)
@@ -563,17 +595,24 @@ fn group_blob_claims(claims: Vec<CacheBlobClaim>) -> Result<Vec<BlobClaimGroup>>
             .descriptor
             .media_type
             .context("cache blob claim omitted its media type")?;
+        if groups
+            .iter()
+            .any(|group| group.checksum == checksum && group.byte_size != byte_size)
+        {
+            bail!("cache blob claims disagree on byte size for checksum {checksum}");
+        }
+        let representative = PayloadRepresentative {
+            record_id: claim.record_id,
+            kind: claim.kind,
+            media_type,
+        };
         if let Some(group) = groups.iter_mut().find(|group| group.checksum == checksum) {
-            if group.byte_size != byte_size || group.media_type != media_type {
-                bail!("cache blob claims disagree on metadata for checksum {checksum}");
-            }
-            group.representatives.push((claim.record_id, claim.kind));
+            group.representatives.push(representative);
         } else {
             groups.push(BlobClaimGroup {
                 checksum,
                 byte_size,
-                media_type,
-                representatives: vec![(claim.record_id, claim.kind)],
+                representatives: vec![representative],
             });
         }
     }
@@ -1056,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn equal_checksums_with_conflicting_metadata_are_rejected() {
+    fn equal_checksums_with_conflicting_sizes_are_rejected() {
         let checksum = "a".repeat(64);
         let claims = vec![
             CacheBlobClaim {
@@ -1084,7 +1123,55 @@ mod tests {
         assert!(group_blob_claims(claims)
             .unwrap_err()
             .to_string()
-            .contains("disagree on metadata"));
+            .contains("disagree on byte size"));
+    }
+
+    #[tokio::test]
+    async fn full_audio_reuses_identical_bytes_across_media_types() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let source = HubId::new();
+        let bytes = b"identical bytes with media aliases";
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let left = RecordId::new();
+        let right = RecordId::new();
+        let (first, second) = if left.to_string() < right.to_string() {
+            (left, right)
+        } else {
+            (right, left)
+        };
+        let payloads = Arc::new(ScriptedPayloads::new(vec![
+            Ok(payload_response(404, b"", Some(0), None)),
+            Ok(payload_response(
+                200,
+                bytes,
+                Some(bytes.len() as u64),
+                Some("audio/mpeg"),
+            )),
+        ]));
+        let worker = CacheReplica::new(
+            db_path.clone(),
+            hub(source),
+            CacheLevel::TextAndAvailableAudio,
+            Arc::new(ScriptedChanges::new(vec![page(
+                0,
+                2,
+                vec![
+                    available_change(1, first, &checksum, bytes.len() as u64, "audio/wav"),
+                    available_change(2, second, &checksum, bytes.len() as u64, "audio/mpeg"),
+                ],
+            )])),
+            payloads.clone(),
+        );
+
+        worker.process_once().await.unwrap();
+
+        let conn = crate::db::open_db_at(&db_path).unwrap();
+        assert!(LibraryCacheStore::active_generation(&conn, source)
+            .unwrap()
+            .is_some());
+        assert_eq!(payloads.calls.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1387,16 +1474,10 @@ mod tests {
 
     #[test]
     fn missing_payload_content_type_marks_snapshot_advanced() {
-        let group = BlobClaimGroup {
-            checksum: "a".repeat(64),
-            byte_size: 1,
-            media_type: "audio/wav".into(),
-            representatives: Vec::new(),
-        };
         let response = payload_response(200, b"a", Some(1), None);
 
         assert_eq!(
-            classify_payload_response(&response, &group).unwrap(),
+            classify_payload_response(&response, 1, "audio/wav").unwrap(),
             PayloadResponseDisposition::SnapshotAdvanced
         );
     }
@@ -1611,6 +1692,39 @@ mod tests {
             .join(source.to_string())
             .join(".tmp");
         assert_eq!(std::fs::read_dir(temporary).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn restart_cleanup_removes_abandoned_and_unclaimed_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let source = HubId::new();
+        let temp_path = temp
+            .path()
+            .join("sync/library-cache-blobs")
+            .join(source.to_string())
+            .join(".tmp")
+            .join("interrupted");
+        std::fs::create_dir_all(temp_path.parent().unwrap()).unwrap();
+        std::fs::write(&temp_path, b"partial").unwrap();
+        let orphan_bytes = b"published without registration or claim";
+        let orphan_checksum = format!("{:x}", Sha256::digest(orphan_bytes));
+        let orphan_path = cache_blob_path_for_db(&db_path, source, &orphan_checksum).unwrap();
+        std::fs::create_dir_all(orphan_path.parent().unwrap()).unwrap();
+        std::fs::write(&orphan_path, orphan_bytes).unwrap();
+        let worker = CacheReplica::new(
+            db_path,
+            hub(source),
+            CacheLevel::LiveOnly,
+            Arc::new(ScriptedChanges::new(vec![page(0, 0, Vec::new())])),
+            Arc::new(UnusedPayloads),
+        );
+
+        worker.process_once().await.unwrap();
+
+        assert!(!temp_path.exists());
+        assert!(!orphan_path.exists());
     }
 
     #[tokio::test]
