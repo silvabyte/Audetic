@@ -252,7 +252,7 @@ impl BlobStore {
     ) -> Result<StoredBlob>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
-        E: std::fmt::Display,
+        E: std::error::Error + Send + Sync + 'static,
     {
         self.put_stream_with_policy(
             checksum,
@@ -276,7 +276,7 @@ impl BlobStore {
     ) -> Result<StoredBlob>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
-        E: std::fmt::Display,
+        E: std::error::Error + Send + Sync + 'static,
     {
         self.put_stream_with_policy(
             checksum,
@@ -298,7 +298,7 @@ impl BlobStore {
     ) -> Result<StoredBlob>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
-        E: std::fmt::Display,
+        E: std::error::Error + Send + Sync + 'static,
     {
         validate_blob_metadata(checksum, expected_size, media_type)?;
         let final_path = self.canonical_path(checksum)?;
@@ -319,7 +319,7 @@ impl BlobStore {
             let mut hasher = Sha256::new();
             let mut received = 0u64;
             while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|error| anyhow::anyhow!(error.to_string()))?;
+                let chunk = chunk.map_err(anyhow::Error::new)?;
                 received = received
                     .checked_add(chunk.len() as u64)
                     .context("blob size overflow")?;

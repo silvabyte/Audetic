@@ -60,6 +60,19 @@ pub struct VerifiedCacheBlob {
     media_type: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct VerifiedCacheGeneration {
+    generation: CacheGeneration,
+    blobs: Vec<GenerationBlobVerification>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct GenerationBlobVerification {
+    checksum: String,
+    byte_size: u64,
+    local_path: PathBuf,
+}
+
 impl VerifiedCacheBlob {
     /// Verify and atomically publish a source-scoped cache blob outside the
     /// authoritative Recording Payload namespace.
@@ -99,7 +112,7 @@ impl VerifiedCacheBlob {
     ) -> Result<Self>
     where
         S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Unpin,
-        E: std::fmt::Display,
+        E: std::error::Error + Send + Sync + 'static,
     {
         let store = crate::sync::payload::BlobStore::new(
             cache_blob_root(db_path).join(source_hub_id.to_string()),
@@ -443,30 +456,62 @@ impl LibraryCacheStore {
         source_hub_id: HubId,
         generation_id: i64,
     ) -> Result<()> {
+        let verification = Self::verify_complete_generation(conn, source_hub_id, generation_id)?;
+        Self::activate_verified_generation(conn, &verification)
+    }
+
+    pub(crate) fn verify_complete_generation(
+        conn: &Connection,
+        source_hub_id: HubId,
+        generation_id: i64,
+    ) -> Result<VerifiedCacheGeneration> {
+        let generation = Self::generation(conn, source_hub_id, generation_id)?
+            .context("Library Cache generation does not exist for this source Hub")?;
+        validate_complete_generation(&generation)?;
+        let blobs = if generation.level == CacheLevel::TextAndAvailableAudio {
+            verify_generation_blob_files(conn, &generation)?
+        } else {
+            Vec::new()
+        };
+        Ok(VerifiedCacheGeneration { generation, blobs })
+    }
+
+    pub(crate) fn activate_verified_generation(
+        conn: &mut Connection,
+        verification: &VerifiedCacheGeneration,
+    ) -> Result<()> {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("starting Library Cache activation")?;
-        let generation = Self::generation(&tx, source_hub_id, generation_id)?
-            .context("Library Cache generation does not exist for this source Hub")?;
-        if !generation.complete || generation.applied_cursor != generation.target_cursor.cursor() {
-            bail!("Library Cache generation has not reached its exact target");
+        let generation = Self::generation(
+            &tx,
+            verification.generation.source_hub_id,
+            verification.generation.id,
+        )?
+        .context("Library Cache generation does not exist for this source Hub")?;
+        if generation != verification.generation {
+            bail!("Library Cache generation changed after blob verification");
         }
-        ensure_source(&tx, source_hub_id)?;
-        if generation.target_cursor.cursor() < Self::source_cursor(&tx, source_hub_id)? {
+        validate_complete_generation(&generation)?;
+        ensure_source(&tx, generation.source_hub_id)?;
+        if generation.target_cursor.cursor() < Self::source_cursor(&tx, generation.source_hub_id)? {
             bail!("Library Cache activation would move the source cursor backwards");
         }
         if generation.level == CacheLevel::TextAndAvailableAudio {
-            verify_generation_blobs(&tx, &generation)?;
+            let current = generation_blob_verifications(&tx, &generation)?;
+            if current != verification.blobs {
+                bail!("Library Cache blob metadata changed after file verification");
+            }
         }
         tx.execute(
             "DELETE FROM library_cache_generations
              WHERE source_hub_id=?1 AND active=1 AND generation_id!=?2",
-            params![source_hub_id.to_string(), generation_id],
+            params![generation.source_hub_id.to_string(), generation.id],
         )?;
         tx.execute(
             "UPDATE library_cache_generations SET active=1,activated_at=CURRENT_TIMESTAMP
              WHERE source_hub_id=?1 AND generation_id=?2",
-            params![source_hub_id.to_string(), generation_id],
+            params![generation.source_hub_id.to_string(), generation.id],
         )?;
         tx.execute(
             "UPDATE library_cache_sources
@@ -474,7 +519,7 @@ impl LibraryCacheStore {
                  updated_at=CURRENT_TIMESTAMP
              WHERE source_hub_id=?1",
             params![
-                source_hub_id.to_string(),
+                generation.source_hub_id.to_string(),
                 to_i64(
                     generation.target_cursor.cursor().value(),
                     "generation target cursor"
@@ -694,10 +739,10 @@ impl LibraryCacheStore {
         }
         validate_blob_metadata(blob.byte_size, &blob.media_type)?;
         validate_cache_blob_path(blob)?;
+        verify_blob_file(&blob.local_path, &blob.checksum, blob.byte_size)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("starting verified cache blob registration")?;
-        verify_blob_file(&blob.local_path, &blob.checksum, blob.byte_size)?;
         let authoritative_owns_path: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM library_blobs WHERE canonical_path=?1)",
             [blob.local_path.to_string_lossy()],
@@ -1467,10 +1512,36 @@ fn page_hash(page: &ChangePage) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-fn verify_generation_blobs(conn: &Connection, generation: &CacheGeneration) -> Result<()> {
+fn validate_complete_generation(generation: &CacheGeneration) -> Result<()> {
+    if !generation.complete || generation.applied_cursor != generation.target_cursor.cursor() {
+        bail!("Library Cache generation has not reached its exact target");
+    }
+    Ok(())
+}
+
+fn verify_generation_blob_files(
+    conn: &Connection,
+    generation: &CacheGeneration,
+) -> Result<Vec<GenerationBlobVerification>> {
+    let blobs = generation_blob_verifications(conn, generation)?;
+    for blob in &blobs {
+        verify_blob_file(&blob.local_path, &blob.checksum, blob.byte_size).with_context(|| {
+            format!(
+                "verifying full-audio cache blob for checksum {}",
+                blob.checksum
+            )
+        })?;
+    }
+    Ok(blobs)
+}
+
+fn generation_blob_verifications(
+    conn: &Connection,
+    generation: &CacheGeneration,
+) -> Result<Vec<GenerationBlobVerification>> {
     let claims = {
         let mut statement = conn.prepare(
-            "SELECT r.checksum,r.byte_size,r.media_type,b.local_path
+            "SELECT DISTINCT r.checksum,r.byte_size,b.local_path
              FROM library_cache_blob_refs r
              LEFT JOIN library_cache_blobs b
                 ON b.source_hub_id=r.source_hub_id
@@ -1480,7 +1551,7 @@ fn verify_generation_blobs(conn: &Connection, generation: &CacheGeneration) -> R
               AND b.cleanup_pending=0
              WHERE r.source_hub_id=?1 AND r.generation_id=?2
                AND r.availability='available'
-             ORDER BY r.checksum,r.record_id",
+              ORDER BY r.checksum,r.byte_size",
         )?;
         let rows = statement
             .query_map(
@@ -1489,24 +1560,30 @@ fn verify_generation_blobs(conn: &Connection, generation: &CacheGeneration) -> R
                     Ok((
                         row.get::<_, String>(0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(2)?,
                     ))
                 },
             )?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         rows
     };
-    for (checksum, byte_size, media_type, path) in claims {
+    let mut blobs = Vec::new();
+    for (checksum, byte_size, path) in claims {
         let path = path.context("full-audio generation is missing a verified cache blob")?;
         let byte_size = u64::try_from(byte_size).context("negative cache blob claim size")?;
-        validate_blob_metadata(byte_size, &media_type)?;
-        let path = Path::new(&path);
-        validate_cache_blob_path_parts(generation.source_hub_id, &checksum, path)?;
-        verify_blob_file(path, &checksum, byte_size)
-            .with_context(|| format!("verifying full-audio cache blob for checksum {checksum}"))?;
+        validate_blob_size(byte_size)?;
+        let local_path = PathBuf::from(path);
+        validate_cache_blob_path_parts(generation.source_hub_id, &checksum, &local_path)?;
+        let verification = GenerationBlobVerification {
+            checksum,
+            byte_size,
+            local_path,
+        };
+        if blobs.last() != Some(&verification) {
+            blobs.push(verification);
+        }
     }
-    Ok(())
+    Ok(blobs)
 }
 
 fn enqueue_orphaned_blobs(conn: &Transaction<'_>) -> Result<()> {
@@ -1568,11 +1645,16 @@ fn remove_cache_temp_directory(path: &Path) -> Result<()> {
 }
 
 fn validate_blob_metadata(byte_size: u64, media_type: &str) -> Result<()> {
-    if byte_size == 0 || byte_size > MAX_BLOB_BYTES {
-        bail!("cache blob size must be between 1 and {MAX_BLOB_BYTES} bytes");
-    }
+    validate_blob_size(byte_size)?;
     if media_type.is_empty() || media_type.len() > 255 || media_type.contains(['\r', '\n']) {
         bail!("cache blob media type is invalid");
+    }
+    Ok(())
+}
+
+fn validate_blob_size(byte_size: u64) -> Result<()> {
+    if byte_size == 0 || byte_size > MAX_BLOB_BYTES {
+        bail!("cache blob size must be between 1 and {MAX_BLOB_BYTES} bytes");
     }
     Ok(())
 }
@@ -2561,6 +2643,46 @@ mod tests {
     }
 
     #[test]
+    fn full_audio_activation_rechecks_metadata_after_file_verification() {
+        let temp = tempfile::tempdir().unwrap();
+        let bytes = b"activation-race";
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let source = HubId::new();
+        let path = namespaced_blob_path(&temp, source, &checksum);
+        std::fs::write(&path, bytes).unwrap();
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let generation = complete_full_audio_generation(
+            &mut conn,
+            source,
+            RecordId::new(),
+            DeviceId::new(),
+            &checksum,
+            bytes.len() as u64,
+            "audio/wav",
+        );
+        insert_cache_blob_row(
+            &conn,
+            source,
+            &checksum,
+            &path,
+            bytes.len() as u64,
+            "audio/wav",
+        );
+
+        let verification =
+            LibraryCacheStore::verify_complete_generation(&conn, source, generation).unwrap();
+        conn.execute(
+            "UPDATE library_cache_blobs SET verified=0,cleanup_pending=1
+             WHERE source_hub_id=?1 AND checksum=?2",
+            params![source.to_string(), checksum],
+        )
+        .unwrap();
+
+        assert!(LibraryCacheStore::activate_verified_generation(&mut conn, &verification).is_err());
+    }
+
+    #[test]
     fn verified_blob_registration_rejects_actual_file_mismatch() {
         let temp = tempfile::tempdir().unwrap();
         let expected = b"cache-audio";
@@ -3098,9 +3220,10 @@ mod tests {
     }
 
     #[test]
-    fn transition_to_live_only_preserves_cursor_target_and_deletion_overlay() {
-        let mut conn = Connection::open_in_memory().unwrap();
-        crate::db::migrate(&conn).unwrap();
+    fn transition_to_live_only_preserves_cursor_target_and_deletion_overlay_after_reopen() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        let mut conn = crate::db::migrate_db_at(&db_path).unwrap();
         let source = HubId::new();
         let deleted_id = RecordId::new();
         let retained_id = RecordId::new();
@@ -3146,6 +3269,8 @@ mod tests {
         .unwrap();
 
         LibraryCacheStore::transition_to_live_only(&mut conn, source).unwrap();
+        drop(conn);
+        let conn = crate::db::open_db_at(&db_path).unwrap();
 
         assert!(LibraryCacheStore::active_generation(&conn, source)
             .unwrap()

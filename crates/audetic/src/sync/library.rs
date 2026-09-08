@@ -228,7 +228,7 @@ impl HubLibrary {
     ) -> Result<StoredBlob>
     where
         S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Unpin,
-        E: std::fmt::Display,
+        E: std::error::Error + Send + Sync + 'static,
     {
         self.require_payload_association(checksum, byte_size, media_type)?;
         let stored = self

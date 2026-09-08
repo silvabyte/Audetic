@@ -21,6 +21,7 @@ use super::transport::{
 };
 
 const CACHE_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const MAX_CACHE_RETRY_DELAY: Duration = Duration::from_secs(300);
 
 pub(crate) struct CacheReplica {
     db_path: PathBuf,
@@ -31,12 +32,20 @@ pub(crate) struct CacheReplica {
     payloads: Arc<dyn RemotePayloadSource>,
     clock: Arc<dyn SyncClock>,
     observer: Arc<dyn WorkerObserver>,
+    retry_jitter_seed: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RefreshOutcome {
     Completed,
     Cancelled,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("{message}")]
+struct CacheCycleFailure {
+    message: String,
+    retryable: bool,
 }
 
 #[derive(Debug)]
@@ -77,6 +86,7 @@ impl CacheReplica {
             payloads,
             clock: Arc::new(SystemSyncClock),
             observer: Arc::new(NoopWorkerObserver),
+            retry_jitter_seed: uuid::Uuid::new_v4().as_u128() as u64,
         }
     }
 
@@ -99,23 +109,27 @@ impl CacheReplica {
     pub(crate) async fn process_once(&self) -> Result<()> {
         self.process_once_cancellable(&CancellationToken::new())
             .await
+            .map_err(anyhow::Error::new)
     }
 
     pub(crate) async fn run(self, cancellation: CancellationToken) {
         self.observer.observe(WorkerEvent::CacheReplicaStarted {
             role_epoch: self.role_epoch,
         });
+        let mut consecutive_retryable_failures = 0u32;
         while !cancellation.is_cancelled() {
             self.observer
                 .observe(WorkerEvent::CacheReplicaCycleStarted {
                     role_epoch: self.role_epoch,
                 });
-            match self.process_once_cancellable(&cancellation).await {
+            let delay = match self.process_once_cancellable(&cancellation).await {
                 Ok(()) if !cancellation.is_cancelled() => {
+                    consecutive_retryable_failures = 0;
                     self.observer
                         .observe(WorkerEvent::CacheReplicaCycleSucceeded {
                             role_epoch: self.role_epoch,
                         });
+                    CACHE_POLL_INTERVAL
                 }
                 Err(error) if !cancellation.is_cancelled() => {
                     tracing::warn!(
@@ -127,27 +141,41 @@ impl CacheReplica {
                         role_epoch: self.role_epoch,
                         error: error.to_string(),
                     });
+                    if error.retryable {
+                        consecutive_retryable_failures =
+                            consecutive_retryable_failures.saturating_add(1);
+                        cache_retry_delay(
+                            consecutive_retryable_failures,
+                            self.retry_jitter_seed ^ u64::from(consecutive_retryable_failures),
+                        )
+                    } else {
+                        consecutive_retryable_failures = 0;
+                        MAX_CACHE_RETRY_DELAY
+                    }
                 }
                 Ok(()) | Err(_) => break,
-            }
-            self.clock.sleep(CACHE_POLL_INTERVAL, &cancellation).await;
+            };
+            self.clock.sleep(delay, &cancellation).await;
         }
         self.observer.observe(WorkerEvent::CacheReplicaStopped {
             role_epoch: self.role_epoch,
         });
     }
 
-    pub(crate) async fn process_once_cancellable(
+    async fn process_once_cancellable(
         &self,
         cancellation: &CancellationToken,
-    ) -> Result<()> {
+    ) -> std::result::Result<(), CacheCycleFailure> {
         if cancellation.is_cancelled() {
             return Ok(());
         }
 
         let mut failures = Vec::new();
         if let Err(error) = self.process_pending_blob_cleanups() {
-            failures.push(format!("pre-refresh cache blob cleanup failed: {error}"));
+            failures.push(CacheCycleFailure {
+                message: format!("pre-refresh cache blob cleanup failed: {error}"),
+                retryable: true,
+            });
         }
         if cancellation.is_cancelled() {
             return Ok(());
@@ -162,19 +190,34 @@ impl CacheReplica {
         match refresh {
             Ok(RefreshOutcome::Cancelled) => return Ok(()),
             Ok(RefreshOutcome::Completed) => {}
-            Err(error) => failures.push(format!("Library Cache refresh failed: {error}")),
+            Err(error) => failures.push(CacheCycleFailure {
+                retryable: error
+                    .downcast_ref::<HubTransferError>()
+                    .is_some_and(HubTransferError::is_retryable),
+                message: format!("Library Cache refresh failed: {error}"),
+            }),
         }
 
         if cancellation.is_cancelled() {
             return Ok(());
         }
         if let Err(error) = self.process_pending_blob_cleanups() {
-            failures.push(format!("post-refresh cache blob cleanup failed: {error}"));
+            failures.push(CacheCycleFailure {
+                message: format!("post-refresh cache blob cleanup failed: {error}"),
+                retryable: true,
+            });
         }
         if failures.is_empty() {
             Ok(())
         } else {
-            bail!(failures.join("; "))
+            Err(CacheCycleFailure {
+                retryable: failures.iter().all(|failure| failure.retryable),
+                message: failures
+                    .into_iter()
+                    .map(|failure| failure.message)
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            })
         }
     }
 
@@ -355,8 +398,25 @@ impl CacheReplica {
         if cancellation.is_cancelled() {
             return Ok(RefreshOutcome::Cancelled);
         }
+        let db_path = self.db_path.clone();
+        let generation_id = generation.id;
+        let verification = tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(RefreshOutcome::Cancelled),
+            result = tokio::task::spawn_blocking(move || {
+                let connection = crate::db::open_db_at(&db_path)?;
+                LibraryCacheStore::verify_complete_generation(
+                    &connection,
+                    source,
+                    generation_id,
+                )
+            }) => result.context("joining Library Cache blob verification")??,
+        };
+        if cancellation.is_cancelled() {
+            return Ok(RefreshOutcome::Cancelled);
+        }
         let mut connection = crate::db::open_db_at(&self.db_path)?;
-        LibraryCacheStore::activate_complete_generation(&mut connection, source, generation.id)?;
+        LibraryCacheStore::activate_verified_generation(&mut connection, &verification)?;
         Ok(RefreshOutcome::Completed)
     }
 
@@ -552,9 +612,19 @@ fn classify_payload_response(
         200 => {}
         404 | 409 => return Ok(PayloadResponseDisposition::TryAnotherClaim),
         status @ (408 | 425 | 429 | 500..=599) => {
-            bail!("Home Hub returned retryable HTTP {status} while downloading a cache blob")
+            return Err(HubTransferError::Http {
+                status,
+                message: "cache blob download failed".into(),
+                retry_after: None,
+            }
+            .into())
         }
-        status => bail!("Home Hub returned HTTP {status} instead of a full payload"),
+        status => {
+            return Err(HubTransferError::NeedsAttention(format!(
+                "Home Hub returned HTTP {status} instead of a full payload"
+            ))
+            .into())
+        }
     }
     if response.metadata.content_range.is_some() {
         bail!("Home Hub returned Content-Range with a full cache payload");
@@ -618,6 +688,16 @@ fn group_blob_claims(claims: Vec<CacheBlobClaim>) -> Result<Vec<BlobClaimGroup>>
         }
     }
     Ok(groups)
+}
+
+fn cache_retry_delay(attempts: u32, jitter: u64) -> Duration {
+    let exponent = attempts.saturating_sub(1).min(8);
+    let base = 2_i64.pow(exponent);
+    let spread = (base / 4).max(1);
+    let width = (spread * 2 + 1) as u64;
+    let offset = (jitter % width) as i64 - spread;
+    let seconds = (base + offset).clamp(1, MAX_CACHE_RETRY_DELAY.as_secs() as i64);
+    Duration::from_secs(seconds as u64)
 }
 
 #[cfg(test)]
@@ -803,6 +883,28 @@ mod tests {
 
         async fn sleep(&self, _duration: Duration, cancellation: &CancellationToken) {
             cancellation.cancel();
+        }
+    }
+
+    struct RecordingClock {
+        sleeps: Mutex<Vec<Duration>>,
+        cancel_after: usize,
+    }
+
+    #[async_trait]
+    impl SyncClock for RecordingClock {
+        fn now(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::parse_from_rfc3339("2030-01-02T03:04:05Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        }
+
+        async fn sleep(&self, duration: Duration, cancellation: &CancellationToken) {
+            let mut sleeps = self.sleeps.lock().unwrap();
+            sleeps.push(duration);
+            if sleeps.len() == self.cancel_after {
+                cancellation.cancel();
+            }
         }
     }
 
@@ -1814,5 +1916,56 @@ mod tests {
                 WorkerEvent::CacheReplicaStopped { role_epoch: 42 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn run_backs_off_retryable_failures_and_throttles_permanent_failures() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        crate::db::migrate_db_at(&db_path).unwrap();
+        let source = HubId::new();
+        let changes = Arc::new(ScriptedChanges {
+            pages: Mutex::new(
+                vec![
+                    Err(HubTransferError::Transport("offline".into())),
+                    Err(HubTransferError::Retryable(
+                        "temporarily unavailable".into(),
+                    )),
+                    Err(HubTransferError::Http {
+                        status: 503,
+                        message: "overloaded".into(),
+                        retry_after: None,
+                    }),
+                    Err(HubTransferError::Transport("still offline".into())),
+                    Err(HubTransferError::NeedsAttention("identity changed".into())),
+                ]
+                .into(),
+            ),
+            calls: Mutex::new(Vec::new()),
+        });
+        let clock = Arc::new(RecordingClock {
+            sleeps: Mutex::new(Vec::new()),
+            cancel_after: 5,
+        });
+        let worker = CacheReplica::new(
+            db_path,
+            hub(source),
+            CacheLevel::LiveOnly,
+            changes,
+            Arc::new(UnusedPayloads),
+        )
+        .with_clock(clock.clone());
+
+        worker.run(CancellationToken::new()).await;
+
+        let sleeps = clock.sleeps.lock().unwrap();
+        assert_eq!(sleeps.len(), 5);
+        assert!(sleeps[0] >= Duration::from_secs(1));
+        assert!(sleeps[2] >= Duration::from_secs(3));
+        assert!(sleeps[3] >= Duration::from_secs(6));
+        assert!(sleeps[..4]
+            .iter()
+            .all(|delay| *delay <= MAX_CACHE_RETRY_DELAY));
+        assert_eq!(sleeps[4], Duration::from_secs(300));
     }
 }
