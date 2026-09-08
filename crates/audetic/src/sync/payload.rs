@@ -3,6 +3,7 @@ use bytes::Bytes;
 use fs2::FileExt;
 use futures_util::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
+use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
@@ -199,6 +200,23 @@ pub struct BlobStore {
     root: PathBuf,
 }
 
+#[derive(Debug, Error)]
+#[error(
+    "blob verification failed: expected {expected_checksum}/{expected_size}, received {actual_checksum}/{actual_size}"
+)]
+pub(crate) struct BlobIntegrityError {
+    expected_checksum: String,
+    expected_size: u64,
+    actual_checksum: String,
+    actual_size: u64,
+}
+
+#[derive(Clone, Copy)]
+enum ExistingBlobPolicy {
+    Preserve,
+    ReplaceInvalidCacheBlob,
+}
+
 impl BlobStore {
     pub fn for_db(db_path: &Path) -> Self {
         Self::new(
@@ -230,7 +248,53 @@ impl BlobStore {
         checksum: &str,
         expected_size: u64,
         media_type: &str,
+        stream: S,
+    ) -> Result<StoredBlob>
+    where
+        S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        self.put_stream_with_policy(
+            checksum,
+            expected_size,
+            media_type,
+            stream,
+            ExistingBlobPolicy::Preserve,
+        )
+        .await
+    }
+
+    /// Cache-only publication path. Unlike authoritative publication, this may
+    /// atomically replace an existing file after proving that file is corrupt.
+    /// Callers must construct this store with a source-scoped cache root.
+    pub(crate) async fn put_cache_stream<S, E>(
+        &self,
+        checksum: &str,
+        expected_size: u64,
+        media_type: &str,
+        stream: S,
+    ) -> Result<StoredBlob>
+    where
+        S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        self.put_stream_with_policy(
+            checksum,
+            expected_size,
+            media_type,
+            stream,
+            ExistingBlobPolicy::ReplaceInvalidCacheBlob,
+        )
+        .await
+    }
+
+    async fn put_stream_with_policy<S, E>(
+        &self,
+        checksum: &str,
+        expected_size: u64,
+        media_type: &str,
         mut stream: S,
+        existing_policy: ExistingBlobPolicy,
     ) -> Result<StoredBlob>
     where
         S: Stream<Item = std::result::Result<Bytes, E>> + Unpin,
@@ -238,7 +302,6 @@ impl BlobStore {
     {
         validate_blob_metadata(checksum, expected_size, media_type)?;
         let final_path = self.canonical_path(checksum)?;
-        let existed = final_path.is_file();
 
         let temp_dir = self.root.join(".tmp");
         tokio::fs::create_dir_all(&temp_dir)
@@ -284,40 +347,77 @@ impl BlobStore {
         };
         if received != expected_size || actual_checksum != checksum {
             let _ = tokio::fs::remove_file(&temp).await;
-            bail!(
-                "blob verification failed: expected {checksum}/{expected_size}, received {actual_checksum}/{received}"
-            );
-        }
-        if existed {
-            tokio::fs::remove_file(&temp)
-                .await
-                .context("discarding duplicate blob upload")?;
-            verify_file(&final_path, checksum, expected_size)?;
-            return Ok(StoredBlob {
-                checksum: checksum.to_owned(),
-                path: final_path,
-                byte_size: expected_size,
-                media_type: media_type.to_owned(),
-                created: false,
-            });
+            return Err(BlobIntegrityError {
+                expected_checksum: checksum.to_owned(),
+                expected_size,
+                actual_checksum,
+                actual_size: received,
+            }
+            .into());
         }
         if let Some(parent) = final_path.parent() {
             tokio::fs::create_dir_all(parent)
                 .await
                 .context("creating canonical blob directory")?;
         }
+
+        if final_path.is_file() {
+            match verify_file(&final_path, checksum, expected_size) {
+                Ok(()) => {
+                    tokio::fs::remove_file(&temp)
+                        .await
+                        .context("discarding duplicate blob upload")?;
+                    return Ok(stored_blob(
+                        checksum,
+                        final_path,
+                        expected_size,
+                        media_type,
+                        false,
+                    ));
+                }
+                Err(error) if matches!(existing_policy, ExistingBlobPolicy::Preserve) => {
+                    return Err(error).context("verifying existing canonical blob");
+                }
+                Err(_) => {
+                    tokio::fs::rename(&temp, &final_path)
+                        .await
+                        .context("atomically replacing corrupt cache blob")?;
+                    if let Some(parent) = final_path.parent() {
+                        sync_directory(parent)?;
+                    }
+                    return Ok(stored_blob(
+                        checksum,
+                        final_path,
+                        expected_size,
+                        media_type,
+                        true,
+                    ));
+                }
+            }
+        }
         match tokio::fs::rename(&temp, &final_path).await {
             Ok(()) => {}
             Err(_error) if final_path.is_file() => {
-                let _ = tokio::fs::remove_file(&temp).await;
-                verify_file(&final_path, checksum, expected_size)?;
-                return Ok(StoredBlob {
-                    checksum: checksum.to_owned(),
-                    path: final_path,
-                    byte_size: expected_size,
-                    media_type: media_type.to_owned(),
-                    created: false,
-                });
+                match verify_file(&final_path, checksum, expected_size) {
+                    Ok(()) => {
+                        let _ = tokio::fs::remove_file(&temp).await;
+                        return Ok(stored_blob(
+                            checksum,
+                            final_path,
+                            expected_size,
+                            media_type,
+                            false,
+                        ));
+                    }
+                    Err(error) if matches!(existing_policy, ExistingBlobPolicy::Preserve) => {
+                        return Err(error).context("verifying concurrently published blob");
+                    }
+                    Err(_) => {
+                        tokio::fs::rename(&temp, &final_path).await.context(
+                            "atomically replacing concurrently published corrupt cache blob",
+                        )?;
+                    }
+                }
             }
             Err(error) => {
                 let _ = tokio::fs::remove_file(&temp).await;
@@ -327,13 +427,13 @@ impl BlobStore {
         if let Some(parent) = final_path.parent() {
             sync_directory(parent)?;
         }
-        Ok(StoredBlob {
-            checksum: checksum.to_owned(),
-            path: final_path,
-            byte_size: expected_size,
-            media_type: media_type.to_owned(),
-            created: true,
-        })
+        Ok(stored_blob(
+            checksum,
+            final_path,
+            expected_size,
+            media_type,
+            true,
+        ))
     }
 
     pub async fn put_file(
@@ -349,6 +449,22 @@ impl BlobStore {
         let stream = tokio_util::io::ReaderStream::new(file);
         self.put_stream(checksum, expected_size, media_type, stream)
             .await
+    }
+}
+
+fn stored_blob(
+    checksum: &str,
+    path: PathBuf,
+    byte_size: u64,
+    media_type: &str,
+    created: bool,
+) -> StoredBlob {
+    StoredBlob {
+        checksum: checksum.to_owned(),
+        path,
+        byte_size,
+        media_type: media_type.to_owned(),
+        created,
     }
 }
 
@@ -442,6 +558,31 @@ mod tests {
 
         let temporary = temp.path().join("blobs").join(".tmp");
         assert_eq!(std::fs::read_dir(temporary).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn authoritative_publication_never_replaces_an_existing_corrupt_blob() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = BlobStore::new(temp.path().join("blobs"));
+        let expected = b"authoritative payload";
+        let checksum = format!("{:x}", Sha256::digest(expected));
+        let path = store.canonical_path(&checksum).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"corrupt authoritative blob").unwrap();
+
+        assert!(store
+            .put_stream(
+                &checksum,
+                expected.len() as u64,
+                "audio/wav",
+                futures_util::stream::iter([Ok::<_, std::io::Error>(
+                    Bytes::from_static(expected,)
+                )]),
+            )
+            .await
+            .is_err());
+
+        assert_eq!(std::fs::read(path).unwrap(), b"corrupt authoritative blob");
     }
 
     #[cfg(unix)]

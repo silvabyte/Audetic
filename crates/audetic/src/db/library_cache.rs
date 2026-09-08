@@ -84,6 +84,70 @@ impl VerifiedCacheBlob {
             media_type: stored.media_type,
         })
     }
+
+    /// Verify a stream and atomically publish it into one source Hub's cache
+    /// namespace. A corrupt cache file may be replaced, but authoritative blob
+    /// paths are never considered by this API.
+    pub(crate) async fn publish_stream_for_db<S, E>(
+        db_path: &Path,
+        source_hub_id: HubId,
+        checksum: String,
+        byte_size: u64,
+        media_type: String,
+        stream: S,
+    ) -> Result<Self>
+    where
+        S: futures_util::Stream<Item = std::result::Result<bytes::Bytes, E>> + Unpin,
+        E: std::fmt::Display,
+    {
+        let store = crate::sync::payload::BlobStore::new(
+            cache_blob_root(db_path).join(source_hub_id.to_string()),
+        );
+        let stored = store
+            .put_cache_stream(&checksum, byte_size, &media_type, stream)
+            .await?;
+        Ok(Self {
+            source_hub_id,
+            checksum: stored.checksum,
+            local_path: stored.path,
+            byte_size: stored.byte_size,
+            media_type: stored.media_type,
+        })
+    }
+
+    /// Recover a file published before its database registration committed.
+    pub(crate) fn recover_published_for_db(
+        db_path: &Path,
+        source_hub_id: HubId,
+        checksum: String,
+        byte_size: u64,
+        media_type: String,
+    ) -> Result<Option<Self>> {
+        validate_blob_metadata(byte_size, &media_type)?;
+        let local_path = cache_blob_path_for_db(db_path, source_hub_id, &checksum)?;
+        if !local_path.is_file() {
+            return Ok(None);
+        }
+        let blob = Self {
+            source_hub_id,
+            checksum,
+            local_path,
+            byte_size,
+            media_type,
+        };
+        blob.verify()?;
+        Ok(Some(blob))
+    }
+
+    pub(crate) fn has_metadata(&self, byte_size: u64, media_type: &str) -> bool {
+        self.byte_size == byte_size && self.media_type == media_type
+    }
+
+    pub(crate) fn verify(&self) -> Result<()> {
+        validate_cache_blob_path(self)?;
+        validate_blob_metadata(self.byte_size, &self.media_type)?;
+        verify_blob_file(&self.local_path, &self.checksum, self.byte_size)
+    }
 }
 
 const CACHE_BLOB_NAMESPACE: &str = "library-cache-blobs";
@@ -248,6 +312,25 @@ impl LibraryCacheStore {
         )
         .optional()
         .context("reading active source-scoped Library Cache generation")
+        .and_then(|value| value.transpose())
+    }
+
+    /// Recover the sole inactive generation for this source, whether feed
+    /// traversal is incomplete or payload materialization is pending.
+    pub fn inactive_generation(
+        conn: &Connection,
+        source_hub_id: HubId,
+    ) -> Result<Option<CacheGeneration>> {
+        conn.query_row(
+            "SELECT generation_id,source_hub_id,cache_level,start_cursor,target_cursor,
+                    applied_cursor,complete,active
+             FROM library_cache_generations
+             WHERE source_hub_id=?1 AND active=0",
+            [source_hub_id.to_string()],
+            generation_from_row,
+        )
+        .optional()
+        .context("reading inactive source-scoped Library Cache generation")
         .and_then(|value| value.transpose())
     }
 
@@ -744,6 +827,47 @@ impl LibraryCacheStore {
         tx.commit()
             .context("committing incomplete cache abandonment")?;
         Ok(())
+    }
+
+    /// Discard resumable state for one source without affecting its active
+    /// generation or cursor. Complete inactive generations are included because
+    /// payload download happens after feed completion.
+    pub fn discard_inactive_generation(
+        conn: &mut Connection,
+        source_hub_id: HubId,
+        generation_id: i64,
+    ) -> Result<()> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting inactive cache generation discard")?;
+        let generation = Self::generation(&tx, source_hub_id, generation_id)?
+            .context("Library Cache generation does not exist for this source Hub")?;
+        if generation.active {
+            bail!("an active Library Cache generation cannot be discarded as inactive");
+        }
+        tx.execute(
+            "DELETE FROM library_cache_generations
+             WHERE source_hub_id=?1 AND generation_id=?2 AND active=0",
+            params![source_hub_id.to_string(), generation_id],
+        )?;
+        enqueue_orphaned_blobs(&tx)?;
+        tx.commit()
+            .context("committing inactive cache generation discard")
+    }
+
+    /// Enter Live Only while retaining the source cursor, any in-progress live
+    /// target, and the durable deletion overlay.
+    pub fn transition_to_live_only(conn: &mut Connection, source_hub_id: HubId) -> Result<()> {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("starting transition to Live Only")?;
+        ensure_source(&tx, source_hub_id)?;
+        tx.execute(
+            "DELETE FROM library_cache_generations WHERE source_hub_id=?1",
+            [source_hub_id.to_string()],
+        )?;
+        enqueue_orphaned_blobs(&tx)?;
+        tx.commit().context("committing transition to Live Only")
     }
 
     /// Process durable cache-blob cleanup while the SQLite write lock prevents
@@ -2785,5 +2909,250 @@ mod tests {
             LibraryCacheStore::apply_live_only_page(&mut conn, source, &idle).unwrap(),
             ApplyPageOutcome::Duplicate
         );
+    }
+
+    #[test]
+    fn inactive_generation_is_recovered_only_for_its_source() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let source = HubId::new();
+        let other_source = HubId::new();
+        let generation = LibraryCacheStore::begin_generation(
+            &mut conn,
+            source,
+            CacheLevel::TextForOfflineUse,
+            ChangeCursor::ZERO,
+            ChangeTarget::new(ChangeCursor::new(1)),
+        )
+        .unwrap();
+        LibraryCacheStore::apply_validated_page(
+            &mut conn,
+            source,
+            generation,
+            &page(
+                0,
+                1,
+                vec![dictation_change(
+                    1,
+                    RecordId::new(),
+                    DeviceId::new(),
+                    1,
+                    "complete but not active",
+                )],
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            LibraryCacheStore::inactive_generation(&conn, source)
+                .unwrap()
+                .unwrap(),
+            LibraryCacheStore::generation(&conn, source, generation)
+                .unwrap()
+                .unwrap()
+        );
+        assert!(LibraryCacheStore::inactive_generation(&conn, other_source)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn discarding_any_inactive_generation_enqueues_its_orphaned_blobs() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        let bytes = b"discarded-complete-generation";
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let source = HubId::new();
+        let path = namespaced_blob_path(&temp, source, &checksum);
+        std::fs::write(&path, bytes).unwrap();
+        let mut conn = crate::db::migrate_db_at(&db_path).unwrap();
+        let generation = complete_full_audio_generation(
+            &mut conn,
+            source,
+            RecordId::new(),
+            DeviceId::new(),
+            &checksum,
+            bytes.len() as u64,
+            "audio/wav",
+        );
+        LibraryCacheStore::register_verified_blob(
+            &mut conn,
+            &VerifiedCacheBlob {
+                source_hub_id: source,
+                checksum: checksum.clone(),
+                local_path: path.clone(),
+                byte_size: bytes.len() as u64,
+                media_type: "audio/wav".into(),
+            },
+        )
+        .unwrap();
+
+        LibraryCacheStore::discard_inactive_generation(&mut conn, source, generation).unwrap();
+
+        assert!(LibraryCacheStore::inactive_generation(&conn, source)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            conn.query_row(
+                "SELECT verified,cleanup_pending FROM library_cache_blobs
+                 WHERE source_hub_id=?1 AND checksum=?2",
+                params![source.to_string(), checksum],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .unwrap(),
+            (0, 1)
+        );
+        assert!(path.is_file());
+        LibraryCacheStore::process_pending_blob_cleanups(&mut conn).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn transition_to_live_only_preserves_cursor_target_and_deletion_overlay() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&conn).unwrap();
+        let source = HubId::new();
+        let deleted_id = RecordId::new();
+        let retained_id = RecordId::new();
+        LibraryCacheStore::apply_live_only_page(
+            &mut conn,
+            source,
+            &page(0, 1, vec![dictation_deletion(1, deleted_id, 1)]),
+        )
+        .unwrap();
+        let generation = LibraryCacheStore::begin_generation(
+            &mut conn,
+            source,
+            CacheLevel::TextForOfflineUse,
+            ChangeCursor::ZERO,
+            ChangeTarget::new(ChangeCursor::new(2)),
+        )
+        .unwrap();
+        LibraryCacheStore::apply_validated_page(
+            &mut conn,
+            source,
+            generation,
+            &page(
+                0,
+                2,
+                vec![
+                    dictation_deletion(1, deleted_id, 1),
+                    dictation_change(2, retained_id, DeviceId::new(), 1, "cached"),
+                ],
+            ),
+        )
+        .unwrap();
+        LibraryCacheStore::activate_complete_generation(&mut conn, source, generation).unwrap();
+        LibraryCacheStore::apply_live_only_page(
+            &mut conn,
+            source,
+            &page(
+                2,
+                4,
+                vec![dictation_change(
+                    3,
+                    RecordId::new(),
+                    DeviceId::new(),
+                    1,
+                    "live continuation",
+                )],
+            ),
+        )
+        .unwrap();
+
+        LibraryCacheStore::transition_to_live_only(&mut conn, source).unwrap();
+
+        assert!(LibraryCacheStore::active_generation(&conn, source)
+            .unwrap()
+            .is_none());
+        assert!(LibraryCacheStore::inactive_generation(&conn, source)
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            LibraryCacheStore::source_cursor(&conn, source).unwrap(),
+            ChangeCursor::new(3)
+        );
+        assert_eq!(
+            LibraryCacheStore::live_traversal_target(&conn, source).unwrap(),
+            Some(ChangeTarget::new(ChangeCursor::new(4)))
+        );
+        assert!(LibraryCacheStore::live_overlay_contains(&conn, source, deleted_id).unwrap());
+    }
+
+    #[tokio::test]
+    async fn stream_publication_repairs_only_the_source_scoped_cache_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        let expected = b"replacement cache payload";
+        let checksum = format!("{:x}", Sha256::digest(expected));
+        let source = HubId::new();
+        let cache_path = namespaced_blob_path(&temp, source, &checksum);
+        std::fs::write(&cache_path, b"corrupt cache payload").unwrap();
+        let authoritative = crate::sync::payload::BlobStore::for_db(&db_path)
+            .canonical_path(&checksum)
+            .unwrap();
+        std::fs::create_dir_all(authoritative.parent().unwrap()).unwrap();
+        std::fs::write(&authoritative, b"authoritative sentinel").unwrap();
+
+        let blob = VerifiedCacheBlob::publish_stream_for_db(
+            &db_path,
+            source,
+            checksum,
+            expected.len() as u64,
+            "audio/wav".into(),
+            futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(
+                expected,
+            ))]),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(blob.local_path, cache_path);
+        assert_eq!(std::fs::read(cache_path).unwrap(), expected);
+        assert_eq!(
+            std::fs::read(authoritative).unwrap(),
+            b"authoritative sentinel"
+        );
+    }
+
+    #[tokio::test]
+    async fn filesystem_publication_can_be_recovered_before_db_registration() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("cache.db");
+        let bytes = b"published before simulated crash";
+        let checksum = format!("{:x}", Sha256::digest(bytes));
+        let source = HubId::new();
+        let mut conn = crate::db::migrate_db_at(&db_path).unwrap();
+        let generation = complete_full_audio_generation(
+            &mut conn,
+            source,
+            RecordId::new(),
+            DeviceId::new(),
+            &checksum,
+            bytes.len() as u64,
+            "audio/wav",
+        );
+        VerifiedCacheBlob::publish_stream_for_db(
+            &db_path,
+            source,
+            checksum.clone(),
+            bytes.len() as u64,
+            "audio/wav".into(),
+            futures_util::stream::iter([Ok::<_, std::io::Error>(bytes::Bytes::from_static(bytes))]),
+        )
+        .await
+        .unwrap();
+
+        let recovered = VerifiedCacheBlob::recover_published_for_db(
+            &db_path,
+            source,
+            checksum.clone(),
+            bytes.len() as u64,
+            "audio/wav".into(),
+        )
+        .unwrap()
+        .unwrap();
+        LibraryCacheStore::register_verified_blob(&mut conn, &recovered).unwrap();
+        LibraryCacheStore::activate_complete_generation(&mut conn, source, generation).unwrap();
     }
 }

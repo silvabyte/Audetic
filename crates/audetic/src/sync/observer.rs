@@ -24,6 +24,22 @@ pub(crate) enum WorkerEvent {
     OutboxStopped {
         role_epoch: u64,
     },
+    CacheReplicaStarted {
+        role_epoch: u64,
+    },
+    CacheReplicaCycleStarted {
+        role_epoch: u64,
+    },
+    CacheReplicaCycleSucceeded {
+        role_epoch: u64,
+    },
+    CacheReplicaCycleFailed {
+        role_epoch: u64,
+        error: String,
+    },
+    CacheReplicaStopped {
+        role_epoch: u64,
+    },
 }
 
 pub(crate) trait WorkerObserver: Send + Sync {

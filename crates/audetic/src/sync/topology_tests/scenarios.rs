@@ -4,12 +4,13 @@ use futures_util::TryStreamExt;
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+use crate::db::library_cache::LibraryCacheStore;
 use crate::db::meeting_artifacts::MeetingArtifactRepository;
 use crate::db::meetings::MeetingRepository;
 use crate::history::SearchParams;
 use crate::sync::client::HandshakeExpectation;
 use crate::sync::observer::WorkerEvent;
-use crate::sync::protocol::{MeetingTitlePatch, SnapshotBatch, SnapshotDisposition};
+use crate::sync::protocol::{MeetingTitlePatch, RecordKind, SnapshotBatch, SnapshotDisposition};
 use crate::sync::tailscale::MappingState;
 
 use super::{HomeHubTopology, OperationFault};
@@ -812,5 +813,177 @@ async fn cycle_driver_ignores_a_restarts_initial_cycle_before_advancing_clock() 
             )
             .unwrap(),
         ("pending".into(), None)
+    );
+}
+
+#[tokio::test]
+async fn connected_cache_replica_traverses_all_levels_over_the_real_hub() {
+    let topology = HomeHubTopology::new();
+    let hub = topology.daemon("hub", "owner@example.com");
+    let device = topology.daemon("device", "owner@example.com");
+    hub.start().await;
+    device.start().await;
+    let hub_connection = hub.activate_hub(true).await;
+    hub.wait_for_cycle().await;
+
+    let payload = b"cached through the real payload stream";
+    let checksum = format!("{:x}", Sha256::digest(payload));
+    let (_, record_id) = hub.insert_dictation("cached through change feed", Some(payload));
+    hub.drive_cycle().await;
+    device
+        .connect_with_cache_level(hub_connection.clone(), false, CacheLevel::TextForOfflineUse)
+        .await;
+
+    device.wait_for_cache_cycle().await;
+
+    let connection = device.connection();
+    let generation = LibraryCacheStore::active_generation(&connection, hub_connection.hub_id)
+        .unwrap()
+        .expect("the first complete text generation should activate");
+    assert_eq!(generation.level, CacheLevel::TextForOfflineUse);
+    let items = LibraryCacheStore::active_items(&connection, hub_connection.hub_id).unwrap();
+    assert!(items.iter().any(|item| item.record_id == record_id));
+    assert_eq!(device.probe.successful_cache_cycles(device.role_epoch()), 1);
+    drop(connection);
+
+    device
+        .connect_with_cache_level(
+            hub_connection.clone(),
+            false,
+            CacheLevel::TextAndAvailableAudio,
+        )
+        .await;
+    device.wait_for_cache_cycle().await;
+
+    let connection = device.connection();
+    let full_generation = LibraryCacheStore::active_generation(&connection, hub_connection.hub_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(full_generation.level, CacheLevel::TextAndAvailableAudio);
+    assert!(
+        LibraryCacheStore::verified_blob(&connection, hub_connection.hub_id, &checksum)
+            .unwrap()
+            .is_some()
+    );
+    drop(connection);
+
+    device
+        .direct_client("hub")
+        .delete_record(hub_connection.hub_id, record_id, RecordKind::Dictation)
+        .await
+        .unwrap();
+    device
+        .connect_with_cache_level(hub_connection.clone(), false, CacheLevel::LiveOnly)
+        .await;
+    device.wait_for_cache_cycle().await;
+
+    let connection = device.connection();
+    assert!(
+        LibraryCacheStore::active_generation(&connection, hub_connection.hub_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(LibraryCacheStore::live_overlay_contains(
+        &connection,
+        hub_connection.hub_id,
+        record_id
+    )
+    .unwrap());
+}
+
+#[tokio::test]
+async fn connected_demotion_cancels_and_joins_an_in_flight_cache_download() {
+    let topology = HomeHubTopology::new();
+    let hub = topology.daemon("hub", "owner@example.com");
+    let device = topology.daemon("device", "owner@example.com");
+    hub.start().await;
+    device.start().await;
+    let hub_connection = hub.activate_hub(true).await;
+    hub.wait_for_cycle().await;
+
+    let payload = vec![b'c'; 128 * 1024];
+    let checksum = format!("{:x}", Sha256::digest(&payload));
+    let (_, record_id) = hub.insert_dictation("cancelled cache download", Some(&payload));
+    hub.drive_cycle().await;
+    let gate = super::FaultGate::new();
+    topology.tailnet.fault(
+        "device",
+        "hub",
+        Method::GET,
+        &format!("/audetic/v1/dictations/{record_id}/payload"),
+        OperationFault::HoldResponseBodyAfterFirstChunk(gate.clone()),
+    );
+    device
+        .connect_with_cache_level(
+            hub_connection.clone(),
+            false,
+            CacheLevel::TextAndAvailableAudio,
+        )
+        .await;
+    gate.wait_entered().await;
+    let connected_epoch = device.role_epoch();
+
+    let service = device.service().clone();
+    let demotion = tokio::spawn(async move {
+        service
+            .configure(SyncSetupRequest {
+                role: SyncRole::Standalone,
+                device_name: Some("device".into()),
+                hub: None,
+                upload_recording_payloads: false,
+                cache_level: CacheLevel::LiveOnly,
+                shared_config_enabled: false,
+                confirm_serve_change: false,
+            })
+            .await
+    });
+    gate.wait_cancelled().await;
+    demotion.await.unwrap().unwrap();
+
+    assert_eq!(
+        device.service().status().await.unwrap().role,
+        SyncRole::Standalone
+    );
+    let connection = device.connection();
+    assert!(
+        LibraryCacheStore::active_generation(&connection, hub_connection.hub_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        LibraryCacheStore::inactive_generation(&connection, hub_connection.hub_id)
+            .unwrap()
+            .is_some_and(|generation| generation.complete)
+    );
+    assert!(device.probe.events().iter().any(|event| matches!(
+        event,
+        WorkerEvent::CacheReplicaStopped { role_epoch } if *role_epoch == connected_epoch
+    )));
+    drop(connection);
+
+    device
+        .connect_with_cache_level(
+            hub_connection.clone(),
+            false,
+            CacheLevel::TextAndAvailableAudio,
+        )
+        .await;
+    device.wait_for_cache_cycle().await;
+
+    let connection = device.connection();
+    assert!(
+        LibraryCacheStore::inactive_generation(&connection, hub_connection.hub_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        LibraryCacheStore::active_generation(&connection, hub_connection.hub_id)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        LibraryCacheStore::verified_blob(&connection, hub_connection.hub_id, &checksum)
+            .unwrap()
+            .is_some()
     );
 }

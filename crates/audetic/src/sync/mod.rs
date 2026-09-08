@@ -1,5 +1,6 @@
 //! HTTP-independent Home Hub synchronization domain.
 
+mod cache_replica;
 pub mod client;
 mod clock;
 pub mod identity;

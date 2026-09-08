@@ -145,13 +145,23 @@ impl TestDaemon {
     }
 
     pub(super) async fn connect(&self, hub: HubConnection, upload_payloads: bool) {
+        self.connect_with_cache_level(hub, upload_payloads, CacheLevel::LiveOnly)
+            .await;
+    }
+
+    pub(super) async fn connect_with_cache_level(
+        &self,
+        hub: HubConnection,
+        upload_payloads: bool,
+        cache_level: CacheLevel,
+    ) {
         self.service()
             .configure(SyncSetupRequest {
                 role: SyncRole::ConnectedDevice,
                 device_name: Some(self.name.clone()),
                 hub: Some(hub),
                 upload_recording_payloads: upload_payloads,
-                cache_level: CacheLevel::LiveOnly,
+                cache_level,
                 shared_config_enabled: false,
                 confirm_serve_change: false,
             })
@@ -208,6 +218,22 @@ impl TestDaemon {
             .await;
     }
 
+    pub(super) async fn wait_for_cache_cycle(&self) {
+        let role_epoch = self.role_epoch();
+        self.probe
+            .wait_for(|events| {
+                events.iter().any(|event| {
+                    matches!(
+                        event,
+                        crate::sync::observer::WorkerEvent::CacheReplicaCycleSucceeded {
+                            role_epoch: event_epoch
+                        } if *event_epoch == role_epoch
+                    )
+                })
+            })
+            .await;
+    }
+
     pub(super) async fn drive_cycle(&self) {
         self.drive_cycle_by(Duration::from_secs(2)).await;
     }
@@ -226,7 +252,9 @@ impl TestDaemon {
     }
 
     pub(super) async fn begin_cycle_by(&self, duration: Duration) {
-        self.clock.wait_for_sleepers(1).await;
+        self.clock
+            .wait_for_sleepers(self.expected_worker_sleepers())
+            .await;
         self.clock.advance(duration);
     }
 
@@ -234,7 +262,9 @@ impl TestDaemon {
         // Establish the baseline only after the worker is idle. In particular,
         // a freshly reconstructed worker may still be finishing its initial
         // cycle while this call is waiting for its first sleep.
-        self.clock.wait_for_sleepers(1).await;
+        self.clock
+            .wait_for_sleepers(self.expected_worker_sleepers())
+            .await;
         let role_epoch = self.role_epoch();
         let before = self.probe.successful_cycles(role_epoch);
         let failed_before = self
@@ -286,6 +316,17 @@ impl TestDaemon {
             .await;
     }
 
+    fn expected_worker_sleepers(&self) -> usize {
+        match crate::db::sync_settings::SyncSettingsRepository::get(&self.connection())
+            .unwrap()
+            .role
+        {
+            SyncRole::Standalone => 0,
+            SyncRole::HomeHub => 1,
+            SyncRole::ConnectedDevice => 2,
+        }
+    }
+
     pub(super) async fn restart(&mut self) {
         let role_epoch = self.role_epoch();
         let listener_stops = self
@@ -306,6 +347,19 @@ impl TestDaemon {
                 matches!(
                     event,
                     crate::sync::observer::WorkerEvent::OutboxStopped {
+                        role_epoch: event_epoch
+                    } if *event_epoch == role_epoch
+                )
+            })
+            .count();
+        let cache_stops = self
+            .probe
+            .events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    crate::sync::observer::WorkerEvent::CacheReplicaStopped {
                         role_epoch: event_epoch
                     } if *event_epoch == role_epoch
                 )
@@ -362,6 +416,32 @@ impl TestDaemon {
                     .filter(|event| matches!(
                         event,
                         crate::sync::observer::WorkerEvent::OutboxStarted {
+                            role_epoch: event_epoch
+                        } if *event_epoch == role_epoch
+                    ))
+                    .count(),
+                2
+            );
+        }
+        if role == SyncRole::ConnectedDevice {
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::sync::observer::WorkerEvent::CacheReplicaStopped {
+                            role_epoch: event_epoch
+                        } if *event_epoch == role_epoch
+                    ))
+                    .count(),
+                cache_stops + 1
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(
+                        event,
+                        crate::sync::observer::WorkerEvent::CacheReplicaStarted {
                             role_epoch: event_epoch
                         } if *event_epoch == role_epoch
                     ))

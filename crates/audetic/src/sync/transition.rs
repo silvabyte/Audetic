@@ -1520,6 +1520,7 @@ fn runtime_spec(
                 )
             })?,
             upload_recording_payloads: installation.settings.upload_recording_payloads,
+            cache_level: installation.settings.cache_level,
         }),
     }
 }
@@ -2496,6 +2497,15 @@ mod tests {
                 .await
                 .outbox_worker_running
         );
+        assert!(
+            !fixture
+                .service
+                .coordinator
+                .runtime
+                .snapshot()
+                .await
+                .cache_replica_running
+        );
         fixture.service.shutdown().await.unwrap();
     }
 
@@ -2562,6 +2572,7 @@ mod tests {
         );
         let runtime = fixture.service.coordinator.runtime.snapshot().await;
         assert!(runtime.outbox_worker_running);
+        assert!(runtime.cache_replica_running);
         assert!(runtime.hub_reachable);
         fixture.service.shutdown().await.unwrap();
     }
@@ -2845,6 +2856,15 @@ mod tests {
                 .await
                 .outbox_worker_running
         );
+        assert!(
+            fixture
+                .service
+                .coordinator
+                .runtime
+                .snapshot()
+                .await
+                .cache_replica_running
+        );
         fixture.service.shutdown().await.unwrap();
     }
 
@@ -3091,6 +3111,15 @@ mod tests {
                 .await
                 .outbox_worker_running
         );
+        assert!(
+            fixture
+                .service
+                .coordinator
+                .runtime
+                .snapshot()
+                .await
+                .cache_replica_running
+        );
         fixture.service.shutdown().await.unwrap();
     }
 
@@ -3192,6 +3221,7 @@ mod tests {
         assert_eq!(home.role, Some(SyncRole::HomeHub));
         assert!(home.hub_listener_running);
         assert!(home.outbox_worker_running);
+        assert!(!home.cache_replica_running);
 
         fixture
             .service
@@ -3202,6 +3232,7 @@ mod tests {
         assert_eq!(standalone.role, Some(SyncRole::Standalone));
         assert!(!standalone.hub_listener_running);
         assert!(!standalone.outbox_worker_running);
+        assert!(!standalone.cache_replica_running);
 
         fixture
             .service
@@ -3212,6 +3243,7 @@ mod tests {
         assert_eq!(connected.role, Some(SyncRole::ConnectedDevice));
         assert!(!connected.hub_listener_running);
         assert!(connected.outbox_worker_running);
+        assert!(connected.cache_replica_running);
         fixture.service.shutdown().await.unwrap();
     }
 

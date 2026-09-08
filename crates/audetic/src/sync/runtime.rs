@@ -1,6 +1,6 @@
 //! Sole lifecycle and process-ownership boundary for Library Sync runtimes.
 
-use audetic_core::sync::{HubConnection, HubId, SyncRole};
+use audetic_core::sync::{CacheLevel, HubConnection, HubId, SyncRole};
 use fs2::FileExt;
 use thiserror::Error;
 use tokio::sync::{oneshot, Mutex};
@@ -16,6 +16,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use super::cache_replica::CacheReplica;
 use super::clock::{SyncClock, SystemSyncClock};
 use super::library::HubLibrary;
 use super::observer::{NoopWorkerObserver, WorkerEvent, WorkerObserver};
@@ -121,6 +122,7 @@ pub(super) enum RuntimeSpec {
         role_epoch: u64,
         hub: HubConnection,
         upload_recording_payloads: bool,
+        cache_level: CacheLevel,
     },
 }
 
@@ -148,6 +150,7 @@ pub(super) struct RuntimeSnapshot {
     pub(super) role_version: Option<RoleVersion>,
     pub hub_listener_running: bool,
     pub outbox_worker_running: bool,
+    pub cache_replica_running: bool,
     pub hub_reachable: bool,
     pub listener_error: Option<String>,
     pub ownership_held: bool,
@@ -209,6 +212,8 @@ impl ActivationOutcome {
 pub(super) enum RuntimeCleanupDiagnostic {
     #[error("obsolete sync outbox worker cleanup failed: {0}")]
     OutboxWorker(String),
+    #[error("obsolete Library Cache replica cleanup failed: {0}")]
+    CacheReplica(String),
     #[error("obsolete Home Hub listener cleanup failed: {0}")]
     HomeHubListener(String),
 }
@@ -420,10 +425,94 @@ impl Drop for PreparedOutbox {
     }
 }
 
+struct CacheReplicaRuntime {
+    cancellation: CancellationToken,
+    task: Option<JoinHandle<()>>,
+}
+
+impl CacheReplicaRuntime {
+    fn request_stop(&self) {
+        self.cancellation.cancel();
+    }
+
+    async fn stop(mut self) {
+        self.request_stop();
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+
+    async fn stop_with_diagnostic(mut self) -> Option<RuntimeCleanupDiagnostic> {
+        self.request_stop();
+        let task = self.task.take()?;
+        task.await.err().map(|error| {
+            RuntimeCleanupDiagnostic::CacheReplica(format!("worker task join failed: {error}"))
+        })
+    }
+
+    fn abort(&mut self) {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.task.as_ref().is_some_and(|task| !task.is_finished())
+    }
+}
+
+impl Drop for CacheReplicaRuntime {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
+struct PreparedCacheReplica {
+    start: Option<oneshot::Sender<()>>,
+    runtime: Option<CacheReplicaRuntime>,
+}
+
+impl PreparedCacheReplica {
+    fn activate(mut self) -> Result<CacheReplicaRuntime, RuntimeError> {
+        let runtime = self.runtime.take().ok_or_else(|| {
+            RuntimeError::Invariant("prepared cache replica has no runtime".into())
+        })?;
+        if let Some(start) = self.start.take() {
+            let _ = start.send(());
+        }
+        Ok(runtime)
+    }
+
+    async fn stop(mut self) {
+        self.request_stop();
+        if let Some(runtime) = self.runtime.take() {
+            runtime.stop().await;
+        }
+    }
+
+    fn request_stop(&mut self) {
+        self.start.take();
+        if let Some(runtime) = self.runtime.as_ref() {
+            runtime.request_stop();
+        }
+    }
+}
+
+impl Drop for PreparedCacheReplica {
+    fn drop(&mut self) {
+        self.start.take();
+        if let Some(runtime) = self.runtime.as_mut() {
+            runtime.abort();
+        }
+    }
+}
+
 struct ActiveRuntime {
     spec: RuntimeSpec,
     hub: Option<HubRuntime>,
     outbox: Option<OutboxRuntime>,
+    cache_replica: Option<CacheReplicaRuntime>,
     hub_reachable: bool,
     listener_error: Option<String>,
 }
@@ -432,6 +521,9 @@ impl ActiveRuntime {
     fn request_stop(&mut self) {
         if let Some(outbox) = self.outbox.as_ref() {
             outbox.request_stop();
+        }
+        if let Some(cache_replica) = self.cache_replica.as_ref() {
+            cache_replica.request_stop();
         }
         if let Some(hub) = self.hub.as_mut() {
             hub.request_stop();
@@ -442,6 +534,9 @@ impl ActiveRuntime {
         self.request_stop();
         if let Some(outbox) = self.outbox.take() {
             outbox.stop().await;
+        }
+        if let Some(cache_replica) = self.cache_replica.take() {
+            cache_replica.stop().await;
         }
         if let Some(hub) = self.hub.take() {
             hub.stop().await?;
@@ -459,6 +554,11 @@ impl ActiveRuntime {
                 diagnostics.push(diagnostic);
             }
         }
+        if let Some(cache_replica) = self.cache_replica.take() {
+            if let Some(diagnostic) = cache_replica.stop_with_diagnostic().await {
+                diagnostics.push(diagnostic);
+            }
+        }
         if let Some(hub) = self.hub.take() {
             if let Err(error) = hub.stop().await {
                 diagnostics.push(RuntimeCleanupDiagnostic::HomeHubListener(error.to_string()));
@@ -473,10 +573,11 @@ struct ProvisionalRuntime {
     spec: RuntimeSpec,
     hub: Option<HubRuntime>,
     outbox: Option<PreparedOutbox>,
+    cache_replica: Option<PreparedCacheReplica>,
     reuse_active_hub: bool,
     allow_degraded_listener: bool,
     listener_error: Option<String>,
-    worker_quiesced: bool,
+    workers_quiesced: bool,
 }
 
 impl ProvisionalRuntime {
@@ -484,14 +585,21 @@ impl ProvisionalRuntime {
         if let Some(outbox) = self.outbox.as_mut() {
             outbox.request_stop();
         }
+        if let Some(cache_replica) = self.cache_replica.as_mut() {
+            cache_replica.request_stop();
+        }
         if let Some(hub) = self.hub.as_mut() {
             hub.request_stop();
         }
     }
 
     async fn stop(mut self) {
+        self.request_stop();
         if let Some(outbox) = self.outbox.take() {
             outbox.stop().await;
+        }
+        if let Some(cache_replica) = self.cache_replica.take() {
+            cache_replica.stop().await;
         }
         if let Some(hub) = self.hub.take() {
             let _ = hub.stop().await;
@@ -656,6 +764,7 @@ impl RuntimeSet {
         } else {
             Some(self.prepare_outbox(&spec)?)
         };
+        let cache_replica = self.prepare_cache_replica(&spec)?;
         // Phase two validates that shutdown or another owner did not change the
         // runtime while slow resources were being prepared.
         let mut inner = self.shared.inner.lock().await;
@@ -666,10 +775,11 @@ impl RuntimeSet {
                 spec,
                 hub,
                 outbox,
+                cache_replica,
                 reuse_active_hub,
                 allow_degraded_listener,
                 listener_error,
-                worker_quiesced: false,
+                workers_quiesced: false,
             }
             .stop()
             .await;
@@ -688,10 +798,11 @@ impl RuntimeSet {
                 spec,
                 hub,
                 outbox,
+                cache_replica,
                 reuse_active_hub,
                 allow_degraded_listener,
                 listener_error,
-                worker_quiesced: false,
+                workers_quiesced: false,
             }
             .stop()
             .await;
@@ -704,10 +815,11 @@ impl RuntimeSet {
             spec,
             hub,
             outbox,
+            cache_replica,
             reuse_active_hub,
             allow_degraded_listener,
             listener_error: listener_error.clone(),
-            worker_quiesced: false,
+            workers_quiesced: false,
         });
         Ok(PersistedTransition {
             transition: RuntimeTransition { id },
@@ -719,23 +831,35 @@ impl RuntimeSet {
         &self,
         transition: RuntimeTransition,
     ) -> Result<(), RuntimeError> {
-        let outbox = {
+        let (outbox, cache_replica) = {
             let mut inner = self.shared.inner.lock().await;
             Self::ensure_available(&inner)?;
             Self::provisional(&inner, transition)?;
-            let outbox = inner
+            let (outbox, cache_replica) = inner
                 .active
                 .as_mut()
-                .and_then(|active| active.outbox.take());
-            if outbox.is_some() {
-                Self::provisional_mut(&mut inner, transition)?.worker_quiesced = true;
+                .map(|active| (active.outbox.take(), active.cache_replica.take()))
+                .unwrap_or_default();
+            if outbox.is_some() || cache_replica.is_some() {
+                Self::provisional_mut(&mut inner, transition)?.workers_quiesced = true;
             }
-            outbox
+            (outbox, cache_replica)
         };
-        if let Some(outbox) = outbox {
-            #[cfg(test)]
+        if let Some(outbox) = outbox.as_ref() {
+            outbox.request_stop();
+        }
+        if let Some(cache_replica) = cache_replica.as_ref() {
+            cache_replica.request_stop();
+        }
+        #[cfg(test)]
+        if outbox.is_some() || cache_replica.is_some() {
             self.pause_quiesce_before_join().await;
+        }
+        if let Some(outbox) = outbox {
             outbox.stop().await;
+        }
+        if let Some(cache_replica) = cache_replica {
+            cache_replica.stop().await;
         }
         #[cfg(test)]
         if self.shared.fail_next_quiesce.swap(false, Ordering::SeqCst) {
@@ -777,7 +901,7 @@ impl RuntimeSet {
         let (provisional, restore_spec) = {
             let mut inner = self.shared.inner.lock().await;
             let provisional = Self::take_provisional(&mut inner, transition)?;
-            let restore_spec = provisional.worker_quiesced.then(|| {
+            let restore_spec = provisional.workers_quiesced.then(|| {
                 inner
                     .active
                     .as_ref()
@@ -788,19 +912,38 @@ impl RuntimeSet {
         };
         provisional.stop().await;
         if let Some(restore_spec) = restore_spec.transpose()? {
-            let outbox = self.prepare_outbox(&restore_spec)?.activate()?;
+            let mut outbox = Some(self.prepare_outbox(&restore_spec)?.activate()?);
+            let mut cache_replica = self
+                .prepare_cache_replica(&restore_spec)?
+                .map(PreparedCacheReplica::activate)
+                .transpose()?;
             let mut inner = self.shared.inner.lock().await;
             let active = inner.active.as_mut().ok_or_else(|| {
                 RuntimeError::Invariant("runtime disappeared during abort".into())
             })?;
-            if active.spec != restore_spec || active.outbox.is_some() {
+            if active.spec != restore_spec
+                || active.outbox.is_some()
+                || active.cache_replica.is_some()
+            {
                 drop(inner);
-                outbox.stop().await;
+                if let Some(outbox) = outbox.as_ref() {
+                    outbox.request_stop();
+                }
+                if let Some(cache_replica) = cache_replica.as_ref() {
+                    cache_replica.request_stop();
+                }
+                if let Some(outbox) = outbox.take() {
+                    outbox.stop().await;
+                }
+                if let Some(cache_replica) = cache_replica.take() {
+                    cache_replica.stop().await;
+                }
                 return Err(RuntimeError::Invariant(
                     "runtime changed while aborting its transition".into(),
                 ));
             }
-            active.outbox = Some(outbox);
+            active.outbox = outbox;
+            active.cache_replica = cache_replica;
         }
         Ok(())
     }
@@ -850,11 +993,20 @@ impl RuntimeSet {
             Some(result) => Some(result?),
             None => None,
         };
+        let cache_replica = match provisional
+            .cache_replica
+            .take()
+            .map(PreparedCacheReplica::activate)
+        {
+            Some(result) => Some(result?),
+            None => None,
+        };
         let role_version = provisional.spec.role_version();
         let active = ActiveRuntime {
             spec: provisional.spec,
             hub,
             outbox,
+            cache_replica,
             hub_reachable: false,
             listener_error: listener_error.clone(),
         };
@@ -909,6 +1061,10 @@ impl RuntimeSet {
                 .outbox
                 .as_ref()
                 .is_some_and(OutboxRuntime::is_running),
+            cache_replica_running: active
+                .cache_replica
+                .as_ref()
+                .is_some_and(CacheReplicaRuntime::is_running),
             hub_reachable: active.hub_reachable,
             listener_error,
             ownership_held: inner.lease.is_some(),
@@ -1210,6 +1366,43 @@ impl RuntimeSet {
                 task: Some(task),
             }),
         })
+    }
+
+    fn prepare_cache_replica(
+        &self,
+        spec: &RuntimeSpec,
+    ) -> Result<Option<PreparedCacheReplica>, RuntimeError> {
+        let RuntimeSpec::ConnectedDevice {
+            hub, cache_level, ..
+        } = spec
+        else {
+            return Ok(None);
+        };
+        let worker = CacheReplica::new(
+            self.shared.state.db_path().to_path_buf(),
+            hub.clone(),
+            *cache_level,
+            self.shared.hub_capabilities.changes(),
+            self.shared.hub_capabilities.payloads(),
+        )
+        .with_role_epoch(spec.role_version().value())
+        .with_clock(Arc::clone(&self.shared.dependencies.clock))
+        .with_observer(Arc::clone(&self.shared.dependencies.observer));
+        let (start, start_receiver) = oneshot::channel();
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            if start_receiver.await.is_ok() {
+                worker.run(worker_cancellation).await;
+            }
+        });
+        Ok(Some(PreparedCacheReplica {
+            start: Some(start),
+            runtime: Some(CacheReplicaRuntime {
+                cancellation,
+                task: Some(task),
+            }),
+        }))
     }
 
     async fn prepare_hub(&self, spec: &RuntimeSpec) -> Result<HubRuntime, RuntimeError> {

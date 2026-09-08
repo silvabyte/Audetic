@@ -126,6 +126,22 @@ impl WorkerProbe {
             .count()
     }
 
+    pub(super) fn successful_cache_cycles(&self, role_epoch: u64) -> usize {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    WorkerEvent::CacheReplicaCycleSucceeded {
+                        role_epoch: event_epoch
+                    } if *event_epoch == role_epoch
+                )
+            })
+            .count()
+    }
+
     pub(super) async fn wait_for(&self, predicate: impl Fn(&[WorkerEvent]) -> bool) {
         watchdog("waiting for worker event", async {
             loop {

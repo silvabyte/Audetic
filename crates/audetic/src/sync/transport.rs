@@ -278,8 +278,8 @@ impl HubCapabilities {
         self.mutations.as_ref()
     }
 
-    pub fn payloads(&self) -> &dyn RemotePayloadSource {
-        self.payloads.as_ref()
+    pub fn payloads(&self) -> Arc<dyn RemotePayloadSource> {
+        Arc::clone(&self.payloads)
     }
 
     pub fn changes(&self) -> Arc<dyn HubChangeSource> {
@@ -327,6 +327,10 @@ mod tests {
         ];
 
         assert!(pointers.windows(2).all(|pair| pair[0] == pair[1]));
+        assert_eq!(
+            Arc::as_ptr(&capabilities.payloads()) as *const (),
+            pointers[0]
+        );
     }
 
     #[test]
