@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use audetic_core::sync::{CacheLevel, HubId, PayloadAvailability, RecordId};
 use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
+use tokio_util::sync::CancellationToken;
 
 use std::collections::HashSet;
 use std::fs::File;
@@ -130,12 +131,31 @@ impl VerifiedCacheBlob {
     }
 
     /// Recover a file published before its database registration committed.
+    #[cfg(test)]
     pub(crate) fn recover_published_for_db(
         db_path: &Path,
         source_hub_id: HubId,
         checksum: String,
         byte_size: u64,
         media_type: String,
+    ) -> Result<Option<Self>> {
+        Self::recover_published_for_db_cancellable(
+            db_path,
+            source_hub_id,
+            checksum,
+            byte_size,
+            media_type,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub(crate) fn recover_published_for_db_cancellable(
+        db_path: &Path,
+        source_hub_id: HubId,
+        checksum: String,
+        byte_size: u64,
+        media_type: String,
+        cancellation: &CancellationToken,
     ) -> Result<Option<Self>> {
         validate_blob_metadata(byte_size, &media_type)?;
         let local_path = cache_blob_path_for_db(db_path, source_hub_id, &checksum)?;
@@ -149,7 +169,7 @@ impl VerifiedCacheBlob {
             byte_size,
             media_type,
         };
-        blob.verify()?;
+        blob.verify_cancellable(cancellation)?;
         Ok(Some(blob))
     }
 
@@ -157,10 +177,20 @@ impl VerifiedCacheBlob {
         self.byte_size == byte_size
     }
 
+    #[cfg(test)]
     pub(crate) fn verify(&self) -> Result<()> {
+        self.verify_cancellable(&CancellationToken::new())
+    }
+
+    pub(crate) fn verify_cancellable(&self, cancellation: &CancellationToken) -> Result<()> {
         validate_cache_blob_path(self)?;
         validate_blob_metadata(self.byte_size, &self.media_type)?;
-        verify_blob_file(&self.local_path, &self.checksum, self.byte_size)
+        verify_blob_file_cancellable(
+            &self.local_path,
+            &self.checksum,
+            self.byte_size,
+            cancellation,
+        )
     }
 }
 
@@ -465,11 +495,25 @@ impl LibraryCacheStore {
         source_hub_id: HubId,
         generation_id: i64,
     ) -> Result<VerifiedCacheGeneration> {
+        Self::verify_complete_generation_cancellable(
+            conn,
+            source_hub_id,
+            generation_id,
+            &CancellationToken::new(),
+        )
+    }
+
+    pub(crate) fn verify_complete_generation_cancellable(
+        conn: &Connection,
+        source_hub_id: HubId,
+        generation_id: i64,
+        cancellation: &CancellationToken,
+    ) -> Result<VerifiedCacheGeneration> {
         let generation = Self::generation(conn, source_hub_id, generation_id)?
             .context("Library Cache generation does not exist for this source Hub")?;
         validate_complete_generation(&generation)?;
         let blobs = if generation.level == CacheLevel::TextAndAvailableAudio {
-            verify_generation_blob_files(conn, &generation)?
+            verify_generation_blob_files(conn, &generation, cancellation)?
         } else {
             Vec::new()
         };
@@ -740,6 +784,18 @@ impl LibraryCacheStore {
         validate_blob_metadata(blob.byte_size, &blob.media_type)?;
         validate_cache_blob_path(blob)?;
         verify_blob_file(&blob.local_path, &blob.checksum, blob.byte_size)?;
+        Self::register_preverified_blob(conn, blob)
+    }
+
+    pub(crate) fn register_preverified_blob(
+        conn: &mut Connection,
+        blob: &VerifiedCacheBlob,
+    ) -> Result<()> {
+        if !is_canonical_sha256(&blob.checksum) {
+            bail!("verified cache blob checksum is not canonical SHA-256");
+        }
+        validate_blob_metadata(blob.byte_size, &blob.media_type)?;
+        validate_cache_blob_path(blob)?;
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("starting verified cache blob registration")?;
@@ -1522,10 +1578,17 @@ fn validate_complete_generation(generation: &CacheGeneration) -> Result<()> {
 fn verify_generation_blob_files(
     conn: &Connection,
     generation: &CacheGeneration,
+    cancellation: &CancellationToken,
 ) -> Result<Vec<GenerationBlobVerification>> {
     let blobs = generation_blob_verifications(conn, generation)?;
     for blob in &blobs {
-        verify_blob_file(&blob.local_path, &blob.checksum, blob.byte_size).with_context(|| {
+        verify_blob_file_cancellable(
+            &blob.local_path,
+            &blob.checksum,
+            blob.byte_size,
+            cancellation,
+        )
+        .with_context(|| {
             format!(
                 "verifying full-audio cache blob for checksum {}",
                 blob.checksum
@@ -1664,12 +1727,29 @@ fn verify_blob_file(
     expected_checksum: &str,
     expected_size: u64,
 ) -> Result<()> {
+    verify_blob_file_cancellable(
+        path,
+        expected_checksum,
+        expected_size,
+        &CancellationToken::new(),
+    )
+}
+
+fn verify_blob_file_cancellable(
+    path: &std::path::Path,
+    expected_checksum: &str,
+    expected_size: u64,
+    cancellation: &CancellationToken,
+) -> Result<()> {
     let mut file =
         File::open(path).with_context(|| format!("opening cache blob {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut size = 0u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
+        if cancellation.is_cancelled() {
+            bail!("cache blob verification cancelled");
+        }
         let read = file
             .read(&mut buffer)
             .with_context(|| format!("reading cache blob {}", path.display()))?;

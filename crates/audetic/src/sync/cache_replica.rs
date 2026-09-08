@@ -400,21 +400,20 @@ impl CacheReplica {
         }
         let db_path = self.db_path.clone();
         let generation_id = generation.id;
-        let verification = tokio::select! {
-            biased;
-            _ = cancellation.cancelled() => return Ok(RefreshOutcome::Cancelled),
-            result = tokio::task::spawn_blocking(move || {
+        let Some(verification) =
+            run_blocking_cancellable(cancellation, move |verification_cancellation| {
                 let connection = crate::db::open_db_at(&db_path)?;
-                LibraryCacheStore::verify_complete_generation(
+                LibraryCacheStore::verify_complete_generation_cancellable(
                     &connection,
                     source,
                     generation_id,
+                    &verification_cancellation,
                 )
-            }) => result.context("joining Library Cache blob verification")??,
-        };
-        if cancellation.is_cancelled() {
+            })
+            .await?
+        else {
             return Ok(RefreshOutcome::Cancelled);
-        }
+        };
         let mut connection = crate::db::open_db_at(&self.db_path)?;
         LibraryCacheStore::activate_verified_generation(&mut connection, &verification)?;
         Ok(RefreshOutcome::Completed)
@@ -449,15 +448,27 @@ impl CacheReplica {
             if cancellation.is_cancelled() {
                 return Ok(RefreshOutcome::Cancelled);
             }
-            if self.reuse_registered_blob(generation.source_hub_id, &group)? {
+            let Some(reused) = self
+                .reuse_registered_blob(generation.source_hub_id, &group, cancellation)
+                .await?
+            else {
+                return Ok(RefreshOutcome::Cancelled);
+            };
+            if reused {
                 continue;
             }
-            if let Some(blob) = self.recover_unregistered_blob(generation.source_hub_id, &group)? {
+            let Some(recovered) = self
+                .recover_unregistered_blob(generation.source_hub_id, &group, cancellation)
+                .await?
+            else {
+                return Ok(RefreshOutcome::Cancelled);
+            };
+            if let Some(blob) = recovered {
                 if cancellation.is_cancelled() {
                     return Ok(RefreshOutcome::Cancelled);
                 }
                 let mut connection = crate::db::open_db_at(&self.db_path)?;
-                LibraryCacheStore::register_verified_blob(&mut connection, &blob)?;
+                LibraryCacheStore::register_preverified_blob(&mut connection, &blob)?;
                 continue;
             }
             match self
@@ -480,48 +491,63 @@ impl CacheReplica {
         Ok(RefreshOutcome::Completed)
     }
 
-    fn reuse_registered_blob(
+    async fn reuse_registered_blob(
         &self,
         source: audetic_core::sync::HubId,
         group: &BlobClaimGroup,
-    ) -> Result<bool> {
+        cancellation: &CancellationToken,
+    ) -> Result<Option<bool>> {
         let connection = crate::db::open_db_at(&self.db_path)?;
         let Some(blob) = LibraryCacheStore::verified_blob(&connection, source, &group.checksum)?
         else {
-            return Ok(false);
+            return Ok(Some(false));
         };
-        Ok(blob.has_byte_size(group.byte_size) && blob.verify().is_ok())
+        if !blob.has_byte_size(group.byte_size) {
+            return Ok(Some(false));
+        }
+        run_blocking_cancellable(cancellation, move |verification_cancellation| {
+            Ok(blob.verify_cancellable(&verification_cancellation).is_ok())
+        })
+        .await
     }
 
-    fn recover_unregistered_blob(
+    async fn recover_unregistered_blob(
         &self,
         source: audetic_core::sync::HubId,
         group: &BlobClaimGroup,
-    ) -> Result<Option<VerifiedCacheBlob>> {
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Option<VerifiedCacheBlob>>> {
         let media_type = group
             .representatives
             .first()
             .context("cache blob group has no representative")?
             .media_type
             .clone();
-        let recovered = match VerifiedCacheBlob::recover_published_for_db(
-            &self.db_path,
-            source,
-            group.checksum.clone(),
-            group.byte_size,
-            media_type,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    checksum = %group.checksum,
-                    "source-scoped cache file needs repair"
-                );
-                None
-            }
-        };
-        Ok(recovered)
+        let db_path = self.db_path.clone();
+        let checksum = group.checksum.clone();
+        let byte_size = group.byte_size;
+        run_blocking_cancellable(cancellation, move |verification_cancellation| {
+            let recovered = match VerifiedCacheBlob::recover_published_for_db_cancellable(
+                &db_path,
+                source,
+                checksum.clone(),
+                byte_size,
+                media_type,
+                &verification_cancellation,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        %checksum,
+                        "source-scoped cache file needs repair"
+                    );
+                    None
+                }
+            };
+            Ok(recovered)
+        })
+        .await
     }
 
     async fn download_blob(
@@ -589,7 +615,7 @@ impl CacheReplica {
                 return Ok(PayloadOutcome::Cancelled);
             }
             let mut connection = crate::db::open_db_at(&self.db_path)?;
-            LibraryCacheStore::register_verified_blob(&mut connection, &blob)?;
+            LibraryCacheStore::register_preverified_blob(&mut connection, &blob)?;
             return Ok(PayloadOutcome::Registered);
         }
         Ok(PayloadOutcome::SnapshotAdvanced)
@@ -688,6 +714,33 @@ fn group_blob_claims(claims: Vec<CacheBlobClaim>) -> Result<Vec<BlobClaimGroup>>
         }
     }
     Ok(groups)
+}
+
+async fn run_blocking_cancellable<T, F>(
+    cancellation: &CancellationToken,
+    operation: F,
+) -> Result<Option<T>>
+where
+    T: Send + 'static,
+    F: FnOnce(CancellationToken) -> Result<T> + Send + 'static,
+{
+    let verification_cancellation = cancellation.clone();
+    let mut task = tokio::task::spawn_blocking(move || operation(verification_cancellation));
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => {
+            let _ = task.await;
+            Ok(None)
+        }
+        result = &mut task => {
+            let value = result.context("joining Library Cache file verification")??;
+            if cancellation.is_cancelled() {
+                Ok(None)
+            } else {
+                Ok(Some(value))
+            }
+        }
+    }
 }
 
 fn cache_retry_delay(attempts: u32, jitter: u64) -> Duration {

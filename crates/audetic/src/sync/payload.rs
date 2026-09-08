@@ -4,7 +4,7 @@ use fs2::FileExt;
 use futures_util::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
 use std::fs::{File, OpenOptions};
@@ -362,7 +362,7 @@ impl BlobStore {
         }
 
         if final_path.is_file() {
-            match verify_file(&final_path, checksum, expected_size) {
+            match verify_file_async(&final_path, checksum, expected_size).await {
                 Ok(()) => {
                     tokio::fs::remove_file(&temp)
                         .await
@@ -398,7 +398,7 @@ impl BlobStore {
         match tokio::fs::rename(&temp, &final_path).await {
             Ok(()) => {}
             Err(_error) if final_path.is_file() => {
-                match verify_file(&final_path, checksum, expected_size) {
+                match verify_file_async(&final_path, checksum, expected_size).await {
                     Ok(()) => {
                         let _ = tokio::fs::remove_file(&temp).await;
                         return Ok(stored_blob(
@@ -488,6 +488,31 @@ fn verify_file(path: &Path, expected_checksum: &str, expected_size: u64) -> Resu
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer).context("reading canonical blob")?;
+        if read == 0 {
+            break;
+        }
+        size += read as u64;
+        hasher.update(&buffer[..read]);
+    }
+    let checksum = format!("{:x}", hasher.finalize());
+    if size != expected_size || checksum != expected_checksum {
+        bail!("existing canonical blob failed verification");
+    }
+    Ok(())
+}
+
+async fn verify_file_async(path: &Path, expected_checksum: &str, expected_size: u64) -> Result<()> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .context("opening existing canonical blob")?;
+    let mut hasher = Sha256::new();
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .await
+            .context("reading canonical blob")?;
         if read == 0 {
             break;
         }
