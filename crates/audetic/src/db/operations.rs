@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use rusqlite::Connection;
+use uuid::Uuid;
 
 use super::schemas::{VoiceToTextData, Workflow, WorkflowData, WorkflowType};
+use super::sync::SyncRepository;
 
 pub fn insert_workflow(conn: &Connection, workflow: &Workflow) -> Result<i64> {
     let (workflow_type_str, _json_data) = workflow.to_row()?;
@@ -10,10 +12,14 @@ pub fn insert_workflow(conn: &Connection, workflow: &Workflow) -> Result<i64> {
     let (text, audio_path) = match &workflow.data {
         WorkflowData::VoiceToText(data) => (&data.text, &data.audio_path),
     };
+    let sync_id = Uuid::new_v4().to_string();
+    let origin_node_id = SyncRepository::node_id(conn)?;
 
     conn.execute(
-        "INSERT INTO workflows (workflow_type, text, audio_path) VALUES (?1, ?2, ?3)",
-        rusqlite::params![workflow_type_str, text, audio_path],
+        "INSERT INTO workflows \
+         (workflow_type, text, audio_path, sync_id, sync_revision, origin_node_id) \
+         VALUES (?1, ?2, ?3, ?4, 0, ?5)",
+        rusqlite::params![workflow_type_str, text, audio_path, sync_id, origin_node_id],
     )
     .context("Failed to insert workflow")?;
 
@@ -22,7 +28,11 @@ pub fn insert_workflow(conn: &Connection, workflow: &Workflow) -> Result<i64> {
 
 pub fn get_recent_workflows(conn: &Connection, limit: usize) -> Result<Vec<Workflow>> {
     let mut stmt = conn
-        .prepare("SELECT id, workflow_type, text, audio_path, created_at FROM workflows ORDER BY created_at DESC LIMIT ?1")
+        .prepare(
+            "SELECT id, workflow_type, text, audio_path, created_at, \
+             sync_id, sync_revision, origin_node_id \
+             FROM workflows ORDER BY created_at DESC LIMIT ?1",
+        )
         .context("Failed to prepare query")?;
 
     let workflows = stmt
@@ -32,6 +42,9 @@ pub fn get_recent_workflows(conn: &Connection, limit: usize) -> Result<Vec<Workf
             let text: String = row.get(2)?;
             let audio_path: String = row.get(3)?;
             let created_at: String = row.get(4)?;
+            let sync_id: String = row.get(5)?;
+            let sync_revision: i64 = row.get(6)?;
+            let origin_node_id: String = row.get(7)?;
 
             // Reconstruct the WorkflowData from the database fields
             let data = WorkflowData::VoiceToText(VoiceToTextData { text, audio_path });
@@ -44,6 +57,9 @@ pub fn get_recent_workflows(conn: &Connection, limit: usize) -> Result<Vec<Workf
                 workflow_type: workflow_type_enum,
                 data,
                 created_at: Some(created_at),
+                sync_id: Some(sync_id),
+                sync_revision,
+                origin_node_id: Some(origin_node_id),
             })
         })
         .context("Failed to query workflows")?
@@ -89,7 +105,8 @@ pub fn search_workflows(
     date_to: Option<&str>,
     limit: usize,
 ) -> Result<Vec<Workflow>> {
-    let mut sql = "SELECT id, workflow_type, text, audio_path, created_at FROM workflows WHERE 1=1"
+    let mut sql = "SELECT id, workflow_type, text, audio_path, created_at, \
+                   sync_id, sync_revision, origin_node_id FROM workflows WHERE 1=1"
         .to_string();
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -124,6 +141,9 @@ pub fn search_workflows(
             let text: String = row.get(2)?;
             let audio_path: String = row.get(3)?;
             let created_at: String = row.get(4)?;
+            let sync_id: String = row.get(5)?;
+            let sync_revision: i64 = row.get(6)?;
+            let origin_node_id: String = row.get(7)?;
 
             let data = WorkflowData::VoiceToText(VoiceToTextData { text, audio_path });
 
@@ -135,6 +155,9 @@ pub fn search_workflows(
                 workflow_type: workflow_type_enum,
                 data,
                 created_at: Some(created_at),
+                sync_id: Some(sync_id),
+                sync_revision,
+                origin_node_id: Some(origin_node_id),
             })
         })
         .context("Failed to execute search query")?

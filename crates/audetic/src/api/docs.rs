@@ -8,7 +8,7 @@ use utoipa::OpenApi;
 
 use super::routes::{
     agents, history, keybind, logs, meeting_artifacts, meetings, models, post_processing, provider,
-    recording, setup, summary_templates, system, transcribe,
+    recording, setup, summary_templates, sync, system, transcribe,
 };
 
 #[derive(OpenApi)]
@@ -54,6 +54,7 @@ use super::routes::{
         transcribe::transcribe,
         // System
         setup::get_setup,
+        sync::get_status,
         system::get_deps,
         system::restart_daemon,
         system::start_install_ffmpeg,
@@ -132,6 +133,8 @@ use super::routes::{
         audetic_core::setup::PlatformInfo,
         audetic_core::setup::WorkflowReadiness,
         audetic_core::setup::SetupAssessment,
+        audetic_core::config::SyncRole,
+        audetic_core::sync::SyncStatus,
         system::SystemDeps,
         system::RestartAccepted,
         system::InstallPhase,
@@ -195,6 +198,7 @@ use super::routes::{
         (name = "transcribe", description = "One-shot file transcription"),
         (name = "system", description = "External tool / dependency availability"),
         (name = "setup", description = "Unified host setup assessment"),
+        (name = "sync", description = "Local synchronization identity and status"),
         (name = "update", description = "Daemon self-update"),
         (name = "logs", description = "Application and transcription logs"),
         (name = "post_processing", description = "User-defined commands fired on daemon events"),
@@ -260,6 +264,7 @@ mod tests {
             paths::TRANSCRIBE,
             paths::SETUP,
             paths::SYSTEM_RESTART,
+            paths::SYNC_STATUS,
             paths::KEYBIND_STATUS,
             paths::KEYBIND_INSTALL,
             paths::KEYBIND,
@@ -283,6 +288,44 @@ mod tests {
         assert!(spec["components"]["schemas"]["SetupAssessment"].is_object());
         assert!(spec["components"]["schemas"]["SetupCapabilityId"].is_object());
         assert!(spec["components"]["schemas"]["SetupState"].is_object());
+    }
+
+    #[test]
+    fn sync_status_operation_and_types_are_registered() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert_eq!(
+            spec["paths"][paths::SYNC_STATUS]["get"]["operationId"],
+            "get_sync_status"
+        );
+        assert!(spec["components"]["schemas"]["SyncStatus"].is_object());
+        assert!(spec["components"]["schemas"]["SyncRole"].is_object());
+        assert!(
+            spec["paths"][paths::SYNC_STATUS]["get"]["responses"]["200"]["content"]
+                ["application/json"]["schema"]["$ref"]
+                .as_str()
+                .is_some_and(|reference| reference.ends_with("/SyncStatus"))
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["SyncRole"]["enum"],
+            serde_json::json!(["standalone", "hub", "client"])
+        );
+        assert!(
+            spec["components"]["schemas"]["SyncStatus"]["properties"]["role"]["$ref"]
+                .as_str()
+                .is_some_and(|reference| reference.ends_with("/SyncRole"))
+        );
+        assert_eq!(
+            spec["components"]["schemas"]["SyncStatus"]["properties"]["node_id"]["type"],
+            "string"
+        );
+        for field in ["role", "node_id"] {
+            assert!(spec["components"]["schemas"]["SyncStatus"]["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|required| required == field));
+        }
     }
 
     #[test]

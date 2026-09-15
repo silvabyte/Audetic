@@ -3,6 +3,7 @@
 mod command;
 
 use anyhow::{anyhow, Context, Result};
+use audetic_core::sync::SyncStatus;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{error, info, warn};
 
@@ -282,6 +283,27 @@ pub async fn run_service() -> Result<()> {
     // server. It carries the database path so every dispatched job reads the
     // same store as the daemon and tests can use an isolated store.
     let db_path = crate::global::db_file()?;
+    let conn = crate::db::init_db_at(&db_path).context("Failed to initialize Audetic database")?;
+    let node_id = crate::db::sync::SyncRepository::node_id(&conn)?;
+
+    // Sweep meetings a previous daemon left mid-pipeline (recording /
+    // review / compressing / transcribing) into `error` before anything can
+    // accept new work. The machine's state died with the old process, so
+    // those rows would otherwise show "transcribing" forever; as `error`
+    // they surface the interruption and the retry endpoint can re-submit
+    // the audio still on disk. Failure to sweep is non-fatal because the
+    // durable sync identity has already been initialized successfully.
+    match crate::db::meetings::MeetingRepository::sweep_interrupted(&conn) {
+        Ok(0) => {}
+        Ok(n) => warn!(
+            "Marked {} meeting(s) interrupted by a previous daemon shutdown as errored; \
+             they can be retried from the meetings list",
+            n
+        ),
+        Err(e) => warn!("Failed to sweep interrupted meetings: {e:#}"),
+    }
+    drop(conn);
+
     let post_processing = Arc::new(PostProcessingService::new(db_path.clone()));
 
     let status_handle = RecordingStatusHandle::default();
@@ -297,25 +319,6 @@ pub async fn run_service() -> Result<()> {
         status_handle.clone(),
         Arc::clone(&post_processing),
     );
-
-    // Sweep meetings a previous daemon left mid-pipeline (recording /
-    // review / compressing / transcribing) into `error` before anything can
-    // accept new work. The machine's state died with the old process, so
-    // those rows would otherwise show "transcribing" forever; as `error`
-    // they surface the interruption and the retry endpoint can re-submit
-    // the audio still on disk. Failure to sweep is non-fatal — worst case
-    // the stale rows remain, which is exactly the status quo without it.
-    match crate::db::init_db()
-        .and_then(|conn| crate::db::meetings::MeetingRepository::sweep_interrupted(&conn))
-    {
-        Ok(0) => {}
-        Ok(n) => warn!(
-            "Marked {} meeting(s) interrupted by a previous daemon shutdown as errored; \
-             they can be retried from the meetings list",
-            n
-        ),
-        Err(e) => warn!("Failed to sweep interrupted meetings: {e:#}"),
-    }
 
     // Meeting pipeline (independent from recording pipeline). `meetings_dir`,
     // the media inspector, and the post-processing service all live at the
@@ -341,6 +344,10 @@ pub async fn run_service() -> Result<()> {
         status_handle.clone(),
         &config,
         Arc::clone(&post_processing),
+        SyncStatus {
+            role: config.sync.role,
+            node_id,
+        },
     )
     .with_meeting_state(
         meeting_status.clone(),

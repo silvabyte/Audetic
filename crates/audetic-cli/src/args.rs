@@ -36,6 +36,20 @@ pub enum CliCommand {
     Meeting(MeetingCliArgs),
     /// Manage post-processing jobs (run commands on daemon events)
     PostProcessing(PostProcessingCliArgs),
+    /// Inspect synchronization state
+    Sync(SyncCliArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct SyncCliArgs {
+    #[command(subcommand)]
+    pub command: SyncCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SyncCommand {
+    /// Show synchronization role and durable node identity
+    Status,
 }
 
 #[derive(ClapArgs, Debug)]
@@ -379,6 +393,18 @@ mod tests {
 
         assert!(help.contains("validates initialization"));
         assert!(!help.contains("records brief sample"));
+    }
+
+    #[test]
+    fn sync_status_command_parses() {
+        let cli = Cli::try_parse_from(["audetic", "sync", "status"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Sync(SyncCliArgs {
+                command: SyncCommand::Status,
+            }))
+        ));
     }
 }
 

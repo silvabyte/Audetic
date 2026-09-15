@@ -18,6 +18,7 @@ mod models;
 mod post_processing;
 mod provider;
 mod setup;
+mod sync;
 mod transcribe;
 
 use anyhow::Result;
@@ -52,6 +53,7 @@ async fn main() -> Result<()> {
         Some(CliCommand::PostProcessing(args)) => {
             post_processing::handle_post_processing_command(args).await
         }
+        Some(CliCommand::Sync(args)) => sync::handle_sync_command(args).await,
         None => {
             use clap::CommandFactory;
             Cli::command().print_help()?;

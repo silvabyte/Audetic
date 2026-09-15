@@ -19,6 +19,7 @@ pub mod static_assets;
 pub use audetic_core::url;
 
 use anyhow::Result;
+use audetic_core::sync::SyncStatus;
 use axum::{
     extract::Request,
     http::{header, HeaderValue, Method, StatusCode},
@@ -65,6 +66,7 @@ pub struct ApiServer {
     meeting_state: Option<routes::meetings::MeetingState>,
     post_processing_state: routes::post_processing::PostProcessingApiState,
     runtime_provider: crate::config::WhisperConfig,
+    sync_state: routes::sync::SyncApiState,
     instance_id: ProcessInstanceId,
 }
 
@@ -74,6 +76,7 @@ impl ApiServer {
         status: crate::audio::RecordingStatusHandle,
         config: &Config,
         post_processing: std::sync::Arc<PostProcessingService>,
+        sync_status: SyncStatus,
     ) -> Self {
         Self {
             port: url::DEFAULT_PORT,
@@ -87,6 +90,7 @@ impl ApiServer {
                 service: post_processing,
             },
             runtime_provider: config.whisper.clone(),
+            sync_state: routes::sync::SyncApiState::new(sync_status),
             instance_id: ProcessInstanceId(uuid::Uuid::new_v4().to_string()),
         }
     }
@@ -144,6 +148,7 @@ impl ApiServer {
             .merge(routes::transcribe::router())
             .merge(routes::agents::router())
             .merge(routes::summary_templates::router())
+            .merge(routes::sync::router(self.sync_state))
             .merge(routes::meeting_artifacts::router())
             .merge(routes::post_processing::router(self.post_processing_state))
             .layer(Extension(self.instance_id));

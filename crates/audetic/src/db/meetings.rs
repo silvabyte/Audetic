@@ -4,10 +4,13 @@
 //! `operations.rs` — raw SQL with rusqlite, no ORM.
 
 use anyhow::{Context, Result};
+use audetic_core::jobs_client::Segment;
 use rusqlite::{params, Connection, OptionalExtension};
+use uuid::Uuid;
 
 use crate::meeting::status::MeetingPhase;
-use audetic_core::jobs_client::Segment;
+
+use super::sync::SyncRepository;
 
 /// Result of a soft-delete attempt, so the API can answer with the right
 /// status code (200 / 404 / 409).
@@ -48,6 +51,9 @@ pub struct MeetingRecord {
     /// API surface (list, detail, audio, retry). The row and on-disk audio
     /// survive; recovery is a manual DB edit.
     pub deleted_at: Option<String>,
+    pub sync_id: String,
+    pub sync_revision: i64,
+    pub origin_node_id: String,
 }
 
 /// Repository for meeting records.
@@ -81,17 +87,23 @@ impl MeetingRepository {
         let source_filename = source_filename
             .map(str::trim)
             .filter(|filename| !filename.is_empty());
+        let sync_id = Uuid::new_v4().to_string();
+        let origin_node_id = SyncRepository::node_id(conn)?;
         conn.execute(
             "INSERT INTO meetings \
-             (title, title_source, title_updated_at, status, audio_path, source_filename) \
+             (title, title_source, title_updated_at, status, audio_path, source_filename, \
+              sync_id, sync_revision, origin_node_id) \
              VALUES (?1, CASE WHEN ?1 IS NULL THEN NULL ELSE 'manual' END, \
-                     CASE WHEN ?1 IS NULL THEN NULL \
-                          ELSE strftime('%Y-%m-%d %H:%M:%f', 'now') END, ?2, ?3, ?4)",
+                      CASE WHEN ?1 IS NULL THEN NULL \
+                           ELSE strftime('%Y-%m-%d %H:%M:%f', 'now') END, \
+                      ?2, ?3, ?4, ?5, 0, ?6)",
             params![
                 title,
                 MeetingPhase::Recording.as_str(),
                 audio_path,
-                source_filename
+                source_filename,
+                sync_id,
+                origin_node_id,
             ],
         )
         .context("Failed to insert meeting")?;
@@ -102,7 +114,7 @@ impl MeetingRepository {
     /// Update the meeting status.
     pub fn update_status(conn: &Connection, id: i64, phase: MeetingPhase) -> Result<()> {
         conn.execute(
-            "UPDATE meetings SET status = ?1 WHERE id = ?2",
+            "UPDATE meetings SET status = ?1, sync_revision = sync_revision + 1 WHERE id = ?2",
             params![phase.as_str(), id],
         )
         .context("Failed to update meeting status")?;
@@ -115,7 +127,8 @@ impl MeetingRepository {
     /// `MeetingMachine::confirm`.
     pub fn set_review(conn: &Connection, id: i64, duration_seconds: i64) -> Result<()> {
         conn.execute(
-            "UPDATE meetings SET status = ?1, duration_seconds = ?2 WHERE id = ?3",
+            "UPDATE meetings SET status = ?1, duration_seconds = ?2, \
+             sync_revision = sync_revision + 1 WHERE id = ?3",
             params![MeetingPhase::Review.as_str(), duration_seconds, id],
         )
         .context("Failed to mark meeting for review")?;
@@ -127,7 +140,7 @@ impl MeetingRepository {
     /// at the file that actually exists on disk so retries can find it.
     pub fn update_audio_path(conn: &Connection, id: i64, audio_path: &str) -> Result<()> {
         conn.execute(
-            "UPDATE meetings SET audio_path = ?1 WHERE id = ?2",
+            "UPDATE meetings SET audio_path = ?1, sync_revision = sync_revision + 1 WHERE id = ?2",
             params![audio_path, id],
         )
         .context("Failed to update meeting audio_path")?;
@@ -146,7 +159,8 @@ impl MeetingRepository {
                  title = ?1, \
                  title_source = 'manual', \
                  title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
-                 title_version = title_version + 1 \
+                 title_version = title_version + 1, \
+                 sync_revision = sync_revision + 1 \
                  WHERE id = ?2 AND deleted_at IS NULL",
                 params![title, id],
             )
@@ -170,7 +184,8 @@ impl MeetingRepository {
         let affected = conn
             .execute(
                 "UPDATE meetings SET title = ?1, title_source = 'generated', \
-                 title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now') \
+                 title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
+                 sync_revision = sync_revision + 1 \
                  WHERE id = ?2 AND deleted_at IS NULL \
                  AND title IS NULL AND title_source IS NULL AND title_version = ?3",
                 params![title, id, title_version],
@@ -186,7 +201,8 @@ impl MeetingRepository {
             .execute(
                 "UPDATE meetings SET title = NULL, title_source = NULL, \
                  title_updated_at = strftime('%Y-%m-%d %H:%M:%f', 'now'), \
-                 title_version = title_version + 1 \
+                 title_version = title_version + 1, \
+                 sync_revision = sync_revision + 1 \
                  WHERE id = ?1 AND deleted_at IS NULL AND status = ?2 \
                  AND transcript_text IS NOT NULL AND trim(transcript_text) <> ''",
                 params![id, MeetingPhase::Completed.as_str()],
@@ -238,8 +254,8 @@ impl MeetingRepository {
             .and_then(|s| serde_json::to_string(s).ok());
         conn.execute(
             "UPDATE meetings SET status = ?1, transcript_path = ?2, transcript_text = ?3, \
-             transcript_segments = ?4, duration_seconds = ?5, error = NULL, \
-             completed_at = CURRENT_TIMESTAMP WHERE id = ?6",
+              transcript_segments = ?4, duration_seconds = ?5, error = NULL, \
+              completed_at = CURRENT_TIMESTAMP, sync_revision = sync_revision + 1 WHERE id = ?6",
             params![
                 MeetingPhase::Completed.as_str(),
                 transcript_path,
@@ -257,7 +273,7 @@ impl MeetingRepository {
     pub fn fail(conn: &Connection, id: i64, error: &str, duration_seconds: i64) -> Result<()> {
         conn.execute(
             "UPDATE meetings SET status = ?1, error = ?2, duration_seconds = ?3, \
-             completed_at = CURRENT_TIMESTAMP WHERE id = ?4",
+              completed_at = CURRENT_TIMESTAMP, sync_revision = sync_revision + 1 WHERE id = ?4",
             params![MeetingPhase::Error.as_str(), error, duration_seconds, id],
         )
         .context("Failed to mark meeting as failed")?;
@@ -293,9 +309,10 @@ impl MeetingRepository {
                 &format!(
                     "UPDATE meetings SET \
                      error = 'Interrupted: the Audetic daemon stopped while this meeting was ' \
-                             || status, \
+                              || status, \
                      status = ?1, \
-                     completed_at = CURRENT_TIMESTAMP \
+                     completed_at = CURRENT_TIMESTAMP, \
+                     sync_revision = sync_revision + 1 \
                      WHERE status NOT IN ('{terminal}') AND deleted_at IS NULL"
                 ),
                 params![MeetingPhase::Error.as_str()],
@@ -316,7 +333,7 @@ impl MeetingRepository {
     pub fn begin_retry(conn: &Connection, id: i64) -> Result<bool> {
         let affected = conn
             .execute(
-                "UPDATE meetings SET status = ?1 \
+                "UPDATE meetings SET status = ?1, sync_revision = sync_revision + 1 \
                  WHERE id = ?2 AND status = ?3 AND deleted_at IS NULL",
                 params![
                     MeetingPhase::Transcribing.as_str(),
@@ -332,7 +349,7 @@ impl MeetingRepository {
     pub fn cancel(conn: &Connection, id: i64, duration_seconds: i64) -> Result<()> {
         conn.execute(
             "UPDATE meetings SET status = ?1, duration_seconds = ?2, \
-             completed_at = CURRENT_TIMESTAMP WHERE id = ?3",
+              completed_at = CURRENT_TIMESTAMP, sync_revision = sync_revision + 1 WHERE id = ?3",
             params![MeetingPhase::Cancelled.as_str(), duration_seconds, id],
         )
         .context("Failed to mark meeting as cancelled")?;
@@ -368,7 +385,8 @@ impl MeetingRepository {
         let affected = conn
             .execute(
                 &format!(
-                    "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP \
+                    "UPDATE meetings SET deleted_at = CURRENT_TIMESTAMP, \
+                     sync_revision = sync_revision + 1 \
                      WHERE id = ?1 AND deleted_at IS NULL AND status IN ('{terminal}')"
                 ),
                 params![id],
@@ -405,7 +423,8 @@ impl MeetingRepository {
             .prepare(
                 "SELECT id, title, title_source, title_version, status, audio_path, source_filename, \
                  transcript_path, transcript_text, duration_seconds, started_at, completed_at, \
-                 error, created_at, deleted_at, transcript_segments \
+                 error, created_at, deleted_at, transcript_segments, \
+                 sync_id, sync_revision, origin_node_id \
                  FROM meetings WHERE id = ?1 AND deleted_at IS NULL",
             )
             .context("Failed to prepare meeting query")?;
@@ -434,6 +453,9 @@ impl MeetingRepository {
                         .get::<_, Option<String>>(15)?
                         .as_deref()
                         .and_then(|json| serde_json::from_str(json).ok()),
+                    sync_id: row.get(16)?,
+                    sync_revision: row.get(17)?,
+                    origin_node_id: row.get(18)?,
                 })
             })
             .context("Failed to query meeting")?;
@@ -451,7 +473,8 @@ impl MeetingRepository {
             .prepare(
                 "SELECT id, title, title_source, title_version, status, audio_path, source_filename, \
                  transcript_path, transcript_text, duration_seconds, started_at, completed_at, \
-                 error, created_at, deleted_at, transcript_segments \
+                 error, created_at, deleted_at, transcript_segments, \
+                 sync_id, sync_revision, origin_node_id \
                  FROM meetings WHERE deleted_at IS NULL \
                  ORDER BY started_at DESC, id DESC LIMIT ?1",
             )
@@ -481,6 +504,9 @@ impl MeetingRepository {
                         .get::<_, Option<String>>(15)?
                         .as_deref()
                         .and_then(|json| serde_json::from_str(json).ok()),
+                    sync_id: row.get(16)?,
+                    sync_revision: row.get(17)?,
+                    origin_node_id: row.get(18)?,
                 })
             })
             .context("Failed to list meetings")?;
@@ -514,6 +540,21 @@ mod tests {
         let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
         assert_eq!(meeting.title.as_deref(), Some("Standup"));
         assert_eq!(meeting.title_source.as_deref(), Some("manual"));
+        Uuid::parse_str(&meeting.sync_id).unwrap();
+        assert_eq!(meeting.sync_revision, 0);
+        assert_eq!(
+            meeting.origin_node_id,
+            SyncRepository::node_id(&conn).unwrap()
+        );
+
+        let second = MeetingRepository::insert(&conn, None, "/tmp/second.wav").unwrap();
+        assert_ne!(
+            MeetingRepository::get(&conn, second)
+                .unwrap()
+                .unwrap()
+                .sync_id,
+            meeting.sync_id
+        );
     }
 
     #[test]
@@ -574,6 +615,23 @@ mod tests {
 
         let meeting = MeetingRepository::get(&conn, id).unwrap().unwrap();
         assert_eq!(meeting.status, "transcribing");
+        assert_eq!(meeting.sync_revision, 1);
+    }
+
+    #[test]
+    fn meeting_mutations_preserve_identity_and_advance_revision() {
+        let conn = setup_db();
+        let id = MeetingRepository::insert(&conn, None, "/tmp/test.wav").unwrap();
+        let initial = MeetingRepository::get(&conn, id).unwrap().unwrap();
+
+        MeetingRepository::set_review(&conn, id, 10).unwrap();
+        MeetingRepository::update_audio_path(&conn, id, "/tmp/test.mp3").unwrap();
+        MeetingRepository::cancel(&conn, id, 10).unwrap();
+
+        let updated = MeetingRepository::get(&conn, id).unwrap().unwrap();
+        assert_eq!(updated.sync_id, initial.sync_id);
+        assert_eq!(updated.origin_node_id, initial.origin_node_id);
+        assert_eq!(updated.sync_revision, 3);
     }
 
     #[test]

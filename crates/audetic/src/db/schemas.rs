@@ -40,6 +40,9 @@ pub struct Workflow {
     pub workflow_type: WorkflowType,
     pub data: WorkflowData,
     pub created_at: Option<String>,
+    pub sync_id: Option<String>,
+    pub sync_revision: i64,
+    pub origin_node_id: Option<String>,
 }
 
 impl Workflow {
@@ -55,12 +58,18 @@ impl Workflow {
         workflow_type: String,
         json: String,
         created_at: String,
+        sync_id: String,
+        sync_revision: i64,
+        origin_node_id: String,
     ) -> Result<Workflow> {
         Ok(Workflow {
             id: Some(id),
             workflow_type: WorkflowType::parse(&workflow_type)?,
             data: serde_json::from_str(&json)?,
             created_at: Some(created_at),
+            sync_id: Some(sync_id),
+            sync_revision,
+            origin_node_id: Some(origin_node_id),
         })
     }
 
@@ -70,6 +79,9 @@ impl Workflow {
             workflow_type,
             data,
             created_at: None,
+            sync_id: None,
+            sync_revision: 0,
+            origin_node_id: None,
         }
     }
 }
