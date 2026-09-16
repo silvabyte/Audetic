@@ -51,6 +51,7 @@ pub mod paths {
     pub const TRANSCRIBE: &str = "/transcribe";
     pub const SETUP: &str = "/setup";
     pub const SYSTEM_RESTART: &str = "/system/restart";
+    pub const SYNC_STATUS: &str = "/sync/status";
     pub const KEYBIND_STATUS: &str = "/keybind/status";
     pub const KEYBIND_INSTALL: &str = "/keybind/install";
     pub const KEYBIND: &str = "/keybind";
@@ -115,6 +116,10 @@ mod tests {
         );
         assert_eq!(api_url(paths::VERSION), "http://127.0.0.1:3737/api/version");
         assert_eq!(api_url(paths::SETUP), "http://127.0.0.1:3737/api/setup");
+        assert_eq!(
+            api_url(paths::SYNC_STATUS),
+            "http://127.0.0.1:3737/api/sync/status"
+        );
         assert_eq!(
             api_url(paths::KEYBIND_INSTALL),
             "http://127.0.0.1:3737/api/keybind/install"

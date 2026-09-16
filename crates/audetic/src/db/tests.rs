@@ -1,8 +1,11 @@
+use anyhow::Result;
+use rusqlite::Connection;
+use uuid::Uuid;
+
 use super::init::migrate;
 use super::operations::*;
 use super::schemas::{VoiceToTextData, Workflow, WorkflowData, WorkflowType};
-use anyhow::Result;
-use rusqlite::Connection;
+use super::sync::SyncRepository;
 
 fn setup_test_db() -> Result<Connection> {
     let conn = Connection::open_in_memory()?;
@@ -43,6 +46,22 @@ fn test_insert_workflow() {
 
     let id = insert_workflow(&conn, &workflow).unwrap();
     assert!(id > 0);
+
+    let persisted = get_recent_workflows(&conn, 1).unwrap().pop().unwrap();
+    Uuid::parse_str(persisted.sync_id.as_deref().unwrap()).unwrap();
+    assert_eq!(persisted.sync_revision, 0);
+    let node_id = SyncRepository::node_id(&conn).unwrap();
+    assert_eq!(persisted.origin_node_id.as_deref(), Some(node_id.as_str()));
+}
+
+#[test]
+fn inserted_workflows_receive_distinct_sync_identities() {
+    let conn = setup_test_db().unwrap();
+    insert_workflow(&conn, &create_test_workflow("First")).unwrap();
+    insert_workflow(&conn, &create_test_workflow("Second")).unwrap();
+
+    let workflows = get_recent_workflows(&conn, 2).unwrap();
+    assert_ne!(workflows[0].sync_id, workflows[1].sync_id);
 }
 
 #[test]
@@ -168,11 +187,19 @@ fn test_workflow_from_row() {
         r#"{"type":"VoiceToText","payload":{"text":"Test","audio_path":"/tmp/test.wav"}}"#
             .to_string(),
         "2025-01-01 00:00:00".to_string(),
+        "67e55044-10b1-426f-9247-bb680e5fe0c8".to_string(),
+        0,
+        "b7cc76e2-759f-4df2-b725-d98ed912474c".to_string(),
     )
     .unwrap();
 
     assert_eq!(workflow.id, Some(1));
     assert_eq!(workflow.created_at, Some("2025-01-01 00:00:00".to_string()));
+    assert_eq!(
+        workflow.sync_id.as_deref(),
+        Some("67e55044-10b1-426f-9247-bb680e5fe0c8")
+    );
+    assert_eq!(workflow.sync_revision, 0);
 
     let WorkflowData::VoiceToText(data) = workflow.data;
     assert_eq!(data.text, "Test");

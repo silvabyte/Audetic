@@ -1,8 +1,10 @@
-use crate::global;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
 use tracing::info;
+
+use std::path::PathBuf;
+
+use crate::global;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -11,6 +13,34 @@ pub struct Config {
     pub ui: UiConfig,
     pub wayland: WaylandConfig,
     pub behavior: BehaviorConfig,
+    pub sync: SyncConfig,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SyncRole {
+    #[default]
+    Standalone,
+    Hub,
+    Client,
+}
+
+impl SyncRole {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Standalone => "standalone",
+            Self::Hub => "hub",
+            Self::Client => "client",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[serde(default)]
+pub struct SyncConfig {
+    pub role: SyncRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -153,5 +183,34 @@ impl Config {
 
     fn config_path() -> Result<PathBuf> {
         global::config_file()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_config_defaults_to_standalone_sync() {
+        let config: Config = toml::from_str("").unwrap();
+
+        assert_eq!(config.sync, SyncConfig::default());
+        assert_eq!(config.sync.role, SyncRole::Standalone);
+    }
+
+    #[test]
+    fn sync_roles_have_stable_serialized_values() {
+        for (role, expected) in [
+            (SyncRole::Standalone, "standalone"),
+            (SyncRole::Hub, "hub"),
+            (SyncRole::Client, "client"),
+        ] {
+            let serialized = toml::to_string(&SyncConfig { role }).unwrap();
+            assert_eq!(serialized, format!("role = \"{expected}\"\n"));
+
+            let parsed: SyncConfig = toml::from_str(&serialized).unwrap();
+            assert_eq!(parsed.role, role);
+            assert_eq!(role.as_str(), expected);
+        }
     }
 }

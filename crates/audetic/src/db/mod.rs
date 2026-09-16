@@ -4,6 +4,7 @@ pub mod meeting_artifacts;
 pub mod meetings;
 mod operations;
 mod schemas;
+pub mod sync;
 
 #[cfg(test)]
 mod tests;
