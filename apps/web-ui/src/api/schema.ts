@@ -941,6 +941,8 @@ export interface components {
             profiles: components["schemas"]["AgentProfile"][];
         };
         /** @enum {string} */
+        ArtifactKind: "meeting_minutes" | "summary" | "action_items" | "talking_points" | "mind_map";
+        /** @enum {string} */
         ArtifactStatus: "pending" | "running" | "completed" | "error";
         /** @description The `last_completed_job` nested block inside `RecordingStatusResponse`. */
         CompletedJobSummary: {
@@ -1001,7 +1003,6 @@ export interface components {
             /** Format: int64 */
             agent_profile_id?: number | null;
             custom_context?: string | null;
-            kind?: string;
             template_id?: string;
         };
         GenerateArtifactResponse: {
@@ -1503,7 +1504,9 @@ export interface components {
         SummaryTemplate: {
             description: string;
             id: string;
+            kind: components["schemas"]["ArtifactKind"];
             name: string;
+            requires_timestamps: boolean;
             sections: components["schemas"]["SummaryTemplateSection"][];
         };
         SummaryTemplateSection: {

@@ -162,6 +162,7 @@ use super::routes::{
         agents::AgentProfileTestResponse,
         crate::summary_templates::SummaryTemplate,
         crate::summary_templates::SummaryTemplateSection,
+        crate::summary_templates::ArtifactKind,
         summary_templates::SummaryTemplatesResponse,
         crate::db::meeting_artifacts::ArtifactStatus,
         crate::db::meeting_artifacts::MeetingArtifact,

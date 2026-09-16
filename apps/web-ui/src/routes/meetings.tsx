@@ -144,12 +144,15 @@ function parseOptionalSeconds(raw: FormDataEntryValue | null): number | undefine
 function MeetingsRoute() {
   return (
     <ImportDropZone>
-      <div className="mx-auto max-w-3xl space-y-6 p-4 sm:p-8">
+      <div className="mx-auto max-w-5xl space-y-7 p-4 sm:p-8">
         <header className="flex flex-col items-start justify-between gap-4 sm:flex-row">
           <div>
-            <h1 className="text-2xl font-semibold">Meetings</h1>
-            <p className="text-sm text-muted-foreground">
-              Long-form recordings. Press{" "}
+            <p className="mb-1 text-xs font-semibold uppercase tracking-[0.16em] text-primary">
+              Library
+            </p>
+            <h1 className="text-3xl font-semibold tracking-tight">Meetings</h1>
+            <p className="mt-1 max-w-xl text-sm text-muted-foreground">
+              Record, import, and revisit long-form conversations. Press{" "}
               <kbd className="rounded border px-1.5 py-0.5 font-mono text-xs">
                 Super+Shift+R
               </kbd>{" "}
@@ -432,7 +435,7 @@ function MeetingList() {
             );
           }
           return (
-            <ul className="space-y-3">
+            <ul className="divide-y overflow-hidden rounded-xl border bg-card shadow-sm">
               {store.meetings.list.map((m) => (
                 <li key={m.id}>
                   <MeetingRow meeting={m} />
