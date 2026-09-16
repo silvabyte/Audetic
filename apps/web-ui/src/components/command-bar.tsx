@@ -28,8 +28,14 @@ import { MEETING_INTENTS } from "@/routes/meetings";
 export function CommandBar() {
   return (
     <header className="sticky top-0 z-20 w-full border-b bg-background/80 backdrop-blur supports-[backdrop-filter]:bg-background/60">
-      <div className="mx-auto flex w-full max-w-5xl items-center gap-3 px-4 py-2">
+      <div className="mx-auto flex w-full max-w-7xl items-center gap-3 px-4 py-2">
         <StateOrb />
+        <div className="hidden min-w-0 sm:block">
+          <div className="text-sm font-semibold leading-none tracking-tight">Audetic</div>
+          <div className="mt-1 text-[10px] leading-none text-muted-foreground">
+            Local voice workspace
+          </div>
+        </div>
         <DaemonReachabilityChip />
         <div className="flex-1" />
         <DictationToggleButton />

@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use utoipa::ToSchema;
 
+use audetic_core::jobs_client::Segment;
+
 use crate::agents::{run_agent, AgentRunPaths, AgentRunRequest};
 use crate::db::agent_profiles::{AgentProfile, AgentProfileRepository};
 use crate::db::meeting_artifacts::{MeetingArtifact, MeetingArtifactRepository};
@@ -15,8 +17,6 @@ const DEFAULT_AGENT_TIMEOUT_SECONDS: u64 = 600;
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct GenerateArtifactRequest {
-    #[serde(default = "default_artifact_kind")]
-    pub kind: String,
     #[serde(default = "default_template_id")]
     pub template_id: String,
     pub agent_profile_id: Option<i64>,
@@ -53,11 +53,13 @@ pub async fn generate_meeting_artifact(
     template.validate()?;
     let profile = resolve_profile(&conn, request.agent_profile_id)?;
     let title = format!("{} — {}", template.name, profile.name);
+    let transcript_for_agent =
+        render_timestamped_transcript(&transcript, meeting.transcript_segments.as_deref());
 
     let artifact_id = MeetingArtifactRepository::insert_pending(
         &conn,
         meeting_id,
-        &request.kind,
+        template.kind.as_str(),
         &title,
         Some(&template.id),
         Some(profile.id),
@@ -69,7 +71,7 @@ pub async fn generate_meeting_artifact(
             artifact_id,
             meeting_id,
             meeting.title.as_deref(),
-            &transcript,
+            &transcript_for_agent,
             &template,
             request.custom_context.as_deref(),
             &profile,
@@ -234,10 +236,67 @@ Markdown skeleton to fill:
     )
 }
 
-fn default_artifact_kind() -> String {
-    "summary".to_string()
-}
-
 fn default_template_id() -> String {
     "standard_meeting".to_string()
+}
+
+fn render_timestamped_transcript(transcript: &str, segments: Option<&[Segment]>) -> String {
+    let Some(segments) = segments.filter(|segments| !segments.is_empty()) else {
+        return transcript.to_string();
+    };
+
+    let mut rendered = String::from(
+        "<!-- Each line starts with the recording timestamp for this transcript segment. -->\n\n",
+    );
+    for segment in segments {
+        rendered.push_str(&format!(
+            "[{}] {}\n",
+            format_timestamp(segment.start),
+            segment.text.trim()
+        ));
+    }
+    rendered
+}
+
+fn format_timestamp(seconds: f64) -> String {
+    let total = seconds.max(0.0).floor() as u64;
+    let hours = total / 3600;
+    let minutes = (total % 3600) / 60;
+    let seconds = total % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes:02}:{seconds:02}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_timestamped_transcript;
+    use audetic_core::jobs_client::Segment;
+
+    #[test]
+    fn transcript_segments_are_rendered_with_timestamps() {
+        let segments = vec![
+            Segment {
+                start: 3.8,
+                end: 8.0,
+                text: " Opening context ".into(),
+            },
+            Segment {
+                start: 3661.2,
+                end: 3665.0,
+                text: "Closing thought".into(),
+            },
+        ];
+
+        let rendered = render_timestamped_transcript("fallback", Some(&segments));
+        assert!(rendered.contains("[00:03] Opening context"));
+        assert!(rendered.contains("[1:01:01] Closing thought"));
+    }
+
+    #[test]
+    fn plain_transcript_is_preserved_without_segments() {
+        assert_eq!(render_timestamped_transcript("hello", None), "hello");
+    }
 }

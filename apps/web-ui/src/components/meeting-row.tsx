@@ -1,8 +1,15 @@
 import { Observer } from "mobx-react-lite";
 import { NavLink } from "react-router-dom";
-import { Radio, CheckCircle2, TriangleAlert, Loader2, XCircle, Trash2 } from "lucide-react";
+import {
+  CheckCircle2,
+  ChevronRight,
+  Loader2,
+  Radio,
+  Trash2,
+  TriangleAlert,
+  XCircle,
+} from "lucide-react";
 import { toast } from "sonner";
-import { Card, CardContent } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import {
   Tooltip,
@@ -54,41 +61,47 @@ export function MeetingRow({ meeting }: { meeting: MeetingSummary }) {
           <NavLink
             to={`/meetings/${meeting.id}`}
             className={({ isActive }) =>
-              cn("block", isActive && "outline outline-primary/40 rounded-lg")
+              cn(
+                "group block transition-colors hover:bg-muted/55",
+                isActive && "bg-primary/5",
+              )
             }
           >
-            <Card className="hover:border-primary/40 transition-colors">
-              <CardContent className="p-4 flex items-center gap-4">
-                <StatusIcon status={meeting.status} />
-                <div className="min-w-0 flex-1">
-                  <div className="truncate font-medium text-sm">{title}</div>
-                  <div className="text-xs text-muted-foreground">
-                    {!usingDateFallback &&
-                      new Date(meeting.started_at).toLocaleString()}
-                    {typeof meeting.duration_seconds === "number"
-                      ? `${usingDateFallback ? "" : " · "}${formatDuration(meeting.duration_seconds)}`
-                      : ""}
-                  </div>
+            <div className="flex items-center gap-4 px-4 py-4 sm:px-5">
+              <StatusIcon status={meeting.status} />
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-semibold tracking-tight">
+                  {title}
                 </div>
+                <div className="mt-1 text-xs text-muted-foreground">
+                  {!usingDateFallback &&
+                    new Date(meeting.started_at).toLocaleString()}
+                  {typeof meeting.duration_seconds === "number"
+                    ? `${usingDateFallback ? "" : " · "}${formatDuration(meeting.duration_seconds)}`
+                    : ""}
+                </div>
+              </div>
+              <div className="hidden sm:block">
                 <StatusPill status={meeting.status} />
-                {deletable && (
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <Button
-                        variant="ghost"
-                        size="icon"
-                        className="text-muted-foreground hover:text-destructive"
-                        aria-label="Delete meeting"
-                        onClick={handleDelete}
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </TooltipTrigger>
-                    <TooltipContent>Delete meeting</TooltipContent>
-                  </Tooltip>
-                )}
-              </CardContent>
-            </Card>
+              </div>
+              {deletable && (
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      variant="ghost"
+                      size="icon"
+                      className="text-muted-foreground hover:text-destructive"
+                      aria-label="Delete meeting"
+                      onClick={handleDelete}
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Delete meeting</TooltipContent>
+                </Tooltip>
+              )}
+              <ChevronRight className="h-4 w-4 text-muted-foreground/50 transition-transform group-hover:translate-x-0.5 group-hover:text-foreground" />
+            </div>
           </NavLink>
         );
       }}
