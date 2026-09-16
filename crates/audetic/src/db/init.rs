@@ -14,6 +14,14 @@ pub fn init_db() -> Result<Connection> {
 }
 
 pub fn init_db_at(db_path: &Path) -> Result<Connection> {
+    let conn = open_db_at(db_path)?;
+
+    migrate(&conn)?;
+
+    Ok(conn)
+}
+
+pub(crate) fn open_db_at(db_path: &Path) -> Result<Connection> {
     // Ensure parent directory exists
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent).context("Failed to create database directory")?;
@@ -27,13 +35,12 @@ pub fn init_db_at(db_path: &Path) -> Result<Connection> {
     conn.busy_timeout(Duration::from_secs(5))
         .context("Failed to set SQLite busy timeout")?;
 
-    migrate(&conn)?;
-
     Ok(conn)
 }
 
 pub fn migrate(conn: &Connection) -> Result<()> {
     let node_id = SyncRepository::ensure_node_id(conn)?;
+    SyncRepository::migrate_pairing_tables(conn)?;
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS workflows (

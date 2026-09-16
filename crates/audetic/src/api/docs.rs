@@ -55,6 +55,12 @@ use super::routes::{
         // System
         setup::get_setup,
         sync::get_status,
+        sync::enable_hub,
+        sync::pair,
+        sync::unpair,
+        sync::list_devices,
+        sync::add_device,
+        sync::revoke_device,
         system::get_deps,
         system::restart_daemon,
         system::start_install_ffmpeg,
@@ -96,6 +102,7 @@ use super::routes::{
         // Service
         super::ServiceInfo,
         super::VersionInfo,
+        super::error::ApiErrorResponse,
         // Recording
         recording::ToggleRequest,
         recording::ToggleResponse,
@@ -134,7 +141,17 @@ use super::routes::{
         audetic_core::setup::WorkflowReadiness,
         audetic_core::setup::SetupAssessment,
         audetic_core::config::SyncRole,
-        audetic_core::sync::SyncStatus,
+        audetic_core::sync::PairedHub,
+        audetic_core::sync::SyncStatusResponse,
+        audetic_core::sync::HubEnableResponse,
+        audetic_core::sync::SyncDevice,
+        audetic_core::sync::DeviceAddRequest,
+        audetic_core::sync::DeviceAddResponse,
+        audetic_core::sync::DeviceListResponse,
+        audetic_core::sync::DeviceRevokeResponse,
+        audetic_core::sync::LocalPairRequest,
+        audetic_core::sync::LocalPairResponse,
+        audetic_core::sync::LocalUnpairResponse,
         system::SystemDeps,
         system::RestartAccepted,
         system::InstallPhase,
@@ -265,6 +282,9 @@ mod tests {
             paths::SETUP,
             paths::SYSTEM_RESTART,
             paths::SYNC_STATUS,
+            paths::SYNC_HUB_ENABLE,
+            paths::SYNC_PAIR,
+            paths::SYNC_DEVICES,
             paths::KEYBIND_STATUS,
             paths::KEYBIND_INSTALL,
             paths::KEYBIND,
@@ -291,40 +311,111 @@ mod tests {
     }
 
     #[test]
-    fn sync_status_operation_and_types_are_registered() {
+    fn local_sync_operations_and_types_are_registered() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
-        assert_eq!(
-            spec["paths"][paths::SYNC_STATUS]["get"]["operationId"],
-            "get_sync_status"
-        );
-        assert!(spec["components"]["schemas"]["SyncStatus"].is_object());
+        for (path, method, operation_id) in [
+            (paths::SYNC_STATUS, "get", "get_sync_status"),
+            (paths::SYNC_HUB_ENABLE, "post", "enable_sync_hub"),
+            (paths::SYNC_PAIR, "post", "pair_sync_client"),
+            (paths::SYNC_PAIR, "delete", "unpair_sync_client"),
+            (paths::SYNC_DEVICES, "get", "list_sync_devices"),
+            (paths::SYNC_DEVICES, "post", "add_sync_device"),
+            ("/sync/devices/{device_id}", "delete", "revoke_sync_device"),
+        ] {
+            assert_eq!(
+                spec["paths"][path][method]["operationId"], operation_id,
+                "{method} {path}"
+            );
+        }
+
+        for schema in [
+            "ApiErrorResponse",
+            "PairedHub",
+            "SyncStatusResponse",
+            "HubEnableResponse",
+            "SyncDevice",
+            "DeviceAddRequest",
+            "DeviceAddResponse",
+            "DeviceListResponse",
+            "DeviceRevokeResponse",
+            "LocalPairRequest",
+            "LocalPairResponse",
+            "LocalUnpairResponse",
+        ] {
+            assert!(
+                spec["components"]["schemas"][schema].is_object(),
+                "missing schema {schema}"
+            );
+        }
         assert!(spec["components"]["schemas"]["SyncRole"].is_object());
         assert!(
             spec["paths"][paths::SYNC_STATUS]["get"]["responses"]["200"]["content"]
                 ["application/json"]["schema"]["$ref"]
                 .as_str()
-                .is_some_and(|reference| reference.ends_with("/SyncStatus"))
+                .is_some_and(|reference| reference.ends_with("/SyncStatusResponse"))
         );
         assert_eq!(
             spec["components"]["schemas"]["SyncRole"]["enum"],
             serde_json::json!(["standalone", "hub", "client"])
         );
         assert!(
-            spec["components"]["schemas"]["SyncStatus"]["properties"]["role"]["$ref"]
+            spec["components"]["schemas"]["SyncStatusResponse"]["properties"]["role"]["$ref"]
                 .as_str()
                 .is_some_and(|reference| reference.ends_with("/SyncRole"))
         );
         assert_eq!(
-            spec["components"]["schemas"]["SyncStatus"]["properties"]["node_id"]["type"],
+            spec["components"]["schemas"]["SyncStatusResponse"]["properties"]["node_id"]["type"],
             "string"
         );
         for field in ["role", "node_id"] {
-            assert!(spec["components"]["schemas"]["SyncStatus"]["required"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|required| required == field));
+            assert!(
+                spec["components"]["schemas"]["SyncStatusResponse"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|required| required == field)
+            );
+        }
+
+        for (path, method, status) in [
+            (paths::SYNC_STATUS, "get", "500"),
+            (paths::SYNC_HUB_ENABLE, "post", "409"),
+            (paths::SYNC_PAIR, "post", "401"),
+            (paths::SYNC_PAIR, "post", "502"),
+            (paths::SYNC_PAIR, "delete", "409"),
+            (paths::SYNC_DEVICES, "get", "409"),
+            (paths::SYNC_DEVICES, "post", "400"),
+            ("/sync/devices/{device_id}", "delete", "404"),
+        ] {
+            assert!(
+                spec["paths"][path][method]["responses"][status]["content"]["application/json"]
+                    ["schema"]["$ref"]
+                    .as_str()
+                    .is_some_and(|reference| reference.ends_with("/ApiErrorResponse")),
+                "untyped {status} response for {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn local_sync_openapi_exposes_secrets_only_in_required_exchange_schemas() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schemas = &spec["components"]["schemas"];
+
+        assert_eq!(
+            schemas["DeviceAddResponse"]["properties"]["credential"]["type"],
+            "string"
+        );
+        assert_eq!(
+            schemas["LocalPairRequest"]["properties"]["credential"]["type"],
+            "string"
+        );
+        for public_schema in ["SyncDevice", "PairedHub", "SyncStatusResponse"] {
+            let properties = &schemas[public_schema]["properties"];
+            for secret_field in ["credential", "credential_hash", "bearer_credential"] {
+                assert!(properties[secret_field].is_null(), "{public_schema}");
+            }
         }
     }
 

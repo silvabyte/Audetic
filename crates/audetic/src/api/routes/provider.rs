@@ -165,10 +165,12 @@ pub async fn get_raw_config() -> ApiResult<Json<WhisperConfig>> {
 )]
 pub async fn set_raw_config(Json(whisper): Json<WhisperConfig>) -> ApiResult<Json<WhisperConfig>> {
     backup_config_file().map_err(ApiError::from)?;
-    let mut config = Config::load().map_err(ApiError::from)?;
-    config.whisper = whisper;
-    config.save().map_err(ApiError::from)?;
-    Ok(Json(config.whisper))
+    let persisted = Config::update(|config| {
+        config.whisper = whisper;
+        config.whisper.clone()
+    })
+    .map_err(ApiError::from)?;
+    Ok(Json(persisted))
 }
 
 /// Validate a proposed provider configuration without persisting it.
@@ -204,10 +206,12 @@ pub async fn validate_config(
 )]
 pub async fn reset_config() -> ApiResult<Json<WhisperConfig>> {
     backup_config_file().map_err(ApiError::from)?;
-    let mut config = Config::load().map_err(ApiError::from)?;
-    config.whisper = WhisperConfig::default();
-    config.save().map_err(ApiError::from)?;
-    Ok(Json(config.whisper))
+    let persisted = Config::update(|config| {
+        config.whisper = WhisperConfig::default();
+        config.whisper.clone()
+    })
+    .map_err(ApiError::from)?;
+    Ok(Json(persisted))
 }
 
 /// Test the provider active in this daemon process, optionally against an audio file.

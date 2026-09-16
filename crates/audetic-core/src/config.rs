@@ -2,9 +2,12 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tracing::info;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use crate::global;
+
+static CONFIG_UPDATE_LOCK: Mutex<()> = Mutex::new(());
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -148,18 +151,21 @@ impl Default for BehaviorConfig {
 impl Config {
     pub fn load() -> Result<Self> {
         let config_path = Self::config_path()?;
+        Self::load_from(&config_path)
+    }
+
+    pub fn load_from(config_path: &Path) -> Result<Self> {
         if !config_path.exists() {
             info!(
                 "Config file not found, creating default at {:?}",
                 config_path
             );
             let config = Self::default();
-            config.save()?;
+            config.save_to(config_path)?;
             return Ok(config);
         }
 
-        let content =
-            std::fs::read_to_string(&config_path).context("Failed to read config file")?;
+        let content = std::fs::read_to_string(config_path).context("Failed to read config file")?;
 
         let config: Self = toml::from_str(&content).context("Failed to parse config file")?;
 
@@ -169,16 +175,34 @@ impl Config {
 
     pub fn save(&self) -> Result<()> {
         let config_path = Self::config_path()?;
+        self.save_to(&config_path)
+    }
 
+    pub fn save_to(&self, config_path: &Path) -> Result<()> {
         if let Some(parent) = config_path.parent() {
             std::fs::create_dir_all(parent).context("Failed to create config directory")?;
         }
 
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
 
-        std::fs::write(&config_path, content).context("Failed to write config file")?;
+        std::fs::write(config_path, content).context("Failed to write config file")?;
 
         Ok(())
+    }
+
+    pub fn update<R>(mutator: impl FnOnce(&mut Self) -> R) -> Result<R> {
+        let config_path = Self::config_path()?;
+        Self::update_at(&config_path, mutator)
+    }
+
+    pub fn update_at<R>(config_path: &Path, mutator: impl FnOnce(&mut Self) -> R) -> Result<R> {
+        let _guard = CONFIG_UPDATE_LOCK
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Config update lock is poisoned"))?;
+        let mut config = Self::load_from(config_path)?;
+        let result = mutator(&mut config);
+        config.save_to(config_path)?;
+        Ok(result)
     }
 
     fn config_path() -> Result<PathBuf> {

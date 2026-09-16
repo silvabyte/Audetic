@@ -10,6 +10,7 @@ pub mod sync;
 mod tests;
 
 // Re-export public API
+pub(crate) use init::open_db_at;
 pub use init::{init_db, init_db_at, migrate};
 pub use operations::{
     count_workflows, get_recent_workflows, insert_workflow, prune_old_workflows, search_workflows,

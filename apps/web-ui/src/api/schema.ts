@@ -764,6 +764,70 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/sync/devices": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_sync_devices"];
+        put?: never;
+        post: operations["add_sync_device"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/devices/{device_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["revoke_sync_device"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/hub/enable": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["enable_sync_hub"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/sync/pair": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["pair_sync_client"];
+        delete: operations["unpair_sync_client"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/sync/status": {
         parameters: {
             query?: never;
@@ -956,6 +1020,12 @@ export interface components {
         AgentProfilesResponse: {
             profiles: components["schemas"]["AgentProfile"][];
         };
+        /** @description Stable JSON body returned for local API failures. */
+        ApiErrorResponse: {
+            /** @example true */
+            error: boolean;
+            message: string;
+        };
         /** @enum {string} */
         ArtifactStatus: "pending" | "running" | "completed" | "error";
         /** @description The `last_completed_job` nested block inside `RecordingStatusResponse`. */
@@ -975,6 +1045,23 @@ export interface components {
             /** Format: int64 */
             id: number;
             success: boolean;
+        };
+        DeviceAddRequest: {
+            name: string;
+        };
+        /**
+         * @description The only Hub administration response that contains a plaintext credential.
+         *     Its custom `Debug` representation intentionally redacts that credential.
+         */
+        DeviceAddResponse: {
+            credential: string;
+            device: components["schemas"]["SyncDevice"];
+        };
+        DeviceListResponse: {
+            devices: components["schemas"]["SyncDevice"][];
+        };
+        DeviceRevokeResponse: {
+            device: components["schemas"]["SyncDevice"];
         };
         /** @description Progress of a model download. */
         DownloadProgress: {
@@ -1030,6 +1117,10 @@ export interface components {
             /** Format: int64 */
             id: number;
             text: string;
+        };
+        HubEnableResponse: {
+            restart_required: boolean;
+            role: components["schemas"]["SyncRole"];
         };
         /**
          * @description Phase string for the install status endpoint. Renderer uses this to drive
@@ -1139,6 +1230,24 @@ export interface components {
          * @enum {string}
          */
         KeybindTarget: "dictation" | "meeting";
+        /**
+         * @description Local request asking this daemon to pair with a remote Hub.
+         *     Its custom `Debug` representation intentionally redacts the credential.
+         */
+        LocalPairRequest: {
+            credential: string;
+            hub_url: string;
+        };
+        LocalPairResponse: {
+            paired_hub: components["schemas"]["PairedHub"];
+            restart_required: boolean;
+            role: components["schemas"]["SyncRole"];
+        };
+        LocalUnpairResponse: {
+            hub_credential_revoked: boolean;
+            restart_required: boolean;
+            role: components["schemas"]["SyncRole"];
+        };
         /** @description Combined logs result containing both app logs and transcription history. */
         LogsResult: {
             /** @description Application logs from systemd journal */
@@ -1375,6 +1484,15 @@ export interface components {
             event: components["schemas"]["EventKind"];
             name: string;
         };
+        /** @description Non-secret information about the Hub paired with this Client Node. */
+        PairedHub: {
+            device_id: string;
+            hub_node_id: string;
+            hub_url: string;
+            paired_at: string;
+            /** Format: int32 */
+            protocol_version: number;
+        };
         PlatformInfo: {
             arch_linux: boolean;
             architecture: string;
@@ -1531,10 +1649,23 @@ export interface components {
         SummaryTemplatesResponse: {
             templates: components["schemas"]["SummaryTemplate"][];
         };
+        /** @description Public Hub-side device projection. It never contains a credential or hash. */
+        SyncDevice: {
+            client_node_id?: string | null;
+            created_at: string;
+            device_id: string;
+            name: string;
+            paired: boolean;
+            paired_at?: string | null;
+            revoked: boolean;
+            revoked_at?: string | null;
+        };
         /** @enum {string} */
         SyncRole: "standalone" | "hub" | "client";
-        SyncStatus: {
+        /** @description Extended local status returned by Slice 2 synchronization APIs. */
+        SyncStatusResponse: {
             node_id: string;
+            paired_hub?: null | components["schemas"]["PairedHub"];
             role: components["schemas"]["SyncRole"];
         };
         /** @description Availability of external tools the daemon depends on. */
@@ -2987,6 +3118,299 @@ export interface operations {
             };
         };
     };
+    list_sync_devices: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hub devices, including revoked devices */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeviceListResponse"];
+                };
+            };
+            /** @description Operation requires an active Hub */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Devices could not be read */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    add_sync_device: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["DeviceAddRequest"];
+            };
+        };
+        responses: {
+            /** @description Device and one-time plaintext credential issued */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeviceAddResponse"];
+                };
+            };
+            /** @description Device request is invalid */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Operation requires an active Hub */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Device could not be issued */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    revoke_sync_device: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Device UUID */
+                device_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Device credential revoked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeviceRevokeResponse"];
+                };
+            };
+            /** @description Device ID is invalid */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Device does not exist */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Operation requires an active Hub */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Device could not be revoked */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    enable_sync_hub: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Hub role persisted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HubEnableResponse"];
+                };
+            };
+            /** @description Active role or pairing conflicts with Hub mode */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Hub role could not be persisted */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    pair_sync_client: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["LocalPairRequest"];
+            };
+        };
+        responses: {
+            /** @description Client paired with the Hub */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LocalPairResponse"];
+                };
+            };
+            /** @description Pairing request is invalid */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Hub rejected the credential */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Active role or existing pairing conflicts */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Pairing could not be persisted */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Hub is unavailable or incompatible */
+            502: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    unpair_sync_client: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Local Client pairing removed */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LocalUnpairResponse"];
+                };
+            };
+            /** @description Active role conflicts with Client administration */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Pairing could not be removed */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
     get_sync_status: {
         parameters: {
             query?: never;
@@ -2996,13 +3420,22 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Current synchronization role and durable node identity */
+            /** @description Current synchronization role, identity, and pairing */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["SyncStatus"];
+                    "application/json": components["schemas"]["SyncStatusResponse"];
+                };
+            };
+            /** @description Synchronization state could not be read */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
                 };
             };
         };

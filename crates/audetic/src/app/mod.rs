@@ -3,7 +3,6 @@
 mod command;
 
 use anyhow::{anyhow, Context, Result};
-use audetic_core::sync::SyncStatus;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{error, info, warn};
 
@@ -21,6 +20,7 @@ use crate::audio::{
 use crate::config::Config;
 use crate::meeting::{FfprobeMediaInspector, MediaInspector, MeetingMachine, MeetingStatusHandle};
 use crate::post_processing::PostProcessingService;
+use crate::sync::{SyncService, TransportServer};
 use crate::text_io::TextIoService;
 use crate::transcription::job_service::{
     LocalTranscriptionJobService, RemoteTranscriptionJobService,
@@ -285,6 +285,7 @@ pub async fn run_service() -> Result<()> {
     let db_path = crate::global::db_file()?;
     let conn = crate::db::init_db_at(&db_path).context("Failed to initialize Audetic database")?;
     let node_id = crate::db::sync::SyncRepository::node_id(&conn)?;
+    let config_path = crate::global::config_file()?;
 
     // Sweep meetings a previous daemon left mid-pipeline (recording /
     // review / compressing / transcribing) into `error` before anything can
@@ -303,6 +304,11 @@ pub async fn run_service() -> Result<()> {
         Err(e) => warn!("Failed to sweep interrupted meetings: {e:#}"),
     }
     drop(conn);
+
+    let sync_service = Arc::new(
+        SyncService::new(config.sync.role, node_id, db_path.clone(), config_path)
+            .context("Failed to initialize synchronization service")?,
+    );
 
     let post_processing = Arc::new(PostProcessingService::new(db_path.clone()));
 
@@ -344,10 +350,7 @@ pub async fn run_service() -> Result<()> {
         status_handle.clone(),
         &config,
         Arc::clone(&post_processing),
-        SyncStatus {
-            role: config.sync.role,
-            node_id,
-        },
+        Arc::clone(&sync_service),
     )
     .with_meeting_state(
         meeting_status.clone(),
@@ -357,11 +360,43 @@ pub async fn run_service() -> Result<()> {
         meetings_dir.clone(),
     );
 
-    tokio::spawn(async move {
-        if let Err(e) = api_server.start().await {
-            error!("API server failed: {}", e);
-        }
+    // Bind every listener required by the startup role before exposing the
+    // local readiness endpoint or reporting that the daemon is ready.
+    let api_listener = api_server
+        .bind()
+        .await
+        .context("Failed to bind local API listener")?;
+    let transport_server = if config.sync.role == crate::config::SyncRole::Hub {
+        Some(TransportServer::new((*sync_service).clone()))
+    } else {
+        None
+    };
+    let transport_listener = if let Some(server) = &transport_server {
+        Some(
+            server
+                .bind()
+                .await
+                .context("Failed to bind sync transport listener")?,
+        )
+    } else {
+        None
+    };
+
+    let mut servers = tokio::task::JoinSet::new();
+    servers.spawn(async move {
+        api_server
+            .serve(api_listener)
+            .await
+            .context("Local API server stopped")
     });
+    if let (Some(server), Some(listener)) = (transport_server, transport_listener) {
+        servers.spawn(async move {
+            server
+                .serve_listener(listener)
+                .await
+                .context("Sync transport server stopped")
+        });
+    }
 
     let toggle_url = crate::api::url::api_url(crate::api::url::paths::TOGGLE);
     let meetings_toggle_url = crate::api::url::api_url(crate::api::url::paths::MEETINGS_TOGGLE);
@@ -371,7 +406,21 @@ pub async fn run_service() -> Result<()> {
     info!("bindd = SUPER SHIFT, R, Audetic Meeting, exec, curl -X POST {meetings_toggle_url}");
     info!("Or test manually: curl -X POST {toggle_url}");
 
-    while let Some(command) = rx.recv().await {
+    loop {
+        let command = tokio::select! {
+            command = rx.recv() => command,
+            server = servers.join_next() => {
+                return match server {
+                    Some(Ok(Ok(()))) => Err(anyhow!("A required HTTP server exited unexpectedly")),
+                    Some(Ok(Err(error))) => Err(error),
+                    Some(Err(error)) => Err(anyhow!("A required HTTP server task failed: {error}")),
+                    None => Err(anyhow!("No required HTTP servers remain running")),
+                };
+            }
+        };
+        let Some(command) = command else {
+            break;
+        };
         match command {
             command @ DaemonCommand::ToggleRecording(_) => {
                 handle_dictation_command(&recording_machine, command).await;
