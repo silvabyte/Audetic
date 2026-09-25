@@ -20,6 +20,9 @@ pub const HOST: &str = "127.0.0.1";
 /// Default TCP port. WHSP in numbers (W=23, H=8, S=19, P=16 → 3737).
 pub const DEFAULT_PORT: u16 = 3737;
 
+/// Loopback-only port used by the authenticated synchronization transport.
+pub const SYNC_TRANSPORT_PORT: u16 = 3738;
+
 /// Path prefix every API route is mounted under. Kept in sync with
 /// the OpenAPI `servers` URL declared in `api::docs` so generated
 /// clients hit the right path without translation.
@@ -52,9 +55,19 @@ pub mod paths {
     pub const SETUP: &str = "/setup";
     pub const SYSTEM_RESTART: &str = "/system/restart";
     pub const SYNC_STATUS: &str = "/sync/status";
+    pub const SYNC_HUB_ENABLE: &str = "/sync/hub/enable";
+    pub const SYNC_PAIR: &str = "/sync/pair";
+    pub const SYNC_DEVICES: &str = "/sync/devices";
     pub const KEYBIND_STATUS: &str = "/keybind/status";
     pub const KEYBIND_INSTALL: &str = "/keybind/install";
     pub const KEYBIND: &str = "/keybind";
+}
+
+/// Versioned paths exposed by the dedicated synchronization transport server.
+pub mod sync_transport_paths {
+    pub const PREFIX: &str = "/api/sync/v1";
+    pub const PAIR: &str = "/api/sync/v1/pair";
+    pub const STATUS: &str = "/api/sync/v1/status";
 }
 
 /// Path to one agent profile test endpoint: `AGENT_PROFILES/{id}/test`.
@@ -92,6 +105,24 @@ pub fn post_processing_job_test_path(id: i64) -> String {
     format!("{}/{id}/test", paths::POST_PROCESSING_JOBS)
 }
 
+/// Local administration path for one Hub device.
+pub fn sync_device_path(device_id: &str) -> String {
+    format!("{}/{device_id}", paths::SYNC_DEVICES)
+}
+
+/// Append a fixed transport path to a normalized or slash-terminated Hub origin.
+pub fn sync_transport_url(hub_origin: &str, path: &str) -> String {
+    format!("{}{}", hub_origin.trim_end_matches('/'), path)
+}
+
+pub fn sync_transport_pair_url(hub_origin: &str) -> String {
+    sync_transport_url(hub_origin, sync_transport_paths::PAIR)
+}
+
+pub fn sync_transport_status_url(hub_origin: &str) -> String {
+    sync_transport_url(hub_origin, sync_transport_paths::STATUS)
+}
+
 /// Build a fully-qualified daemon API URL — e.g.
 /// `api_url(paths::TOGGLE)` → `http://127.0.0.1:3737/api/toggle`.
 pub fn api_url(path: &str) -> String {
@@ -121,6 +152,14 @@ mod tests {
             "http://127.0.0.1:3737/api/sync/status"
         );
         assert_eq!(
+            api_url(paths::SYNC_HUB_ENABLE),
+            "http://127.0.0.1:3737/api/sync/hub/enable"
+        );
+        assert_eq!(
+            api_url(paths::SYNC_DEVICES),
+            "http://127.0.0.1:3737/api/sync/devices"
+        );
+        assert_eq!(
             api_url(paths::KEYBIND_INSTALL),
             "http://127.0.0.1:3737/api/keybind/install"
         );
@@ -129,5 +168,19 @@ mod tests {
     #[test]
     fn app_url_formats_correctly() {
         assert_eq!(app_url(), "http://127.0.0.1:3737/");
+    }
+
+    #[test]
+    fn sync_paths_format_correctly() {
+        assert_eq!(sync_device_path("device-id"), "/sync/devices/device-id");
+        assert_eq!(
+            sync_transport_pair_url("https://sync.example.com/"),
+            "https://sync.example.com/api/sync/v1/pair"
+        );
+        assert_eq!(
+            sync_transport_status_url("http://127.0.0.1:3738"),
+            "http://127.0.0.1:3738/api/sync/v1/status"
+        );
+        assert_eq!(SYNC_TRANSPORT_PORT, 3738);
     }
 }

@@ -48,8 +48,58 @@ pub struct SyncCliArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum SyncCommand {
-    /// Show synchronization role and durable node identity
+    /// Show synchronization role, node identity, and pairing state
     Status,
+    /// Configure this node as a synchronization Hub
+    Hub(SyncHubCliArgs),
+    /// Pair this node with a Hub
+    Pair {
+        /// Hub origin URL
+        #[arg(long)]
+        hub: String,
+        /// Read the Hub credential from the first line of standard input
+        #[arg(long)]
+        token_stdin: bool,
+    },
+    /// Remove this node's local Hub pairing
+    Unpair,
+    /// Manage devices authorized to pair with this Hub
+    Devices(SyncDevicesCliArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct SyncHubCliArgs {
+    #[command(subcommand)]
+    pub command: SyncHubCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SyncHubCommand {
+    /// Configure this node as a Hub
+    Enable,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct SyncDevicesCliArgs {
+    #[command(subcommand)]
+    pub command: SyncDevicesCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum SyncDevicesCommand {
+    /// List devices authorized on this Hub
+    List,
+    /// Issue a one-time credential for a new device
+    Add {
+        /// Human-readable device name
+        #[arg(long)]
+        name: String,
+    },
+    /// Revoke a device credential
+    Revoke {
+        /// Device ID
+        device_id: String,
+    },
 }
 
 #[derive(ClapArgs, Debug)]
@@ -404,6 +454,143 @@ mod tests {
             Some(CliCommand::Sync(SyncCliArgs {
                 command: SyncCommand::Status,
             }))
+        ));
+    }
+
+    #[test]
+    fn sync_hub_enable_command_parses() {
+        let cli = Cli::try_parse_from(["audetic", "sync", "hub", "enable"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Sync(SyncCliArgs {
+                command: SyncCommand::Hub(SyncHubCliArgs {
+                    command: SyncHubCommand::Enable,
+                }),
+            }))
+        ));
+    }
+
+    #[test]
+    fn sync_pair_command_parses_for_interactive_credential() {
+        let cli = Cli::try_parse_from([
+            "audetic",
+            "sync",
+            "pair",
+            "--hub",
+            "https://sync.example.com",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Sync(SyncCliArgs {
+                command: SyncCommand::Pair {
+                    hub,
+                    token_stdin: false,
+                },
+            })) if hub == "https://sync.example.com"
+        ));
+    }
+
+    #[test]
+    fn sync_pair_command_parses_for_stdin_credential() {
+        let cli = Cli::try_parse_from([
+            "audetic",
+            "sync",
+            "pair",
+            "--hub",
+            "https://sync.example.com",
+            "--token-stdin",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Sync(SyncCliArgs {
+                command: SyncCommand::Pair {
+                    hub,
+                    token_stdin: true,
+                },
+            })) if hub == "https://sync.example.com"
+        ));
+    }
+
+    #[test]
+    fn sync_pair_rejects_token_argument() {
+        let result = Cli::try_parse_from([
+            "audetic",
+            "sync",
+            "pair",
+            "--hub",
+            "https://sync.example.com",
+            "--token",
+            "secret",
+        ]);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sync_unpair_command_parses() {
+        let cli = Cli::try_parse_from(["audetic", "sync", "unpair"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Sync(SyncCliArgs {
+                command: SyncCommand::Unpair,
+            }))
+        ));
+    }
+
+    #[test]
+    fn sync_devices_list_command_parses() {
+        let cli = Cli::try_parse_from(["audetic", "sync", "devices", "list"]).unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Sync(SyncCliArgs {
+                command: SyncCommand::Devices(SyncDevicesCliArgs {
+                    command: SyncDevicesCommand::List,
+                }),
+            }))
+        ));
+    }
+
+    #[test]
+    fn sync_devices_add_command_parses() {
+        let cli =
+            Cli::try_parse_from(["audetic", "sync", "devices", "add", "--name", "Work laptop"])
+                .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Sync(SyncCliArgs {
+                command: SyncCommand::Devices(SyncDevicesCliArgs {
+                    command: SyncDevicesCommand::Add { name },
+                }),
+            })) if name == "Work laptop"
+        ));
+    }
+
+    #[test]
+    fn sync_devices_revoke_command_parses() {
+        let cli = Cli::try_parse_from([
+            "audetic",
+            "sync",
+            "devices",
+            "revoke",
+            "257dc5a6-d8d7-463b-8f2f-f95f616c3a15",
+        ])
+        .unwrap();
+
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Sync(SyncCliArgs {
+                command: SyncCommand::Devices(SyncDevicesCliArgs {
+                    command: SyncDevicesCommand::Revoke { device_id },
+                }),
+            })) if device_id == "257dc5a6-d8d7-463b-8f2f-f95f616c3a15"
         ));
     }
 }

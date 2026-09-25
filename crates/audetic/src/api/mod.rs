@@ -19,7 +19,6 @@ pub mod static_assets;
 pub use audetic_core::url;
 
 use anyhow::Result;
-use audetic_core::sync::SyncStatus;
 use axum::{
     extract::Request,
     http::{header, HeaderValue, Method, StatusCode},
@@ -36,6 +35,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::config::Config;
 use crate::post_processing::PostProcessingService;
+use crate::sync::SyncService;
 
 pub use crate::app::DaemonCommand as ApiCommand;
 pub use routes::recording::{RecordingState, ToggleRequest};
@@ -76,7 +76,7 @@ impl ApiServer {
         status: crate::audio::RecordingStatusHandle,
         config: &Config,
         post_processing: std::sync::Arc<PostProcessingService>,
-        sync_status: SyncStatus,
+        sync_service: std::sync::Arc<SyncService>,
     ) -> Self {
         Self {
             port: url::DEFAULT_PORT,
@@ -90,7 +90,7 @@ impl ApiServer {
                 service: post_processing,
             },
             runtime_provider: config.whisper.clone(),
-            sync_state: routes::sync::SyncApiState::new(sync_status),
+            sync_state: routes::sync::SyncApiState::new(sync_service),
             instance_id: ProcessInstanceId(uuid::Uuid::new_v4().to_string()),
         }
     }
@@ -122,7 +122,11 @@ impl ApiServer {
         self
     }
 
-    pub async fn start(self) -> Result<()> {
+    pub async fn bind(&self) -> Result<tokio::net::TcpListener> {
+        Ok(tokio::net::TcpListener::bind((url::HOST, self.port)).await?)
+    }
+
+    pub async fn serve(self, listener: tokio::net::TcpListener) -> Result<()> {
         // Build the API surface. All routes nest under `/api` so the daemon
         // can serve the bundled web-ui at `/` without colliding with API
         // paths (e.g. /meetings is also a SPA route).
@@ -163,9 +167,6 @@ impl ApiServer {
             .fallback(static_assets::serve_static)
             .layer(cors_layer())
             .layer(middleware::from_fn(reject_disallowed_origin));
-
-        let listener =
-            tokio::net::TcpListener::bind(&format!("{}:{}", url::HOST, self.port)).await?;
 
         info!("API server listening on http://{}:{}", url::HOST, self.port);
         info!("API spec: {}", url::api_url("/openapi.json"));
