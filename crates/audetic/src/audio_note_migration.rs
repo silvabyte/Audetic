@@ -745,14 +745,19 @@ mod tests {
             .unwrap();
         assert_eq!(text, "WAL text");
         assert_eq!(report.notes, 5);
-        for suffix in ["-wal", "-shm", "-journal"] {
-            let mut sidecar = backup_path.as_os_str().to_os_string();
-            sidecar.push(suffix);
-            assert!(
-                !Path::new(&sidecar).exists(),
-                "backup must be self-contained"
-            );
-        }
+        // Verify independence from sidecars by restoring ONLY the backup file.
+        // Some SQLite builds retain an inert journal after closing it; mere
+        // presence does not tell us whether the backup depends on that file.
+        let restore_dir = tempfile::tempdir().unwrap();
+        let restore_path = restore_dir.path().join("standalone.sqlite3");
+        std::fs::copy(&backup_path, &restore_path).unwrap();
+        let restored =
+            Connection::open_with_flags(&restore_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        validate_integrity(&restored).unwrap();
+        let restored_text: String = restored
+            .query_row("SELECT text FROM workflows WHERE id=99", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(restored_text, "WAL text");
         let source_mode: String = conn
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
