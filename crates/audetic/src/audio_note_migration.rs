@@ -181,6 +181,10 @@ fn copy_sqlite_snapshot(source: &Connection, destination: &Path) -> Result<()> {
         result == rusqlite::backup::StepResult::Done,
         "Cannot finish SQLite backup ({result:?}). Stop all Audetic processes and retry"
     );
+    // The copied header can carry WAL mode from the source. Materialize a
+    // standalone rollback-journal backup while it is still writable: macOS's
+    // SQLite cannot always reopen a WAL-mode file read-only without sidecars.
+    destination.pragma_update(None, "journal_mode", "DELETE")?;
     Ok(())
 }
 
@@ -727,12 +731,35 @@ mod tests {
                 0o600
             );
         }
-        let backup = Connection::open(backup_path).unwrap();
+        let backup =
+            Connection::open_with_flags(&backup_path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let journal_mode: String = backup
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            journal_mode, "delete",
+            "backup must not require WAL sidecars"
+        );
         let text: String = backup
             .query_row("SELECT text FROM workflows WHERE id=99", [], |r| r.get(0))
             .unwrap();
         assert_eq!(text, "WAL text");
         assert_eq!(report.notes, 5);
+        for suffix in ["-wal", "-shm", "-journal"] {
+            let mut sidecar = backup_path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            assert!(
+                !Path::new(&sidecar).exists(),
+                "backup must be self-contained"
+            );
+        }
+        let source_mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            source_mode, "wal",
+            "backup must not change the source journal mode"
+        );
     }
 
     #[test]

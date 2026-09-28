@@ -73,8 +73,9 @@ contains transcripts and agent/hook configuration.
 1. SQLite's backup API creates a consistent snapshot, including committed data
    in a WAL, into an exclusively reserved private file. This avoids the
    platform-dependent existing-file behavior of `VACUUM INTO`. The backup is
-   synced and its integrity checked. A raw copy of just the live `.db` file would
-   not provide this guarantee.
+   converted to standalone rollback-journal mode, synced, and integrity checked;
+   it needs no WAL/SHM sidecars. The source database's journal mode is preserved.
+   A raw copy of just the live `.db` file would not provide this guarantee.
 2. Conversion obtains an **exclusive SQLite transaction**. In WAL mode readers
    can continue, but no other writer can commit during conversion. A
    `data_version` check rejects any external commit between backup preparation
