@@ -70,9 +70,11 @@ contains transcripts and agent/hook configuration.
 
 ### Safety and conversion rules
 
-1. SQLite `VACUUM INTO` creates a consistent backup, including committed data in
-   a WAL. The backup is synced and its integrity checked. A raw copy of just the
-   live `.db` file would not provide this guarantee.
+1. SQLite's backup API creates a consistent snapshot, including committed data
+   in a WAL, into an exclusively reserved private file. This avoids the
+   platform-dependent existing-file behavior of `VACUUM INTO`. The backup is
+   synced and its integrity checked. A raw copy of just the live `.db` file would
+   not provide this guarantee.
 2. Conversion obtains an **exclusive SQLite transaction**. In WAL mode readers
    can continue, but no other writer can commit during conversion. A
    `data_version` check rejects any external commit between backup preparation

@@ -147,13 +147,8 @@ fn backup_database(conn: &Connection, database: &Path) -> Result<PathBuf> {
     let file = options
         .open(&backup)
         .context("Failed to reserve private backup file")?;
-    // VACUUM INTO uses SQLite's snapshot, including committed WAL content.
-    // Copying the database file with fs::copy would lose those transactions.
-    conn.execute(
-        "VACUUM INTO ?1",
-        [backup.to_str().context("Backup path is not UTF-8")?],
-    )
-    .with_context(|| format!("Failed to create SQLite backup at {}", backup.display()))?;
+    copy_sqlite_snapshot(conn, &backup)
+        .with_context(|| format!("Failed to create SQLite backup at {}", backup.display()))?;
     file.sync_all().context("Failed to sync SQLite backup")?;
     #[cfg(unix)]
     {
@@ -168,6 +163,25 @@ fn backup_database(conn: &Connection, database: &Path) -> Result<PathBuf> {
     let backup_conn = Connection::open_with_flags(&backup, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     validate_integrity(&backup_conn).context("Backup integrity validation failed")?;
     Ok(backup)
+}
+
+fn copy_sqlite_snapshot(source: &Connection, destination: &Path) -> Result<()> {
+    // Keep the create_new reservation and its private permissions. macOS's
+    // SQLite can reject even an empty existing VACUUM INTO destination; the
+    // backup API explicitly supports an existing destination connection and
+    // copies committed WAL content as part of a consistent snapshot.
+    let mut destination =
+        Connection::open_with_flags(destination, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .context("Failed to open reserved backup database")?;
+    destination.busy_timeout(Duration::from_secs(5))?;
+    let result = rusqlite::backup::Backup::new(source, &mut destination)?.step(-1)?;
+    // This is offline tooling: copy all pages under one source read lock and
+    // fail on contention instead of retrying indefinitely against a live writer.
+    ensure!(
+        result == rusqlite::backup::StepResult::Done,
+        "Cannot finish SQLite backup ({result:?}). Stop all Audetic processes and retry"
+    );
+    Ok(())
 }
 
 fn validate_integrity(conn: &Connection) -> Result<()> {
@@ -700,12 +714,59 @@ mod tests {
         // Keep the source connection open so SQLite cannot remove/checkpoint
         // the WAL on last-close before the backup is taken.
         let report = migrate_audio_notes(&path, false).unwrap();
-        let backup = Connection::open(report.backup_path.unwrap()).unwrap();
+        let backup_path = report.backup_path.unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&backup_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let backup = Connection::open(backup_path).unwrap();
         let text: String = backup
             .query_row("SELECT text FROM workflows WHERE id=99", [], |r| r.get(0))
             .unwrap();
         assert_eq!(text, "WAL text");
         assert_eq!(report.notes, 5);
+    }
+
+    #[test]
+    fn backup_accepts_a_reserved_sqlite_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = Connection::open_in_memory().unwrap();
+        source.execute_batch("CREATE TABLE original(text TEXT); INSERT INTO original VALUES('preserved'); PRAGMA user_version = 7;").unwrap();
+        let destination = dir.path().join("reserved.sqlite3");
+        let reserved = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .unwrap();
+        // Exercise SQLite's existing-output rejection on every platform. An
+        // initialized destination also must work with the backup API, rather
+        // than depending on VACUUM's platform-specific empty-file handling.
+        let destination_conn = Connection::open(&destination).unwrap();
+        destination_conn
+            .pragma_update(None, "user_version", 99)
+            .unwrap();
+        drop(destination_conn);
+
+        copy_sqlite_snapshot(&source, &destination).unwrap();
+        reserved.sync_all().unwrap();
+        let backup = Connection::open(&destination).unwrap();
+        let text: String = backup
+            .query_row("SELECT text FROM original", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(text, "preserved");
+        let version: i64 = backup
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+        validate_integrity(&backup).unwrap();
     }
 
     #[test]
