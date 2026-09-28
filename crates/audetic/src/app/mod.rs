@@ -136,6 +136,13 @@ pub async fn run_service() -> Result<()> {
         crate::db::audio_notes::AudioNoteRepository::sweep_interrupted_enrichment(&conn)?;
         crate::db::audio_note_artifacts::AudioNoteArtifactRepository::sweep_interrupted(&conn)?;
     }
+    // CoreAudio's process tap does not reliably show the Screen Recording
+    // prompt itself. Keep the permission/grant restart path for system-audio
+    // capture, after the database upgrade check has succeeded.
+    #[cfg(target_os = "macos")]
+    crate::audio::system_source::permissions::spawn_grant_watcher_then_exit(
+        std::time::Duration::from_secs(2),
+    );
     let config = Config::load()?;
     let transcription = build_transcription_service(&config)?;
     let audio_notes_dir = crate::global::data_dir()?.join("audio-notes");
