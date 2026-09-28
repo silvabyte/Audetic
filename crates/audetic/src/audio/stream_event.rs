@@ -4,8 +4,7 @@ use std::sync::Arc;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureSource {
-    Dictation,
-    MeetingMicrophone,
+    Microphone,
     SystemTap,
 }
 

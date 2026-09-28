@@ -7,8 +7,8 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section {
-                KeyboardShortcuts.Recorder("Toggle Dictation:", name: .toggleDictation)
-                KeyboardShortcuts.Recorder("Toggle Meeting:", name: .toggleMeeting)
+                KeyboardShortcuts.Recorder("Microphone Note:", name: .toggleNote)
+                KeyboardShortcuts.Recorder("Microphone + System Audio:", name: .toggleSystemNote)
             } header: {
                 Text("Global Keyboard Shortcuts")
             } footer: {

@@ -20,20 +20,16 @@ pub enum CliCommand {
     Version,
     /// Inspect or configure transcription providers
     Provider(ProviderCliArgs),
-    /// Assess dictation and meeting setup readiness
+    /// Assess audio note capture readiness
     Setup,
-    /// Search and view transcription history
-    History(HistoryCliArgs),
     /// View application and transcription logs
     Logs(LogsCliArgs),
     /// Manage Hyprland keybindings for Audetic
     Keybind(KeybindCliArgs),
-    /// Transcribe a local audio or video file
-    Transcribe(TranscribeCliArgs),
     /// Manage on-device transcription models (list, download)
     Models(ModelsCliArgs),
-    /// Record and transcribe meetings
-    Meeting(MeetingCliArgs),
+    /// Capture, import, and manage durable audio notes
+    Notes(NotesCliArgs),
     /// Manage post-processing jobs (run commands on daemon events)
     PostProcessing(PostProcessingCliArgs),
 }
@@ -48,7 +44,7 @@ pub struct PostProcessingCliArgs {
 pub enum PostProcessingCommand {
     /// List all configured jobs (optionally filtered by event)
     List {
-        /// Filter to a single event kind (e.g. `dictation.completed`)
+        /// Filter to a single event kind (e.g. `audio_note.completed`)
         #[arg(short, long)]
         event: Option<String>,
     },
@@ -62,7 +58,7 @@ pub enum PostProcessingCommand {
         /// Human-readable name
         #[arg(short, long)]
         name: String,
-        /// Event to subscribe to (e.g. `dictation.completed`)
+        /// Event to subscribe to (e.g. `audio_note.completed`)
         #[arg(short, long)]
         event: String,
         /// Shell command to run
@@ -130,20 +126,49 @@ pub enum ModelsCommand {
 }
 
 #[derive(ClapArgs, Debug)]
-pub struct MeetingCliArgs {
+pub struct NotesCliArgs {
     #[command(subcommand)]
-    pub command: MeetingCommand,
+    pub command: NotesCommand,
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct CaptureArgs {
+    #[arg(short, long)]
+    pub title: Option<String>,
+    #[arg(long, value_enum, default_value = "microphone")]
+    pub capture_source: CaptureSource,
+    #[arg(long)]
+    pub review_before_processing: bool,
+    /// Override the configured paste preference (off by default)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub auto_paste: Option<bool>,
+    #[arg(long)]
+    pub copy_to_clipboard: bool,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum CaptureSource {
+    Microphone,
+    #[value(name = "microphone_and_system", alias = "microphone-and-system")]
+    MicrophoneAndSystem,
+}
+
+impl CaptureSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Microphone => "microphone",
+            Self::MicrophoneAndSystem => "microphone_and_system",
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
-pub enum MeetingCommand {
-    /// Start recording a meeting
-    Start {
-        /// Optional meeting title
-        #[arg(short, long)]
-        title: Option<String>,
-    },
-    /// Stop recording the current meeting (pauses for review before transcribing)
+pub enum NotesCommand {
+    /// Start capturing an audio note
+    Start(CaptureArgs),
+    /// Start or stop the current capture
+    Toggle(CaptureArgs),
+    /// Stop capturing (process immediately unless review was requested)
     Stop,
     /// Confirm the recording awaiting review and send it for transcription,
     /// optionally trimming the start/end first. Times accept `SS`, `MM:SS`,
@@ -156,27 +181,33 @@ pub enum MeetingCommand {
         #[arg(long)]
         end: Option<String>,
     },
-    /// Cancel the in-progress or under-review meeting without transcribing
+    /// Cancel the in-progress or under-review audio note
     Cancel,
-    /// Show current meeting recording status
+    /// Show current audio note capture status
     Status,
-    /// List recorded meetings
+    /// Search and filter audio notes
     List {
         /// Maximum number of results to show
         #[arg(short, long, default_value = "20")]
         limit: usize,
+        #[arg(long, default_value = "0")]
+        offset: usize,
+        #[arg(short, long)]
+        query: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
     },
-    /// Show details of a specific meeting
+    /// Show details and transcript of an audio note
     Show {
-        /// Meeting ID
+        /// Audio note ID
         id: i64,
     },
-    /// Delete a meeting (hides it from all views; audio stays on disk)
+    /// Hide an audio note (audio stays on disk)
     Delete {
-        /// Meeting ID
+        /// Audio note ID
         id: i64,
     },
-    /// Import an existing audio or video file as a new meeting
+    /// Import audio or video through the daemon's durable transcription pipeline
     Import {
         /// Path to the media file (audio or video) to import
         path: PathBuf,
@@ -184,6 +215,12 @@ pub enum MeetingCommand {
         #[arg(short, long)]
         title: Option<String>,
     },
+    /// Retry transcription from retained audio
+    Retry { id: i64 },
+    /// Run classification and enrichment
+    Process { id: i64 },
+    /// Copy the persisted raw transcript
+    Copy { id: i64 },
 }
 
 #[derive(ClapArgs, Debug)]
@@ -219,25 +256,6 @@ pub enum ProviderCommand {
 }
 
 #[derive(ClapArgs, Debug)]
-pub struct HistoryCliArgs {
-    /// Search query to filter transcriptions by text content
-    #[arg(short, long)]
-    pub query: Option<String>,
-    /// Filter by start date (YYYY-MM-DD format)
-    #[arg(long)]
-    pub from: Option<String>,
-    /// Filter by end date (YYYY-MM-DD format)
-    #[arg(long)]
-    pub to: Option<String>,
-    /// Maximum number of results to show
-    #[arg(short, long, default_value = "20")]
-    pub limit: usize,
-    /// ID of specific workflow to copy to clipboard
-    #[arg(short, long)]
-    pub copy: Option<i64>,
-}
-
-#[derive(ClapArgs, Debug)]
 pub struct LogsCliArgs {
     /// Number of log entries to show
     #[arg(short = 'n', long, default_value = "30")]
@@ -252,9 +270,9 @@ pub struct KeybindCliArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum KeybindCommand {
-    /// Install an Audetic keybinding (dictation defaults to SUPER+R)
+    /// Install an Audetic keybinding (microphone defaults to SUPER+R)
     Install {
-        /// Shortcut action to install: dictation or meeting
+        /// Capture source shortcut: note or system-note
         #[arg(short, long, default_value_t)]
         target: KeybindTarget,
         /// Custom keybinding (e.g., "SUPER SHIFT, R" or "SUPER+T")
@@ -266,7 +284,7 @@ pub enum KeybindCommand {
     },
     /// Remove Audetic keybinding from config
     Uninstall {
-        /// Shortcut action to remove: dictation or meeting
+        /// Capture source shortcut: note or system-note
         #[arg(short, long, default_value_t)]
         target: KeybindTarget,
         /// Preview changes without applying
@@ -281,61 +299,19 @@ pub enum KeybindCommand {
     },
 }
 
-/// Transcribe audio or video files to text.
-///
-/// Files are automatically compressed to mp3 format before upload.
-/// Use --no-compress to send the file in its original format.
-#[derive(ClapArgs, Debug)]
-pub struct TranscribeCliArgs {
-    /// Path to audio or video file to transcribe
-    pub file: PathBuf,
-
-    /// Language code (e.g., 'en', 'es', 'auto')
-    #[arg(short, long)]
-    pub language: Option<String>,
-
-    /// Write transcription to file (default: stdout)
-    #[arg(short, long)]
-    pub output: Option<PathBuf>,
-
-    /// Output format: text, json, srt
-    #[arg(short, long, default_value = "text")]
-    pub format: OutputFormat,
-
-    /// Include timestamps in output
-    #[arg(long)]
-    pub timestamps: bool,
-
-    /// Disable progress indicator
-    #[arg(long)]
-    pub no_progress: bool,
-
-    /// Copy result to clipboard
-    #[arg(short, long)]
-    pub copy: bool,
-
-    /// Override transcription API base URL
-    #[arg(long)]
-    pub api_url: Option<String>,
-
-    /// Skip compression (send file in original format)
-    #[arg(long)]
-    pub no_compress: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::CommandFactory;
 
     #[test]
-    fn keybind_install_defaults_to_dictation() {
+    fn keybind_install_defaults_to_note() {
         let cli = Cli::try_parse_from(["audetic", "keybind", "install"]).unwrap();
         assert!(matches!(
             cli.command,
             Some(CliCommand::Keybind(KeybindCliArgs {
                 command: Some(KeybindCommand::Install {
-                    target: KeybindTarget::Dictation,
+                    target: KeybindTarget::Note,
                     ..
                 }),
             }))
@@ -343,13 +319,13 @@ mod tests {
     }
 
     #[test]
-    fn keybind_commands_accept_meeting_target() {
+    fn keybind_commands_accept_system_note_target() {
         let cli = Cli::try_parse_from([
             "audetic",
             "keybind",
             "install",
             "--target",
-            "meeting",
+            "system-note",
             "--dry-run",
         ])
         .unwrap();
@@ -357,7 +333,7 @@ mod tests {
             cli.command,
             Some(CliCommand::Keybind(KeybindCliArgs {
                 command: Some(KeybindCommand::Install {
-                    target: KeybindTarget::Meeting,
+                    target: KeybindTarget::SystemNote,
                     dry_run: true,
                     ..
                 }),
@@ -380,11 +356,4 @@ mod tests {
         assert!(help.contains("validates initialization"));
         assert!(!help.contains("records brief sample"));
     }
-}
-
-#[derive(Clone, Debug, ValueEnum)]
-pub enum OutputFormat {
-    Text,
-    Json,
-    Srt,
 }

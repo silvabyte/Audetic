@@ -6,7 +6,7 @@
 use anyhow::Result;
 use tracing::warn;
 
-use crate::audio::audio_source::{AudioSource, MeetingSystemSource};
+use crate::audio::audio_source::{AudioSource, CaptureSystemSource};
 use crate::audio::stream_event::StreamEventSink;
 
 pub struct SystemAudioSource {
@@ -15,7 +15,7 @@ pub struct SystemAudioSource {
 }
 
 #[async_trait::async_trait(?Send)]
-impl MeetingSystemSource for SystemAudioSource {
+impl CaptureSystemSource for SystemAudioSource {
     fn has_captured_audio(&self) -> bool {
         false
     }

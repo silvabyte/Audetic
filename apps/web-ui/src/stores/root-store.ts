@@ -1,13 +1,12 @@
 import { makeAutoObservable } from "mobx";
 import { createContext, useContext } from "react";
 import { ConfigStore } from "./config-store";
-import { HistoryStore } from "./history-store";
-import { MeetingStore } from "./meeting-store";
-import { MeetingArtifactsStore } from "./meeting-artifacts-store";
+import { AudioNotesStore } from "./audio-notes-store";
+import { AudioNoteSettingsStore } from "./audio-note-settings-store";
+import { NoteArtifactsStore } from "./note-artifacts-store";
 import { MetaStore } from "./meta-store";
 import { OnboardingStore } from "./onboarding-store";
 import { PostProcessingStore } from "./post-processing-store";
-import { StatusStore } from "./status-store";
 import { SetupStore } from "./setup-store";
 import { UiStore } from "./ui-store";
 
@@ -17,11 +16,10 @@ import { UiStore } from "./ui-store";
  * and hand down through React context.
  */
 export class RootStore {
-  status: StatusStore;
   meta: MetaStore;
-  history: HistoryStore;
-  meetings: MeetingStore;
-  meetingArtifacts: MeetingArtifactsStore;
+  audioNotes: AudioNotesStore;
+  noteSettings: AudioNoteSettingsStore;
+  noteArtifacts: NoteArtifactsStore;
   config: ConfigStore;
   postProcessing: PostProcessingStore;
   onboarding: OnboardingStore;
@@ -29,11 +27,10 @@ export class RootStore {
   ui: UiStore;
 
   constructor() {
-    this.status = new StatusStore(this);
     this.meta = new MetaStore(this);
-    this.history = new HistoryStore(this);
-    this.meetings = new MeetingStore(this);
-    this.meetingArtifacts = new MeetingArtifactsStore(this);
+    this.audioNotes = new AudioNotesStore();
+    this.noteSettings = new AudioNoteSettingsStore();
+    this.noteArtifacts = new NoteArtifactsStore();
     this.config = new ConfigStore(this);
     this.postProcessing = new PostProcessingStore(this);
     this.onboarding = new OnboardingStore(this);
@@ -44,10 +41,10 @@ export class RootStore {
 
   /** Kick off background polling. Called once at app mount. */
   start(): void {
-    this.status.start();
-    this.meetings.start();
+    this.audioNotes.start();
+    void this.noteSettings.load();
     // Prime the optional FFmpeg installer state. Missing FFmpeg affects
-    // meeting readiness but never blocks app render.
+    // media processing readiness but never blocks app render.
     void this.onboarding.check();
     // UiStore.start is async (kept for parity even though localStorage
     // reads are sync). Fire-and-forget — theme flicker is bounded.
@@ -56,8 +53,7 @@ export class RootStore {
 
   /** Stop all polling. Called on window close / app quit. */
   stop(): void {
-    this.status.stop();
-    this.meetings.stop();
+    this.audioNotes.stop();
   }
 
   /**
@@ -66,8 +62,8 @@ export class RootStore {
    * doesn't flash on boot.
    */
   get daemonReachable(): boolean {
-    if (!this.status.firstPollDone) return true;
-    return this.status.reachable;
+    if (!this.audioNotes.firstPollDone) return true;
+    return this.audioNotes.reachable;
   }
 }
 

@@ -22,7 +22,7 @@ pub fn router(state: SetupApiState) -> Router {
         .with_state(state)
 }
 
-/// Assess host capabilities used by dictation and meeting recording.
+/// Assess host capabilities used by microphone and system-audio capture.
 #[utoipa::path(
     get,
     path = "/setup",

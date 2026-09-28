@@ -113,26 +113,28 @@ fn managed_section_range(content: &str, marker: &str) -> Option<(usize, usize)> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keybind::{target_endpoint, AUDETIC_MEETING_SECTION_MARKER, AUDETIC_SECTION_MARKER};
+    use crate::keybind::{
+        target_endpoint, AUDETIC_SECTION_MARKER, AUDETIC_SYSTEM_NOTE_SECTION_MARKER,
+    };
 
     #[test]
     fn target_sections_coexist_and_update_independently() {
         let original = "# Existing config\nbind = SUPER, SPACE, exec, rofi\n";
-        let dictation = ProposedBinding::for_target(KeybindTarget::Dictation);
-        let meeting = ProposedBinding::for_target(KeybindTarget::Meeting);
+        let dictation = ProposedBinding::for_target(KeybindTarget::Note);
+        let meeting = ProposedBinding::for_target(KeybindTarget::SystemNote);
 
         let both = update_or_append_binding(
-            &update_or_append_binding(original, KeybindTarget::Dictation, &dictation),
-            KeybindTarget::Meeting,
+            &update_or_append_binding(original, KeybindTarget::Note, &dictation),
+            KeybindTarget::SystemNote,
             &meeting,
         );
         assert!(both.contains(AUDETIC_SECTION_MARKER));
-        assert!(both.contains(AUDETIC_MEETING_SECTION_MARKER));
-        assert!(both.contains(&target_endpoint(KeybindTarget::Dictation)));
-        assert!(both.contains(&target_endpoint(KeybindTarget::Meeting)));
+        assert!(both.contains(AUDETIC_SYSTEM_NOTE_SECTION_MARKER));
+        assert!(both.contains(&target_endpoint(KeybindTarget::Note)));
+        assert!(both.contains(&target_endpoint(KeybindTarget::SystemNote)));
 
-        let changed = ProposedBinding::new(KeybindTarget::Dictation, &["SUPER", "ALT"], "D");
-        let updated = update_or_append_binding(&both, KeybindTarget::Dictation, &changed);
+        let changed = ProposedBinding::new(KeybindTarget::Note, &["SUPER", "ALT"], "D");
+        let updated = update_or_append_binding(&both, KeybindTarget::Note, &changed);
         assert!(updated.contains("bindd = SUPER ALT, D, Audetic"));
         assert!(updated.contains(&meeting.to_hyprland_line()));
     }
@@ -141,32 +143,33 @@ mod tests {
     fn removing_one_target_preserves_the_other() {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("bindings.conf");
-        let dictation = ProposedBinding::for_target(KeybindTarget::Dictation);
-        let meeting = ProposedBinding::for_target(KeybindTarget::Meeting);
+        let dictation = ProposedBinding::for_target(KeybindTarget::Note);
+        let meeting = ProposedBinding::for_target(KeybindTarget::SystemNote);
         let content = update_or_append_binding(
-            &update_or_append_binding("", KeybindTarget::Dictation, &dictation),
-            KeybindTarget::Meeting,
+            &update_or_append_binding("", KeybindTarget::Note, &dictation),
+            KeybindTarget::SystemNote,
             &meeting,
         );
         fs::write(&config, content).unwrap();
 
-        assert!(remove_binding(&config, KeybindTarget::Dictation).unwrap());
+        assert!(remove_binding(&config, KeybindTarget::Note).unwrap());
         let remaining = fs::read_to_string(&config).unwrap();
         assert!(!remaining.contains(AUDETIC_SECTION_MARKER));
-        assert!(remaining.contains(AUDETIC_MEETING_SECTION_MARKER));
+        assert!(remaining.contains(AUDETIC_SYSTEM_NOTE_SECTION_MARKER));
         assert!(remaining.contains(&meeting.to_hyprland_line()));
     }
 
     #[test]
-    fn legacy_dictation_marker_is_updated_without_touching_following_comment() {
+    fn managed_marker_is_updated_without_touching_following_comment() {
         let content = format!(
             "{AUDETIC_SECTION_MARKER}\nbindd = SUPER, R, Audetic, exec, old\n# Other section\nbind = ALT, X, exec, other\n"
         );
-        let binding = ProposedBinding::for_target(KeybindTarget::Dictation);
-        let updated = update_or_append_binding(&content, KeybindTarget::Dictation, &binding);
+        let binding = ProposedBinding::for_target(KeybindTarget::Note);
+        let updated = update_or_append_binding(&content, KeybindTarget::Note, &binding);
 
         assert!(!updated.contains("exec, old"));
-        assert!(updated.contains("/toggle\n# Other section\nbind = ALT, X, exec, other"));
+        assert!(updated.contains(&binding.to_hyprland_line()));
+        assert!(updated.contains("\n# Other section\nbind = ALT, X, exec, other"));
     }
 
     #[test]
@@ -174,9 +177,9 @@ mod tests {
         let content = format!(
             "# Keep this note mentioning {AUDETIC_SECTION_MARKER} for documentation\nbind = SUPER, U, exec, user-command\n"
         );
-        let binding = ProposedBinding::for_target(KeybindTarget::Dictation);
+        let binding = ProposedBinding::for_target(KeybindTarget::Note);
 
-        let updated = update_or_append_binding(&content, KeybindTarget::Dictation, &binding);
+        let updated = update_or_append_binding(&content, KeybindTarget::Note, &binding);
         assert!(updated.starts_with(&content));
         assert!(updated.contains("bind = SUPER, U, exec, user-command"));
         assert!(updated.contains(&binding.to_hyprland_line()));
@@ -184,7 +187,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("bindings.conf");
         fs::write(&config, &content).unwrap();
-        assert!(!remove_binding(&config, KeybindTarget::Dictation).unwrap());
+        assert!(!remove_binding(&config, KeybindTarget::Note).unwrap());
         assert_eq!(fs::read_to_string(config).unwrap(), content);
     }
 }

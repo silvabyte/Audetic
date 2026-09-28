@@ -1,0 +1,1449 @@
+//! AudioNote lifecycle orchestrator for live recordings.
+//!
+//! Owns mic + system audio capture and writes the final WAV. Post-recording
+//! processing (compress → transcribe → write transcript → dispatch
+//! classification and artifacts) is delegated
+//! to `audio_notes::processing::process_audio_note`, the shared pipeline
+//! reused by retries and imported media files. Phase transitions during
+//! processing are forwarded to the singleton `AudioNoteStatusHandle` and the
+//! `Indicator` via `LiveProgressObserver`.
+
+use anyhow::{bail, Context, Result};
+use hound::{WavSpec, WavWriter};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use tracing::{info, warn};
+
+use crate::audio::audio_mixer::AudioMixer;
+use crate::audio::audio_source::{CaptureMicSource, CaptureSystemSource};
+use crate::audio::capture_recovery::CaptureRecovery;
+use crate::audio::stream_event::StreamDeath;
+use crate::db::{self, audio_notes::AudioNoteRepository};
+use crate::transcription::job_service::TranscriptionJobService;
+use crate::ui::Indicator;
+
+use super::processing::{
+    process_audio_note, AudioNoteDeliveryOptions, ProcessingArgs, ProcessingServices,
+};
+use super::progress::LiveProgressObserver;
+use super::status::{
+    AudioNoteCaptureSource, AudioNotePhase, AudioNoteStartOptions, AudioNoteStatusHandle,
+};
+
+/// Which audio sources were actually capturing at the start of a meeting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureState {
+    /// Both microphone and system audio are being captured.
+    Both,
+    /// Only the microphone is being captured (system audio unavailable).
+    MicOnly,
+    /// Only the system audio is being captured (mic unavailable).
+    SystemOnly,
+}
+
+impl CaptureState {
+    /// Human-readable label for CLI output / notifications.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Both => "mic + system audio",
+            Self::MicOnly => "microphone only",
+            Self::SystemOnly => "system audio only (mic unavailable)",
+        }
+    }
+
+    /// Stable machine-readable tag for the HTTP API. Wire consumers
+    /// (the Electron UI) switch on these values; `as_str()` is for
+    /// humans and may change wording without breaking the contract.
+    pub fn tag(&self) -> &'static str {
+        match self {
+            Self::Both => "both",
+            Self::MicOnly => "mic_only",
+            Self::SystemOnly => "system_only",
+        }
+    }
+}
+
+/// Result returned from stopping a meeting.
+#[derive(Debug, Clone)]
+pub struct AudioNoteStopResult {
+    pub note_id: i64,
+    pub duration_seconds: u64,
+}
+
+/// Result returned from starting a meeting.
+#[derive(Debug, Clone)]
+pub struct AudioNoteStartResult {
+    pub note_id: i64,
+    pub audio_path: PathBuf,
+    pub capture_state: CaptureState,
+}
+
+pub struct AudioNoteMachine {
+    mic_source: Box<dyn CaptureMicSource>,
+    system_source: Box<dyn CaptureSystemSource>,
+    processing: ProcessingServices,
+    options: AudioNoteStartOptions,
+    indicator: Indicator,
+    status: AudioNoteStatusHandle,
+    audio_notes_dir: PathBuf,
+    db_path: PathBuf,
+}
+
+impl AudioNoteMachine {
+    pub fn new(
+        mic_source: Box<dyn CaptureMicSource>,
+        system_source: Box<dyn CaptureSystemSource>,
+        transcription: Arc<dyn TranscriptionJobService>,
+        indicator: Indicator,
+        status: AudioNoteStatusHandle,
+        audio_notes_dir: PathBuf,
+        db_path: PathBuf,
+    ) -> Self {
+        Self {
+            mic_source,
+            system_source,
+            processing: ProcessingServices::new(transcription, db_path.clone()),
+            options: Default::default(),
+            indicator,
+            status,
+            audio_notes_dir,
+            db_path,
+        }
+    }
+
+    /// Override pipeline integrations while retaining the machine's explicit
+    /// repository path (useful for isolated embedders and deterministic tests).
+    pub fn with_processing_services(mut self, services: ProcessingServices) -> Result<Self> {
+        anyhow::ensure!(
+            services.db_path == self.db_path,
+            "Capture and processing must share one database"
+        );
+        self.processing = services;
+        Ok(self)
+    }
+
+    /// Start a meeting recording.
+    ///
+    /// Returns an error if a meeting is already recording or if both audio
+    /// sources fail to start. Gracefully degrades to mic-only or system-only
+    /// if just one source fails; the `capture_state` on the result tells the
+    /// caller which sources are live.
+    pub async fn start(
+        &mut self,
+        options: Option<AudioNoteStartOptions>,
+    ) -> Result<AudioNoteStartResult> {
+        let current = self.status.get().await;
+        if matches!(
+            current.phase,
+            AudioNotePhase::Recording | AudioNotePhase::Review
+        ) {
+            bail!(
+                "AudioNote already in progress (id: {}). Stop it first or use toggle.",
+                current.note_id.unwrap_or(0)
+            );
+        }
+
+        let opts = options.unwrap_or_default();
+        let audio_path = self.generate_audio_path();
+
+        // Ensure audio_notes directory exists
+        if let Some(parent) = audio_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // Insert meeting record in DB
+        let note_id = {
+            let mut conn = db::init_db_at(&self.db_path)?;
+            let tx = conn.transaction()?;
+            let id = AudioNoteRepository::insert(
+                &tx,
+                opts.title.as_deref(),
+                &audio_path.to_string_lossy(),
+            )?;
+            AudioNoteRepository::set_capture_source(&tx, id, opts.capture_source.as_str())?;
+            tx.commit()?;
+            id
+        };
+        let system_requested = opts.capture_source == AudioNoteCaptureSource::MicrophoneAndSystem;
+        self.options = opts.clone();
+
+        // Start audio sources — track which ones actually came up.
+        let mic_started = match self.mic_source.start() {
+            Ok(()) => true,
+            Err(e) => {
+                warn!("Failed to start mic: {}", e);
+                false
+            }
+        };
+
+        let system_started = system_requested
+            && match self.system_source.start() {
+                Ok(()) => true,
+                Err(e) => {
+                    warn!("Failed to start system audio: {}", e);
+                    false
+                }
+            };
+        self.mic_source.mark_capture_started();
+        if system_requested {
+            self.system_source.mark_capture_started();
+        }
+
+        let mic_ok = mic_started && self.mic_source.has_live_stream();
+        let system_ok = system_started && self.system_source.has_live_stream();
+        let capture_state = match (mic_ok, system_ok) {
+            (true, true) => CaptureState::Both,
+            (true, false) => CaptureState::MicOnly,
+            (false, true) => CaptureState::SystemOnly,
+            (false, false) => {
+                let _ = self.mic_source.stop();
+                let _ = self.system_source.stop();
+                // Clean up DB row so we don't leave a dangling "recording" meeting
+                let conn = db::init_db_at(&self.db_path)?;
+                AudioNoteRepository::fail(&conn, note_id, "Failed to start any audio source", 0)?;
+                bail!("Failed to start any audio source");
+            }
+        };
+
+        self.status
+            .start_recording(
+                note_id,
+                opts.title.clone(),
+                audio_path.clone(),
+                mic_ok,
+                system_ok,
+            )
+            .await;
+        self.status.set_capture_source(opts.capture_source).await;
+
+        info!(
+            "AudioNote {} recording started ({}): {:?}",
+            note_id,
+            capture_state.as_str(),
+            audio_path
+        );
+
+        // Fire the "recording" notification + start beep.
+        if let Err(e) = self.indicator.show_recording().await {
+            warn!("Failed to show recording indicator: {}", e);
+        }
+
+        // If system audio silently dropped, surface it as a warning notification
+        // so the user isn't surprised by a mic-only recording later.
+        if system_requested && matches!(capture_state, CaptureState::MicOnly) {
+            if let Err(e) = self
+                .indicator
+                .show_error("System audio unavailable — recording mic only")
+                .await
+            {
+                warn!("Failed to show capture warning: {}", e);
+            }
+        }
+
+        Ok(AudioNoteStartResult {
+            note_id,
+            audio_path,
+            capture_state,
+        })
+    }
+
+    pub(crate) async fn default_input_switched(&mut self) -> Result<()> {
+        self.status.mark_microphone_degraded().await;
+        let recovery = self.mic_source.default_input_switched().await;
+        self.finish_microphone_recovery(
+            recovery,
+            "Failed to switch Audio Note microphone Default Input",
+        )
+        .await
+    }
+
+    pub(crate) async fn microphone_stream_died(&mut self, death: StreamDeath) -> Result<()> {
+        if !self.mic_source.has_live_stream() {
+            self.status.mark_microphone_degraded().await;
+        }
+        let recovery = self.mic_source.stream_died(death).await;
+        self.finish_microphone_recovery(
+            recovery,
+            "Failed to recover Audio Note microphone from stream death",
+        )
+        .await
+    }
+
+    pub(crate) async fn default_output_switched(&mut self) -> Result<()> {
+        if self.options.capture_source != AudioNoteCaptureSource::MicrophoneAndSystem {
+            return Ok(());
+        }
+        if !self.system_source.supports_hot_swap() {
+            return Ok(());
+        }
+        self.status.mark_system_degraded().await;
+        let recovery = self.system_source.default_output_switched().await;
+        self.finish_system_recovery(recovery, "Failed to switch System Tap Default Output")
+            .await
+    }
+
+    pub(crate) async fn system_stream_died(&mut self, death: StreamDeath) -> Result<()> {
+        if self.options.capture_source != AudioNoteCaptureSource::MicrophoneAndSystem {
+            return Ok(());
+        }
+        if !self.system_source.has_live_stream() {
+            self.status.mark_system_degraded().await;
+        }
+        let recovery = self.system_source.stream_died(death).await;
+        self.finish_system_recovery(recovery, "Failed to recover System Tap from stream death")
+            .await
+    }
+
+    async fn finish_microphone_recovery(
+        &self,
+        recovery: Result<CaptureRecovery>,
+        error_context: &'static str,
+    ) -> Result<()> {
+        match recovery {
+            Ok(recovery) => {
+                self.status.apply_microphone_recovery(recovery).await;
+                Ok(())
+            }
+            Err(error) => {
+                let actual = if self.mic_source.has_live_stream() {
+                    CaptureRecovery::Capturing
+                } else {
+                    CaptureRecovery::Degraded
+                };
+                self.status.apply_microphone_recovery(actual).await;
+                Err(error).context(error_context)
+            }
+        }
+    }
+
+    async fn finish_system_recovery(
+        &self,
+        recovery: Result<CaptureRecovery>,
+        error_context: &'static str,
+    ) -> Result<()> {
+        match recovery {
+            Ok(recovery) => {
+                self.status.apply_system_recovery(recovery).await;
+                Ok(())
+            }
+            Err(error) => {
+                let actual = if self.system_source.has_live_stream() {
+                    CaptureRecovery::Capturing
+                } else {
+                    CaptureRecovery::Degraded
+                };
+                self.status.apply_system_recovery(actual).await;
+                Err(error).context(error_context)
+            }
+        }
+    }
+
+    /// Stop the meeting recording.
+    ///
+    /// Halts audio sources, mixes the captured samples, and writes the WAV
+    /// file, then transitions the meeting into the `Review` phase. The
+    /// recording is **not** sent for transcription yet — the user reviews it
+    /// (and may trim the start/end) and then calls `confirm`, or discards it
+    /// with `cancel`. Returns `AudioNoteStopResult` immediately after the WAV is
+    /// written so the HTTP caller unblocks within milliseconds.
+    pub async fn stop(&mut self) -> Result<AudioNoteStopResult> {
+        let state = self.status.get().await;
+        if state.phase != AudioNotePhase::Recording {
+            bail!(
+                "No audio note recording in progress (current phase: {})",
+                state.phase.as_str()
+            );
+        }
+
+        let note_id = state
+            .note_id
+            .context("Active capture is missing its note id")?;
+        let duration_seconds = state.duration_seconds().unwrap_or(0);
+        let audio_path = state.audio_path.clone().unwrap_or_default();
+
+        // Stop audio sources and collect samples
+        let (mic_samples, mic_stop_succeeded) = match self.mic_source.stop() {
+            Ok(samples) => (samples, true),
+            Err(e) => {
+                warn!("Failed to stop mic: {}", e);
+                (Vec::new(), false)
+            }
+        };
+        let mic_captured_audio = mic_stop_succeeded && self.mic_source.has_captured_audio();
+
+        let mic_rate = self.mic_source.sample_rate();
+
+        let (system_samples, system_stop_succeeded) =
+            if self.options.capture_source == AudioNoteCaptureSource::MicrophoneAndSystem {
+                match self.system_source.stop() {
+                    Ok(samples) => (samples, true),
+                    Err(e) => {
+                        warn!("Failed to stop system audio: {}", e);
+                        (Vec::new(), false)
+                    }
+                }
+            } else {
+                (Vec::new(), false)
+            };
+        let system_captured_audio =
+            system_stop_succeeded && self.system_source.has_captured_audio();
+
+        let system_rate = self.system_source.sample_rate();
+
+        if !mic_captured_audio && !system_captured_audio {
+            // Persist failure so the meeting row isn't left stuck in `recording`.
+            self.status.set_error("No audio captured".to_string()).await;
+            let conn = db::init_db_at(&self.db_path)?;
+            AudioNoteRepository::fail(
+                &conn,
+                note_id,
+                "No audio captured",
+                duration_seconds as i64,
+            )?;
+            let _ = self.indicator.show_error("No audio captured").await;
+            bail!("No audio samples captured during recording");
+        }
+
+        info!(
+            "AudioNote {} stopped: mic={} samples ({}Hz), system={} samples ({}Hz), duration={}s",
+            note_id,
+            mic_samples.len(),
+            mic_rate,
+            system_samples.len(),
+            system_rate,
+            duration_seconds,
+        );
+
+        // Mix audio (resample if needed, then mix)
+        let target_rate: u32 = 16000; // Whisper optimal
+        let mic_resampled = AudioMixer::resample(&mic_samples, mic_rate, target_rate);
+        let system_resampled = AudioMixer::resample(&system_samples, system_rate, target_rate);
+        let mixed = AudioMixer::mix(&[mic_resampled, system_resampled]);
+
+        // Write WAV file
+        if let Err(error) = self.write_wav(&audio_path, &mixed, target_rate) {
+            self.status.set_error(error.to_string()).await;
+            let conn = db::init_db_at(&self.db_path)?;
+            AudioNoteRepository::fail(&conn, note_id, &error.to_string(), duration_seconds as i64)?;
+            return Err(error);
+        }
+
+        // Pause for user review instead of transcribing immediately. Persist
+        // the captured duration and freeze the live timer so the UI shows the
+        // recording's length (and the trim end bound). The user proceeds via
+        // `confirm` (optionally trimming) or discards via `cancel`.
+        let saved = db::init_db_at(&self.db_path).and_then(|conn| {
+            AudioNoteRepository::set_review(&conn, note_id, duration_seconds as i64)
+        });
+        if let Err(error) = saved {
+            self.status
+                .set_error(format!("Failed to save stopped capture: {error:#}"))
+                .await;
+            return Err(error);
+        }
+        self.status.enter_review(duration_seconds).await;
+        if !self.options.review_before_processing {
+            return self.confirm(None, None).await;
+        }
+        if let Err(e) = self.indicator.show_review().await {
+            warn!("Failed to show review indicator: {}", e);
+        }
+
+        Ok(AudioNoteStopResult {
+            note_id,
+            duration_seconds,
+        })
+    }
+
+    /// Confirm a meeting that is awaiting review and send it for
+    /// transcription, optionally trimming the recording to the half-open range
+    /// `[start_seconds, end_seconds)` first. Either bound may be omitted to
+    /// keep that edge; both omitted sends the recording untouched. Trimming
+    /// slices the lossless WAV by sample index, so the cut is exactly
+    /// sample-accurate. Returns an error unless a meeting is currently
+    /// awaiting review.
+    pub async fn confirm(
+        &mut self,
+        start_seconds: Option<f64>,
+        end_seconds: Option<f64>,
+    ) -> Result<AudioNoteStopResult> {
+        let state = self.status.get().await;
+        if state.phase != AudioNotePhase::Review {
+            bail!(
+                "No audio note awaiting review (current phase: {})",
+                state.phase.as_str()
+            );
+        }
+
+        let note_id = state
+            .note_id
+            .context("Reviewed capture is missing its note id")?;
+        let audio_path = state.audio_path.clone().unwrap_or_default();
+        let mut duration_seconds = state.duration_seconds().unwrap_or(0);
+
+        // Apply the trim if either boundary was provided.
+        if start_seconds.is_some() || end_seconds.is_some() {
+            let trimmed = Self::trim_wav(&audio_path, start_seconds, end_seconds)
+                .context("Failed to trim Audio Note audio")?;
+            duration_seconds = trimmed.round().max(0.0) as u64;
+            info!(
+                "AudioNote {} trimmed to {:.3}s (start={:?}, end={:?})",
+                note_id, trimmed, start_seconds, end_seconds
+            );
+        }
+
+        self.status.enter_review(duration_seconds).await;
+        self.spawn_processing(note_id, audio_path, duration_seconds)
+            .await;
+
+        Ok(AudioNoteStopResult {
+            note_id,
+            duration_seconds,
+        })
+    }
+
+    /// Build and spawn the compress → transcribe → dispatch pipeline for a
+    /// meeting whose WAV is already on disk. Transitions the live status to
+    /// `Compressing` and shows the processing indicator first so the status is
+    /// coherent the moment this returns; the pipeline itself runs detached.
+    /// `LiveProgressObserver` forwards later phase transitions to the
+    /// singleton status handle and the indicator.
+    async fn spawn_processing(&self, note_id: i64, audio_path: PathBuf, duration_seconds: u64) {
+        self.status.set_phase(AudioNotePhase::Compressing).await;
+        if let Err(e) = self.indicator.show_processing().await {
+            warn!("Failed to show processing indicator: {}", e);
+        }
+
+        let observer = Arc::new(LiveProgressObserver::new(
+            note_id,
+            self.status.clone(),
+            self.indicator.clone(),
+        ));
+        let args = ProcessingArgs {
+            note_id,
+            audio_path,
+            duration_seconds,
+            services: self.processing.clone(),
+            observer,
+            delivery: AudioNoteDeliveryOptions {
+                auto_paste: self.options.auto_paste,
+                copy_to_clipboard: self.options.copy_to_clipboard,
+            },
+        };
+        tokio::spawn(async move { process_audio_note(args).await });
+    }
+
+    /// Cancel a meeting without running the transcription pipeline.
+    ///
+    /// Works while still `Recording` (discards captured samples) or while
+    /// awaiting `Review` (discards the recorded WAV). Deletes any WAV on disk
+    /// and marks the meeting `cancelled` in the DB. Returns an error if no
+    /// meeting is recording or awaiting review.
+    pub async fn cancel(&mut self) -> Result<AudioNoteStopResult> {
+        let state = self.status.get().await;
+        if !matches!(
+            state.phase,
+            AudioNotePhase::Recording | AudioNotePhase::Review
+        ) {
+            bail!(
+                "No audio note recording or awaiting review to cancel (current phase: {})",
+                state.phase.as_str()
+            );
+        }
+
+        let note_id = state.note_id.context("Capture is missing its note id")?;
+        let duration_seconds = state.duration_seconds().unwrap_or(0);
+        let audio_path = state.audio_path.clone().unwrap_or_default();
+
+        // Stop sources only if still recording — from Review they were already
+        // halted by `stop()` and the WAV is finalized on disk.
+        if state.phase == AudioNotePhase::Recording {
+            let _ = self.mic_source.stop();
+            let _ = self.system_source.stop();
+        }
+
+        // Persist cancellation before destructive file cleanup.
+        let conn = db::init_db_at(&self.db_path)?;
+        AudioNoteRepository::cancel(&conn, note_id, duration_seconds as i64)?;
+        drop(conn);
+
+        // Remove the recorded WAV if present (always present in Review).
+        if audio_path.exists() {
+            if let Err(e) = std::fs::remove_file(&audio_path) {
+                warn!("Failed to remove discarded WAV {:?}: {}", audio_path, e);
+            }
+        }
+
+        self.status.cancelled().await;
+        self.status.reset().await;
+
+        info!(
+            "AudioNote {} cancelled after {}s",
+            note_id, duration_seconds
+        );
+
+        Ok(AudioNoteStopResult {
+            note_id,
+            duration_seconds,
+        })
+    }
+
+    /// Toggle meeting recording.
+    pub async fn toggle(
+        &mut self,
+        options: Option<AudioNoteStartOptions>,
+    ) -> Result<ToggleOutcome> {
+        let state = self.status.get().await;
+        match state.phase {
+            AudioNotePhase::Recording => {
+                let result = self.stop().await?;
+                Ok(ToggleOutcome::Stopped(result))
+            }
+            AudioNotePhase::Idle
+            | AudioNotePhase::Compressing
+            | AudioNotePhase::Transcribing
+            | AudioNotePhase::Completed
+            | AudioNotePhase::Error
+            | AudioNotePhase::Cancelled => {
+                let result = self.start(options).await?;
+                Ok(ToggleOutcome::Started(result))
+            }
+            phase => {
+                bail!(
+                    "Cannot toggle capture while {} — please wait",
+                    phase.as_str()
+                );
+            }
+        }
+    }
+
+    fn write_wav(&self, path: &Path, samples: &[f32], sample_rate: u32) -> Result<()> {
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+
+        let mut writer = WavWriter::create(path, spec)?;
+        for &sample in samples {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
+
+        info!(
+            "AudioNote audio saved: {:?} ({} samples)",
+            path,
+            samples.len()
+        );
+        Ok(())
+    }
+
+    /// Trim a mono float WAV in place to the half-open range
+    /// `[start_seconds, end_seconds)`. Missing bounds default to the start/end
+    /// of the file; out-of-range values are clamped. Because the source is
+    /// lossless PCM, slicing by sample index (`round(seconds * sample_rate)`)
+    /// is exactly sample-accurate — there is no ffmpeg keyframe seeking
+    /// involved. Returns the trimmed duration in seconds.
+    fn trim_wav(path: &Path, start_seconds: Option<f64>, end_seconds: Option<f64>) -> Result<f64> {
+        if start_seconds.is_some_and(|v| !v.is_finite())
+            || end_seconds.is_some_and(|v| !v.is_finite())
+        {
+            bail!("Invalid trim range: bounds must be finite");
+        }
+        let mut reader = hound::WavReader::open(path)
+            .with_context(|| format!("Failed to open WAV for trimming: {path:?}"))?;
+        let spec = reader.spec();
+        let sample_rate = spec.sample_rate;
+
+        let samples: Vec<f32> = reader
+            .samples::<f32>()
+            .collect::<std::result::Result<Vec<f32>, _>>()
+            .context("Failed to read WAV samples")?;
+        let total = samples.len();
+
+        let to_index = |secs: f64| -> usize {
+            ((secs.max(0.0) * sample_rate as f64).round() as usize).min(total)
+        };
+        let start_idx = start_seconds.map(to_index).unwrap_or(0);
+        let end_idx = end_seconds.map(to_index).unwrap_or(total);
+
+        if start_idx >= end_idx {
+            bail!(
+                "Invalid trim range: start ({:?}s) is at or after end ({:?}s)",
+                start_seconds,
+                end_seconds
+            );
+        }
+
+        let trimmed = &samples[start_idx..end_idx];
+
+        let mut writer = WavWriter::create(path, spec)
+            .with_context(|| format!("Failed to rewrite trimmed WAV: {path:?}"))?;
+        for &sample in trimmed {
+            writer.write_sample(sample)?;
+        }
+        writer.finalize()?;
+
+        info!(
+            "Trimmed WAV {:?}: {} → {} samples ([{}, {}))",
+            path,
+            total,
+            trimmed.len(),
+            start_idx,
+            end_idx
+        );
+
+        Ok(trimmed.len() as f64 / sample_rate as f64)
+    }
+
+    fn generate_audio_path(&self) -> PathBuf {
+        let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        // The random suffix keeps two audio_notes created within the same second
+        // on distinct paths — a live daemon only runs one meeting at a time,
+        // but parallel test threads can collide. Without it both WAVs (and the
+        // temp mp3s derived from those filenames) would clobber each other.
+        let unique = uuid::Uuid::new_v4().simple();
+        self.audio_notes_dir
+            .join(format!("audio-note-{timestamp}-{unique}.wav"))
+    }
+}
+
+/// Outcome of a toggle operation.
+pub enum ToggleOutcome {
+    Started(AudioNoteStartResult),
+    Stopped(AudioNoteStopResult),
+}
+
+#[cfg(test)]
+mod tests {
+    use async_trait::async_trait;
+
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    use crate::audio::audio_source::AudioSource;
+    use crate::audio::input_device::{
+        ActiveInput, CaptureBackend, InputDataCallback, InputErrorCallback,
+    };
+    use crate::audio::mic_source::{MicAudioSource, MonotonicClock};
+    use crate::audio::system_tap::{
+        ActiveSystemTap, SystemTapAudioSource, SystemTapBackend, SystemTapDataCallback,
+        SystemTapErrorCallback,
+    };
+    use crate::transcription::job_service::{TranscriptionJobResult, TranscriptionJobService};
+
+    use super::*;
+
+    #[derive(Default)]
+    struct FakeClock {
+        nanos: AtomicU64,
+    }
+
+    impl FakeClock {
+        fn advance(&self, duration: Duration) {
+            self.nanos
+                .fetch_add(duration.as_nanos().try_into().unwrap(), Ordering::SeqCst);
+        }
+    }
+
+    impl MonotonicClock for FakeClock {
+        fn now(&self) -> Duration {
+            Duration::from_nanos(self.nanos.load(Ordering::SeqCst))
+        }
+    }
+
+    struct PlannedInput {
+        sample_rate: u32,
+        samples: Vec<f32>,
+        open_duration: Duration,
+    }
+
+    enum CapturePlan {
+        Input(PlannedInput),
+        Fail {
+            message: &'static str,
+            open_duration: Duration,
+        },
+    }
+
+    struct PlannedCaptureBackend {
+        plans: Mutex<VecDeque<CapturePlan>>,
+        clock: Arc<FakeClock>,
+    }
+
+    impl CaptureBackend for PlannedCaptureBackend {
+        fn start_default_input(
+            &self,
+            mut on_data: InputDataCallback,
+            _on_error: InputErrorCallback,
+        ) -> Result<ActiveInput> {
+            match self.plans.lock().unwrap().pop_front().unwrap() {
+                CapturePlan::Input(input) => {
+                    self.clock.advance(input.open_duration);
+                    on_data(&input.samples, 1);
+                    Ok(ActiveInput::new(input.sample_rate, ()))
+                }
+                CapturePlan::Fail {
+                    message,
+                    open_duration,
+                } => {
+                    self.clock.advance(open_duration);
+                    Err(anyhow::anyhow!(message))
+                }
+            }
+        }
+    }
+
+    struct PlannedSystemBackend {
+        plans: Mutex<VecDeque<CapturePlan>>,
+        clock: Arc<FakeClock>,
+    }
+
+    impl SystemTapBackend for PlannedSystemBackend {
+        fn start_default_output(
+            &self,
+            mut on_data: SystemTapDataCallback,
+            _on_error: SystemTapErrorCallback,
+        ) -> Result<ActiveSystemTap> {
+            match self.plans.lock().unwrap().pop_front().unwrap() {
+                CapturePlan::Input(input) => {
+                    self.clock.advance(input.open_duration);
+                    on_data(&input.samples, 1);
+                    Ok(ActiveSystemTap::new(input.sample_rate, ()))
+                }
+                CapturePlan::Fail {
+                    message,
+                    open_duration,
+                } => {
+                    self.clock.advance(open_duration);
+                    Err(anyhow::anyhow!(message))
+                }
+            }
+        }
+    }
+
+    struct ContinuousSystemSource {
+        samples: Vec<f32>,
+        active: bool,
+    }
+
+    impl AudioSource for ContinuousSystemSource {
+        fn start(&mut self) -> Result<()> {
+            self.active = true;
+            Ok(())
+        }
+
+        fn stop(&mut self) -> Result<Vec<f32>> {
+            self.active = false;
+            Ok(self.samples.clone())
+        }
+
+        fn is_active(&self) -> bool {
+            self.active
+        }
+
+        fn sample_rate(&self) -> u32 {
+            16_000
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl CaptureSystemSource for ContinuousSystemSource {
+        fn has_captured_audio(&self) -> bool {
+            !self.samples.is_empty()
+        }
+    }
+
+    struct UnusedTranscription;
+
+    fn dual_review() -> Option<AudioNoteStartOptions> {
+        Some(AudioNoteStartOptions {
+            capture_source: AudioNoteCaptureSource::MicrophoneAndSystem,
+            review_before_processing: true,
+            ..Default::default()
+        })
+    }
+
+    #[async_trait]
+    impl TranscriptionJobService for UnusedTranscription {
+        async fn submit_and_poll(
+            &self,
+            _file_path: &Path,
+            _language: Option<&str>,
+        ) -> Result<TranscriptionJobResult> {
+            unreachable!("stopping into Review does not start transcription")
+        }
+    }
+
+    fn write_test_wav(path: &Path, samples: &[f32], sample_rate: u32) {
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut writer = WavWriter::create(path, spec).unwrap();
+        for &s in samples {
+            writer.write_sample(s).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    fn read_wav(path: &Path) -> Vec<f32> {
+        let mut reader = hound::WavReader::open(path).unwrap();
+        reader.samples::<f32>().map(|s| s.unwrap()).collect()
+    }
+
+    fn temp_wav_path() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "audetic-trim-test-{}.wav",
+            uuid::Uuid::new_v4().simple()
+        ))
+    }
+
+    #[tokio::test]
+    async fn audio_note_hot_swap_keeps_mic_and_system_tracks_aligned() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    }),
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 44_100,
+                        samples: vec![-0.25; 441],
+                        open_duration: Duration::from_millis(260),
+                    }),
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = AudioNoteStatusHandle::default();
+        let audio_notes_dir = tempfile::tempdir().unwrap();
+        let db_path = audio_notes_dir.path().join("audetic.db");
+        let mut machine = AudioNoteMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: vec![0.1; 4_320],
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            audio_notes_dir.path().to_path_buf(),
+            db_path.clone(),
+        );
+
+        let started = machine.start(dual_review()).await.unwrap();
+        assert!(!status.get().await.capture_degraded);
+        machine.default_input_switched().await.unwrap();
+        machine.stop().await.unwrap();
+
+        let mixed = read_wav(&started.audio_path);
+        assert_eq!(mixed.len(), 4_320);
+        assert!(mixed[..160].iter().all(|sample| *sample > 0.1));
+        assert!(mixed[160..4_160]
+            .iter()
+            .all(|sample| (*sample - 0.1).abs() < f32::EPSILON));
+        assert!(mixed[4_160..].iter().all(|sample| *sample < 0.0));
+        let review = status.get().await;
+        assert_eq!(review.phase, AudioNotePhase::Review);
+        assert!(!review.capture_degraded);
+    }
+
+    #[tokio::test]
+    async fn system_tap_hot_swap_keeps_continuous_mic_track_aligned() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Input(PlannedInput {
+                    sample_rate: 16_000,
+                    samples: vec![0.1; 4_320],
+                    open_duration: Duration::ZERO,
+                })])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let system = SystemTapAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedSystemBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    }),
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 44_100,
+                        samples: vec![-0.25; 441],
+                        open_duration: Duration::from_millis(260),
+                    }),
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = AudioNoteStatusHandle::default();
+        let audio_notes_dir = tempfile::tempdir().unwrap();
+        let db_path = audio_notes_dir.path().join("audetic.db");
+        let mut machine = AudioNoteMachine::new(
+            Box::new(mic),
+            Box::new(system),
+            Arc::new(UnusedTranscription),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            audio_notes_dir.path().to_path_buf(),
+            db_path.clone(),
+        );
+
+        let started = machine.start(dual_review()).await.unwrap();
+        assert!(!status.get().await.capture_degraded);
+        machine.default_output_switched().await.unwrap();
+        assert!(!status.get().await.capture_degraded);
+        machine.stop().await.unwrap();
+
+        let mixed = read_wav(&started.audio_path);
+        assert_eq!(mixed.len(), 4_320);
+        assert!(mixed[..160].iter().all(|sample| *sample > 0.1));
+        assert!(mixed[160..4_160]
+            .iter()
+            .all(|sample| (*sample - 0.1).abs() < f32::EPSILON));
+        assert!(mixed[4_160..].iter().all(|sample| *sample < 0.1));
+        assert_eq!(status.get().await.phase, AudioNotePhase::Review);
+    }
+
+    #[tokio::test]
+    async fn initial_system_tap_failure_recovers_with_prefix_silence() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Input(PlannedInput {
+                    sample_rate: 16_000,
+                    samples: vec![0.1; 4_960],
+                    open_duration: Duration::ZERO,
+                })])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let system = SystemTapAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedSystemBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Fail {
+                        message: "Default Output unavailable",
+                        open_duration: Duration::from_secs(5),
+                    },
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::ZERO,
+                    }),
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let status = AudioNoteStatusHandle::default();
+        let audio_notes_dir = tempfile::tempdir().unwrap();
+        let db_path = audio_notes_dir.path().join("audetic.db");
+        let mut machine = AudioNoteMachine::new(
+            Box::new(mic),
+            Box::new(system),
+            Arc::new(UnusedTranscription),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            audio_notes_dir.path().to_path_buf(),
+            db_path.clone(),
+        );
+
+        let started = machine.start(dual_review()).await.unwrap();
+        assert_eq!(started.capture_state, CaptureState::MicOnly);
+        assert!(status.get().await.capture_degraded);
+        clock.advance(Duration::from_millis(300));
+        machine.default_output_switched().await.unwrap();
+        assert!(!status.get().await.capture_degraded);
+        machine.stop().await.unwrap();
+
+        let mixed = read_wav(&started.audio_path);
+        assert_eq!(mixed.len(), 4_960);
+        assert!(mixed[..4_800]
+            .iter()
+            .all(|sample| (*sample - 0.1).abs() < f32::EPSILON));
+        assert!(mixed[4_800..].iter().all(|sample| *sample > 0.1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audio_note_status_is_degraded_while_system_tap_retries() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Input(PlannedInput {
+                    sample_rate: 16_000,
+                    samples: vec![0.1; 160],
+                    open_duration: Duration::ZERO,
+                })])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let system = SystemTapAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedSystemBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 16_000,
+                        samples: vec![0.25; 160],
+                        open_duration: Duration::ZERO,
+                    }),
+                    CapturePlan::Fail {
+                        message: "replacement 1 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                    CapturePlan::Fail {
+                        message: "replacement 2 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                    CapturePlan::Fail {
+                        message: "replacement 3 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = AudioNoteStatusHandle::default();
+        let audio_notes_dir = tempfile::tempdir().unwrap();
+        let db_path = audio_notes_dir.path().join("audetic.db");
+        let mut machine = AudioNoteMachine::new(
+            Box::new(mic),
+            Box::new(system),
+            Arc::new(UnusedTranscription),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            audio_notes_dir.path().to_path_buf(),
+            db_path.clone(),
+        );
+
+        machine.start(dual_review()).await.unwrap();
+        let replacement = machine.default_output_switched();
+        tokio::pin!(replacement);
+        tokio::select! {
+            biased;
+            result = &mut replacement => panic!("replacement completed before retrying: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        assert!(status.get().await.capture_degraded);
+        replacement.await.unwrap();
+        assert!(status.get().await.capture_degraded);
+    }
+
+    #[tokio::test]
+    async fn initial_mic_gap_starts_after_blocked_source_startup() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Fail {
+                        message: "Default Input permission unresolved",
+                        open_duration: Duration::from_secs(5),
+                    },
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::ZERO,
+                    }),
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let status = AudioNoteStatusHandle::default();
+        let audio_notes_dir = tempfile::tempdir().unwrap();
+        let db_path = audio_notes_dir.path().join("audetic.db");
+        let mut machine = AudioNoteMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: vec![0.1; 4_960],
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            audio_notes_dir.path().to_path_buf(),
+            db_path.clone(),
+        );
+
+        let started = machine.start(dual_review()).await.unwrap();
+        assert_eq!(started.capture_state, CaptureState::SystemOnly);
+        assert!(status.get().await.capture_degraded);
+
+        clock.advance(Duration::from_millis(300));
+        machine.default_input_switched().await.unwrap();
+        assert!(!status.get().await.capture_degraded);
+        machine.stop().await.unwrap();
+
+        let mixed = read_wav(&started.audio_path);
+        assert_eq!(mixed.len(), 4_960);
+        assert!(mixed[..4_800]
+            .iter()
+            .all(|sample| (*sample - 0.1).abs() < f32::EPSILON));
+        assert!(mixed[4_800..].iter().all(|sample| *sample > 0.1));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn audio_note_status_is_degraded_while_microphone_retries() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    }),
+                    CapturePlan::Fail {
+                        message: "replacement 1 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                    CapturePlan::Fail {
+                        message: "replacement 2 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                    CapturePlan::Fail {
+                        message: "replacement 3 failed",
+                        open_duration: Duration::ZERO,
+                    },
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = AudioNoteStatusHandle::default();
+        let audio_notes_dir = tempfile::tempdir().unwrap();
+        let db_path = audio_notes_dir.path().join("audetic.db");
+        let mut machine = AudioNoteMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: vec![0.1; 160],
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            audio_notes_dir.path().to_path_buf(),
+            db_path.clone(),
+        );
+
+        machine.start(dual_review()).await.unwrap();
+        let replacement = machine.default_input_switched();
+        tokio::pin!(replacement);
+        tokio::select! {
+            biased;
+            result = &mut replacement => panic!("replacement completed before retrying: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+
+        assert!(status.get().await.capture_degraded);
+        replacement.await.unwrap();
+        assert!(status.get().await.capture_degraded);
+    }
+
+    #[tokio::test]
+    async fn silence_fill_alone_does_not_count_as_captured_audio() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            16_000,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Fail {
+                    message: "Default Input unavailable",
+                    open_duration: Duration::ZERO,
+                }])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock.clone(),
+        );
+        let status = AudioNoteStatusHandle::default();
+        let audio_notes_dir = tempfile::tempdir().unwrap();
+        let db_path = audio_notes_dir.path().join("audetic.db");
+        let mut machine = AudioNoteMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: Vec::new(),
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            audio_notes_dir.path().to_path_buf(),
+            db_path.clone(),
+        );
+
+        let started = machine.start(dual_review()).await.unwrap();
+        assert_eq!(started.capture_state, CaptureState::SystemOnly);
+        clock.advance(Duration::from_millis(300));
+
+        assert!(machine.stop().await.is_err());
+        assert_eq!(status.get().await.phase, AudioNotePhase::Error);
+        assert!(!started.audio_path.exists());
+    }
+
+    #[tokio::test]
+    async fn failed_mic_normalization_does_not_count_as_captured_audio() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            0,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([CapturePlan::Input(PlannedInput {
+                    sample_rate: 48_000,
+                    samples: vec![0.25; 480],
+                    open_duration: Duration::ZERO,
+                })])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = AudioNoteStatusHandle::default();
+        let audio_notes_dir = tempfile::tempdir().unwrap();
+        let db_path = audio_notes_dir.path().join("audetic.db");
+        let mut machine = AudioNoteMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: Vec::new(),
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            audio_notes_dir.path().to_path_buf(),
+            db_path.clone(),
+        );
+
+        let started = machine.start(dual_review()).await.unwrap();
+        assert_eq!(started.capture_state, CaptureState::Both);
+
+        assert!(machine.stop().await.is_err());
+        assert_eq!(status.get().await.phase, AudioNotePhase::Error);
+        assert!(!started.audio_path.exists());
+    }
+
+    #[tokio::test]
+    async fn replacement_normalization_error_reports_the_live_microphone() {
+        let clock = Arc::new(FakeClock::default());
+        let mic = MicAudioSource::with_backend_and_clock(
+            0,
+            Box::new(PlannedCaptureBackend {
+                plans: Mutex::new(VecDeque::from([
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    }),
+                    CapturePlan::Input(PlannedInput {
+                        sample_rate: 48_000,
+                        samples: vec![-0.25; 480],
+                        open_duration: Duration::from_millis(10),
+                    }),
+                ])),
+                clock: clock.clone(),
+            }),
+            Arc::new(|_| {}),
+            clock,
+        );
+        let status = AudioNoteStatusHandle::default();
+        let audio_notes_dir = tempfile::tempdir().unwrap();
+        let db_path = audio_notes_dir.path().join("audetic.db");
+        let mut machine = AudioNoteMachine::new(
+            Box::new(mic),
+            Box::new(ContinuousSystemSource {
+                samples: vec![0.1; 160],
+                active: false,
+            }),
+            Arc::new(UnusedTranscription),
+            Indicator::new().with_audio_feedback(false),
+            status.clone(),
+            audio_notes_dir.path().to_path_buf(),
+            db_path.clone(),
+        );
+
+        machine.start(dual_review()).await.unwrap();
+        assert!(machine.default_input_switched().await.is_err());
+
+        assert!(!status.get().await.capture_degraded);
+    }
+
+    #[test]
+    fn test_trim_wav_slices_by_sample_index() {
+        let sample_rate = 16000u32;
+        // 4 seconds of a ramp so we can assert exact sample boundaries.
+        let samples: Vec<f32> = (0..sample_rate * 4).map(|i| i as f32).collect();
+        let path = temp_wav_path();
+        write_test_wav(&path, &samples, sample_rate);
+
+        // Trim to [1.0s, 3.0s) → exactly 2 seconds == 32000 samples.
+        let dur = AudioNoteMachine::trim_wav(&path, Some(1.0), Some(3.0)).unwrap();
+        assert!((dur - 2.0).abs() < 1e-9);
+
+        let out = read_wav(&path);
+        assert_eq!(out.len(), (sample_rate * 2) as usize);
+        // First kept sample is index 16000, last is index 47999 of the ramp.
+        assert_eq!(out[0], sample_rate as f32);
+        assert_eq!(out[out.len() - 1], (sample_rate * 3 - 1) as f32);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_trim_wav_defaults_and_clamps_out_of_range_end() {
+        let sample_rate = 16000u32;
+        let samples: Vec<f32> = (0..sample_rate * 2).map(|i| i as f32).collect();
+        let path = temp_wav_path();
+        write_test_wav(&path, &samples, sample_rate);
+
+        // Only an end is given, past the end of the file → clamps to full length.
+        let dur = AudioNoteMachine::trim_wav(&path, None, Some(99.0)).unwrap();
+        assert!((dur - 2.0).abs() < 1e-9);
+        assert_eq!(read_wav(&path).len(), (sample_rate * 2) as usize);
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn test_trim_wav_rejects_inverted_range() {
+        let sample_rate = 16000u32;
+        let samples: Vec<f32> = (0..sample_rate * 2).map(|i| i as f32).collect();
+        let path = temp_wav_path();
+        write_test_wav(&path, &samples, sample_rate);
+
+        assert!(AudioNoteMachine::trim_wav(&path, Some(1.5), Some(1.0)).is_err());
+
+        std::fs::remove_file(&path).ok();
+    }
+}

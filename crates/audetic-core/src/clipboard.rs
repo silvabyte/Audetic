@@ -2,7 +2,7 @@
 //!
 //! The daemon's text-injection path (`text_io`) reuses [`CLIPBOARD_BACKENDS`]
 //! for its async clipboard fallback; the CLI uses [`copy_to_clipboard_sync`]
-//! for `transcribe --copy` / `history --copy`. Keeping the backend table in
+//! for `notes copy`. Keeping the backend table in
 //! one place avoids the two diverging.
 
 use anyhow::{anyhow, Result};
@@ -20,6 +20,13 @@ pub struct ClipboardBackend {
 
 /// Clipboard tools tried in order: wl-copy (Wayland) first, then xclip/xsel (X11).
 pub const CLIPBOARD_BACKENDS: &[ClipboardBackend] = &[
+    #[cfg(target_os = "macos")]
+    ClipboardBackend {
+        name: "pbcopy",
+        copy_cmd: "pbcopy",
+        copy_args: &[],
+        use_stdin: true,
+    },
     ClipboardBackend {
         name: "wl-copy",
         copy_cmd: "wl-copy",

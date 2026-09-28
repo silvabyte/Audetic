@@ -31,10 +31,10 @@ pub enum SetupCapabilityId {
     TranscriptionProvider,
     TextDelivery,
     ClipboardFallback,
-    DictationKeybind,
-    MeetingKeybind,
+    NoteKeybind,
+    SystemNoteKeybind,
     Ffmpeg,
-    MeetingAudio,
+    SystemAudio,
 }
 
 impl SetupCapabilityId {
@@ -46,10 +46,10 @@ impl SetupCapabilityId {
             Self::TranscriptionProvider => "transcription_provider",
             Self::TextDelivery => "text_delivery",
             Self::ClipboardFallback => "clipboard_fallback",
-            Self::DictationKeybind => "dictation_keybind",
-            Self::MeetingKeybind => "meeting_keybind",
+            Self::NoteKeybind => "note_keybind",
+            Self::SystemNoteKeybind => "system_note_keybind",
             Self::Ffmpeg => "ffmpeg",
-            Self::MeetingAudio => "meeting_audio",
+            Self::SystemAudio => "system_audio",
         }
     }
 }
@@ -70,10 +70,10 @@ pub struct ToolReadiness {
 pub struct SetupCapability {
     pub id: SetupCapabilityId,
     pub state: SetupState,
-    /// Whether this capability participates in basic dictation readiness.
-    pub required_for_dictation: bool,
-    /// Whether this capability participates in meeting readiness.
-    pub required_for_meetings: bool,
+    /// Whether this capability participates in microphone capture readiness.
+    pub required_for_microphone: bool,
+    /// Whether this capability participates in microphone + system capture readiness.
+    pub required_for_system_audio: bool,
     pub summary: String,
     pub detail: Option<String>,
     pub action: Option<String>,
@@ -92,8 +92,8 @@ pub struct PlatformInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
 pub struct WorkflowReadiness {
-    pub dictation: SetupState,
-    pub meetings: SetupState,
+    pub microphone: SetupState,
+    pub microphone_and_system: SetupState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,16 +128,16 @@ mod tests {
     #[test]
     fn capability_ids_have_stable_wire_names() {
         assert_eq!(
-            serde_json::to_string(&SetupCapabilityId::DictationKeybind).unwrap(),
-            "\"dictation_keybind\""
+            serde_json::to_string(&SetupCapabilityId::NoteKeybind).unwrap(),
+            "\"note_keybind\""
         );
         assert_eq!(
             serde_json::to_string(&SetupState::NeedsAction).unwrap(),
             "\"needs_action\""
         );
         assert_eq!(
-            serde_json::to_string(&SetupCapabilityId::MeetingKeybind).unwrap(),
-            "\"meeting_keybind\""
+            serde_json::to_string(&SetupCapabilityId::SystemNoteKeybind).unwrap(),
+            "\"system_note_keybind\""
         );
     }
 }

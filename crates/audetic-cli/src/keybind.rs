@@ -38,10 +38,14 @@ async fn status(target: Option<KeybindTarget>) -> Result<()> {
 
     let targets = target
         .map(|target| vec![target])
-        .unwrap_or_else(|| vec![KeybindTarget::Dictation, KeybindTarget::Meeting]);
+        .unwrap_or_else(|| vec![KeybindTarget::Note, KeybindTarget::SystemNote]);
     for target in targets {
         println!();
-        print_target_status(target, &body[target.as_str()]);
+        let field = match target {
+            KeybindTarget::Note => "note",
+            KeybindTarget::SystemNote => "system_note",
+        };
+        print_target_status(target, &body[field]);
     }
     Ok(())
 }
@@ -128,7 +132,7 @@ async fn uninstall(target: KeybindTarget, dry_run: bool) -> Result<()> {
 async fn interactive() -> Result<()> {
     if !io::stdin().is_terminal() {
         eprintln!(
-            "Non-interactive session. Use 'audetic keybind install [--target meeting]' for automated setup."
+            "Non-interactive session. Use 'audetic keybind install [--target system-note]' for automated setup."
         );
         return Ok(());
     }
@@ -139,13 +143,16 @@ async fn interactive() -> Result<()> {
     let theme = ColorfulTheme::default();
     let selected = Select::with_theme(&theme)
         .with_prompt("Shortcut to install or update")
-        .items(&["Dictation (SUPER+R)", "Meeting (SUPER+SHIFT+R)"])
+        .items(&[
+            "Microphone (SUPER+R)",
+            "Microphone + system audio (SUPER+SHIFT+R)",
+        ])
         .default(0)
         .interact()?;
     let target = if selected == 0 {
-        KeybindTarget::Dictation
+        KeybindTarget::Note
     } else {
-        KeybindTarget::Meeting
+        KeybindTarget::SystemNote
     };
     let proceed = Confirm::with_theme(&theme)
         .with_prompt(format!("Install or update the {target} keybinding now?"))
@@ -157,8 +164,8 @@ async fn interactive() -> Result<()> {
     }
 
     let default_key = match target {
-        KeybindTarget::Dictation => "SUPER, R",
-        KeybindTarget::Meeting => "SUPER SHIFT, R",
+        KeybindTarget::Note => "SUPER, R",
+        KeybindTarget::SystemNote => "SUPER SHIFT, R",
     };
     let key: String = Input::with_theme(&theme)
         .with_prompt("Keybinding (e.g. \"SUPER, R\" or \"SUPER SHIFT, T\")")
@@ -205,8 +212,8 @@ fn print_install_result(body: &Value) {
 
 fn title(target: KeybindTarget) -> &'static str {
     match target {
-        KeybindTarget::Dictation => "Dictation",
-        KeybindTarget::Meeting => "Meeting",
+        KeybindTarget::Note => "Microphone",
+        KeybindTarget::SystemNote => "Microphone + system audio",
     }
 }
 

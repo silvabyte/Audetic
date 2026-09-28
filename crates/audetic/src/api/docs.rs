@@ -7,8 +7,8 @@
 use utoipa::OpenApi;
 
 use super::routes::{
-    agents, history, keybind, logs, meeting_artifacts, meetings, models, post_processing, provider,
-    recording, setup, summary_templates, system, transcribe,
+    agents, audio_note_artifacts, audio_notes, keybind, logs, models, post_processing, provider,
+    setup, summary_templates, system,
 };
 
 #[derive(OpenApi)]
@@ -26,12 +26,6 @@ use super::routes::{
         // Service
         super::status,
         super::version,
-        // Recording (dictation)
-        recording::toggle_recording,
-        recording::recording_status,
-        // History
-        history::list_history,
-        history::get_history_by_id,
         // Keybind
         keybind::get_status,
         keybind::install_keybind,
@@ -51,37 +45,40 @@ use super::routes::{
         models::list_models,
         models::get_model,
         models::download_model,
-        transcribe::transcribe,
         // System
         setup::get_setup,
         system::get_deps,
         system::restart_daemon,
         system::start_install_ffmpeg,
         system::get_install_ffmpeg_status,
-        // Meetings
-        meetings::start_meeting,
-        meetings::stop_meeting,
-        meetings::confirm_meeting,
-        meetings::cancel_meeting,
-        meetings::toggle_meeting,
-        meetings::meeting_status,
-        meetings::list_meetings,
-        meetings::recent_meeting_titles,
-        meetings::get_meeting,
-        meetings::update_meeting_title,
-        meetings::regenerate_meeting_title,
-        meetings::delete_meeting,
-        meetings::meeting_audio,
-        meetings::retry_meeting,
-        meetings::import_meeting,
-        // Meeting intelligence
+        // AudioNotes
+        audio_notes::start_audio_note,
+        audio_notes::get_audio_note_settings,
+        audio_notes::set_audio_note_settings,
+        audio_notes::stop_audio_note,
+        audio_notes::confirm_audio_note,
+        audio_notes::cancel_audio_note,
+        audio_notes::toggle_audio_note,
+        audio_notes::audio_note_status,
+        audio_notes::list_audio_notes,
+        audio_notes::recent_audio_note_titles,
+        audio_notes::get_audio_note,
+        audio_notes::update_audio_note_title,
+        audio_notes::regenerate_audio_note_title,
+        audio_notes::delete_audio_note,
+        audio_notes::audio_note_audio,
+        audio_notes::retry_audio_note,
+        audio_notes::process_audio_note,
+        audio_notes::import_audio_note,
+        // AudioNote intelligence
         agents::list_agent_profiles,
         agents::test_agent_profile,
+        agents::select_default_agent,
         summary_templates::list_summary_templates,
-        meeting_artifacts::list_meeting_artifacts,
-        meeting_artifacts::generate_artifact,
-        meeting_artifacts::get_meeting_artifact,
-        meeting_artifacts::delete_meeting_artifact,
+        audio_note_artifacts::list_audio_note_artifacts,
+        audio_note_artifacts::generate_artifact,
+        audio_note_artifacts::get_audio_note_artifact,
+        audio_note_artifacts::delete_audio_note_artifact,
         // Post-processing jobs
         post_processing::list_events,
         post_processing::list_jobs,
@@ -95,13 +92,6 @@ use super::routes::{
         // Service
         super::ServiceInfo,
         super::VersionInfo,
-        // Recording
-        recording::ToggleRequest,
-        recording::ToggleResponse,
-        recording::CompletedJobSummary,
-        recording::RecordingStatusResponse,
-        // History
-        crate::history::HistoryEntry,
         // Keybind
         audetic_core::keybind::KeybindTarget,
         crate::keybind::KeybindConflict,
@@ -123,7 +113,6 @@ use super::routes::{
         crate::transcription::models::ModelDescriptor,
         crate::transcription::models::DownloadProgress,
         models::ModelsListResponse,
-        transcribe::TranscribeResponse,
         // System
         audetic_core::setup::SetupState,
         audetic_core::setup::SetupCapabilityId,
@@ -136,26 +125,29 @@ use super::routes::{
         system::RestartAccepted,
         system::InstallPhase,
         system::InstallStatusResponse,
-        // Meetings
-        meetings::MeetingStartRequest,
-        meetings::MeetingStartResponse,
-        meetings::MeetingConfirmRequest,
-        meetings::MeetingStopResponse,
-        meetings::MeetingToggleResponse,
-        meetings::MeetingStatusResponse,
-        meetings::MeetingSummary,
-        meetings::MeetingsListResponse,
-        meetings::MeetingDetailResponse,
-        meetings::MeetingTitleSource,
-        meetings::RecentMeetingTitlesResponse,
-        meetings::MeetingTitleUpdateRequest,
-        meetings::MeetingTitleResponse,
-        meetings::MeetingTitleRegenerationResponse,
+        // AudioNotes
+        audio_notes::AudioNoteStartRequest,
+        audio_notes::AudioNoteSettings,
+        audio_notes::AudioNoteImportRequest,
+        crate::audio_notes::AudioNoteCaptureSource,
+        audio_notes::AudioNoteStartResponse,
+        audio_notes::AudioNoteConfirmRequest,
+        audio_notes::AudioNoteStopResponse,
+        audio_notes::AudioNoteToggleResponse,
+        audio_notes::AudioNoteStatusResponse,
+        audio_notes::AudioNoteSummary,
+        audio_notes::AudioNotesListResponse,
+        audio_notes::AudioNoteDetailResponse,
+        audio_notes::AudioNoteTitleSource,
+        audio_notes::RecentAudioNoteTitlesResponse,
+        audio_notes::AudioNoteTitleUpdateRequest,
+        audio_notes::AudioNoteTitleResponse,
+        audio_notes::AudioNoteTitleRegenerationResponse,
         audetic_core::jobs_client::Segment,
-        meetings::MeetingRetryResponse,
-        meetings::MeetingDeleteResponse,
-        meetings::MeetingImportResponse,
-        // Meeting intelligence
+        audio_notes::AudioNoteRetryResponse,
+        audio_notes::AudioNoteDeleteResponse,
+        audio_notes::AudioNoteImportResponse,
+        // AudioNote intelligence
         crate::db::agent_profiles::AgentProfile,
         crate::db::agent_profiles::PromptMode,
         agents::AgentProfilesResponse,
@@ -163,12 +155,12 @@ use super::routes::{
         crate::summary_templates::SummaryTemplate,
         crate::summary_templates::SummaryTemplateSection,
         summary_templates::SummaryTemplatesResponse,
-        crate::db::meeting_artifacts::ArtifactStatus,
-        crate::db::meeting_artifacts::MeetingArtifact,
-        crate::meeting_artifacts::GenerateArtifactRequest,
-        crate::meeting_artifacts::GenerateArtifactResponse,
-        meeting_artifacts::MeetingArtifactsResponse,
-        meeting_artifacts::DeleteArtifactResponse,
+        crate::db::audio_note_artifacts::ArtifactStatus,
+        crate::db::audio_note_artifacts::AudioNoteArtifact,
+        crate::audio_note_artifacts::GenerateArtifactRequest,
+        crate::audio_note_artifacts::GenerateArtifactResponse,
+        audio_note_artifacts::AudioNoteArtifactsResponse,
+        audio_note_artifacts::DeleteArtifactResponse,
         // Post-processing
         crate::post_processing::Action,
         crate::post_processing::Job,
@@ -183,16 +175,13 @@ use super::routes::{
     )),
     tags(
         (name = "service", description = "Service identity and liveness"),
-        (name = "recording", description = "Dictation (voice-to-text) control"),
-        (name = "meetings", description = "Long-form meeting recording"),
-        (name = "meeting_artifacts", description = "Generated meeting summaries and notes"),
+        (name = "audio_notes", description = "Unified audio capture, transcription, and enrichment"),
+        (name = "audio_note_artifacts", description = "Generated Audio Note artifacts and structured outputs"),
         (name = "agents", description = "Local coding-agent CLI profiles"),
-        (name = "summary_templates", description = "Built-in meeting artifact templates"),
-        (name = "history", description = "Past transcriptions"),
+        (name = "summary_templates", description = "Built-in Audio Note processor templates"),
         (name = "keybind", description = "Hyprland keybinding management"),
         (name = "provider", description = "Transcription provider configuration"),
         (name = "models", description = "On-device transcription model management"),
-        (name = "transcribe", description = "One-shot file transcription"),
         (name = "system", description = "External tool / dependency availability"),
         (name = "setup", description = "Unified host setup assessment"),
         (name = "update", description = "Daemon self-update"),
@@ -242,9 +231,8 @@ mod tests {
 
         for known in [
             paths::VERSION,
-            paths::TOGGLE,
-            paths::MEETINGS_TOGGLE,
-            paths::MEETINGS_IMPORT,
+            paths::AUDIO_NOTES_TOGGLE,
+            paths::AUDIO_NOTES_IMPORT,
             paths::AGENT_PROFILES,
             paths::SUMMARY_TEMPLATES,
             paths::POST_PROCESSING_JOBS,
@@ -257,7 +245,6 @@ mod tests {
             paths::PROVIDER_RESET,
             paths::PROVIDER_TEST,
             paths::MODELS,
-            paths::TRANSCRIBE,
             paths::SETUP,
             paths::SYSTEM_RESTART,
             paths::KEYBIND_STATUS,
@@ -290,11 +277,10 @@ mod tests {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
         assert!(spec["components"]["schemas"]["KeybindTarget"].is_object());
+        assert!(spec["components"]["schemas"]["KeybindStatuses"]["properties"]["note"].is_object());
         assert!(
-            spec["components"]["schemas"]["KeybindStatuses"]["properties"]["dictation"].is_object()
-        );
-        assert!(
-            spec["components"]["schemas"]["KeybindStatuses"]["properties"]["meeting"].is_object()
+            spec["components"]["schemas"]["KeybindStatuses"]["properties"]["system_note"]
+                .is_object()
         );
         assert_eq!(
             spec["paths"][paths::KEYBIND_INSTALL]["post"]["operationId"],
@@ -325,9 +311,21 @@ mod tests {
     }
 
     #[test]
-    fn recording_status_schema_requires_capture_health() {
+    fn obsolete_capture_endpoints_and_schemas_are_absent() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let schema = &spec["components"]["schemas"]["RecordingStatusResponse"];
+        for path in ["/toggle", "/status", "/history", "/meetings", "/transcribe"] {
+            assert!(spec["paths"].get(path).is_none(), "obsolete path {path}");
+        }
+        assert!(spec["components"]["schemas"]
+            .get("RecordingStatusResponse")
+            .is_none());
+        assert!(spec["paths"]["/audio-notes/{id}/process"]["post"].is_object());
+    }
+
+    #[test]
+    fn audio_note_status_schema_requires_capture_health() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        let schema = &spec["components"]["schemas"]["AudioNoteStatusResponse"];
 
         assert_eq!(schema["properties"]["capture_degraded"]["type"], "boolean");
         assert!(schema["required"]
@@ -338,29 +336,45 @@ mod tests {
     }
 
     #[test]
-    fn meeting_status_schema_requires_capture_health() {
-        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
-        let schema = &spec["components"]["schemas"]["MeetingStatusResponse"];
-
-        assert_eq!(schema["properties"]["capture_degraded"]["type"], "boolean");
-        assert!(schema["required"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|field| field == "capture_degraded"));
-    }
-
-    #[test]
-    fn meeting_title_operations_and_presentation_fields_are_public() {
+    fn audio_note_title_operations_and_presentation_fields_are_public() {
         let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
 
-        assert!(spec["paths"]["/meetings/recent-titles"]["get"].is_object());
-        assert!(spec["paths"]["/meetings/{id}/title"]["patch"].is_object());
-        assert!(spec["paths"]["/meetings/{id}/regenerate-title"]["post"].is_object());
-        for schema_name in ["MeetingSummary", "MeetingDetailResponse"] {
+        assert!(spec["paths"]["/audio-notes/recent-titles"]["get"].is_object());
+        assert!(spec["paths"]["/audio-notes/{id}/title"]["patch"].is_object());
+        assert!(spec["paths"]["/audio-notes/{id}/regenerate-title"]["post"].is_object());
+        for schema_name in ["AudioNoteSummary", "AudioNoteDetailResponse"] {
             let properties = &spec["components"]["schemas"][schema_name]["properties"];
             assert!(properties["title_source"].is_object());
             assert!(properties["source_filename"].is_object());
+            for field in [
+                "classification",
+                "enrichment_status",
+                "enrichment_error",
+                "capture_source",
+                "transcript_text",
+            ] {
+                assert!(properties[field].is_object(), "{schema_name} lacks {field}");
+            }
         }
+    }
+
+    #[test]
+    fn capture_settings_and_multipart_import_are_typed() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+        assert!(spec["paths"]["/audio-notes/settings"]["get"].is_object());
+        assert!(spec["paths"]["/audio-notes/settings"]["put"].is_object());
+        let multipart = &spec["paths"]["/audio-notes/import"]["post"]["requestBody"]["content"]
+            ["multipart/form-data"];
+        assert_eq!(
+            multipart["schema"]["$ref"],
+            "#/components/schemas/AudioNoteImportRequest"
+        );
+        let upload = &spec["components"]["schemas"]["AudioNoteImportRequest"];
+        assert_eq!(upload["properties"]["file"]["type"], "string");
+        assert_eq!(upload["properties"]["file"]["format"], "binary");
+        assert!(upload["properties"]["title"].is_object());
+        let required =
+            spec["components"]["schemas"]["AudioNoteStartRequest"]["required"].as_array();
+        assert!(required.is_none_or(|fields| !fields.iter().any(|field| field == "auto_paste")));
     }
 }

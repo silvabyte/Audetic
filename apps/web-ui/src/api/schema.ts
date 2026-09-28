@@ -36,6 +36,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/agent-profiles/{id}/default": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["select_default_agent"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/agent-profiles/{id}/test": {
         parameters: {
             query?: never;
@@ -52,15 +68,14 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/history": {
+    "/audio-notes": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** List transcription history. */
-        get: operations["list_history"];
+        get: operations["list_audio_notes"];
         put?: never;
         post?: never;
         delete?: never;
@@ -69,21 +84,324 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/history/{id}": {
+    "/audio-notes/cancel": {
         parameters: {
             query?: never;
             header?: never;
             path?: never;
             cookie?: never;
         };
-        /** Get a single transcription. */
-        get: operations["get_history_by_id"];
+        get?: never;
+        put?: never;
+        post: operations["cancel_audio_note"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["confirm_audio_note"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/import": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Import a media file as a new meeting.
+         * @description Accepts a `multipart/form-data` body with:
+         *     - `file`: the audio or video bytes (required)
+         *     - `title`: optional Manual Title; absent or blank imports remain untitled
+         *       until transcript-derived generation succeeds
+         *
+         *     The file is streamed chunk-by-chunk into a temp file under the audio_notes
+         *     directory, then handed to `meeting::import_audio_note_file`, which moves
+         *     it into place, inserts the DB row, and spawns the processing pipeline.
+         *     Returns 202 with the new meeting id; clients poll `GET /audio-notes/{id}`
+         *     for status. The response intentionally omits the storage path —
+         *     callers shouldn't depend on the filesystem layout.
+         */
+        post: operations["import_audio_note"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/recent-titles": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["recent_audio_note_titles"];
         put?: never;
         post?: never;
         delete?: never;
         options?: never;
         head?: never;
         patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/settings": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_audio_note_settings"];
+        put: operations["set_audio_note_settings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/start": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["start_audio_note"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["audio_note_status"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/stop": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["stop_audio_note"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/toggle": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["toggle_audio_note"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_audio_note"];
+        put?: never;
+        post?: never;
+        /**
+         * Soft-delete a meeting.
+         * @description The user-facing label is "Delete", but the row is only hidden — we stamp
+         *     `deleted_at` so it drops out of every API surface (list, detail, audio,
+         *     retry) while the recording stays on disk. Recovery is a manual DB edit.
+         *     If the live status handle still describes this meeting (it keeps the most
+         *     recent terminal meeting so the UI can show the outcome), it is reset too,
+         *     so `GET /audio-notes/status` doesn't keep reporting a deleted meeting.
+         *
+         *     In-flight audio_notes (recording / review / processing) are refused with 409:
+         *     their id is still owned by the meeting machine and background pipeline, so
+         *     hiding the row would 404 the active/review UI and break completion
+         *     auto-nav. Stop or cancel the meeting first. Returns 404 if the meeting
+         *     doesn't exist or was already deleted.
+         */
+        delete: operations["delete_audio_note"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/{id}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_audio_note_artifacts"];
+        put?: never;
+        post: operations["generate_artifact"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/{id}/artifacts/{artifact_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_audio_note_artifact"];
+        put?: never;
+        post?: never;
+        delete: operations["delete_audio_note_artifact"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/{id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Stream a meeting's audio file for in-browser playback. Used by the review
+         *     UI so the user can listen back before choosing trim points. Resolves the
+         *     file actually on disk — the row points at the `.wav` while review is
+         *     pending and the `.mp3` after processing. Served via `ServeFile`, which
+         *     honours HTTP Range requests so the `<audio>` element can seek.
+         */
+        get: operations["audio_note_audio"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/{id}/process": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Retry classification and downstream processors without retranscribing or
+         *     redelivering text. The intelligence layer owns the atomic work claim.
+         */
+        post: operations["process_audio_note"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/{id}/regenerate-title": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["regenerate_audio_note_title"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/{id}/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Re-run transcription on the durable mp3 from a previously failed
+         *     meeting. Useful when the backend was the cause (e.g. the 5-min
+         *     Bun-fetch idle bug in InferenceServerManager) and the audio is fine.
+         * @description Validates: meeting exists, is in `error` state, and its mp3 is still
+         *     on disk. Spawns the retry in a tokio task and returns 202
+         *     immediately so the renderer can begin polling for the status flip.
+         */
+        post: operations["retry_audio_note"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/{id}/title": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch: operations["update_audio_note_title"];
         trace?: never;
     };
     "/keybind": {
@@ -152,306 +470,6 @@ export interface paths {
         options?: never;
         head?: never;
         patch?: never;
-        trace?: never;
-    };
-    "/meetings": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_meetings"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/cancel": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["cancel_meeting"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/confirm": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["confirm_meeting"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/import": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Import a media file as a new meeting.
-         * @description Accepts a `multipart/form-data` body with:
-         *     - `file`: the audio or video bytes (required)
-         *     - `title`: optional Manual Title; absent or blank imports remain untitled
-         *       until transcript-derived generation succeeds
-         *
-         *     The file is streamed chunk-by-chunk into a temp file under the meetings
-         *     directory, then handed to `meeting::import_meeting_file`, which moves
-         *     it into place, inserts the DB row, and spawns the processing pipeline.
-         *     Returns 202 with the new meeting id; clients poll `GET /meetings/{id}`
-         *     for status. The response intentionally omits the storage path —
-         *     callers shouldn't depend on the filesystem layout.
-         */
-        post: operations["import_meeting"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/recent-titles": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["recent_meeting_titles"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/start": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["start_meeting"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["meeting_status"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/stop": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["stop_meeting"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/toggle": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["toggle_meeting"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/{id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_meeting"];
-        put?: never;
-        post?: never;
-        /**
-         * Soft-delete a meeting.
-         * @description The user-facing label is "Delete", but the row is only hidden — we stamp
-         *     `deleted_at` so it drops out of every API surface (list, detail, audio,
-         *     retry) while the recording stays on disk. Recovery is a manual DB edit.
-         *     If the live status handle still describes this meeting (it keeps the most
-         *     recent terminal meeting so the UI can show the outcome), it is reset too,
-         *     so `GET /meetings/status` doesn't keep reporting a deleted meeting.
-         *
-         *     In-flight meetings (recording / review / processing) are refused with 409:
-         *     their id is still owned by the meeting machine and background pipeline, so
-         *     hiding the row would 404 the active/review UI and break completion
-         *     auto-nav. Stop or cancel the meeting first. Returns 404 if the meeting
-         *     doesn't exist or was already deleted.
-         */
-        delete: operations["delete_meeting"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/{id}/artifacts": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["list_meeting_artifacts"];
-        put?: never;
-        post: operations["generate_artifact"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/{id}/artifacts/{artifact_id}": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get: operations["get_meeting_artifact"];
-        put?: never;
-        post?: never;
-        delete: operations["delete_meeting_artifact"];
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/{id}/audio": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Stream a meeting's audio file for in-browser playback. Used by the review
-         *     UI so the user can listen back before choosing trim points. Resolves the
-         *     file actually on disk — the row points at the `.wav` while review is
-         *     pending and the `.mp3` after processing. Served via `ServeFile`, which
-         *     honours HTTP Range requests so the `<audio>` element can seek.
-         */
-        get: operations["meeting_audio"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/{id}/regenerate-title": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post: operations["regenerate_meeting_title"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/{id}/retry": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /**
-         * Re-run transcription on the durable mp3 from a previously failed
-         *     meeting. Useful when the backend was the cause (e.g. the 5-min
-         *     Bun-fetch idle bug in InferenceServerManager) and the audio is fine.
-         * @description Validates: meeting exists, is in `error` state, and its mp3 is still
-         *     on disk. Spawns the retry in a tokio task and returns 202
-         *     immediately so the renderer can begin polling for the status flip.
-         */
-        post: operations["retry_meeting"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/meetings/{id}/title": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch: operations["update_meeting_title"];
         trace?: never;
     };
     "/models": {
@@ -718,28 +736,8 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Assess host capabilities used by dictation and meeting recording. */
+        /** Assess host capabilities used by microphone and system-audio capture. */
         get: operations["get_setup_assessment"];
-        put?: never;
-        post?: never;
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/status": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /**
-         * Gets the current recording status.
-         * @description Pass `?style=waybar` for a Waybar-formatted `{text, class, tooltip}` payload.
-         */
-        get: operations["recording_status"];
         put?: never;
         post?: never;
         delete?: never;
@@ -846,40 +844,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/toggle": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Toggles recording on or off with optional per-job options. */
-        post: operations["toggle_recording"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
-    "/transcribe": {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        get?: never;
-        put?: never;
-        /** Transcribe an uploaded audio file using the configured provider. */
-        post: operations["transcribe_file"];
-        delete?: never;
-        options?: never;
-        head?: never;
-        patch?: never;
-        trace?: never;
-    };
     "/version": {
         parameters: {
             query?: never;
@@ -942,13 +906,232 @@ export interface components {
         };
         /** @enum {string} */
         ArtifactStatus: "pending" | "running" | "completed" | "error";
-        /** @description The `last_completed_job` nested block inside `RecordingStatusResponse`. */
-        CompletedJobSummary: {
+        AudioNoteArtifact: {
+            /** Format: int64 */
+            agent_profile_id?: number | null;
+            completed_at?: string | null;
+            content_json?: unknown;
+            content_markdown?: string | null;
+            created_at: string;
+            error?: string | null;
+            /** Format: int64 */
+            id: number;
+            kind: string;
+            /** Format: int64 */
+            note_id: number;
+            status: components["schemas"]["ArtifactStatus"];
+            stderr?: string | null;
+            stdout?: string | null;
+            template_id?: string | null;
+            title: string;
+            updated_at: string;
+        };
+        AudioNoteArtifactsResponse: {
+            artifacts: components["schemas"]["AudioNoteArtifact"][];
+        };
+        /** @enum {string} */
+        AudioNoteCaptureSource: "microphone" | "microphone_and_system";
+        /**
+         * @description Request body for the confirm endpoint. Both bounds are optional; omitting
+         *     one keeps that edge of the recording. Both omitted sends it untouched.
+         */
+        AudioNoteConfirmRequest: {
+            /**
+             * Format: double
+             * @description New end of the recording, in seconds (clamped to the recording).
+             */
+            end_seconds?: number | null;
+            /**
+             * Format: double
+             * @description New start of the recording, in seconds (clamped to the recording).
+             */
+            start_seconds?: number | null;
+        };
+        /**
+         * @description Confirmation that a meeting has been deleted. The delete is *soft*: the
+         *     meeting is hidden from every API surface but its row and on-disk audio
+         *     survive.
+         */
+        AudioNoteDeleteResponse: {
+            message: string;
+            /** Format: int64 */
+            note_id: number;
+            success: boolean;
+        };
+        /** @description Full Audio Note record including transcript text when available. */
+        AudioNoteDetailResponse: {
+            audio_path: string;
+            capture_source: string;
+            classification?: unknown;
+            completed_at?: string | null;
             created_at: string;
             /** Format: int64 */
-            history_id?: number | null;
-            job_id: string;
-            text: string;
+            duration_seconds?: number | null;
+            enrichment_error?: string | null;
+            enrichment_status: string;
+            error?: string | null;
+            /** Format: int64 */
+            id: number;
+            source_filename?: string | null;
+            started_at: string;
+            status: string;
+            title?: string | null;
+            title_source?: null | components["schemas"]["AudioNoteTitleSource"];
+            transcript_path?: string | null;
+            /**
+             * @description Per-segment timestamps for clickable transcript lines. `None` for
+             *     audio_notes transcribed before timestamps were captured.
+             */
+            transcript_segments?: components["schemas"]["Segment"][] | null;
+            transcript_text?: string | null;
+        };
+        /** @description Streamed multipart upload; original filename determines the media format. */
+        AudioNoteImportRequest: {
+            /** Format: binary */
+            file: string;
+            title?: string | null;
+        };
+        /**
+         * @description Confirmation that an imported media file has been accepted as a new
+         *     Audio Note. The processing pipeline runs in the background; clients poll
+         *     `GET /audio-notes/{id}` for phase progression and the final transcript.
+         */
+        AudioNoteImportResponse: {
+            message: string;
+            /** Format: int64 */
+            note_id: number;
+            success: boolean;
+        };
+        /**
+         * @description Confirmation that a failed meeting's transcription has been
+         *     re-queued; the actual work runs in the background.
+         */
+        AudioNoteRetryResponse: {
+            message: string;
+            /** Format: int64 */
+            note_id: number;
+            success: boolean;
+        };
+        /** @description Persisted capture defaults. Changing this does not alter an active note. */
+        AudioNoteSettings: {
+            auto_paste: boolean;
+        };
+        /** @description Request body for start/toggle endpoints. */
+        AudioNoteStartRequest: {
+            /**
+             * @description Omitted/null uses the persisted capture preference; false overrides it.
+             * @default null
+             */
+            auto_paste: boolean | null;
+            /** @default microphone */
+            capture_source: components["schemas"]["AudioNoteCaptureSource"];
+            /** @default false */
+            copy_to_clipboard: boolean;
+            /** @default false */
+            review_before_processing: boolean;
+            /** @default null */
+            title: string | null;
+        };
+        /**
+         * @description Confirmation that capture has begun: the assigned note id,
+         *     where audio is being written, and capture-source state.
+         */
+        AudioNoteStartResponse: {
+            audio_path: string;
+            capture_state: string;
+            message: string;
+            /** Format: int64 */
+            note_id: number;
+            success: boolean;
+        };
+        /**
+         * @description Default (non-waybar) capture status snapshot. The waybar variant
+         *     has a different shape — see the union response on the handler.
+         */
+        AudioNoteStatusResponse: {
+            active: boolean;
+            audio_path?: string | null;
+            capture_degraded: boolean;
+            /** Format: int64 */
+            duration_seconds?: number | null;
+            last_error?: string | null;
+            /** Format: int64 */
+            note_id?: number | null;
+            phase: string;
+            title?: string | null;
+        };
+        /**
+         * @description Result of ending capture (stop or cancel): the note id and how
+         *     long it ran.
+         */
+        AudioNoteStopResponse: {
+            /** Format: int64 */
+            duration_seconds: number;
+            message: string;
+            /** Format: int64 */
+            note_id: number;
+            success: boolean;
+        };
+        /**
+         * @description Summary of one Audio Note in a list response — enough to render a row
+         *     without loading the full transcript.
+         */
+        AudioNoteSummary: {
+            audio_path: string;
+            capture_source: string;
+            classification?: unknown;
+            /** Format: int64 */
+            duration_seconds?: number | null;
+            enrichment_error?: string | null;
+            enrichment_status: string;
+            /** Format: int64 */
+            id: number;
+            source_filename?: string | null;
+            started_at: string;
+            status: string;
+            title?: string | null;
+            title_source?: null | components["schemas"]["AudioNoteTitleSource"];
+            transcript_path?: string | null;
+            /** @description Persisted raw transcript, not enriched output. */
+            transcript_text?: string | null;
+        };
+        AudioNoteTitleRegenerationResponse: {
+            message: string;
+            /** Format: int64 */
+            note_id: number;
+            success: boolean;
+        };
+        AudioNoteTitleResponse: {
+            /** Format: int64 */
+            note_id: number;
+            title?: string | null;
+            title_source?: null | components["schemas"]["AudioNoteTitleSource"];
+        };
+        /** @enum {string} */
+        AudioNoteTitleSource: "manual" | "generated";
+        AudioNoteTitleUpdateRequest: {
+            /** @description New non-empty Manual Title. */
+            title: string;
+        };
+        /**
+         * @description Result of a capture toggle. Shape varies by whether capture was
+         *     started or stopped: `audio_path`/`capture_state` appear on start,
+         *     `duration_seconds` appears on stop, hence the optional fields.
+         */
+        AudioNoteToggleResponse: {
+            audio_path?: string | null;
+            capture_state?: string | null;
+            /** Format: int64 */
+            duration_seconds?: number | null;
+            message: string;
+            /** Format: int64 */
+            note_id: number;
+            phase: string;
+            success: boolean;
+        };
+        /** @description Paginated list of Audio Note summaries. */
+        AudioNotesListResponse: {
+            notes: components["schemas"]["AudioNoteSummary"][];
         };
         DeleteArtifactResponse: {
             /** Format: int64 */
@@ -988,12 +1171,8 @@ export interface components {
              */
             name: string;
         };
-        /**
-         * @description Stable identifier for an event type, as stored in the
-         *     `post_processing_jobs.event` column and exposed over the API.
-         * @enum {string}
-         */
-        EventKind: "dictation.completed" | "meeting.completed";
+        /** @enum {string} */
+        EventKind: "audio_note.completed";
         EventsListResponse: {
             events: components["schemas"]["EventDescriptor"][];
         };
@@ -1005,15 +1184,7 @@ export interface components {
             template_id?: string;
         };
         GenerateArtifactResponse: {
-            artifact: components["schemas"]["MeetingArtifact"];
-        };
-        /** @description A single history entry with formatted display data. */
-        HistoryEntry: {
-            audio_path: string;
-            created_at: string;
-            /** Format: int64 */
-            id: number;
-            text: string;
+            artifact: components["schemas"]["AudioNoteArtifact"];
         };
         /**
          * @description Phase string for the install status endpoint. Renderer uses this to drive
@@ -1029,7 +1200,7 @@ export interface components {
             key?: string | null;
             /** @description Alias for clients that call this operation a preview. */
             preview?: boolean;
-            /** @description Shortcut action. Defaults to dictation. */
+            /** @description Shortcut action. Defaults to microphone Audio Note capture. */
             target?: components["schemas"]["KeybindTarget"];
         };
         /** @description Server-authoritative install or preview result. */
@@ -1115,212 +1286,17 @@ export interface components {
         };
         /** @description Status response for every stable target. */
         KeybindStatuses: {
-            dictation: components["schemas"]["KeybindStatus"];
-            meeting: components["schemas"]["KeybindStatus"];
+            note: components["schemas"]["KeybindStatus"];
+            system_note: components["schemas"]["KeybindStatus"];
         };
-        /**
-         * @description Stable Audetic actions that can be installed as Hyprland shortcuts.
-         * @enum {string}
-         */
-        KeybindTarget: "dictation" | "meeting";
+        /** @enum {string} */
+        KeybindTarget: "note" | "system-note";
         /** @description Combined logs result containing both app logs and transcription history. */
         LogsResult: {
             /** @description Application logs from systemd journal */
             app_logs: string[];
             /** @description Recent transcription entries */
-            transcriptions: components["schemas"]["HistoryEntry"][];
-        };
-        MeetingArtifact: {
-            /** Format: int64 */
-            agent_profile_id?: number | null;
-            completed_at?: string | null;
-            content_markdown?: string | null;
-            created_at: string;
-            error?: string | null;
-            /** Format: int64 */
-            id: number;
-            kind: string;
-            /** Format: int64 */
-            meeting_id: number;
-            status: components["schemas"]["ArtifactStatus"];
-            stderr?: string | null;
-            stdout?: string | null;
-            template_id?: string | null;
-            title: string;
-            updated_at: string;
-        };
-        MeetingArtifactsResponse: {
-            artifacts: components["schemas"]["MeetingArtifact"][];
-        };
-        /**
-         * @description Request body for the confirm endpoint. Both bounds are optional; omitting
-         *     one keeps that edge of the recording. Both omitted sends it untouched.
-         */
-        MeetingConfirmRequest: {
-            /**
-             * Format: double
-             * @description New end of the recording, in seconds (clamped to the recording).
-             */
-            end_seconds?: number | null;
-            /**
-             * Format: double
-             * @description New start of the recording, in seconds (clamped to the recording).
-             */
-            start_seconds?: number | null;
-        };
-        /**
-         * @description Confirmation that a meeting has been deleted. The delete is *soft*: the
-         *     meeting is hidden from every API surface but its row and on-disk audio
-         *     survive.
-         */
-        MeetingDeleteResponse: {
-            /** Format: int64 */
-            meeting_id: number;
-            message: string;
-            success: boolean;
-        };
-        /** @description Full meeting record including transcript text when available. */
-        MeetingDetailResponse: {
-            audio_path: string;
-            completed_at?: string | null;
-            created_at: string;
-            /** Format: int64 */
-            duration_seconds?: number | null;
-            error?: string | null;
-            /** Format: int64 */
-            id: number;
-            source_filename?: string | null;
-            started_at: string;
-            status: string;
-            title?: string | null;
-            title_source?: null | components["schemas"]["MeetingTitleSource"];
-            transcript_path?: string | null;
-            /**
-             * @description Per-segment timestamps for clickable transcript lines. `None` for
-             *     meetings transcribed before timestamps were captured.
-             */
-            transcript_segments?: components["schemas"]["Segment"][] | null;
-            transcript_text?: string | null;
-        };
-        /**
-         * @description Confirmation that an imported media file has been accepted as a new
-         *     meeting. The processing pipeline runs in the background; clients poll
-         *     `GET /meetings/{id}` for phase progression and the final transcript.
-         */
-        MeetingImportResponse: {
-            /** Format: int64 */
-            meeting_id: number;
-            message: string;
-            success: boolean;
-        };
-        /**
-         * @description Confirmation that a failed meeting's transcription has been
-         *     re-queued; the actual work runs in the background.
-         */
-        MeetingRetryResponse: {
-            /** Format: int64 */
-            meeting_id: number;
-            message: string;
-            success: boolean;
-        };
-        /** @description Request body for start/toggle endpoints. */
-        MeetingStartRequest: {
-            title?: string | null;
-        };
-        /**
-         * @description Confirmation that a meeting recording has begun: the assigned id,
-         *     where audio is being written, and capture-source state.
-         */
-        MeetingStartResponse: {
-            audio_path: string;
-            capture_state: string;
-            /** Format: int64 */
-            meeting_id: number;
-            message: string;
-            success: boolean;
-        };
-        /**
-         * @description Default (non-waybar) meeting status snapshot. The waybar variant
-         *     has a different shape — see the union response on the handler.
-         */
-        MeetingStatusResponse: {
-            active: boolean;
-            audio_path?: string | null;
-            capture_degraded: boolean;
-            /** Format: int64 */
-            duration_seconds?: number | null;
-            last_error?: string | null;
-            /** Format: int64 */
-            meeting_id?: number | null;
-            phase: string;
-            title?: string | null;
-        };
-        /**
-         * @description Result of ending a meeting (stop or cancel): the meeting id and how
-         *     long it ran.
-         */
-        MeetingStopResponse: {
-            /** Format: int64 */
-            duration_seconds: number;
-            /** Format: int64 */
-            meeting_id: number;
-            message: string;
-            success: boolean;
-        };
-        /**
-         * @description Summary of one meeting in a list response — enough to render a row
-         *     without loading the full transcript.
-         */
-        MeetingSummary: {
-            audio_path: string;
-            /** Format: int64 */
-            duration_seconds?: number | null;
-            /** Format: int64 */
-            id: number;
-            source_filename?: string | null;
-            started_at: string;
-            status: string;
-            title?: string | null;
-            title_source?: null | components["schemas"]["MeetingTitleSource"];
-            transcript_path?: string | null;
-        };
-        MeetingTitleRegenerationResponse: {
-            /** Format: int64 */
-            meeting_id: number;
-            message: string;
-            success: boolean;
-        };
-        MeetingTitleResponse: {
-            /** Format: int64 */
-            meeting_id: number;
-            title?: string | null;
-            title_source?: null | components["schemas"]["MeetingTitleSource"];
-        };
-        /** @enum {string} */
-        MeetingTitleSource: "manual" | "generated";
-        MeetingTitleUpdateRequest: {
-            /** @description New non-empty Manual Title. */
-            title: string;
-        };
-        /**
-         * @description Result of a meeting toggle. Shape varies by whether a meeting was
-         *     started or stopped: `audio_path`/`capture_state` appear on start,
-         *     `duration_seconds` appears on stop, hence the optional fields.
-         */
-        MeetingToggleResponse: {
-            audio_path?: string | null;
-            capture_state?: string | null;
-            /** Format: int64 */
-            duration_seconds?: number | null;
-            /** Format: int64 */
-            meeting_id: number;
-            message: string;
-            phase: string;
-            success: boolean;
-        };
-        /** @description Paginated list of meeting summaries. */
-        MeetingsListResponse: {
-            meetings: components["schemas"]["MeetingSummary"][];
+            transcriptions: components["schemas"]["TranscriptionLogEntry"][];
         };
         /**
          * @description Public, serializable view of a catalog model plus its on-disk + download
@@ -1366,7 +1342,7 @@ export interface components {
             os: string;
         };
         /**
-         * @description How the rendered meeting prompt is delivered to the agent CLI.
+         * @description How an Audio Note processing prompt is delivered to the agent CLI.
          * @enum {string}
          */
         PromptMode: "stdin" | "arg" | "file_arg";
@@ -1429,20 +1405,8 @@ export interface components {
             /** @description Transcription result (if successful) */
             transcription?: string | null;
         };
-        RecentMeetingTitlesResponse: {
+        RecentAudioNoteTitlesResponse: {
             titles: string[];
-        };
-        /**
-         * @description Default (non-waybar) recording status snapshot. The waybar variant
-         *     is a different shape — see the union response on the handler.
-         */
-        RecordingStatusResponse: {
-            capture_degraded: boolean;
-            job_id?: string | null;
-            last_completed_job?: null | components["schemas"]["CompletedJobSummary"];
-            last_error?: string | null;
-            phase: string;
-            recording: boolean;
         };
         /**
          * @description Acknowledgement returned before the daemon asks its service manager to
@@ -1488,16 +1452,16 @@ export interface components {
             action?: string | null;
             detail?: string | null;
             id: components["schemas"]["SetupCapabilityId"];
-            /** @description Whether this capability participates in basic dictation readiness. */
-            required_for_dictation: boolean;
-            /** @description Whether this capability participates in meeting readiness. */
-            required_for_meetings: boolean;
+            /** @description Whether this capability participates in microphone capture readiness. */
+            required_for_microphone: boolean;
+            /** @description Whether this capability participates in microphone + system capture readiness. */
+            required_for_system_audio: boolean;
             state: components["schemas"]["SetupState"];
             summary: string;
             tools: components["schemas"]["ToolReadiness"][];
         };
         /** @enum {string} */
-        SetupCapabilityId: "omarchy" | "hyprland_session" | "hyprland_config" | "transcription_provider" | "text_delivery" | "clipboard_fallback" | "dictation_keybind" | "meeting_keybind" | "ffmpeg" | "meeting_audio";
+        SetupCapabilityId: "omarchy" | "hyprland_session" | "hyprland_config" | "transcription_provider" | "text_delivery" | "clipboard_fallback" | "note_keybind" | "system_note_keybind" | "ffmpeg" | "system_audio";
         /** @enum {string} */
         SetupState: "ready" | "needs_action" | "unavailable" | "not_applicable";
         SummaryTemplate: {
@@ -1519,7 +1483,7 @@ export interface components {
         SystemDeps: {
             /**
              * @description Whether `ffmpeg` resolves — either app-local sidecar or on PATH.
-             *     Required for meeting audio compression before upload.
+             *     Required for captured audio compression before upload.
              */
             ffmpeg: boolean;
         };
@@ -1532,26 +1496,6 @@ export interface components {
             success: boolean;
             timed_out: boolean;
         };
-        /**
-         * @description Request body for the toggle recording endpoint.
-         *     All fields are optional - if not provided, defaults are used from config.
-         */
-        ToggleRequest: {
-            /** @description Whether to auto-paste/inject text into the focused app (default: from config) */
-            auto_paste?: boolean | null;
-            /** @description Whether to copy the transcription to clipboard (default: true) */
-            copy_to_clipboard?: boolean | null;
-        };
-        /**
-         * @description Result of toggling recording: lifecycle phase, the job id when one
-         *     is being processed, and a human-readable status message.
-         */
-        ToggleResponse: {
-            job_id?: string | null;
-            message: string;
-            phase: string;
-            success: boolean;
-        };
         ToolReadiness: {
             /** @description Arch package that supplies this executable, when known. */
             arch_package?: string | null;
@@ -1560,8 +1504,11 @@ export interface components {
             id: string;
             path?: string | null;
         };
-        /** @description Response for `POST /transcribe`. */
-        TranscribeResponse: {
+        TranscriptionLogEntry: {
+            audio_path: string;
+            created_at: string;
+            /** Format: int64 */
+            id: number;
             text: string;
         };
         /** @description Result of removing or previewing removal of one target. */
@@ -1607,8 +1554,8 @@ export interface components {
             provider: string | null;
         };
         WorkflowReadiness: {
-            dictation: components["schemas"]["SetupState"];
-            meetings: components["schemas"]["SetupState"];
+            microphone: components["schemas"]["SetupState"];
+            microphone_and_system: components["schemas"]["SetupState"];
         };
     };
     responses: never;
@@ -1659,6 +1606,36 @@ export interface operations {
             };
         };
     };
+    select_default_agent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Agent profile id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Selected automatic-processing agent */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentProfile"];
+                };
+            };
+            /** @description Agent profile not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     test_agent_profile: {
         parameters: {
             query?: never;
@@ -1689,16 +1666,13 @@ export interface operations {
             };
         };
     };
-    list_history: {
+    list_audio_notes: {
         parameters: {
             query?: {
-                /** @description Search query */
-                q?: string | null;
-                /** @description Start date (YYYY-MM-DD) */
-                from?: string | null;
-                /** @description End date (YYYY-MM-DD) */
-                to?: string | null;
-                /** @description Maximum results (default 20) */
+                query?: string | null;
+                kind?: string | null;
+                offset?: number | null;
+                /** @description Maximum audio_notes to return (default 20) */
                 limit?: number | null;
             };
             header?: never;
@@ -1707,39 +1681,667 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Transcription entries matching the query */
+            /** @description Recent audio_notes, newest first */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HistoryEntry"][];
+                    "application/json": components["schemas"]["AudioNotesListResponse"];
                 };
             };
         };
     };
-    get_history_by_id: {
+    cancel_audio_note: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description AudioNote cancelled without transcribing */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteStopResponse"];
+                };
+            };
+            /** @description No capture or review to cancel */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    confirm_audio_note: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": null | components["schemas"]["AudioNoteConfirmRequest"];
+            };
+        };
+        responses: {
+            /** @description AudioNote confirmed; transcription queued */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteStopResponse"];
+                };
+            };
+            /** @description Invalid trim range */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description No Audio Note awaiting review */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    import_audio_note: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** @description File upload with optional title */
+        requestBody: {
+            content: {
+                "multipart/form-data": components["schemas"]["AudioNoteImportRequest"];
+            };
+        };
+        responses: {
+            /** @description Import accepted; poll /audio-notes/:id */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteImportResponse"];
+                };
+            };
+            /** @description Missing file part or unsupported extension */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Failed to stage upload or persist Audio Note */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    recent_audio_note_titles: {
+        parameters: {
+            query?: {
+                /** @description Maximum distinct Manual Titles to return (default 10, maximum 50). */
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Distinct recent Manual Titles ordered by latest use */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RecentAudioNoteTitlesResponse"];
+                };
+            };
+        };
+    };
+    get_audio_note_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Persisted capture defaults */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteSettings"];
+                };
+            };
+            /** @description Configuration could not be read */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    set_audio_note_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AudioNoteSettings"];
+            };
+        };
+        responses: {
+            /** @description Capture defaults saved; effective for the next capture */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteSettings"];
+                };
+            };
+            /** @description Configuration could not be saved */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    start_audio_note: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": null | components["schemas"]["AudioNoteStartRequest"];
+            };
+        };
+        responses: {
+            /** @description AudioNote started */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteStartResponse"];
+                };
+            };
+            /** @description Capture or review is already in progress */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    audio_note_status: {
+        parameters: {
+            query?: {
+                /** @description Set to `waybar` for Waybar-formatted response */
+                style?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description AudioNote status (default JSON shape) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteStatusResponse"];
+                };
+            };
+        };
+    };
+    stop_audio_note: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Capture stopped; review or transcription begins according to capture options */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteStopResponse"];
+                };
+            };
+            /** @description No capture in progress */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    toggle_audio_note: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": null | components["schemas"]["AudioNoteStartRequest"];
+            };
+        };
+        responses: {
+            /** @description AudioNote started or stopped */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteToggleResponse"];
+                };
+            };
+        };
+    };
+    get_audio_note: {
         parameters: {
             query?: never;
             header?: never;
             path: {
-                /** @description Transcription history id */
+                /** @description AudioNote id */
                 id: number;
             };
             cookie?: never;
         };
         requestBody?: never;
         responses: {
-            /** @description Transcription entry */
+            /** @description AudioNote detail */
             200: {
                 headers: {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["HistoryEntry"];
+                    "application/json": components["schemas"]["AudioNoteDetailResponse"];
+                };
+            };
+            /** @description AudioNote not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_audio_note: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description AudioNote id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description AudioNote deleted (hidden from all views) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteDeleteResponse"];
+                };
+            };
+            /** @description AudioNote not found or already deleted */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description AudioNote is still in progress; stop or cancel it first */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    list_audio_note_artifacts: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Audio note id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Audio note artifacts */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteArtifactsResponse"];
+                };
+            };
+        };
+    };
+    generate_artifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Audio note id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["GenerateArtifactRequest"];
+            };
+        };
+        responses: {
+            /** @description Generated artifact */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GenerateArtifactResponse"];
+                };
+            };
+            /** @description Invalid request or generation failed; failed artifact remains available */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    get_audio_note_artifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Audio note id */
+                id: number;
+                /** @description Artifact id */
+                artifact_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteArtifact"];
                 };
             };
             /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    delete_audio_note_artifact: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Audio note id */
+                id: number;
+                /** @description Artifact id */
+                artifact_id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DeleteArtifactResponse"];
+                };
+            };
+            /** @description Not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    audio_note_audio: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description AudioNote id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Audio bytes (supports Range) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description AudioNote or audio file not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    process_audio_note: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Audio note id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Enrichment scheduled */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteRetryResponse"];
+                };
+            };
+            /** @description Audio note not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Transcription incomplete or enrichment already running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    regenerate_audio_note_title: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description AudioNote id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Title ownership released and regeneration started */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteTitleRegenerationResponse"];
+                };
+            };
+            /** @description AudioNote not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description AudioNote is not completed or has no transcript */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    retry_audio_note: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description AudioNote id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Retry kicked off; poll /audio-notes/:id */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteRetryResponse"];
+                };
+            };
+            /** @description AudioNote not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description AudioNote is not in a retry-eligible state, or audio file missing */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    update_audio_note_title: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description AudioNote id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AudioNoteTitleUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description AudioNote Title updated with manual ownership */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteTitleResponse"];
+                };
+            };
+            /** @description AudioNote Title is blank */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description AudioNote not found */
             404: {
                 headers: {
                     [name: string]: unknown;
@@ -1818,7 +2420,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Dictation and meeting keybind installation state */
+            /** @description Microphone and system-audio capture shortcut installation state */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -1849,592 +2451,6 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["LogsResult"];
                 };
-            };
-        };
-    };
-    list_meetings: {
-        parameters: {
-            query?: {
-                /** @description Maximum meetings to return (default 20) */
-                limit?: number | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Recent meetings, newest first */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingsListResponse"];
-                };
-            };
-        };
-    };
-    cancel_meeting: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Meeting cancelled without transcribing */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingStopResponse"];
-                };
-            };
-            /** @description No meeting recording in progress to cancel */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    confirm_meeting: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["MeetingConfirmRequest"];
-            };
-        };
-        responses: {
-            /** @description Meeting confirmed; transcription queued */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingStopResponse"];
-                };
-            };
-            /** @description Invalid trim range */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description No meeting awaiting review */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    import_meeting: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** @description File upload with optional title */
-        requestBody?: {
-            content: {
-                "multipart/form-data": unknown;
-            };
-        };
-        responses: {
-            /** @description Import accepted; poll /meetings/:id */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingImportResponse"];
-                };
-            };
-            /** @description Missing file part or unsupported extension */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Failed to stage upload or insert meeting row */
-            500: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    recent_meeting_titles: {
-        parameters: {
-            query?: {
-                /** @description Maximum distinct Manual Titles to return (default 10, maximum 50). */
-                limit?: number | null;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Distinct recent Manual Titles ordered by latest use */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RecentMeetingTitlesResponse"];
-                };
-            };
-        };
-    };
-    start_meeting: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["MeetingStartRequest"];
-            };
-        };
-        responses: {
-            /** @description Meeting started */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingStartResponse"];
-                };
-            };
-            /** @description A meeting is already in progress */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    meeting_status: {
-        parameters: {
-            query?: {
-                /** @description Set to `waybar` for Waybar-formatted response */
-                style?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Meeting status (default JSON shape) */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingStatusResponse"];
-                };
-            };
-        };
-    };
-    stop_meeting: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Meeting stopped; awaiting review before transcription */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingStopResponse"];
-                };
-            };
-            /** @description No meeting recording in progress */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    toggle_meeting: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["MeetingStartRequest"];
-            };
-        };
-        responses: {
-            /** @description Meeting started or stopped */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingToggleResponse"];
-                };
-            };
-        };
-    };
-    get_meeting: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Meeting detail */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingDetailResponse"];
-                };
-            };
-            /** @description Meeting not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    delete_meeting: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Meeting deleted (hidden from all views) */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingDeleteResponse"];
-                };
-            };
-            /** @description Meeting not found or already deleted */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Meeting is still in progress; stop or cancel it first */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    list_meeting_artifacts: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Artifacts generated for a meeting */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingArtifactsResponse"];
-                };
-            };
-        };
-    };
-    generate_artifact: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["GenerateArtifactRequest"];
-            };
-        };
-        responses: {
-            /** @description Generated artifact */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["GenerateArtifactResponse"];
-                };
-            };
-            /** @description Meeting is not eligible or request is invalid */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    get_meeting_artifact: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-                /** @description Artifact id */
-                artifact_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Meeting artifact */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingArtifact"];
-                };
-            };
-            /** @description Artifact not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    delete_meeting_artifact: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-                /** @description Artifact id */
-                artifact_id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Deleted artifact */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["DeleteArtifactResponse"];
-                };
-            };
-            /** @description Artifact not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    meeting_audio: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Audio bytes (supports Range) */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Meeting or audio file not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    regenerate_meeting_title: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Title ownership released and regeneration started */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingTitleRegenerationResponse"];
-                };
-            };
-            /** @description Meeting not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Meeting is not completed or has no transcript */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    retry_meeting: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Retry kicked off; poll /meetings/:id */
-            202: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingRetryResponse"];
-                };
-            };
-            /** @description Meeting not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Meeting is not in a retry-eligible state, or audio file missing */
-            409: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-        };
-    };
-    update_meeting_title: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path: {
-                /** @description Meeting id */
-                id: number;
-            };
-            cookie?: never;
-        };
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["MeetingTitleUpdateRequest"];
-            };
-        };
-        responses: {
-            /** @description Meeting Title updated with manual ownership */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["MeetingTitleResponse"];
-                };
-            };
-            /** @description Meeting Title is blank */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
-            };
-            /** @description Meeting not found */
-            404: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
             };
         };
     };
@@ -2541,7 +2557,7 @@ export interface operations {
     list_jobs: {
         parameters: {
             query?: {
-                /** @description Filter to a single event kind (e.g. `meeting.completed`). */
+                /** @description Filter to a single event kind (`audio_note.completed`). */
                 event?: string | null;
             };
             header?: never;
@@ -2922,29 +2938,6 @@ export interface operations {
             };
         };
     };
-    recording_status: {
-        parameters: {
-            query?: {
-                /** @description Set to `waybar` for Waybar-formatted response */
-                style?: string;
-            };
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            /** @description Recording status (default JSON shape) */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["RecordingStatusResponse"];
-                };
-            };
-        };
-    };
     list_summary_templates: {
         parameters: {
             query?: never;
@@ -3060,63 +3053,6 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["RestartAccepted"];
                 };
-            };
-        };
-    };
-    toggle_recording: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** @description Optional per-job overrides */
-        requestBody: {
-            content: {
-                "application/json": components["schemas"]["ToggleRequest"];
-            };
-        };
-        responses: {
-            /** @description Toggle dispatched; reflects immediate phase */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["ToggleResponse"];
-                };
-            };
-        };
-    };
-    transcribe_file: {
-        parameters: {
-            query?: never;
-            header?: never;
-            path?: never;
-            cookie?: never;
-        };
-        /** @description multipart/form-data with a `file` part */
-        requestBody: {
-            content: {
-                "multipart/form-data": string;
-            };
-        };
-        responses: {
-            /** @description Transcribed text */
-            200: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content: {
-                    "application/json": components["schemas"]["TranscribeResponse"];
-                };
-            };
-            /** @description Missing or unreadable file */
-            400: {
-                headers: {
-                    [name: string]: unknown;
-                };
-                content?: never;
             };
         };
     };

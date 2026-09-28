@@ -27,12 +27,12 @@ export class SetupStore {
     return this.state === "loading";
   }
 
-  get dictationReady(): boolean {
-    return isReady(this.assessment?.workflows.dictation);
+  get microphoneReady(): boolean {
+    return isReady(this.assessment?.workflows.microphone);
   }
 
-  get meetingsReady(): boolean {
-    return isReady(this.assessment?.workflows.meetings);
+  get systemAudioReady(): boolean {
+    return isReady(this.assessment?.workflows.microphone_and_system);
   }
 
   capability(id: SetupCapabilityId): SetupCapability | undefined {
@@ -42,7 +42,7 @@ export class SetupStore {
   get nextRequiredAction(): SetupCapability | undefined {
     return this.assessment?.capabilities.find(
       (capability) =>
-        (capability.required_for_dictation || capability.required_for_meetings) &&
+        (capability.required_for_microphone || capability.required_for_system_audio) &&
         !isReady(capability.state),
     );
   }

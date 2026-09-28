@@ -16,7 +16,7 @@ use crate::keybind::{self, InstallResult, KeybindStatuses, UninstallResult};
 /// Request body for install or server-authoritative preview.
 #[derive(Debug, Deserialize, Default, ToSchema)]
 pub struct InstallRequest {
-    /// Shortcut action. Defaults to dictation.
+    /// Shortcut action. Defaults to microphone Audio Note capture.
     #[serde(default)]
     pub target: KeybindTarget,
     /// Custom key string (for example `SUPER+R` or `SUPER SHIFT, T`).
@@ -52,7 +52,7 @@ pub fn router() -> Router {
     tag = "keybind",
     operation_id = "get_keybind_status",
     responses(
-        (status = 200, description = "Dictation and meeting keybind installation state", body = KeybindStatuses),
+        (status = 200, description = "Microphone and system-audio capture shortcut installation state", body = KeybindStatuses),
     ),
 )]
 pub async fn get_status() -> ApiResult<Json<KeybindStatuses>> {
@@ -110,25 +110,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_request_defaults_to_dictation_and_accepts_preview_alias() {
+    fn install_request_defaults_to_note_and_accepts_preview_alias() {
         let request: InstallRequest =
             serde_json::from_value(serde_json::json!({ "preview": true })).unwrap();
 
-        assert_eq!(request.target, KeybindTarget::Dictation);
+        assert_eq!(request.target, KeybindTarget::Note);
         assert!(request.preview);
         assert!(!request.dry_run);
     }
 
     #[test]
-    fn install_request_accepts_meeting_target_and_dry_run() {
+    fn install_request_accepts_system_note_target_and_dry_run() {
         let request: InstallRequest = serde_json::from_value(serde_json::json!({
-            "target": "meeting",
+            "target": "system-note",
             "key": "SUPER ALT+M",
             "dry_run": true
         }))
         .unwrap();
 
-        assert_eq!(request.target, KeybindTarget::Meeting);
+        assert_eq!(request.target, KeybindTarget::SystemNote);
         assert_eq!(request.key.as_deref(), Some("SUPER ALT+M"));
         assert!(request.dry_run);
     }

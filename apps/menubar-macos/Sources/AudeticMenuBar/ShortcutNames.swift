@@ -7,6 +7,6 @@ import KeyboardShortcuts
 // The user picks both in the Settings window; until then no global hotkey is
 // registered. Point-and-click toggles in the menu always work regardless.
 extension KeyboardShortcuts.Name {
-    static let toggleDictation = Self("toggleDictation")
-    static let toggleMeeting = Self("toggleMeeting")
+    static let toggleNote = Self("toggleNote")
+    static let toggleSystemNote = Self("toggleSystemNote")
 }

@@ -1,4 +1,4 @@
-//! Built-in meeting summary templates.
+//! Built-in audio note templates; meeting is a taxonomy, not an entity type.
 //!
 //! Templates are intentionally data-only: they describe the Markdown sections
 //! an agent should produce without knowing anything about HTTP, CLI args, or
@@ -49,7 +49,7 @@ impl SummaryTemplate {
     }
 
     pub fn markdown_skeleton(&self) -> String {
-        let mut out = String::from("# <Concise meeting title>\n\n");
+        let mut out = String::from("# <Concise audio note title>\n\n");
         for section in &self.sections {
             out.push_str(&format!("## {}\n\n", section.title));
         }
@@ -76,11 +76,32 @@ impl SummaryTemplate {
 pub fn list_templates() -> Vec<SummaryTemplate> {
     vec![
         SummaryTemplate {
+            id: "general_note".into(), name: "General Note".into(),
+            description: "A faithful concise summary of an audio note.".into(),
+            sections: vec![section("Summary", "Summarize the content without inventing facts.", "paragraph")],
+        },
+        SummaryTemplate {
+            id: "cleaned_dictation".into(), name: "Cleaned Dictation".into(),
+            description: "Readable text preserving the speaker's meaning.".into(),
+            sections: vec![section("Cleaned Text", "Remove filler and correct punctuation. Preserve meaning, voice, and all substantive details.", "paragraph")],
+        },
+        SummaryTemplate {
+            id: "conversation".into(), name: "Conversation".into(),
+            description: "Conversation summary and topics.".into(),
+            sections: vec![section("Summary", "Summarize the conversation faithfully.", "paragraph"), section("Topics", "List topics discussed.", "list")],
+        },
+        SummaryTemplate {
+            id: "request_intent".into(), name: "Request Intent".into(),
+            description: "Structured intent for explicit review; never execute requests.".into(),
+            sections: vec![section("Intent", "Describe the requested outcome and any shopping items without acting on them.", "paragraph")],
+        },
+        SummaryTemplate {
             id: "standard_meeting".into(),
             name: "Standard Meeting Notes".into(),
             description: "Executive summary, decisions, action items, and discussion highlights.".into(),
             sections: vec![
                 section("Summary", "Provide a concise executive summary of the meeting.", "paragraph"),
+                section("Participants", "List only participants evidenced in the transcript; do not invent identities.", "list"),
                 section("Key Decisions", "List decisions made or clearly proposed during the meeting.", "list"),
                 SummaryTemplateSection {
                     title: "Action Items".into(),

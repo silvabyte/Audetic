@@ -61,6 +61,13 @@ enum Command {
     /// `codegen` against a freshly built daemon without starting the service
     /// or contending for port 3737.
     Openapi,
+    /// Offline migration of a stopped daemon's legacy database to Audio Notes.
+    MigrateAudioNotes {
+        #[arg(long)]
+        database: Option<std::path::PathBuf>,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[tokio::main]
@@ -92,6 +99,15 @@ async fn main() -> Result<()> {
         Some(Command::Openapi) => {
             let spec = audetic::api::docs::ApiDoc::openapi();
             println!("{}", spec.to_pretty_json()?);
+            Ok(())
+        }
+        Some(Command::MigrateAudioNotes { database, dry_run }) => {
+            let path = match database {
+                Some(path) => path,
+                None => audetic::global::db_file()?,
+            };
+            let report = audetic::audio_note_migration::migrate_audio_notes(&path, dry_run)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
             Ok(())
         }
         None => app::run_service().await,

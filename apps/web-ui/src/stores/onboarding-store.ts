@@ -11,7 +11,7 @@ const POLL_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
  * Owns the optional app-local FFmpeg installer shown in Setup Center.
- * Missing FFmpeg affects meeting readiness but never blocks the SPA.
+ * Missing FFmpeg affects media processing readiness but never blocks the SPA.
  */
 export class OnboardingStore {
   state: DepsState = "unknown";

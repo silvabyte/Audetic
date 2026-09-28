@@ -1,6 +1,6 @@
 # Audio Capture
 
-Audio Capture follows system-selected devices and turns their native audio into canonical audio for dictations and meetings.
+Audio Capture follows system-selected devices and turns their native audio into canonical audio for Audio Notes. One capture lifecycle selects microphone-only or microphone plus system audio.
 
 ## Language
 
@@ -45,9 +45,9 @@ A live recording session that is temporarily receiving no audio because its requ
 _Avoid_: Failed recording, stopped capture
 
 **Silence Fill**:
-Canonical zero-valued audio representing a meeting capture gap so independently captured tracks remain aligned.
+Canonical zero-valued audio representing a capture gap so independently captured tracks remain aligned.
 _Avoid_: Padding, dead air
 
 **System Tap**:
-Capture of audio being played through the Default Output for the meeting system-audio track.
+Capture of audio being played through the Default Output for the optional system-audio track.
 _Avoid_: Loopback mic, output recording

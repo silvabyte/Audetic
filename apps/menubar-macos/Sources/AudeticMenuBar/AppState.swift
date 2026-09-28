@@ -35,12 +35,20 @@ final class AppState {
 
     // MARK: - Actions
 
-    func toggleDictation() {
-        Task { await perform { try await self.client.toggleDictation() } }
+    func toggleNote() {
+        Task { await perform { try await self.client.toggleNote(source: .microphone) } }
     }
 
-    func toggleMeeting() {
-        Task { await perform { try await self.client.toggleMeeting() } }
+    func toggleSystemNote() {
+        Task { await perform { try await self.client.toggleNote(source: .microphoneAndSystem) } }
+    }
+
+    func confirmNote() {
+        Task { await perform { try await self.client.confirmNote() } }
+    }
+
+    func cancelNote() {
+        Task { await perform { try await self.client.cancelNote() } }
     }
 
     func openWebUI() {
@@ -62,11 +70,11 @@ final class AppState {
     // MARK: - Global shortcuts
 
     private func registerShortcutListeners() {
-        KeyboardShortcuts.onKeyUp(for: .toggleDictation) { [weak self] in
-            self?.toggleDictation()
+        KeyboardShortcuts.onKeyUp(for: .toggleNote) { [weak self] in
+            self?.toggleNote()
         }
-        KeyboardShortcuts.onKeyUp(for: .toggleMeeting) { [weak self] in
-            self?.toggleMeeting()
+        KeyboardShortcuts.onKeyUp(for: .toggleSystemNote) { [weak self] in
+            self?.toggleSystemNote()
         }
     }
 }

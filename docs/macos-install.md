@@ -71,10 +71,10 @@ rebuild is never clobbered by a remote release.
 
 Two prompts appear the first time the daemon needs them:
 
-- **Microphone** — voice-to-text and meeting mic capture. Fires the first
+- **Microphone** — Audio Note microphone capture. Fires the first
   time the daemon opens the mic.
 - **Screen Recording** (*Screen & System Audio Recording* on macOS 15+) —
-  meeting *system* audio. The daemon auto-restarts after you click Allow, so
+  Audio Note *system* audio. The daemon auto-restarts after you click Allow, so
   no manual restart is needed.
 
 To force fresh prompts:

@@ -1,7 +1,7 @@
 import Foundation
 
-/// Drives periodic status refreshes so the menu bar icon tracks recording /
-/// meeting state even when the menu is closed. Loopback polls are cheap, so a
+/// Drives periodic status refreshes so the menu bar icon tracks audio note
+/// capture even when the menu is closed. Loopback polls are cheap, so a
 /// single steady cadence keeps the implementation simple and the icon live.
 @MainActor
 final class StatusPoller {

@@ -10,11 +10,11 @@ A component that reads observable state during render MUST do the read inside an
 `<Observer>{() => …}</Observer>` boundary:
 
 ```tsx
-function MeetingDetail() {
+function AudioNoteDetail() {
   const store = useStore();
   return (
     <Observer>
-      {() => <p>{store.meetings.detailStatus}</p>}
+      {() => <p>{store.audioNotes.detailStatus[1]}</p>}
     </Observer>
   );
 }
@@ -26,9 +26,8 @@ observables fed a `useMemo`/`useEffect` dep, move that derivation into the
 `<Observer>` render prop (and drive side-effects, e.g. `scrollIntoView`, from a
 ref callback) instead of memoizing an observable read.
 
-The legacy `observer()` HOC is also accepted (a few components in
-`meeting-detail.tsx` still use it) — the lint rule treats an `observer()`-wrapped
-component as already reactive.
+The lint rule also understands the legacy `observer()` HOC, but new Audio Notes
+components use the `<Observer>` render-prop convention exclusively.
 
 ## Why it matters
 
@@ -42,7 +41,7 @@ This is a real bug, not cosmetic.
 ## What the lint rule covers (and doesn't)
 
 `local/observer-boundary` flags reads off the **store** — the `useStore()` result
-and its aliases (`const { meetings } = store`, `const x = store.meetings`) — when
+and its aliases (`const { audioNotes } = store`, `const x = store.audioNotes`) — when
 they happen at the component's render top-level or in its returned JSX without an
 `<Observer>`/`observer()` boundary.
 
@@ -50,7 +49,7 @@ It deliberately does **not**:
 
 - track `getRootStore()` — that is the non-reactive accessor for route
   loaders/actions, where reading observables is correct;
-- classify observable reads off arbitrary **props** (e.g. a `meeting` or `entry`
+- classify observable reads off arbitrary **props** (e.g. a `note` or `entry`
   prop) — that needs type information and would produce false positives. Reads of
   observable props still need an `<Observer>`; that part stays
   convention-enforced. (A type-checked extension is possible future work.)

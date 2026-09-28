@@ -107,7 +107,7 @@ pub fn spawn_grant_watcher_then_exit(poll_interval: Duration) {
             warn!(
                 "Screen Recording permission not granted. Requesting via TCC — \
                  accept the system prompt to enable system-audio capture in \
-                 meetings. The daemon will auto-restart once you grant access."
+                 audio_notes. The daemon will auto-restart once you grant access."
             );
             let _ = request();
         }

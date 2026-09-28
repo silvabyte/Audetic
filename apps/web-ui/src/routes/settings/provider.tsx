@@ -142,8 +142,7 @@ function SettingsProvider() {
         </div>
         <h2 className="text-xl font-semibold">Provider</h2>
         <p className="max-w-2xl text-sm text-muted-foreground">
-          Choose, validate, and save the transcription backend used for dictation and
-          meetings.
+          Choose, validate, and save the transcription backend used for Audio Notes.
         </p>
       </header>
 

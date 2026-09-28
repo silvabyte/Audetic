@@ -1,16 +1,14 @@
 import { NavLink, Outlet } from "react-router-dom";
 import { Observer } from "mobx-react-lite";
-import { History, Radio, Settings } from "lucide-react";
+import { AudioLines, Settings } from "lucide-react";
 import { Toaster } from "sonner";
 import { CommandBar } from "./components/command-bar";
-import { MeetingAutoNav } from "./components/meeting-auto-nav";
 import { TooltipProvider } from "./components/ui/tooltip";
 import { useStore } from "./stores/root-store";
 import { cn } from "./lib/utils";
 
 const navItems = [
-  { to: "/dictations", label: "Dictations", icon: History, end: false },
-  { to: "/meetings", label: "Meetings", icon: Radio, end: false },
+  { to: "/audio-notes", label: "Audio Notes", icon: AudioLines, end: false },
   { to: "/settings", label: "Settings", icon: Settings, end: false },
 ];
 
@@ -19,7 +17,6 @@ export function AppShell() {
   return (
     <TooltipProvider delayDuration={300}>
       <div className="flex h-dvh min-h-0 flex-col">
-        <MeetingAutoNav />
         <CommandBar />
         <div className="flex min-h-0 flex-1 flex-col sm:flex-row">
           <aside className="w-full shrink-0 border-b bg-card sm:w-52 sm:border-b-0 sm:border-r">

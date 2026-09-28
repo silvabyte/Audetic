@@ -16,6 +16,28 @@ pub fn router() -> Router {
     Router::new()
         .route("/agent-profiles", get(list_agent_profiles))
         .route("/agent-profiles/:id/test", post(test_agent_profile))
+        .route("/agent-profiles/:id/default", post(select_default_agent))
+}
+
+#[utoipa::path(
+    post,
+    path = "/agent-profiles/{id}/default",
+    tag = "agents",
+    params(("id" = i64, Path, description = "Agent profile id")),
+    responses(
+        (status = 200, description = "Selected automatic-processing agent", body = AgentProfile),
+        (status = 404, description = "Agent profile not found"),
+    ),
+)]
+pub async fn select_default_agent(Path(id): Path<i64>) -> ApiResult<Json<AgentProfile>> {
+    let conn = crate::db::init_db().map_err(ApiError::from)?;
+    if !AgentProfileRepository::set_default(&conn, id).map_err(ApiError::from)? {
+        return Err(ApiError::not_found(format!("Agent profile {id} not found")));
+    }
+    let profile = AgentProfileRepository::get(&conn, id)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("Agent profile {id} not found")))?;
+    Ok(Json(profile))
 }
 
 #[derive(Debug, Serialize, ToSchema)]

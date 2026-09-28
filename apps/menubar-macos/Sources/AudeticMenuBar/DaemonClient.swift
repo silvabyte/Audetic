@@ -31,6 +31,10 @@ enum Daemon {
 struct DaemonClient {
     private let session: URLSession
 
+    init(session: URLSession) {
+        self.session = session
+    }
+
     init() {
         let config = URLSessionConfiguration.ephemeral
         // Loopback calls are fast; fail quickly so an offline daemon flips the
@@ -43,53 +47,31 @@ struct DaemonClient {
 
     // MARK: - Toggles
 
-    /// `POST /api/toggle` — dictation (voice-to-text). Empty body: the daemon
-    /// applies its configured defaults for clipboard/auto-paste.
-    func toggleDictation() async throws {
-        try await postEmpty(Daemon.apiURL("/toggle"))
+    /// Source is acquisition, not classification. Delivery remains opt-in.
+    func toggleNote(source: CaptureSource) async throws {
+        try await postJSON(Daemon.apiURL("/audio-notes/toggle"), body: [
+            "capture_source": source.rawValue,
+            "review_before_processing": false,
+            "copy_to_clipboard": false,
+        ])
     }
 
-    /// `POST /api/meetings/toggle` — start/stop a meeting recording.
-    func toggleMeeting() async throws {
-        try await postEmpty(Daemon.apiURL("/meetings/toggle"))
+    func confirmNote() async throws {
+        try await postJSON(Daemon.apiURL("/audio-notes/confirm"))
+    }
+
+    func cancelNote() async throws {
+        try await postJSON(Daemon.apiURL("/audio-notes/cancel"))
     }
 
     // MARK: - Status
 
-    /// Polls both status endpoints concurrently. Any failure (daemon down,
-    /// timeout, decode error) collapses to `.offline` so the menu degrades
-    /// gracefully.
+    /// A single status endpoint owns the capture lifecycle.
     func fetchStatus() async -> AudeticStatus {
-        async let dictation = getDictationStatus()
-        async let meeting = getMeetingStatus()
-
-        let dict = await dictation
-        let meet = await meeting
-
-        // If neither endpoint answered, treat the daemon as offline.
-        guard dict != nil || meet != nil else {
+        guard let note: AudioNoteStatusResponse = try? await getJSON(Daemon.apiURL("/audio-notes/status")) else {
             return .offline
         }
-
-        return AudeticStatus(
-            daemonUp: true,
-            dictation: dict ?? .init(recording: false, phase: "idle"),
-            meeting: meet ?? .init(active: false, phase: "idle", title: nil)
-        )
-    }
-
-    private func getDictationStatus() async -> DictationState? {
-        guard let resp: RecordingStatusResponse = try? await getJSON(Daemon.apiURL("/status")) else {
-            return nil
-        }
-        return DictationState(recording: resp.recording, phase: resp.phase)
-    }
-
-    private func getMeetingStatus() async -> MeetingState? {
-        guard let resp: MeetingStatusResponse = try? await getJSON(Daemon.apiURL("/meetings/status")) else {
-            return nil
-        }
-        return MeetingState(active: resp.active, phase: resp.phase, title: resp.title)
+        return AudeticStatus(daemonUp: true, note: note)
     }
 
     // MARK: - Web UI
@@ -101,11 +83,11 @@ struct DaemonClient {
 
     // MARK: - Plumbing
 
-    private func postEmpty(_ url: URL) async throws {
+    private func postJSON(_ url: URL, body: [String: Any] = [:]) async throws {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = Data("{}".utf8)
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (_, response) = try await session.data(for: request)
         try Self.ensureOK(response, url: url)
     }

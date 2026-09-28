@@ -5,7 +5,7 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// How the rendered meeting prompt is delivered to the agent CLI.
+/// How an Audio Note processing prompt is delivered to the agent CLI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptMode {
@@ -111,7 +111,38 @@ impl AgentProfileRepository {
             params![current_opencode_args, legacy_opencode_args],
         )
         .context("Failed to upgrade built-in OpenCode profile")?;
+        conn.execute(
+            "UPDATE agent_profiles SET args_json = ?1 WHERE kind = 'codex' \
+             AND executable = 'codex' AND args_json = ?2",
+            params![
+                serde_json::to_string(&vec![
+                    "exec",
+                    "--skip-git-repo-check",
+                    "--sandbox",
+                    "read-only",
+                    "-"
+                ])?,
+                serde_json::to_string(&vec!["exec", "--sandbox", "read-only", "-"])?,
+            ],
+        )
+        .context("Failed to upgrade built-in Codex profile")?;
         Ok(())
+    }
+
+    /// Select the automatic-processing agent without depending on installation
+    /// order. Preserve every other profile's enabled state.
+    pub fn set_default(conn: &Connection, id: i64) -> Result<bool> {
+        let tx = conn.unchecked_transaction()?;
+        if Self::get(&tx, id)?.is_none() {
+            return Ok(false);
+        }
+        tx.execute("UPDATE agent_profiles SET default_profile = 0", [])?;
+        tx.execute(
+            "UPDATE agent_profiles SET default_profile = 1, enabled = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+            [id],
+        )?;
+        tx.commit()?;
+        Ok(true)
     }
 
     pub fn list(conn: &Connection) -> Result<Vec<AgentProfile>> {
@@ -229,6 +260,7 @@ fn builtin_profiles() -> Vec<NewAgentProfile> {
             executable: "codex".to_string(),
             args: vec![
                 "exec".into(),
+                "--skip-git-repo-check".into(),
                 "--sandbox".into(),
                 "read-only".into(),
                 "-".into(),
@@ -291,6 +323,35 @@ mod tests {
     use crate::db::migrate;
 
     use super::*;
+
+    #[test]
+    fn startup_profiles_and_default_selection_preserve_user_choices() {
+        let conn = Connection::open_in_memory().unwrap();
+        migrate(&conn).unwrap();
+        AgentProfileRepository::ensure_builtin_profiles(&conn).unwrap();
+        let codex = AgentProfileRepository::list(&conn)
+            .unwrap()
+            .into_iter()
+            .find(|p| p.kind == "codex")
+            .unwrap();
+        assert!(codex.args.contains(&"--skip-git-repo-check".into()));
+        assert!(AgentProfileRepository::set_default(&conn, codex.id).unwrap());
+        AgentProfileRepository::ensure_builtin_profiles(&conn).unwrap();
+        let defaults: Vec<_> = AgentProfileRepository::list(&conn)
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.default_profile)
+            .collect();
+        assert_eq!(defaults.len(), 1);
+        assert_eq!(defaults[0].id, codex.id);
+        assert!(!AgentProfileRepository::set_default(&conn, 99999).unwrap());
+        assert!(
+            AgentProfileRepository::get(&conn, codex.id)
+                .unwrap()
+                .unwrap()
+                .default_profile
+        );
+    }
 
     #[test]
     fn first_available_skips_an_unavailable_default_profile() {

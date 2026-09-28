@@ -7,7 +7,7 @@ use tracing::{error, info};
 
 use std::sync::Arc;
 
-use crate::audio::audio_source::{AudioSource, MeetingSystemSource};
+use crate::audio::audio_source::{AudioSource, CaptureSystemSource};
 use crate::audio::capture_recovery::CaptureRecovery;
 use crate::audio::mic_source::{MonotonicClock, SystemMonotonicClock};
 use crate::audio::stream_event::{StreamDeath, StreamEventSink};
@@ -103,6 +103,9 @@ impl SystemAudioSource {
 
 impl AudioSource for SystemAudioSource {
     fn start(&mut self) -> Result<()> {
+        if !super::permissions::is_granted() && !super::permissions::request() {
+            anyhow::bail!("System audio permission is required. Grant Screen Recording permission and restart Audetic.");
+        }
         self.inner.start()
     }
 
@@ -124,13 +127,13 @@ impl AudioSource for SystemAudioSource {
 }
 
 #[async_trait::async_trait(?Send)]
-impl MeetingSystemSource for SystemAudioSource {
+impl CaptureSystemSource for SystemAudioSource {
     fn supports_hot_swap(&self) -> bool {
         self.inner.supports_hot_swap()
     }
 
-    fn mark_meeting_started(&mut self) {
-        self.inner.mark_meeting_started();
+    fn mark_capture_started(&mut self) {
+        self.inner.mark_capture_started();
     }
 
     fn has_captured_audio(&self) -> bool {

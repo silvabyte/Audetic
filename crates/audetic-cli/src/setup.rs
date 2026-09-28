@@ -72,9 +72,9 @@ fn render_summary(assessment: &SetupAssessment) -> String {
                 .unwrap_or_default()
         ),
         format!(
-            "Readiness: dictation {} | meetings {}",
-            state_label(assessment.workflows.dictation),
-            state_label(assessment.workflows.meetings)
+            "Readiness: microphone {} | microphone + system {}",
+            state_label(assessment.workflows.microphone),
+            state_label(assessment.workflows.microphone_and_system)
         ),
         String::new(),
     ];
@@ -151,19 +151,20 @@ fn choose_action(assessment: &SetupAssessment) -> Result<SetupAction> {
         labels.push("Configure provider (`audetic provider`)".to_string());
     }
     if assessment
-        .capability(SetupCapabilityId::DictationKeybind)
+        .capability(SetupCapabilityId::NoteKeybind)
         .is_some_and(|capability| capability.state == SetupState::NeedsAction)
     {
-        actions.push(SetupAction::Keybind(KeybindTarget::Dictation));
-        labels.push("Install dictation keybind (`audetic keybind install`)".to_string());
+        actions.push(SetupAction::Keybind(KeybindTarget::Note));
+        labels.push("Install microphone keybind (`audetic keybind install`)".to_string());
     }
     if assessment
-        .capability(SetupCapabilityId::MeetingKeybind)
+        .capability(SetupCapabilityId::SystemNoteKeybind)
         .is_some_and(|capability| capability.state == SetupState::NeedsAction)
     {
-        actions.push(SetupAction::Keybind(KeybindTarget::Meeting));
+        actions.push(SetupAction::Keybind(KeybindTarget::SystemNote));
         labels.push(
-            "Install meeting keybind (`audetic keybind install --target meeting`)".to_string(),
+            "Install system audio keybind (`audetic keybind install --target system-note`)"
+                .to_string(),
         );
     }
 
@@ -220,15 +221,15 @@ mod tests {
                 arch_linux: true,
             },
             workflows: WorkflowReadiness {
-                dictation: SetupState::Ready,
-                meetings: SetupState::NeedsAction,
+                microphone: SetupState::Ready,
+                microphone_and_system: SetupState::NeedsAction,
             },
             capabilities: vec![SetupCapability {
-                id: SetupCapabilityId::MeetingAudio,
+                id: SetupCapabilityId::SystemAudio,
                 state: SetupState::NeedsAction,
-                required_for_dictation: false,
-                required_for_meetings: true,
-                summary: "Meeting audio tools incomplete".to_string(),
+                required_for_microphone: false,
+                required_for_system_audio: true,
+                summary: "System audio tools incomplete".to_string(),
                 detail: None,
                 action: Some("Install the missing tools".to_string()),
                 tools: vec![ToolReadiness {
@@ -247,8 +248,8 @@ mod tests {
     fn summary_is_concise_and_includes_actionable_command() {
         let summary = render_summary(&assessment());
 
-        assert!(summary.contains("dictation READY | meetings NEEDS ACTION"));
-        assert!(summary.contains("[!!] meeting_audio"));
+        assert!(summary.contains("microphone READY | microphone + system NEEDS ACTION"));
+        assert!(summary.contains("[!!] system_audio"));
         assert!(summary.contains("-> Install the missing tools"));
         assert!(summary.contains("pacman -S --needed pipewire-audio"));
         assert!(!summary.contains("sudo"));

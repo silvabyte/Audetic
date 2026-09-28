@@ -17,17 +17,20 @@ struct MenuContent: View {
 
         Divider()
 
-        Button(action: { state.toggleDictation() }) {
-            Text(dictationLabel(status))
+        if status.note.phase == "review" {
+            Button("Process Audio Note") { state.confirmNote() }
+            Button("Cancel Audio Note") { state.cancelNote() }
+        } else if status.note.phase == "recording" {
+            Button("Stop Audio Note") { state.toggleNote() }
+                .keyboardShortcutHint(.toggleNote)
+        } else {
+            Button("Start Microphone Note") { state.toggleNote() }
+                .disabled(!status.daemonUp || status.note.active)
+                .keyboardShortcutHint(.toggleNote)
+            Button("Start Microphone + System Audio Note") { state.toggleSystemNote() }
+                .disabled(!status.daemonUp || status.note.active)
+                .keyboardShortcutHint(.toggleSystemNote)
         }
-        .disabled(!status.daemonUp)
-        .keyboardShortcutHint(.toggleDictation)
-
-        Button(action: { state.toggleMeeting() }) {
-            Text(meetingLabel(status))
-        }
-        .disabled(!status.daemonUp)
-        .keyboardShortcutHint(.toggleMeeting)
 
         Divider()
 
@@ -47,13 +50,6 @@ struct MenuContent: View {
         .keyboardShortcut("q")
     }
 
-    private func dictationLabel(_ status: AudeticStatus) -> String {
-        status.dictation.recording ? "Stop Dictation" : "Start Dictation"
-    }
-
-    private func meetingLabel(_ status: AudeticStatus) -> String {
-        status.meeting.active ? "Stop Meeting" : "Start Meeting"
-    }
 }
 
 private extension View {

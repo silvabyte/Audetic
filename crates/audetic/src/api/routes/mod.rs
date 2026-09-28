@@ -1,16 +1,13 @@
 //! API route modules.
 
 pub mod agents;
-pub mod history;
+pub mod audio_note_artifacts;
+pub mod audio_notes;
 pub mod keybind;
 pub mod logs;
-pub mod meeting_artifacts;
-pub mod meetings;
 pub mod models;
 pub mod post_processing;
 pub mod provider;
-pub mod recording;
 pub mod setup;
 pub mod summary_templates;
 pub mod system;
-pub mod transcribe;
