@@ -200,8 +200,14 @@ input_method = "clipboard"  # Use clipboard + paste only, no direct injection
 ### Disable auto-paste
 ```toml
 [behavior]
-auto_paste = false  # Only copy to clipboard, no automatic paste
+auto_paste = false  # Default: neither paste nor clipboard copy
 ```
+
+Clipboard delivery is separately opt-in per capture: use
+`audetic notes start --copy-to-clipboard`, or copy an existing transcript with
+`audetic notes copy <id>`. To opt in to paste for one capture use
+`audetic notes start --auto-paste`; raw text is delivered only after it is
+persisted, before AI enrichment. AI output is never pasted later.
 
 ## Advanced Configuration
 

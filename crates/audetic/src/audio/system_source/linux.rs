@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use tracing::{debug, info, warn};
 use which::which;
 
-use crate::audio::audio_source::{AudioSource, MeetingSystemSource};
+use crate::audio::audio_source::{AudioSource, CaptureSystemSource};
 use crate::audio::stream_event::StreamEventSink;
 
 pub struct SystemAudioSource {
@@ -77,7 +77,7 @@ impl AudioSource for SystemAudioSource {
         // Check pw-cat is available
         if which("pw-cat").is_err() {
             warn!(
-                "pw-cat not found. Meeting will record mic only. \
+                "pw-cat not found. AudioNote will record mic only. \
                  Install PipeWire to capture system audio."
             );
             self.active = true;
@@ -93,7 +93,7 @@ impl AudioSource for SystemAudioSource {
             None => {
                 warn!(
                     "Could not determine default audio sink. \
-                     Meeting will record mic only."
+                     AudioNote will record mic only."
                 );
                 self.active = true;
                 return Ok(());
@@ -125,7 +125,7 @@ impl AudioSource for SystemAudioSource {
             Ok(c) => c,
             Err(e) => {
                 warn!(
-                    "Failed to spawn pw-cat: {}. Meeting will record mic only.",
+                    "Failed to spawn pw-cat: {}. AudioNote will record mic only.",
                     e
                 );
                 self.active = true;
@@ -137,7 +137,7 @@ impl AudioSource for SystemAudioSource {
         let stdout = match child.stdout.take() {
             Some(s) => s,
             None => {
-                warn!("Failed to capture pw-cat stdout. Meeting will record mic only.");
+                warn!("Failed to capture pw-cat stdout. AudioNote will record mic only.");
                 let _ = child.kill();
                 self.active = true;
                 return Ok(());
@@ -203,7 +203,7 @@ impl AudioSource for SystemAudioSource {
 }
 
 #[async_trait::async_trait(?Send)]
-impl MeetingSystemSource for SystemAudioSource {
+impl CaptureSystemSource for SystemAudioSource {
     fn has_captured_audio(&self) -> bool {
         self.captured_audio
     }
@@ -286,7 +286,7 @@ impl Drop for SystemAudioSource {
 
 #[cfg(test)]
 mod tests {
-    use crate::audio::audio_source::MeetingSystemSource;
+    use crate::audio::audio_source::CaptureSystemSource;
     use crate::audio::capture_recovery::CaptureRecovery;
 
     use super::SystemAudioSource;

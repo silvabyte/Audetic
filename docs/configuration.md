@@ -66,9 +66,8 @@ recording_tooltip = "Recording... Press Super+R to stop"     # Tooltip for recor
 input_method = "wtype"          # Text injection method
 
 [behavior]
-auto_paste = true               # Automatically paste transcribed text
+auto_paste = false              # Opt in to pasting the persisted raw transcript
 preserve_clipboard = false      # Keep clipboard content after pasting
-delete_audio_files = true       # Delete temporary audio files after processing
 audio_feedback = true           # Play audio feedback sounds
 ```
 
@@ -177,13 +176,15 @@ Configures integration with Wayland desktop environments.
 
 ### [behavior] - Application Behavior
 
-Controls how Audetic handles transcribed text and temporary files.
+Controls how Audetic delivers persisted raw transcripts. Audio Notes retain audio
+durably; the obsolete `delete_audio_files` setting is ignored when loading old
+configuration and removed when it is saved. Explicit `auto_paste = true`
+preferences are preserved, but new configurations never paste automatically.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `auto_paste` | bool | `true` | Automatically paste/type transcribed text |
+| `auto_paste` | bool | `false` | Opt in to pasting the persisted raw transcript before asynchronous AI processing |
 | `preserve_clipboard` | bool | `false` | Keep existing clipboard content when using clipboard injection |
-| `delete_audio_files` | bool | `true` | Delete temporary audio recordings after processing |
 | `audio_feedback` | bool | `true` | Play audio feedback sounds (start/stop recording) |
 
 ## Configuration File Location
@@ -251,7 +252,7 @@ model = "tiny"       # Smallest, fastest model
 language = "en"
 
 [behavior]
-delete_audio_files = true  # Clean up temp files
+auto_paste = false
 ```
 
 ### For High Accuracy Transcription

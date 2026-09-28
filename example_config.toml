@@ -32,7 +32,6 @@ recording_tooltip = "Recording... Press Super+R to stop"
 input_method = "ydotool"  # Recommended: works on KDE, GNOME, Sway, Hyprland (auto-detected first)
 
 [behavior]
-auto_paste = true
+auto_paste = false # Opt in to pasting the persisted raw transcript
 preserve_clipboard = false
-delete_audio_files = true
 audio_feedback = true

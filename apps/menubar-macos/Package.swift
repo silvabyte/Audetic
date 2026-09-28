@@ -24,6 +24,11 @@ let package = Package(
                 .product(name: "KeyboardShortcuts", package: "KeyboardShortcuts")
             ],
             path: "Sources/AudeticMenuBar"
+        ),
+        .testTarget(
+            name: "AudeticMenuBarTests",
+            dependencies: ["AudeticMenuBar"],
+            path: "Tests/AudeticMenuBarTests"
         )
     ]
 )

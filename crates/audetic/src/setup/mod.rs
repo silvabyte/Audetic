@@ -43,8 +43,8 @@ struct ProbeSnapshot {
     wtype: Option<PathBuf>,
     ydotool: Option<PathBuf>,
     wl_copy: Option<PathBuf>,
-    dictation_keybind: KeybindProbe,
-    meeting_keybind: KeybindProbe,
+    note_keybind: KeybindProbe,
+    system_note_keybind: KeybindProbe,
     ffmpeg: Option<PathBuf>,
     pw_cat: Option<PathBuf>,
     pactl: Option<PathBuf>,
@@ -98,13 +98,13 @@ fn probe(active_provider: &crate::config::WhisperConfig) -> ProbeSnapshot {
         .as_ref()
         .and_then(|discovery| discovery.writable_config().cloned());
     let keybind_statuses = crate::keybind::get_statuses();
-    let dictation_keybind = keybind_statuses
+    let note_keybind = keybind_statuses
         .as_ref()
-        .map(|statuses| probe_keybind_status(statuses.get(KeybindTarget::Dictation)))
+        .map(|statuses| probe_keybind_status(statuses.get(KeybindTarget::Note)))
         .unwrap_or_else(|error| KeybindProbe::Error(error.to_string()));
-    let meeting_keybind = keybind_statuses
+    let system_note_keybind = keybind_statuses
         .as_ref()
-        .map(|statuses| probe_keybind_status(statuses.get(KeybindTarget::Meeting)))
+        .map(|statuses| probe_keybind_status(statuses.get(KeybindTarget::SystemNote)))
         .unwrap_or_else(|error| KeybindProbe::Error(error.to_string()));
 
     ProbeSnapshot {
@@ -118,8 +118,8 @@ fn probe(active_provider: &crate::config::WhisperConfig) -> ProbeSnapshot {
         wtype: find_tool("wtype"),
         ydotool: find_tool("ydotool"),
         wl_copy: find_tool("wl-copy"),
-        dictation_keybind,
-        meeting_keybind,
+        note_keybind,
+        system_note_keybind,
         ffmpeg: audetic_core::ffmpeg::resolve_ffmpeg_binary(),
         pw_cat: find_tool("pw-cat"),
         pactl: find_tool("pactl"),
@@ -269,7 +269,7 @@ fn classify(snapshot: ProbeSnapshot) -> SetupAssessment {
     capabilities.push(capability(
         SetupCapabilityId::TextDelivery,
         linux_state(linux, direct_delivery),
-        (linux, false),
+        (false, false),
         if direct_delivery {
             "Text delivery backend ready"
         } else if linux {
@@ -300,27 +300,28 @@ fn classify(snapshot: ProbeSnapshot) -> SetupAssessment {
     ));
 
     let (keybind_state, keybind_summary, keybind_detail) =
-        classify_keybind(linux, &snapshot.dictation_keybind, "Dictation");
+        classify_keybind(linux, &snapshot.note_keybind, "Microphone note");
     capabilities.push(capability(
-        SetupCapabilityId::DictationKeybind,
+        SetupCapabilityId::NoteKeybind,
         keybind_state,
         (linux, false),
         &keybind_summary,
         keybind_detail,
-        linux.then(|| "Run `audetic keybind install` for the dictation shortcut".to_string()),
+        linux.then(|| "Run `audetic keybind install` for the microphone shortcut".to_string()),
         vec![],
     ));
 
     let (keybind_state, keybind_summary, keybind_detail) =
-        classify_keybind(linux, &snapshot.meeting_keybind, "Meeting");
+        classify_keybind(linux, &snapshot.system_note_keybind, "System audio note");
     capabilities.push(capability(
-        SetupCapabilityId::MeetingKeybind,
+        SetupCapabilityId::SystemNoteKeybind,
         keybind_state,
         (false, linux),
         &keybind_summary,
         keybind_detail,
         linux.then(|| {
-            "Run `audetic keybind install --target meeting` for the meeting shortcut".to_string()
+            "Run `audetic keybind install --target system-note` for the system audio shortcut"
+                .to_string()
         }),
         vec![],
     ));
@@ -333,7 +334,7 @@ fn classify(snapshot: ProbeSnapshot) -> SetupAssessment {
         } else {
             SetupState::NeedsAction
         },
-        (false, true),
+        (true, true),
         if ffmpeg.available {
             "FFmpeg ready"
         } else {
@@ -346,27 +347,29 @@ fn classify(snapshot: ProbeSnapshot) -> SetupAssessment {
 
     let pw_cat = tool("pw-cat", snapshot.pw_cat, "pipewire-audio");
     let pactl = tool("pactl", snapshot.pactl, "libpulse");
-    let meeting_audio_ready = pw_cat.available && pactl.available;
+    let system_audio_ready = pw_cat.available && pactl.available;
     capabilities.push(capability(
-        SetupCapabilityId::MeetingAudio,
-        linux_state(linux, meeting_audio_ready),
+        SetupCapabilityId::SystemAudio,
+        linux_state(linux, system_audio_ready),
         (false, linux),
-        if meeting_audio_ready {
-            "Meeting audio tools ready"
+        if system_audio_ready {
+            "System audio tools ready"
         } else if linux {
-            "Meeting audio tools incomplete"
+            "System audio tools incomplete"
         } else {
-            "PipeWire meeting tools are not used on this platform"
+            "PipeWire tools are not used on this platform"
         },
         None,
         linux.then(|| "Install the missing PipeWire/PulseAudio command-line tools".to_string()),
         vec![pw_cat, pactl],
     ));
 
-    let dictation = workflow_state(&capabilities, |capability| {
-        capability.required_for_dictation
+    let microphone = workflow_state(&capabilities, |capability| {
+        capability.required_for_microphone
     });
-    let meetings = workflow_state(&capabilities, |capability| capability.required_for_meetings);
+    let microphone_and_system = workflow_state(&capabilities, |capability| {
+        capability.required_for_system_audio
+    });
     let (missing_arch_packages, arch_package_command) = if snapshot.platform.arch_linux {
         let packages =
             missing_arch_packages(&capabilities, snapshot.preferred_text_backend.as_deref());
@@ -377,12 +380,12 @@ fn classify(snapshot: ProbeSnapshot) -> SetupAssessment {
     };
 
     SetupAssessment {
-        state: dictation,
+        state: microphone,
         restart_required: snapshot.restart_required,
         platform: snapshot.platform,
         workflows: WorkflowReadiness {
-            dictation,
-            meetings,
+            microphone,
+            microphone_and_system,
         },
         capabilities,
         missing_arch_packages,
@@ -399,12 +402,12 @@ fn capability(
     action: Option<String>,
     tools: Vec<ToolReadiness>,
 ) -> SetupCapability {
-    let (required_for_dictation, required_for_meetings) = required_for;
+    let (required_for_microphone, required_for_system_audio) = required_for;
     SetupCapability {
         id,
         state,
-        required_for_dictation,
-        required_for_meetings,
+        required_for_microphone,
+        required_for_system_audio,
         summary: summary.to_string(),
         detail,
         action,
@@ -598,8 +601,8 @@ mod tests {
             wtype: Some(PathBuf::from("/usr/bin/wtype")),
             ydotool: None,
             wl_copy: Some(PathBuf::from("/usr/bin/wl-copy")),
-            dictation_keybind: KeybindProbe::Installed("SUPER + R".to_string()),
-            meeting_keybind: KeybindProbe::Installed("SUPER SHIFT + R".to_string()),
+            note_keybind: KeybindProbe::Installed("SUPER + R".to_string()),
+            system_note_keybind: KeybindProbe::Installed("SUPER SHIFT + R".to_string()),
             ffmpeg: Some(PathBuf::from("/usr/bin/ffmpeg")),
             pw_cat: Some(PathBuf::from("/usr/bin/pw-cat")),
             pactl: Some(PathBuf::from("/usr/bin/pactl")),
@@ -607,29 +610,34 @@ mod tests {
     }
 
     #[test]
-    fn classifies_ready_dictation_and_meetings() {
+    fn classifies_ready_capture_sources() {
         let assessment = classify(snapshot());
 
         assert_eq!(assessment.state, SetupState::Ready);
-        assert_eq!(assessment.workflows.dictation, SetupState::Ready);
-        assert_eq!(assessment.workflows.meetings, SetupState::Ready);
+        assert_eq!(assessment.workflows.microphone, SetupState::Ready);
+        assert_eq!(
+            assessment.workflows.microphone_and_system,
+            SetupState::Ready
+        );
         assert_eq!(assessment.capabilities.len(), 10);
         assert_eq!(assessment.capabilities[0].id, SetupCapabilityId::Omarchy);
         assert!(assessment.arch_package_command.is_none());
     }
 
     #[test]
-    fn optional_meeting_tools_do_not_block_dictation() {
+    fn optional_system_audio_tools_do_not_block_microphone() {
         let mut input = snapshot();
         input.pw_cat = None;
         input.pactl = None;
-        input.ffmpeg = None;
 
         let assessment = classify(input);
 
         assert_eq!(assessment.state, SetupState::Ready);
-        assert_eq!(assessment.workflows.dictation, SetupState::Ready);
-        assert_eq!(assessment.workflows.meetings, SetupState::NeedsAction);
+        assert_eq!(assessment.workflows.microphone, SetupState::Ready);
+        assert_eq!(
+            assessment.workflows.microphone_and_system,
+            SetupState::NeedsAction
+        );
     }
 
     #[test]
@@ -641,21 +649,24 @@ mod tests {
     }
 
     #[test]
-    fn missing_meeting_keybind_only_blocks_meetings() {
+    fn missing_system_keybind_only_blocks_system_shortcut() {
         let mut input = snapshot();
-        input.meeting_keybind =
+        input.system_note_keybind =
             KeybindProbe::NotInstalled(Some(PathBuf::from("/tmp/bindings.conf")));
 
         let assessment = classify(input);
 
-        assert_eq!(assessment.workflows.dictation, SetupState::Ready);
-        assert_eq!(assessment.workflows.meetings, SetupState::NeedsAction);
+        assert_eq!(assessment.workflows.microphone, SetupState::Ready);
+        assert_eq!(
+            assessment.workflows.microphone_and_system,
+            SetupState::NeedsAction
+        );
         assert_eq!(
             assessment
-                .capability(SetupCapabilityId::MeetingKeybind)
+                .capability(SetupCapabilityId::SystemNoteKeybind)
                 .unwrap()
                 .summary,
-            "Meeting keybind not installed"
+            "System audio note keybind not installed"
         );
     }
 

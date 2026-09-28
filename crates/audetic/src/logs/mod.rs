@@ -3,7 +3,7 @@
 //! This module provides the core business logic for fetching logs.
 //! It is used by both the CLI and REST API.
 
-use crate::history::{self, HistoryEntry};
+use crate::db::{self, audio_notes::AudioNoteRepository};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -16,7 +16,15 @@ pub struct LogsResult {
     /// Application logs from systemd journal
     pub app_logs: Vec<String>,
     /// Recent transcription entries
-    pub transcriptions: Vec<HistoryEntry>,
+    pub transcriptions: Vec<TranscriptionLogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TranscriptionLogEntry {
+    pub id: i64,
+    pub text: String,
+    pub audio_path: String,
+    pub created_at: String,
 }
 
 /// Options for log retrieval.
@@ -35,7 +43,7 @@ impl LogsOptions {
 /// Get combined application logs and transcription history.
 pub fn get_logs(options: &LogsOptions) -> Result<LogsResult> {
     let app_logs = get_app_logs(options.lines)?;
-    let transcriptions = history::get_recent(options.lines)?;
+    let transcriptions = get_transcription_logs(options.lines)?;
 
     Ok(LogsResult {
         app_logs,
@@ -119,8 +127,19 @@ fn get_app_logs_file(lines: usize) -> Result<Vec<String>> {
 /// Get transcription history logs.
 ///
 /// This is a convenience wrapper around history::get_recent.
-pub fn get_transcription_logs(lines: usize) -> Result<Vec<HistoryEntry>> {
-    history::get_recent(lines)
+pub fn get_transcription_logs(lines: usize) -> Result<Vec<TranscriptionLogEntry>> {
+    let conn = db::init_db()?;
+    Ok(AudioNoteRepository::list(&conn, lines)?
+        .into_iter()
+        .filter_map(|note| {
+            note.transcript_text.map(|text| TranscriptionLogEntry {
+                id: note.id,
+                text,
+                audio_path: note.audio_path,
+                created_at: note.created_at,
+            })
+        })
+        .collect())
 }
 
 #[cfg(test)]

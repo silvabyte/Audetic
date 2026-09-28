@@ -37,10 +37,10 @@ const CAPABILITY_ORDER: SetupCapabilityId[] = [
   "transcription_provider",
   "text_delivery",
   "clipboard_fallback",
-  "dictation_keybind",
-  "meeting_keybind",
+  "note_keybind",
+  "system_note_keybind",
   "ffmpeg",
-  "meeting_audio",
+  "system_audio",
 ];
 
 const CAPABILITY_LABELS: Record<SetupCapabilityId, string> = {
@@ -50,10 +50,10 @@ const CAPABILITY_LABELS: Record<SetupCapabilityId, string> = {
   transcription_provider: "Transcription",
   text_delivery: "Text delivery",
   clipboard_fallback: "Clipboard fallback",
-  dictation_keybind: "Dictation shortcut",
-  meeting_keybind: "Meeting shortcut",
+  note_keybind: "Microphone shortcut",
+  system_note_keybind: "System audio shortcut",
   ffmpeg: "FFmpeg",
-  meeting_audio: "Meeting audio",
+  system_audio: "System audio",
 };
 
 export const settingsSetupRoute: RouteObject = {
@@ -125,7 +125,7 @@ function SettingsSetup() {
                 <VoicePath
                   capture={phaseState([
                     store.setup.capability("hyprland_session")?.state,
-                    store.setup.capability("dictation_keybind")?.state,
+                    store.setup.capability("note_keybind")?.state,
                   ])}
                   transcription={store.setup.capability("transcription_provider")?.state ?? "unavailable"}
                   delivery={store.setup.capability("text_delivery")?.state ?? "unavailable"}
@@ -134,14 +134,14 @@ function SettingsSetup() {
                 <div className="grid gap-3 sm:grid-cols-2">
                   <WorkflowCard
                     icon={Mic2}
-                    label="Dictation"
-                    state={setup.workflows.dictation}
-                    detail="Mic capture → transcription → focused-app delivery"
+                    label="Microphone"
+                    state={setup.workflows.microphone}
+                    detail="Microphone → saved transcript → AI processing"
                   />
                   <WorkflowCard
                     icon={Radio}
-                    label="Meetings"
-                    state={setup.workflows.meetings}
+                    label="Microphone + system audio"
+                    state={setup.workflows.microphone_and_system}
                     detail="Mic + system audio → FFmpeg → transcription"
                   />
                 </div>
@@ -253,7 +253,7 @@ function NextAction() {
           return (
             <div className="flex items-center gap-3 rounded-lg border bg-primary p-4 text-primary-foreground shadow-sm">
               <CheckCircle2 className="h-5 w-5" />
-              <div><p className="text-sm font-semibold">Voice path ready</p><p className="text-xs opacity-80">Dictation and meeting requirements are satisfied.</p></div>
+              <div><p className="text-sm font-semibold">Voice path ready</p><p className="text-xs opacity-80">Audio note capture requirements are satisfied.</p></div>
             </div>
           );
         }
@@ -322,12 +322,12 @@ function CapabilityRow({ id }: { id: SetupCapabilityId }) {
       {() => {
         const capability = store.setup.capability(id);
         if (!capability) return null;
-        const requirement = capability.required_for_dictation && capability.required_for_meetings
+        const requirement = capability.required_for_microphone && capability.required_for_system_audio
           ? "Required · both"
-          : capability.required_for_dictation
-            ? "Required · dictation"
-            : capability.required_for_meetings
-              ? "Required · meetings"
+          : capability.required_for_microphone
+            ? "Required · microphone"
+            : capability.required_for_system_audio
+              ? "Required · system audio"
               : "Optional";
         return (
           <div className="grid gap-2 px-4 py-3 sm:grid-cols-[10rem_minmax(0,1fr)_auto] sm:items-start sm:gap-4">
@@ -349,7 +349,7 @@ function CapabilityRow({ id }: { id: SetupCapabilityId }) {
               ) : null}
               {id === "ffmpeg" && capability.state !== "ready" ? <div className="mt-2"><InstallFfmpegButton /></div> : null}
               {id === "transcription_provider" && capability.state !== "ready" ? <InlineLink to="/settings" label="Review provider" /> : null}
-              {(id === "dictation_keybind" || id === "meeting_keybind") && capability.state !== "ready" ? <InlineLink to="/settings/keybind" label="Manage shortcuts" /> : null}
+              {(id === "note_keybind" || id === "system_note_keybind") && capability.state !== "ready" ? <InlineLink to="/settings/keybind" label="Manage shortcuts" /> : null}
             </div>
             <span className="w-fit rounded border px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">{requirement}</span>
           </div>

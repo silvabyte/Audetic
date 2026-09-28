@@ -53,8 +53,7 @@ function SettingsPostProcessing(): React.JSX.Element {
             Run shell commands when Audetic events fire. Each command receives a
             JSON envelope on stdin —{" "}
             <code className="font-mono text-xs">jq</code> it or use the embedded
-            identifiers (<code className="font-mono text-xs">dictation_id</code>,{" "}
-            <code className="font-mono text-xs">meeting_id</code>) with the
+            identifier (<code className="font-mono text-xs">note_id</code>) with the
             daemon API.
           </p>
         </div>
@@ -265,8 +264,7 @@ interface JobFormProps {
 // Fallback event kinds so the form still works if the events fetch failed
 // (e.g. the daemon was momentarily unreachable).
 const EVENT_FALLBACK: EventDescriptor[] = [
-  { name: "dictation.completed", label: "Dictation completed", description: "" },
-  { name: "meeting.completed", label: "Meeting completed", description: "" },
+  { name: "audio_note.completed", label: "Audio note completed", description: "" },
 ];
 
 function JobFormDialog({
@@ -278,7 +276,7 @@ function JobFormDialog({
   const store = useStore();
   const [name, setName] = useState(job?.name ?? "");
   const [event, setEvent] = useState<EventKind>(
-    (job?.event as EventKind) ?? "dictation.completed",
+    job?.event ?? "audio_note.completed",
   );
   const [command, setCommand] = useState(job?.action.command ?? "");
   const [timeout, setTimeout] = useState(
@@ -290,7 +288,7 @@ function JobFormDialog({
   useEffect(() => {
     if (open) {
       setName(job?.name ?? "");
-      setEvent((job?.event as EventKind) ?? "dictation.completed");
+      setEvent(job?.event ?? "audio_note.completed");
       setCommand(job?.action.command ?? "");
       setTimeout(String(job?.action.timeout_seconds ?? 3600));
     }
@@ -390,12 +388,12 @@ function JobFormDialog({
               id="pp-event"
               className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm focus:outline-none focus:ring-1 focus:ring-ring"
               value={event}
-              onChange={(e) => setEvent(e.target.value as EventKind)}
+              onChange={(e) => { if (e.target.value === "audio_note.completed") setEvent(e.target.value); }}
             >
               <Observer>
                 {() => {
                   const events = store.postProcessing.events;
-                  // Fall back to the two v1 kinds so the form still works if the
+                  // Fall back to the unified event so the form still works if the
                   // events fetch failed (e.g. daemon was momentarily unreachable).
                   const eventOptions =
                     events.length > 0 ? events : EVENT_FALLBACK;
@@ -420,7 +418,7 @@ function JobFormDialog({
               className="flex min-h-[5rem] w-full rounded-md border border-input bg-transparent px-3 py-2 font-mono text-xs shadow-sm focus:outline-none focus:ring-1 focus:ring-ring"
               value={command}
               onChange={(e) => setCommand(e.target.value)}
-              placeholder={'jq -r .data.text > /tmp/last-dictation.txt'}
+              placeholder={'jq -r .data.transcript_text > /tmp/last-audio-note.txt'}
               required
             />
           </div>

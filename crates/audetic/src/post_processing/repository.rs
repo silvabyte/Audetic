@@ -1,5 +1,5 @@
 //! SQLite CRUD over `post_processing_jobs`. Same raw-rusqlite shape as
-//! [`crate::db::meetings::MeetingRepository`] — keep it consistent.
+//! [`crate::db::audio_notes::AudioNoteRepository`] — keep it consistent.
 
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, Row};
@@ -31,13 +31,14 @@ impl JobRepository {
         Ok(conn.last_insert_rowid())
     }
 
-    /// Fetch a single job by id.
+    /// Fetch a current job by id. Retired subscriptions remain archived on disk
+    /// for the migration report, but cannot be run or enabled via this API.
     pub fn get(conn: &Connection, id: i64) -> Result<Option<Job>> {
         let mut stmt = conn
             .prepare(
                 "SELECT id, name, event, action_type, action_config, enabled, \
                  created_at, updated_at \
-                 FROM post_processing_jobs WHERE id = ?1",
+                  FROM post_processing_jobs WHERE id = ?1 AND event = 'audio_note.completed'",
             )
             .context("Failed to prepare job get query")?;
         let mut rows = stmt
@@ -75,7 +76,7 @@ impl JobRepository {
                 .prepare(
                     "SELECT id, name, event, action_type, action_config, enabled, \
                      created_at, updated_at \
-                     FROM post_processing_jobs ORDER BY id DESC",
+                      FROM post_processing_jobs WHERE event = 'audio_note.completed' ORDER BY id DESC",
                 )
                 .context("Failed to prepare jobs list query")?;
             let rows = stmt
@@ -197,7 +198,7 @@ mod tests {
     fn sample_new(name: &str) -> NewJob {
         NewJob {
             name: name.to_string(),
-            event: EventKind::DictationCompleted,
+            event: EventKind::AudioNoteCompleted,
             action: Action::Command {
                 command: "tee /tmp/out".to_string(),
                 timeout_seconds: 5,
@@ -213,7 +214,7 @@ mod tests {
         let job = JobRepository::get(&conn, id).unwrap().unwrap();
         assert_eq!(job.id, id);
         assert_eq!(job.name, "notify");
-        assert_eq!(job.event, EventKind::DictationCompleted);
+        assert_eq!(job.event, EventKind::AudioNoteCompleted);
         assert!(job.enabled);
         match job.action {
             Action::Command {
@@ -239,7 +240,7 @@ mod tests {
         JobRepository::insert(
             &conn,
             &NewJob {
-                event: EventKind::MeetingCompleted,
+                event: EventKind::AudioNoteCompleted,
                 ..sample_new("b")
             },
         )
@@ -255,14 +256,13 @@ mod tests {
         JobRepository::insert(
             &conn,
             &NewJob {
-                event: EventKind::MeetingCompleted,
+                event: EventKind::AudioNoteCompleted,
                 ..sample_new("b")
             },
         )
         .unwrap();
-        let meeting_only = JobRepository::list(&conn, Some(EventKind::MeetingCompleted)).unwrap();
-        assert_eq!(meeting_only.len(), 1);
-        assert_eq!(meeting_only[0].name, "b");
+        let notes = JobRepository::list(&conn, Some(EventKind::AudioNoteCompleted)).unwrap();
+        assert_eq!(notes.len(), 2);
     }
 
     #[test]
@@ -279,8 +279,35 @@ mod tests {
         )
         .unwrap();
         let active =
-            JobRepository::list_enabled_for_event(&conn, EventKind::DictationCompleted).unwrap();
+            JobRepository::list_enabled_for_event(&conn, EventKind::AudioNoteCompleted).unwrap();
         assert!(active.is_empty());
+    }
+
+    #[test]
+    fn retired_subscriptions_are_archived_not_executed_or_reenabled() {
+        let conn = setup_db();
+        let old_id = JobRepository::insert(&conn, &sample_new("retired")).unwrap();
+        conn.execute(
+            "UPDATE post_processing_jobs SET event='retired.completed',enabled=0 WHERE id=?1",
+            [old_id],
+        )
+        .unwrap();
+        assert!(JobRepository::list(&conn, None).unwrap().is_empty());
+        assert!(JobRepository::get(&conn, old_id).unwrap().is_none());
+        assert!(!JobRepository::update(
+            &conn,
+            old_id,
+            &UpdateJob {
+                enabled: Some(true),
+                ..Default::default()
+            }
+        )
+        .unwrap());
+        assert!(
+            JobRepository::list_enabled_for_event(&conn, EventKind::AudioNoteCompleted)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -302,7 +329,7 @@ mod tests {
         assert_eq!(job.name, "renamed");
         assert!(!job.enabled);
         // Untouched fields preserved.
-        assert_eq!(job.event, EventKind::DictationCompleted);
+        assert_eq!(job.event, EventKind::AudioNoteCompleted);
     }
 
     #[test]

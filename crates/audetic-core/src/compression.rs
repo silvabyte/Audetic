@@ -41,7 +41,7 @@ pub fn compress_for_transcription(input: &Path) -> Result<PathBuf> {
     // Resolve which ffmpeg to invoke — app-local sidecar wins over PATH so a
     // daemon-managed install is deterministic. The "FFmpeg is required..."
     // wording below is load-bearing: the renderer pattern-matches `/ffmpeg/i`
-    // on meeting errors to route the user to the onboarding card.
+    // on capture errors to route the user to the onboarding card.
     let ffmpeg = match resolve_ffmpeg_binary() {
         Some(path) => path,
         None => bail!(
@@ -55,7 +55,7 @@ pub fn compress_for_transcription(input: &Path) -> Result<PathBuf> {
     };
 
     // Create temp output path. The random component keeps concurrent
-    // compressions of same-named inputs (e.g. parallel `audetic transcribe`
+    // compressions of same-named inputs (e.g. parallel `audetic notes import`
     // calls, or parallel test threads) from writing to the same file — which
     // would make ffmpeg read a half-written input/output and fail.
     let temp_dir = std::env::temp_dir();

@@ -18,8 +18,7 @@ export const settingsConfigFileRoute: RouteObject = {
 const CONFIG_PATH = "~/.config/audetic/config.toml";
 
 /**
- * The daemon has no PUT /config, so `[whisper]`, `[behavior]`, and
- * `[meeting]` tuning happens by editing the config file directly.
+ * Advanced behavior tuning remains config-file driven.
  * Browsers can't shell-open a path, so we just display the path with a
  * Copy button.
  *
@@ -45,8 +44,8 @@ function SettingsConfigFile() {
       <header>
         <h2 className="text-xl font-semibold">Config file</h2>
         <p className="text-sm text-muted-foreground">
-          The daemon has no write endpoints yet, so these sections are
-          tuned by editing the config file directly.
+          Advanced settings are tuned in the config file. Transcription settings
+          and automatic paste can also be changed on the Provider and Capture &amp; delivery pages.
         </p>
       </header>
 
@@ -88,10 +87,7 @@ function SettingsConfigFile() {
             <dd>Provider, model, language, API key, endpoint.</dd>
 
             <dt className="font-mono text-xs text-muted-foreground">[behavior]</dt>
-            <dd>auto_paste, preserve_clipboard, delete_audio_files, audio_feedback.</dd>
-
-            <dt className="font-mono text-xs text-muted-foreground">[meeting]</dt>
-            <dd>post_command, post_command_timeout_seconds.</dd>
+            <dd>auto_paste (off by default), preserve_clipboard, audio_feedback. Capture &amp; delivery saves the automatic-paste preference here; the recording bar also offers a one-recording override.</dd>
 
             <dt className="font-mono text-xs text-muted-foreground">[wayland]</dt>
             <dd>input_method (e.g. wtype, ydotool).</dd>

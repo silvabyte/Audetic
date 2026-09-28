@@ -1,11 +1,9 @@
 //! REST API server for Audetic.
 //!
 //! Provides HTTP endpoints for:
-//! - Recording control (toggle, status)
-//! - Transcription history
+//! - Audio Note capture, stream, transcripts, and enrichment
 //! - Keybinding management
 //! - Provider configuration
-//! - Update management
 //! - Application logs
 //! - OpenAPI spec (/openapi.json)
 
@@ -37,7 +35,6 @@ use crate::config::Config;
 use crate::post_processing::PostProcessingService;
 
 pub use crate::app::DaemonCommand as ApiCommand;
-pub use routes::recording::{RecordingState, ToggleRequest};
 
 /// Response for GET / — service identity and basic status.
 #[derive(Debug, Serialize, ToSchema)]
@@ -60,9 +57,7 @@ pub struct VersionInfo {
 pub(crate) struct ProcessInstanceId(String);
 
 pub struct ApiServer {
-    port: u16,
-    recording_state: RecordingState,
-    meeting_state: Option<routes::meetings::MeetingState>,
+    audio_note_state: routes::audio_notes::AudioNoteState,
     post_processing_state: routes::post_processing::PostProcessingApiState,
     runtime_provider: crate::config::WhisperConfig,
     instance_id: ProcessInstanceId,
@@ -70,19 +65,12 @@ pub struct ApiServer {
 
 impl ApiServer {
     pub fn new(
-        tx: tokio::sync::mpsc::Sender<ApiCommand>,
-        status: crate::audio::RecordingStatusHandle,
+        audio_note_state: routes::audio_notes::AudioNoteState,
         config: &Config,
         post_processing: std::sync::Arc<PostProcessingService>,
     ) -> Self {
         Self {
-            port: url::DEFAULT_PORT,
-            recording_state: RecordingState {
-                tx,
-                status,
-                waybar_config: config.ui.waybar.clone(),
-            },
-            meeting_state: None,
+            audio_note_state,
             post_processing_state: routes::post_processing::PostProcessingApiState {
                 service: post_processing,
             },
@@ -91,43 +79,16 @@ impl ApiServer {
         }
     }
 
-    pub fn with_meeting_state(
-        mut self,
-        meeting_status: crate::meeting::MeetingStatusHandle,
-        transcription: std::sync::Arc<
-            dyn crate::transcription::job_service::TranscriptionJobService,
-        >,
-        post_processing: std::sync::Arc<PostProcessingService>,
-        inspector: std::sync::Arc<dyn crate::meeting::MediaInspector>,
-        meetings_dir: std::path::PathBuf,
-    ) -> Self {
-        let db_path = post_processing.db_path().to_path_buf();
-        let services = crate::meeting::ProcessingServices::new(
-            transcription.clone(),
-            post_processing,
-            db_path,
-        );
-        self.meeting_state = Some(routes::meetings::MeetingState {
-            tx: self.recording_state.tx.clone(),
-            status: meeting_status,
-            transcription,
-            services,
-            inspector,
-            meetings_dir,
-        });
-        self
-    }
-
     pub async fn start(self) -> Result<()> {
+        let db_path = self.audio_note_state.services.db_path.clone();
         // Build the API surface. All routes nest under `/api` so the daemon
         // can serve the bundled web-ui at `/` without colliding with API
-        // paths (e.g. /meetings is also a SPA route).
-        let mut api = Router::new()
+        // paths (e.g. /audio-notes is also a SPA route).
+        let api = Router::new()
             .route("/", get(status))
             .route("/version", get(version))
             .route("/openapi.json", get(openapi_spec))
-            .nest("", routes::recording::router(self.recording_state))
-            .nest("/history", routes::history::router())
+            .merge(routes::audio_notes::router(self.audio_note_state))
             .nest("/keybind", routes::keybind::router())
             .nest("/logs", routes::logs::router())
             .nest("/models", routes::models::router())
@@ -141,17 +102,17 @@ impl ApiServer {
             .merge(routes::setup::router(routes::setup::SetupApiState::new(
                 self.runtime_provider.clone(),
             )))
-            .merge(routes::transcribe::router())
             .merge(routes::agents::router())
             .merge(routes::summary_templates::router())
-            .merge(routes::meeting_artifacts::router())
+            .merge(routes::audio_note_artifacts::router(db_path))
             .merge(routes::post_processing::router(self.post_processing_state))
-            .layer(Extension(self.instance_id));
-
-        let has_meeting = self.meeting_state.is_some();
-        if let Some(meeting_state) = self.meeting_state {
-            api = api.merge(routes::meetings::router(meeting_state));
-        }
+            .layer(Extension(self.instance_id))
+            .fallback(|| async {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({"error":"API route not found"})),
+                )
+            });
 
         let app = Router::new()
             .nest(url::API_PREFIX, api)
@@ -159,15 +120,11 @@ impl ApiServer {
             .layer(cors_layer())
             .layer(middleware::from_fn(reject_disallowed_origin));
 
-        let listener =
-            tokio::net::TcpListener::bind(&format!("{}:{}", url::HOST, self.port)).await?;
+        let port = url::port()?;
+        let listener = tokio::net::TcpListener::bind(&format!("{}:{}", url::HOST, port)).await?;
 
-        info!("API server listening on http://{}:{}", url::HOST, self.port);
+        info!("API server listening on http://{}:{}", url::HOST, port);
         info!("API spec: {}", url::api_url("/openapi.json"));
-        info!(
-            "Meeting endpoints {}",
-            if has_meeting { "enabled" } else { "disabled" }
-        );
 
         axum::serve(listener, app).await?;
 
@@ -200,9 +157,12 @@ fn is_allowed_browser_origin(origin: &HeaderValue) -> bool {
 
     origin.to_str().ok().is_some_and(|origin| {
         HOSTS.iter().any(|host| {
-            PORTS
-                .iter()
-                .any(|port| origin == format!("http://{host}:{port}"))
+            url::port()
+                .ok()
+                .is_some_and(|port| origin == format!("http://{host}:{port}"))
+                || PORTS
+                    .iter()
+                    .any(|port| origin == format!("http://{host}:{port}"))
         })
     })
 }

@@ -23,7 +23,7 @@ ruleTester.run("observer-boundary", rule, {
       code: `
         function C() {
           const store = useStore();
-          return <Observer>{() => <div>{store.status.phase}</div>}</Observer>;
+          return <Observer>{() => <div>{store.audioNotes.phase}</div>}</Observer>;
         }
       `,
     },
@@ -32,7 +32,7 @@ ruleTester.run("observer-boundary", rule, {
       code: `
         function C() {
           const store = useStore();
-          useEffect(() => { void store.meetings.loadDetail(1); }, [store]);
+          useEffect(() => { void store.audioNotes.loadDetail(1); }, [store]);
           return <div />;
         }
       `,
@@ -42,7 +42,7 @@ ruleTester.run("observer-boundary", rule, {
       code: `
         function C() {
           const store = useStore();
-          return <button onClick={() => store.meetings.toggle()} />;
+          return <button onClick={() => store.audioNotes.startCapture()} />;
         }
       `,
     },
@@ -51,7 +51,7 @@ ruleTester.run("observer-boundary", rule, {
       code: `
         const C = observer(function C() {
           const store = useStore();
-          return <div>{store.meetingArtifacts.templates.length}</div>;
+          return <div>{store.noteArtifacts.templates.length}</div>;
         });
       `,
     },
@@ -73,7 +73,7 @@ ruleTester.run("observer-boundary", rule, {
           const store = useStore();
           return (
             <Observer>
-              {() => { const { meetings } = store; return <div>{meetings.active ? "y" : "n"}</div>; }}
+              {() => { const { audioNotes } = store; return <div>{audioNotes.active ? "y" : "n"}</div>; }}
             </Observer>
           );
         }
@@ -99,7 +99,7 @@ ruleTester.run("observer-boundary", rule, {
         const route = {
           action: async () => {
             const root = getRootStore();
-            return root.meetings.lastError;
+            return root.audioNotes.lastError;
           },
         };
       `,
@@ -112,31 +112,31 @@ ruleTester.run("observer-boundary", rule, {
       code: `
         function Bad() {
           const store = useStore();
-          return <div>{store.status.phase}</div>;
+          return <div>{store.audioNotes.phase}</div>;
         }
       `,
-      errors: [{ messageId: "readOutsideObserver", data: { name: "store.status" } }],
+      errors: [{ messageId: "readOutsideObserver", data: { name: "store.audioNotes" } }],
     },
     // store member read in directly-returned JSX (chain root reported once).
     {
       code: `
         function Bad() {
           const store = useStore();
-          return <ul>{store.history.entries.map((e) => <li key={e.id}>{e.text}</li>)}</ul>;
+          return <ul>{store.audioNotes.list.map((e) => <li key={e.id}>{e.transcript_text}</li>)}</ul>;
         }
       `,
-      errors: [{ messageId: "readOutsideObserver", data: { name: "store.history" } }],
+      errors: [{ messageId: "readOutsideObserver", data: { name: "store.audioNotes" } }],
     },
     // Alias read at render top-level outside any boundary.
     {
       code: `
         function Bad() {
           const store = useStore();
-          const { history } = store;
-          return <div>{history.error}</div>;
+          const { audioNotes } = store;
+          return <div>{audioNotes.lastError}</div>;
         }
       `,
-      errors: [{ messageId: "readOutsideObserver", data: { name: "history.error" } }],
+      errors: [{ messageId: "readOutsideObserver", data: { name: "audioNotes.lastError" } }],
     },
   ],
 });

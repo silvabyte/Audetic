@@ -2,23 +2,20 @@
 //!
 //! This binary is independent of the `audeticd` daemon: it links no audio,
 //! transcription-provider, or web-UI code. Commands that need daemon state talk
-//! to the daemon over its local REST API (127.0.0.1:3737); `transcribe` runs
-//! standalone against the external jobs API and needs no daemon at all.
+//! to the daemon over its local REST API, including file imports.
 //!
 //! Service installation lives in `audeticd install`, not here — on macOS it
 //! must run from inside the app bundle for TCC attribution.
 
 mod args;
 mod client;
-mod history;
 mod keybind;
 mod logs;
-mod meeting;
 mod models;
+mod notes;
 mod post_processing;
 mod provider;
 mod setup;
-mod transcribe;
 
 use anyhow::Result;
 use args::{Cli, CliCommand};
@@ -28,6 +25,7 @@ use tracing_subscriber::EnvFilter;
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    audetic_core::url::port()?;
     let log_level = if cli.verbose { "debug" } else { "info" };
     let env_filter = EnvFilter::try_new(log_level).unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -43,12 +41,10 @@ async fn main() -> Result<()> {
         }
         Some(CliCommand::Provider(args)) => provider::handle_provider_command(args).await,
         Some(CliCommand::Setup) => setup::handle_setup_command().await,
-        Some(CliCommand::History(args)) => history::handle_history_command(args).await,
         Some(CliCommand::Logs(args)) => logs::handle_logs_command(args).await,
         Some(CliCommand::Keybind(args)) => keybind::handle_keybind_command(args).await,
-        Some(CliCommand::Transcribe(args)) => transcribe::handle_transcribe_command(args).await,
         Some(CliCommand::Models(args)) => models::handle_models_command(args).await,
-        Some(CliCommand::Meeting(args)) => meeting::handle_meeting_command(args).await,
+        Some(CliCommand::Notes(args)) => notes::handle_notes_command(args).await,
         Some(CliCommand::PostProcessing(args)) => {
             post_processing::handle_post_processing_command(args).await
         }

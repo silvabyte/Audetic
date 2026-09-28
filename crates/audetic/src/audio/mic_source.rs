@@ -1,8 +1,6 @@
 //! Microphone audio capture via cpal.
 //!
-//! Independent from `AudioStreamManager` — this is used exclusively by the
-//! meeting recording pipeline. The existing voice-to-text pipeline uses
-//! `AudioStreamManager` and is not modified.
+//! The single microphone capture implementation used by every Audio Note.
 //!
 //! Each Default Input contributes one native-rate Segment. Completed Segments
 //! are normalized independently and capture gaps become canonical Silence Fill
@@ -15,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::audio_source::{AudioSource, MeetingMicSource};
+use super::audio_source::{AudioSource, CaptureMicSource};
 use super::capture_recovery::{start_capture_with_retries, CaptureRecovery};
 use super::input_device::{
     ActiveInput, CaptureBackend, CpalCaptureBackend, InputDataCallback, InputErrorCallback,
@@ -72,7 +70,7 @@ pub struct MicAudioSource {
     live_generation: Arc<AtomicU64>,
     stream_event_sink: StreamEventSink,
     clock: Arc<dyn MonotonicClock>,
-    meeting_started_at: Option<Duration>,
+    audio_note_started_at: Option<Duration>,
     pending_gap_started_at: Option<Duration>,
     session_active: bool,
     captured_audio: bool,
@@ -94,7 +92,7 @@ impl MicAudioSource {
     pub fn new(sample_rate: u32) -> Result<Self> {
         Ok(Self::with_backend_and_clock(
             sample_rate,
-            Box::new(CpalCaptureBackend::new("Meeting microphone")),
+            Box::new(CpalCaptureBackend::new("AudioNote microphone")),
             Arc::new(|_| {}),
             Arc::new(SystemMonotonicClock::default()),
         ))
@@ -103,7 +101,7 @@ impl MicAudioSource {
     pub(crate) fn with_event_sink(sample_rate: u32, stream_event_sink: StreamEventSink) -> Self {
         Self::with_backend_and_clock(
             sample_rate,
-            Box::new(CpalCaptureBackend::new("Meeting microphone")),
+            Box::new(CpalCaptureBackend::new("AudioNote microphone")),
             stream_event_sink,
             Arc::new(SystemMonotonicClock::default()),
         )
@@ -123,7 +121,7 @@ impl MicAudioSource {
             live_generation: Arc::new(AtomicU64::new(0)),
             stream_event_sink,
             clock,
-            meeting_started_at: None,
+            audio_note_started_at: None,
             pending_gap_started_at: None,
             session_active: false,
             captured_audio: false,
@@ -162,7 +160,7 @@ impl MicAudioSource {
             {
                 *callback_death_started_at.lock().unwrap() = Some(clock.now());
                 stream_event_sink(StreamDeath {
-                    source: CaptureSource::MeetingMicrophone,
+                    source: CaptureSource::Microphone,
                     generation,
                 });
             }
@@ -185,7 +183,7 @@ impl MicAudioSource {
         if self.live_generation.load(Ordering::SeqCst) != generation.0 {
             drop(input);
             return Err(anyhow!(
-                "Meeting microphone stream died while its Segment was starting"
+                "AudioNote microphone stream died while its Segment was starting"
             ));
         }
         Ok(ActiveSegment {
@@ -294,7 +292,7 @@ impl MicAudioSource {
         let native = std::mem::take(&mut *segment.native_samples.lock().unwrap());
         if native.is_empty() {
             let ended_at = segment.gap_before.unwrap_or_else(|| {
-                self.meeting_started_at
+                self.audio_note_started_at
                     .map(|started_at| started_at.max(segment.attempt_started_at))
                     .unwrap_or(segment.attempt_started_at)
             });
@@ -342,7 +340,7 @@ impl MicAudioSource {
                 .active_segment
                 .as_ref()
                 .map(|segment| segment.generation);
-            if death.source != CaptureSource::MeetingMicrophone
+            if death.source != CaptureSource::Microphone
                 || current_generation != Some(death.generation)
             {
                 return Ok(CaptureRecovery::Ignored);
@@ -384,7 +382,7 @@ impl MicAudioSource {
                         self.set_pending_gap(closed.ended_at);
                         closed_segments.push(closed);
                     }
-                    warn!("Meeting microphone remains in Degraded Capture");
+                    warn!("AudioNote microphone remains in Degraded Capture");
                     CaptureRecovery::Degraded
                 } else {
                     info!("Recovered meeting microphone on the current Default Input");
@@ -392,7 +390,7 @@ impl MicAudioSource {
                 }
             }
             Err(_) => {
-                warn!("Meeting microphone remains in Degraded Capture");
+                warn!("AudioNote microphone remains in Degraded Capture");
                 CaptureRecovery::Degraded
             }
         };
@@ -414,7 +412,7 @@ impl AudioSource for MicAudioSource {
         self.close_current_segment()
             .context("Failed to reset previous meeting microphone Segment")?;
         self.canonical_samples.clear();
-        self.meeting_started_at = None;
+        self.audio_note_started_at = None;
         self.pending_gap_started_at = None;
         self.session_active = true;
         self.captured_audio = false;
@@ -422,7 +420,7 @@ impl AudioSource for MicAudioSource {
         match self.start_segment() {
             Ok(segment) => {
                 self.install_segment(segment);
-                info!("Meeting microphone recording started");
+                info!("AudioNote microphone recording started");
                 Ok(())
             }
             Err(error) => Err(error).context("Failed to start meeting microphone"),
@@ -447,14 +445,14 @@ impl AudioSource for MicAudioSource {
         if !self.captured_audio {
             self.pending_gap_started_at = None;
             self.canonical_samples.clear();
-            info!("Meeting microphone stopped without captured audio");
+            info!("AudioNote microphone stopped without captured audio");
             return Ok(Vec::new());
         }
         self.append_silence_fill()
             .context("Failed to close final meeting microphone Silence Fill")?;
         let canonical = std::mem::take(&mut self.canonical_samples);
         info!(
-            "Meeting microphone stopped: {} canonical samples @ {} Hz",
+            "AudioNote microphone stopped: {} canonical samples @ {} Hz",
             canonical.len(),
             self.target_sample_rate
         );
@@ -475,10 +473,10 @@ impl AudioSource for MicAudioSource {
 }
 
 #[async_trait::async_trait(?Send)]
-impl MeetingMicSource for MicAudioSource {
-    fn mark_meeting_started(&mut self) {
+impl CaptureMicSource for MicAudioSource {
+    fn mark_capture_started(&mut self) {
         let started_at = self.clock.now();
-        self.meeting_started_at = Some(started_at);
+        self.audio_note_started_at = Some(started_at);
         if self.session_active && !self.has_live_stream() {
             self.pending_gap_started_at = Some(started_at);
         }
@@ -843,7 +841,7 @@ mod tests {
         mic.start().unwrap();
         clock.advance(Duration::from_millis(200));
         let death = StreamDeath {
-            source: CaptureSource::MeetingMicrophone,
+            source: CaptureSource::Microphone,
             generation: mic.active_segment.as_ref().unwrap().generation,
         };
         *mic.active_segment
@@ -906,7 +904,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_initial_segment_anchors_the_gap_at_meeting_start() {
+    async fn empty_initial_segment_anchors_the_gap_at_audio_note_start() {
         let clock = Arc::new(FakeClock::default());
         let mut mic = MicAudioSource::with_backend_and_clock(
             16_000,
@@ -930,7 +928,7 @@ mod tests {
         );
 
         mic.start().unwrap();
-        mic.mark_meeting_started();
+        mic.mark_capture_started();
         clock.advance(Duration::from_millis(300));
         mic.default_input_switched().await.unwrap();
         let track = mic.stop().unwrap();
@@ -941,7 +939,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_or_other_source_death_cannot_rebuild_meeting_microphone() {
+    async fn stale_or_other_source_death_cannot_rebuild_audio_note_microphone() {
         let starts = Arc::new(AtomicUsize::new(0));
         let backend = RecoveryBackend {
             plans: Mutex::new(VecDeque::from([CapturePlan::Input(PlannedInput {
@@ -962,11 +960,11 @@ mod tests {
 
         for death in [
             StreamDeath {
-                source: CaptureSource::MeetingMicrophone,
+                source: CaptureSource::Microphone,
                 generation: StreamGeneration(0),
             },
             StreamDeath {
-                source: CaptureSource::Dictation,
+                source: CaptureSource::SystemTap,
                 generation: StreamGeneration(1),
             },
         ] {
@@ -979,7 +977,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fresh_meetings_resolve_the_current_default_input() {
+    async fn fresh_audio_notes_resolve_the_current_default_input() {
         let backend = RecoveryBackend {
             plans: Mutex::new(VecDeque::from([
                 CapturePlan::Input(PlannedInput {
@@ -1063,7 +1061,7 @@ mod tests {
     }
 
     #[test]
-    fn system_only_meeting_does_not_materialize_a_silence_track() {
+    fn system_only_audio_note_does_not_materialize_a_silence_track() {
         let clock = Arc::new(FakeClock::default());
         let mut mic = MicAudioSource::with_backend_and_clock(
             16_000,
@@ -1079,7 +1077,7 @@ mod tests {
         );
 
         assert!(mic.start().is_err());
-        mic.mark_meeting_started();
+        mic.mark_capture_started();
         clock.advance(Duration::from_secs(60 * 60));
         let track = mic.stop().unwrap();
 
@@ -1144,7 +1142,7 @@ mod tests {
         assert!(mic.start().is_err());
         assert!(mic.is_active());
         assert!(!mic.has_live_stream());
-        mic.mark_meeting_started();
+        mic.mark_capture_started();
         clock.advance(Duration::from_millis(300));
         assert_eq!(
             mic.default_input_switched().await.unwrap(),
@@ -1234,7 +1232,7 @@ mod tests {
         );
 
         assert!(mic.start().is_err());
-        mic.mark_meeting_started();
+        mic.mark_capture_started();
         let failed_start_death = events.lock().unwrap().pop().unwrap();
         assert_eq!(failed_start_death.generation, StreamGeneration(1));
 

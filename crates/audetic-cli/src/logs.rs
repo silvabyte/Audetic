@@ -48,7 +48,7 @@ pub async fn handle_logs_command(args: LogsCliArgs) -> Result<()> {
         args.lines
     );
     if result.transcriptions.is_empty() {
-        println!("No transcriptions found in history.");
+        println!("No transcription logs found.");
     } else {
         for entry in &result.transcriptions {
             let display_text = if entry.text.len() > 80 {

@@ -24,10 +24,10 @@ use utoipa::ToSchema;
 /// Default keybinding configuration for Audetic targets.
 pub const DEFAULT_KEY: &str = "R";
 pub const DEFAULT_MODIFIERS: &[&str] = &["SUPER"];
-pub const MEETING_DEFAULT_MODIFIERS: &[&str] = &["SUPER", "SHIFT"];
-pub const AUDETIC_SECTION_MARKER: &str = "# Audetic voice-to-text (managed by audetic keybind)";
-pub const AUDETIC_MEETING_SECTION_MARKER: &str =
-    "# Audetic meeting recording (managed by audetic keybind)";
+pub const SYSTEM_NOTE_DEFAULT_MODIFIERS: &[&str] = &["SUPER", "SHIFT"];
+pub const AUDETIC_SECTION_MARKER: &str = "# Audetic microphone note (managed by audetic keybind)";
+pub const AUDETIC_SYSTEM_NOTE_SECTION_MARKER: &str =
+    "# Audetic system audio note (managed by audetic keybind)";
 
 pub fn target_endpoint(target: KeybindTarget) -> String {
     crate::api::url::api_url(target.endpoint_path())
@@ -35,13 +35,13 @@ pub fn target_endpoint(target: KeybindTarget) -> String {
 
 /// Kept as a named helper for existing parser tests and call sites.
 pub fn audetic_toggle_endpoint() -> String {
-    target_endpoint(KeybindTarget::Dictation)
+    target_endpoint(KeybindTarget::Note)
 }
 
 pub fn marker_for_target(target: KeybindTarget) -> &'static str {
     match target {
-        KeybindTarget::Dictation => AUDETIC_SECTION_MARKER,
-        KeybindTarget::Meeting => AUDETIC_MEETING_SECTION_MARKER,
+        KeybindTarget::Note => AUDETIC_SECTION_MARKER,
+        KeybindTarget::SystemNote => AUDETIC_SYSTEM_NOTE_SECTION_MARKER,
     }
 }
 
@@ -56,22 +56,22 @@ pub struct ProposedBinding {
 
 impl Default for ProposedBinding {
     fn default() -> Self {
-        Self::for_target(KeybindTarget::Dictation)
+        Self::for_target(KeybindTarget::Note)
     }
 }
 
 impl ProposedBinding {
     pub fn for_target(target: KeybindTarget) -> Self {
         let (modifiers, description) = match target {
-            KeybindTarget::Dictation => (DEFAULT_MODIFIERS, "Audetic"),
-            KeybindTarget::Meeting => (MEETING_DEFAULT_MODIFIERS, "Audetic Meeting"),
+            KeybindTarget::Note => (DEFAULT_MODIFIERS, "Audetic Note"),
+            KeybindTarget::SystemNote => (SYSTEM_NOTE_DEFAULT_MODIFIERS, "Audetic System Note"),
         };
 
         Self {
             modifiers: Modifiers::from_strs(modifiers),
             key: DEFAULT_KEY.to_string(),
             description: description.to_string(),
-            command: format!("curl -X POST {}", target_endpoint(target)),
+            command: format!("curl -X POST {} -H 'Content-Type: application/json' -d '{{\"capture_source\":\"{}\"}}'", target_endpoint(target), target.capture_source()),
         }
     }
 
@@ -140,15 +140,15 @@ pub enum KeybindStatus {
 /// Status response for every stable target.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeybindStatuses {
-    pub dictation: KeybindStatus,
-    pub meeting: KeybindStatus,
+    pub note: KeybindStatus,
+    pub system_note: KeybindStatus,
 }
 
 impl KeybindStatuses {
     pub fn get(&self, target: KeybindTarget) -> &KeybindStatus {
         match target {
-            KeybindTarget::Dictation => &self.dictation,
-            KeybindTarget::Meeting => &self.meeting,
+            KeybindTarget::Note => &self.note,
+            KeybindTarget::SystemNote => &self.system_note,
         }
     }
 }
@@ -190,8 +190,8 @@ pub fn get_statuses() -> Result<KeybindStatuses> {
     let bindings = all_bindings(&discovery);
 
     Ok(KeybindStatuses {
-        dictation: status_from_bindings(KeybindTarget::Dictation, config_path.clone(), &bindings),
-        meeting: status_from_bindings(KeybindTarget::Meeting, config_path, &bindings),
+        note: status_from_bindings(KeybindTarget::Note, config_path.clone(), &bindings),
+        system_note: status_from_bindings(KeybindTarget::SystemNote, config_path, &bindings),
     })
 }
 
@@ -384,11 +384,9 @@ fn target_config_path(
 }
 
 fn binding_target(binding: &HyprBinding) -> Option<KeybindTarget> {
-    [KeybindTarget::Dictation, KeybindTarget::Meeting]
+    [KeybindTarget::Note, KeybindTarget::SystemNote]
         .into_iter()
-        .find(|target| {
-            binding.command.trim() == format!("curl -X POST {}", target_endpoint(*target))
-        })
+        .find(|target| binding.command.trim() == ProposedBinding::for_target(*target).command)
 }
 
 fn conflict_from_binding(binding: &HyprBinding) -> KeybindConflict {
@@ -440,30 +438,30 @@ mod tests {
     #[test]
     fn target_defaults_generate_exact_stable_lines() {
         assert_eq!(
-            ProposedBinding::for_target(KeybindTarget::Dictation).to_hyprland_line(),
+            ProposedBinding::for_target(KeybindTarget::Note).to_hyprland_line(),
             format!(
-                "bindd = SUPER, R, Audetic, exec, curl -X POST {}",
-                target_endpoint(KeybindTarget::Dictation)
+                "bindd = SUPER, R, Audetic Note, exec, {}",
+                ProposedBinding::for_target(KeybindTarget::Note).command
             )
         );
         assert_eq!(
-            ProposedBinding::for_target(KeybindTarget::Meeting).to_hyprland_line(),
+            ProposedBinding::for_target(KeybindTarget::SystemNote).to_hyprland_line(),
             format!(
-                "bindd = SUPER SHIFT, R, Audetic Meeting, exec, curl -X POST {}",
-                target_endpoint(KeybindTarget::Meeting)
+                "bindd = SUPER SHIFT, R, Audetic System Note, exec, {}",
+                ProposedBinding::for_target(KeybindTarget::SystemNote).command
             )
         );
     }
 
     #[test]
     fn own_binding_is_idempotent_but_other_target_conflicts() {
-        let dictation = ProposedBinding::for_target(KeybindTarget::Dictation);
+        let dictation = ProposedBinding::for_target(KeybindTarget::Note);
         let bindings = parse_bindings_from_content(
             &dictation.to_hyprland_line(),
             Path::new("/tmp/bindings.conf"),
         );
         let result = install_from_bindings(
-            KeybindTarget::Dictation,
+            KeybindTarget::Note,
             dictation,
             PathBuf::from("/tmp/bindings.conf"),
             &bindings,
@@ -475,9 +473,9 @@ mod tests {
         assert!(!result.changed);
         assert!(result.backup_path.is_none());
 
-        let meeting_on_same_key = ProposedBinding::new(KeybindTarget::Meeting, &["SUPER"], "R");
+        let meeting_on_same_key = ProposedBinding::new(KeybindTarget::SystemNote, &["SUPER"], "R");
         let result = install_from_bindings(
-            KeybindTarget::Meeting,
+            KeybindTarget::SystemNote,
             meeting_on_same_key,
             PathBuf::from("/tmp/bindings.conf"),
             &bindings,
@@ -488,13 +486,13 @@ mod tests {
         assert_eq!(result.conflicts.len(), 1);
         assert_eq!(
             result.conflicts[0].managed_target,
-            Some(KeybindTarget::Dictation)
+            Some(KeybindTarget::Note)
         );
     }
 
     #[test]
     fn rejects_unknown_modifiers_instead_of_silently_dropping_them() {
-        let error = parse_key_string(KeybindTarget::Dictation, "MAGIC+R").unwrap_err();
+        let error = parse_key_string(KeybindTarget::Note, "MAGIC+R").unwrap_err();
         assert!(error.to_string().contains("Invalid modifier"));
     }
 
@@ -504,12 +502,12 @@ mod tests {
         let preferred = directory.path().join("bindings.conf");
         let sourced = directory.path().join("custom-bindings.conf");
         std::fs::write(&preferred, "# preferred\n").unwrap();
-        let original = ProposedBinding::for_target(KeybindTarget::Dictation);
+        let original = ProposedBinding::for_target(KeybindTarget::Note);
         std::fs::write(
             &sourced,
             format!(
                 "{}\n{}\n",
-                marker_for_target(KeybindTarget::Dictation),
+                marker_for_target(KeybindTarget::Note),
                 original.to_hyprland_line()
             ),
         )
@@ -517,17 +515,16 @@ mod tests {
         let bindings =
             parse_bindings_from_content(&std::fs::read_to_string(&sourced).unwrap(), &sourced);
 
-        let status =
-            status_from_bindings(KeybindTarget::Dictation, Some(preferred.clone()), &bindings);
+        let status = status_from_bindings(KeybindTarget::Note, Some(preferred.clone()), &bindings);
         assert!(matches!(
             status,
             KeybindStatus::Installed { config_path, .. } if config_path == sourced
         ));
 
         let selected =
-            target_config_path(KeybindTarget::Dictation, Some(&preferred), &bindings).unwrap();
-        let replacement = ProposedBinding::new(KeybindTarget::Dictation, &["SUPER", "ALT"], "D");
-        write_binding(&selected, KeybindTarget::Dictation, &replacement).unwrap();
+            target_config_path(KeybindTarget::Note, Some(&preferred), &bindings).unwrap();
+        let replacement = ProposedBinding::new(KeybindTarget::Note, &["SUPER", "ALT"], "D");
+        write_binding(&selected, KeybindTarget::Note, &replacement).unwrap();
 
         assert_eq!(selected, sourced);
         assert_eq!(
@@ -545,12 +542,12 @@ mod tests {
         let preferred = directory.path().join("bindings.conf");
         let sourced = directory.path().join("custom-bindings.conf");
         std::fs::write(&preferred, "# preferred\n").unwrap();
-        let binding = ProposedBinding::for_target(KeybindTarget::Meeting);
+        let binding = ProposedBinding::for_target(KeybindTarget::SystemNote);
         std::fs::write(
             &sourced,
             format!(
                 "{}\n{}\n",
-                marker_for_target(KeybindTarget::Meeting),
+                marker_for_target(KeybindTarget::SystemNote),
                 binding.to_hyprland_line()
             ),
         )
@@ -559,8 +556,8 @@ mod tests {
             parse_bindings_from_content(&std::fs::read_to_string(&sourced).unwrap(), &sourced);
 
         let selected =
-            target_config_path(KeybindTarget::Meeting, Some(&preferred), &bindings).unwrap();
-        assert!(remove_binding(&selected, KeybindTarget::Meeting).unwrap());
+            target_config_path(KeybindTarget::SystemNote, Some(&preferred), &bindings).unwrap();
+        assert!(remove_binding(&selected, KeybindTarget::SystemNote).unwrap());
 
         assert_eq!(selected, sourced);
         assert_eq!(
@@ -569,6 +566,6 @@ mod tests {
         );
         assert!(!std::fs::read_to_string(&sourced)
             .unwrap()
-            .contains(marker_for_target(KeybindTarget::Meeting)));
+            .contains(marker_for_target(KeybindTarget::SystemNote)));
     }
 }

@@ -5,7 +5,7 @@
 //! enabled job and returns immediately. Failures inside a job are logged
 //! via `tracing` and surface as audit logs (future), but never propagate
 //! back to the caller — a slow or failing hook must not stall the
-//! meeting/dictation pipeline.
+//! audio note pipeline.
 
 use std::path::{Path, PathBuf};
 
@@ -16,7 +16,7 @@ use super::executors::{executor_for, ExecutionOutcome};
 use super::job::Job;
 use super::repository::JobRepository;
 
-/// Service handed to the meeting and recording machines.
+/// Service used by the audio note enrichment pipeline.
 ///
 /// The DB connection is opened per-dispatch. Carrying the path keeps tests
 /// isolated from the user's database without holding a shared connection.

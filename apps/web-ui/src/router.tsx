@@ -1,10 +1,10 @@
 import { createBrowserRouter, redirect } from "react-router-dom";
 import { AppShell } from "./App";
-import { dictationsRoute } from "./routes/dictations";
-import { meetingsRoute } from "./routes/meetings";
-import { meetingDetailRoute } from "./routes/meeting-detail";
+import { audioNotesRoute } from "./routes/audio-notes";
+import { audioNoteDetailRoute } from "./routes/audio-note-detail";
 import { settingsAppearanceRoute } from "./routes/settings/appearance";
 import { settingsConfigFileRoute } from "./routes/settings/config-file";
+import { settingsCaptureRoute } from "./routes/settings/capture";
 import { settingsKeybindRoute } from "./routes/settings/keybind";
 import { settingsLayoutRoute } from "./routes/settings/layout";
 import { settingsPostProcessingRoute } from "./routes/settings/post-processing";
@@ -22,13 +22,13 @@ export function createRouter(): ReturnType<typeof createBrowserRouter> {
       path: "/",
       element: <AppShell />,
       children: [
-        { index: true, loader: () => redirect("/dictations") },
-        dictationsRoute,
-        meetingsRoute,
-        meetingDetailRoute,
+        { index: true, loader: () => redirect("/audio-notes") },
+        audioNotesRoute,
+        audioNoteDetailRoute,
         settingsLayoutRoute([
           settingsSetupRoute,
           settingsProviderRoute,
+          settingsCaptureRoute,
           settingsKeybindRoute,
           settingsPostProcessingRoute,
           settingsAppearanceRoute,

@@ -28,8 +28,8 @@ story of its own: see the **[macOS Install Guide](./macos-install.md)**.
 
 After install:
 1. The service is already enabled and started. Confirm with `make status`.
-2. Run `audetic setup` or open `http://127.0.0.1:3737/settings/setup` to check provider, text delivery, shortcuts, and meeting support.
-3. Preview and install dictation and meeting keybinds from either setup flow surface.
+2. Run `audetic setup` or open `http://127.0.0.1:3737/settings/setup` to check provider, optional text delivery, shortcuts, and system audio support.
+3. Preview and install microphone and microphone + system audio keybinds from either setup flow surface.
 4. Edit `~/.config/audetic/config.toml` if you need custom providers, models, or behavior tweaks.
 
 ## Prerequisites and system dependencies
@@ -56,7 +56,7 @@ All systems require:
 sudo pacman -S --needed base-devel rustup bun cmake pkgconf alsa-lib libxkbcommon curl
 ```
 
-Text-delivery and meeting tools (`wtype` or `ydotool`, `wl-clipboard`,
+Optional text-delivery and system-audio tools (`wtype` or `ydotool`, `wl-clipboard`,
 `pipewire-audio`, and `libpulse`) are diagnosed after installation. The Setup
 Center produces one minimal `pacman` command for whatever is missing; Audetic
 never runs that privileged command from the browser.
@@ -165,9 +165,8 @@ language = "en"
 input_method = "ydotool"  # Recommended (auto-detected first)
 
 [behavior]
-auto_paste = true
+auto_paste = false
 preserve_clipboard = false
-delete_audio_files = true
 audio_feedback = true
 ```
 
@@ -186,9 +185,8 @@ language = "en"
 input_method = "ydotool"  # Recommended (auto-detected first)
 
 [behavior]
-auto_paste = true
+auto_paste = false
 preserve_clipboard = false
-delete_audio_files = true
 audio_feedback = true
 ```
 
@@ -206,9 +204,8 @@ model_path = "/home/user/.local/share/audetic/whisper/models/ggml-large-v3-turbo
 input_method = "ydotool"  # Recommended (auto-detected first)
 
 [behavior]
-auto_paste = true
+auto_paste = false
 preserve_clipboard = false
-delete_audio_files = true
 audio_feedback = true
 ```
 
@@ -240,12 +237,18 @@ make logs       # follow
 Add to your Hyprland config (`~/.config/hypr/hyprland.conf`):
 
 ```
-bindd = SUPER, R, Audetic, exec, curl -X POST http://127.0.0.1:3737/api/toggle
+bindd = SUPER, R, Audetic Note, exec, curl -X POST http://127.0.0.1:3737/api/audio-notes/toggle -H 'Content-Type: application/json' -d '{"capture_source":"microphone"}'
 ```
+
+On upgrade, remove the obsolete Audetic managed shortcut sections before
+reinstalling with `audetic keybind install --target note` and
+`audetic keybind install --target system-note`. The installer deliberately
+reports conflicting old/custom bindings rather than overwriting unrelated
+shortcuts. The new actions differ only by capture source, not classification.
 
 For Omarchy users:
 ```
-bindd = SUPER, R, Audetic, exec, $terminal -e curl -X POST http://127.0.0.1:3737/api/toggle
+bindd = SUPER SHIFT, R, Audetic System Note, exec, curl -X POST http://127.0.0.1:3737/api/audio-notes/toggle -H 'Content-Type: application/json' -d '{"capture_source":"microphone_and_system"}'
 ```
 
 ## GNOME + Wayland Setup
@@ -299,13 +302,13 @@ input_method = "ydotool"  # Recommended (auto-detected first)
 1. Open GNOME Settings
 2. Go to Keyboard → Keyboard Shortcuts → View and Customize Shortcuts
 3. Go to Custom Shortcuts
-4. Add new shortcut with command: `curl -X POST http://127.0.0.1:3737/api/toggle`
+4. Add a microphone shortcut: `audetic notes toggle`; optionally add a system-audio shortcut: `audetic notes toggle --capture-source microphone_and_system`.
 5. Set your preferred key combination (e.g., Super+R)
 
 ## Testing Installation
 
 1. **Test service**: `make status` (or `systemctl --user status audeticd.service`)
-2. **Test API**: `curl -X POST http://127.0.0.1:3737/api/toggle`
+2. **Test API**: `audetic notes toggle`
 3. **Test provider**: `audetic provider test` (validates transcription setup)
 4. **Test recording**: Press your configured keybind
 5. **Check logs**: `make logs` or `journalctl --user -u audeticd.service -f`
@@ -392,7 +395,7 @@ By default:
 - `~/.config/systemd/user/audeticd.service` (Linux) — or `~/Applications/Audetic.app`, both LaunchAgent plists, and `~/Library/Logs/Audetic/` (macOS)
 - `~/.config/audetic/config.toml`
 - `~/.local/share/audetic/audetic.db*` (transcription history)
-- `~/.local/share/audetic/` state: `meetings/`, `models/`, `agent-runs/`, `keybind-backups/`, `config-backups/`
+- `~/.local/share/audetic/` state: `audio-notes/`, retained legacy audio directories, `models/`, `agent-runs/`, `keybind-backups/`, `config-backups/`
 - Any leftovers from the retired auto-updater (`updates/`, `update.lock`, `update_state.json`)
 
 `--keep-config` preserves `config.toml`; `--keep-database` preserves

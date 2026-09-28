@@ -63,15 +63,15 @@ const TARGET_COPY: Record<KeybindTarget, {
   defaultKey: string;
   icon: typeof Mic2;
 }> = {
-  dictation: {
-    label: "Dictation",
-    description: "Toggle short voice capture and paste the transcript.",
+  note: {
+    label: "Microphone note",
+    description: "Start or stop an audio note with microphone capture.",
     defaultKey: "SUPER+R",
     icon: Mic2,
   },
-  meeting: {
-    label: "Meeting",
-    description: "Start or stop long-form microphone and system audio capture.",
+  "system-note": {
+    label: "Microphone + system audio",
+    description: "Start or stop an audio note including system audio.",
     defaultKey: "SUPER+SHIFT+R",
     icon: Radio,
   },
@@ -92,8 +92,8 @@ function SettingsKeybind() {
       </header>
 
       <div className="grid gap-4 xl:grid-cols-2">
-        <KeybindTargetCard target="dictation" />
-        <KeybindTargetCard target="meeting" />
+        <KeybindTargetCard target="note" />
+        <KeybindTargetCard target="system-note" />
       </div>
     </div>
   );
@@ -190,7 +190,7 @@ function KeybindTargetCard({ target }: { target: KeybindTarget }) {
   return (
     <Observer>
       {() => {
-        const status = store.config.keybind?.[target];
+        const status = store.config.keybind?.[target === "system-note" ? "system_note" : "note"];
         const initialLoading = store.config.keybindState === "loading" && !status;
         const noConfig = status?.status === "no_config";
         const installed = status?.status === "installed";

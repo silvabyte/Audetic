@@ -1,34 +1,34 @@
-//! Shared keybind target identifiers used by daemon and CLI consumers.
-
-use std::fmt;
-use std::str::FromStr;
-
+//! Capture-source shortcuts shared by the daemon and its consumers.
 use serde::{Deserialize, Serialize};
+use std::{fmt, str::FromStr};
 
 use crate::url::paths;
 
-/// Stable Audetic actions that can be installed as Hyprland shortcuts.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "kebab-case")]
 pub enum KeybindTarget {
     #[default]
-    Dictation,
-    Meeting,
+    Note,
+    SystemNote,
 }
 
 impl KeybindTarget {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Dictation => "dictation",
-            Self::Meeting => "meeting",
+            Self::Note => "note",
+            Self::SystemNote => "system-note",
         }
     }
 
     pub const fn endpoint_path(self) -> &'static str {
+        paths::AUDIO_NOTES_TOGGLE
+    }
+
+    pub const fn capture_source(self) -> &'static str {
         match self {
-            Self::Dictation => paths::TOGGLE,
-            Self::Meeting => paths::MEETINGS_TOGGLE,
+            Self::Note => "microphone",
+            Self::SystemNote => "microphone_and_system",
         }
     }
 }
@@ -44,10 +44,10 @@ impl FromStr for KeybindTarget {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         match value.to_ascii_lowercase().as_str() {
-            "dictation" => Ok(Self::Dictation),
-            "meeting" => Ok(Self::Meeting),
+            "note" => Ok(Self::Note),
+            "system-note" => Ok(Self::SystemNote),
             _ => Err(format!(
-                "unknown keybind target '{value}'; expected dictation or meeting"
+                "unknown keybind target '{value}'; expected note or system-note"
             )),
         }
     }
@@ -58,19 +58,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn targets_have_stable_wire_names_and_paths() {
+    fn capture_shortcuts_share_endpoint_but_not_source() {
+        for target in [KeybindTarget::Note, KeybindTarget::SystemNote] {
+            assert_eq!(target.endpoint_path(), paths::AUDIO_NOTES_TOGGLE);
+            assert_eq!(target.as_str().parse::<KeybindTarget>().unwrap(), target);
+            assert_eq!(serde_json::to_value(target).unwrap(), target.as_str());
+        }
+        assert_eq!(KeybindTarget::Note.capture_source(), "microphone");
         assert_eq!(
-            serde_json::to_string(&KeybindTarget::Dictation).unwrap(),
-            "\"dictation\""
+            KeybindTarget::SystemNote.capture_source(),
+            "microphone_and_system"
         );
-        assert_eq!(
-            serde_json::to_string(&KeybindTarget::Meeting).unwrap(),
-            "\"meeting\""
-        );
-        assert_eq!(KeybindTarget::Dictation.endpoint_path(), paths::TOGGLE);
-        assert_eq!(
-            KeybindTarget::Meeting.endpoint_path(),
-            paths::MEETINGS_TOGGLE
-        );
+        assert!("meeting".parse::<KeybindTarget>().is_err());
     }
 }

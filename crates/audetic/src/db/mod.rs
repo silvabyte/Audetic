@@ -1,16 +1,7 @@
 pub mod agent_profiles;
-mod init;
-pub mod meeting_artifacts;
-pub mod meetings;
-mod operations;
-mod schemas;
-
-#[cfg(test)]
-mod tests;
+pub mod audio_note_artifacts;
+pub mod audio_notes;
+pub(crate) mod init;
 
 // Re-export public API
 pub use init::{init_db, init_db_at, migrate};
-pub use operations::{
-    count_workflows, get_recent_workflows, insert_workflow, prune_old_workflows, search_workflows,
-};
-pub use schemas::{VoiceToTextData, Workflow, WorkflowData, WorkflowType};

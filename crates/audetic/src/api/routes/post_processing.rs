@@ -2,7 +2,7 @@
 //!
 //! See OpenAPI spec at `/api/openapi.json` for the canonical method/path
 //! list. All operations talk to [`JobRepository`] on a per-request
-//! connection — same shape as `meetings` and `history`.
+//! connection — the daemon owns persistence for all event hooks.
 
 use axum::{
     extract::{Path, Query, State},
@@ -76,7 +76,7 @@ pub struct JobsListResponse {
 
 #[derive(Debug, Default, Deserialize, IntoParams)]
 pub struct JobsListQuery {
-    /// Filter to a single event kind (e.g. `meeting.completed`).
+    /// Filter to a single event kind (`audio_note.completed`).
     pub event: Option<String>,
 }
 
@@ -111,15 +111,11 @@ pub async fn list_events() -> Json<EventsListResponse> {
         .map(|k| EventDescriptor {
             name: k.as_str().to_string(),
             label: match k {
-                EventKind::DictationCompleted => "Dictation completed".to_string(),
-                EventKind::MeetingCompleted => "Meeting completed".to_string(),
+                EventKind::AudioNoteCompleted => "Audio note completed".to_string(),
             },
             description: match k {
-                EventKind::DictationCompleted => {
-                    "Fires after a dictation transcription is saved to history. Payload contains the dictation_id, audio_path, and text.".to_string()
-                }
-                EventKind::MeetingCompleted => {
-                    "Fires after a meeting is fully transcribed. Payload contains the meeting_id, title, audio_path, transcript_path, transcript_text, and duration_seconds.".to_string()
+                EventKind::AudioNoteCompleted => {
+                    "Fires after a saved audio note is classified and enriched. Payload contains note_id, title, audio_path, transcript_path, transcript_text, duration_seconds, and classification.".to_string()
                 }
             },
         })

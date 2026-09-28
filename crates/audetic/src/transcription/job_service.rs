@@ -148,13 +148,16 @@ impl TranscriptionJobService for LocalTranscriptionJobService {
         file_path: &Path,
         _language: Option<&str>,
     ) -> Result<TranscriptionJobResult> {
-        info!("Transcribing meeting locally: {:?}", file_path);
+        info!(
+            "Transcribing Audio Note with configured provider: {:?}",
+            file_path
+        );
         let output = self
             .service
             .transcribe_detailed(&file_path.to_path_buf())
             .await?;
         info!(
-            "Local meeting transcription complete: {} chars, {} segments",
+            "Audio Note transcription complete: {} chars, {} segments",
             output.text.len(),
             output.segments.len()
         );

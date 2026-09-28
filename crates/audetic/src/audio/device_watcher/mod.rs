@@ -349,7 +349,7 @@ mod tests {
             })
             .unwrap();
         let death = StreamDeath {
-            source: CaptureSource::Dictation,
+            source: CaptureSource::Microphone,
             generation: StreamGeneration(1),
         };
 

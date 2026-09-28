@@ -4,6 +4,9 @@ Welcome to the Audetic documentation. This directory contains detailed guides fo
 
 ## Available Documentation
 
+- [Audio Notes](./audio-notes.md) — unified capture, classification, processors, API, and CLI
+- [Audio Notes migration](./audio-notes-migration.md) — upgrading existing meeting/dictation data
+
 ### Installation & Setup
 
 - [Installation Guide](./installation.md) - Complete installation instructions for all platforms
@@ -24,7 +27,8 @@ audetic provider test        # Validate provider without recording
 ```
 
 Audetic is installed from source and has no auto-updater — `git pull && make
-install` is the upgrade path. See
+install` is the ordinary upgrade path. Existing meeting/dictation databases need
+the explicit [Audio Notes migration](./audio-notes-migration.md) first. See
 [ADR 0001](./adr/0001-source-only-distribution.md).
 
 See the [Configuration Guide](./configuration.md#provider-cli-helpers) for detailed provider command documentation.

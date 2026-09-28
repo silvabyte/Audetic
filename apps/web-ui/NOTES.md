@@ -13,14 +13,25 @@ MobX (`<Observer>` only, strict mode — see `feedback_mobx.md`), `react-router-
 
 Routes / surface:
 
-- `/dictations` — voice-to-text history (the index route; `/` redirects here)
-- `/meetings` and `/meetings/:id` — meeting list + detail, with an auto-nav reaction that jumps to
-  `/meetings/:id` when a meeting finishes its pipeline
-- `/settings/{setup,provider,keybind,post-processing,appearance,config-file}` — Setup Center is the
+- `/audio-notes` — one chronological stream of captured and imported audio notes (`/` redirects here).
+  Search titles/transcripts, filter by inferred classification (including future kinds), and paginate.
+- `/audio-notes/:id` — raw transcript, audio playback and segment seeking, title editing/regeneration,
+  classification/enrichment progress and retries, templates/artifacts, and soft deletion.
+  Transcription and enrichment are independent: failed AI processing never hides the raw transcript.
+- `/settings/{setup,provider,capture,keybind,post-processing,appearance,config-file}` — Setup Center is the
   read-only machine capability overview; Provider offers typed validation, save, and daemon restart
-- `components/command-bar.tsx` — omnipresent sticky strip: a live state orb (pulses/glows on the
-  daemon's dictation / meeting / pipeline state), a daemon-down chip, and icon actions to toggle
-  dictation and meeting. `<ActiveMeetingBanner/>` renders below it for meeting-only affordances.
+- `components/command-bar.tsx` — one capture control and status stream, owned by `AudioNotesStore`.
+  Microphone capture is the default; optional system audio and review/trim are acquisition options,
+  not a choice of meaning. Automatic paste and clipboard copying default off. Settings → Capture &
+  delivery reads/writes the daemon-persisted preference through `GET`/`PUT /audio-notes/settings`.
+  `AudioNoteSettingsStore` stays safely off until that preference loads; load/save errors are visible.
+  Capture options use `auto_paste: null` to inherit a loaded preference, or explicit `false`/`true` to
+  override it for one recording. Overrides reset after capture starts; source/review/clipboard
+  options last for the app session. Saves never change an active capture. Delivery is raw text before
+  asynchronous AI processing, never generated output. No delivery setting is stored in localStorage.
+- `components/audio-review-panel.tsx`, `transcript-player.tsx`, `note-title-header.tsx`, and
+  `note-artifacts-panel.tsx` are reusable note components. There are no separate dictation/meeting
+  stores, routes, or status polls, and background completions do not unexpectedly change routes.
 - `stores/setup-store.ts` — consumes `GET /api/setup` for workflow and machine readiness. Missing
   FFmpeg never blocks the application; Settings → Setup offers the app-local installer using
   `onboarding-store`'s existing `POST /api/system/install-ffmpeg` status polling.
@@ -57,8 +68,17 @@ Vite proxies `/api` to the daemon at `127.0.0.1:3737` (see `vite.config.ts`), so
 a real running daemon. The daemon allowlists the local Vite origins; in production the SPA is
 same-origin, and browser requests from other origins are rejected before handlers run.
 
-`make codegen` (`bun run codegen`) regenerates `src/api/schema.ts` from the running daemon's
-`GET /api/openapi.json` (utoipa). Run it after changing daemon routes/schemas.
+`bun run codegen` regenerates `src/api/schema.ts` from `../../target/openapi.json`, exported from
+the daemon's utoipa document. Run it after changing daemon routes/schemas. Never hand-edit the
+generated schema or cast around incompatible endpoints. The post-processing client uses the same
+typed `daemon` client and the single `audio_note.completed` event.
+
+`bun run test` runs the Observer lint-rule tests and Audio Notes behavior tests (Bun, real typed
+client with an injected network boundary, plus React server-render assertions). Tests cover stream
+queries, stale responses, safe delivery defaults, multipart imports, trim failures, deleted-note
+races, transcript playback without timestamps, independent enrichment errors/retry, persisted
+delivery settings, safe pre-load/failure behavior, and nullable/explicit capture overrides. These are
+not browser QA; verify microphone/system capture and clipboard delivery against a real daemon.
 
 `make ui-typecheck` (`bun run typecheck`) is the only check unique to this package; `make quality`
 runs it alongside the Rust gate. CI (`.github/workflows/rust.yml`) installs `bun`, runs
@@ -80,7 +100,7 @@ There is no hosted installer and no auto-updater — see
   There's no story for macOS/Windows (launchd plist, a different launcher, etc.) — and the SPA still
   assumes the daemon is already running.
 - **Tray on macOS lives in the menu-bar agent.** `apps/menubar-macos` (SwiftUI `MenuBarExtra`) now
-  surfaces daemon status, point-and-click dictation/meeting toggles, "Open Audetic", and
+  surfaces daemon status, audio note capture controls, "Open Audetic", and
   user-customizable global keyboard shortcuts. It's an independent HTTP consumer of the daemon
   (like the CLI), bundled inside `Audetic.app/Contents/Library/LoginItems` and registered as a
   LaunchAgent (`ai.audetic.menubar`) by `audeticd install`. Linux still uses the Hyprland keybind;
@@ -93,10 +113,8 @@ There is no hosted installer and no auto-updater — see
   and `GET /api/update/check` drives the version card. So the "locally-tracked flag" caveat from the
   Electron era no longer applies. The browser SPA itself updates by hard-refresh against the
   daemon-served bundle (`index.html` is `no-cache`).
-- **Meeting lifecycle not exercised end-to-end in web-ui.** The meetings list / detail / banner /
-  auto-nav are wired and render, but I haven't actually run a meeting in web-ui to confirm the full
-  chain (start → record → stop → compress → transcribe → auto-nav to `/meetings/:id`). Worth doing
-  before calling v1 done.
+- **Capture browser QA is separate from automated UI tests.** Exercise start → record → stop →
+  review/trim → transcribe, then classification/artifacts against the real daemon before release.
 - **MobX `observableRequiresReaction` warnings on loader reads.** Strict mode warns when route
   loaders call store methods that read observables outside a reaction. Pre-existing and benign; could
   silence per-call with `untracked()` if it gets noisy.

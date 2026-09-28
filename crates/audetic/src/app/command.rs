@@ -1,25 +1,28 @@
 /// Commands serialized by the daemon's single owner loop.
 pub enum DaemonCommand {
-    ToggleRecording(Option<crate::audio::JobOptions>),
     SettledDeviceSwitch(crate::audio::SettledSwitch),
     CaptureStreamDied(crate::audio::stream_event::StreamDeath),
-    MeetingStart {
-        options: Option<crate::meeting::MeetingStartOptions>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStartResult>>,
+    AudioNoteStart {
+        options: Option<crate::audio_notes::AudioNoteStartOptions>,
+        reply:
+            tokio::sync::oneshot::Sender<anyhow::Result<crate::audio_notes::AudioNoteStartResult>>,
     },
-    MeetingStop {
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
+    AudioNoteStop {
+        reply:
+            tokio::sync::oneshot::Sender<anyhow::Result<crate::audio_notes::AudioNoteStopResult>>,
     },
-    MeetingCancel {
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
+    AudioNoteCancel {
+        reply:
+            tokio::sync::oneshot::Sender<anyhow::Result<crate::audio_notes::AudioNoteStopResult>>,
     },
-    MeetingConfirm {
+    AudioNoteConfirm {
         start_seconds: Option<f64>,
         end_seconds: Option<f64>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::MeetingStopResult>>,
+        reply:
+            tokio::sync::oneshot::Sender<anyhow::Result<crate::audio_notes::AudioNoteStopResult>>,
     },
-    MeetingToggle {
-        options: Option<crate::meeting::MeetingStartOptions>,
-        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::meeting::ToggleOutcome>>,
+    AudioNoteToggle {
+        options: Option<crate::audio_notes::AudioNoteStartOptions>,
+        reply: tokio::sync::oneshot::Sender<anyhow::Result<crate::audio_notes::ToggleOutcome>>,
     },
 }

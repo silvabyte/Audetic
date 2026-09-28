@@ -1,5 +1,5 @@
 <img src="./assets/banner.png" alt="Audetic" />
-Basically superwhisper for Omarchy, Audetic is a voice to text application for Wayland/Hyprland. Press a keybind to toggle recording, get automatic transcription and inject text into the focused application/clipboard...
+Audetic captures your thoughts, conversations, meetings, and requests as **Audio Notes**. Record from your microphone, include system audio, or import a media file. Every note appears in one chronological stream with its original transcript, AI classification, and useful generated outputs. Automatic paste into the focused application is optional and off by default.
 
 ## Quickstart Video
 
@@ -24,11 +24,16 @@ CLI on your PATH, and waits for the daemon to bind `127.0.0.1:3737`. On Linux,
 finish setup in the guided terminal flow (`audetic setup`) or the web Setup
 Center (`http://127.0.0.1:3737/settings/setup`).
 
-It's idempotent, so it's also the upgrade path:
+For ordinary upgrades:
 
 ```bash
 git pull && make install
 ```
+
+**Upgrading from meeting/dictation storage:** first build the new binary, stop
+the old daemon, and run the explicit [Audio Notes migration](./docs/audio-notes-migration.md).
+The updated daemon refuses legacy databases until conversion; the migration
+creates a backup and preserves existing transcripts, titles, artifacts, and audio references.
 
 ### Linux
 
@@ -45,15 +50,19 @@ troubleshooting: **[macOS Install Guide](./docs/macos-install.md)**.
 
 **After installation:**
 
-1. On Linux, run `audetic setup` or visit `http://127.0.0.1:3737/settings/setup` to check provider, text delivery, shortcuts, and meeting tools.
-2. The Setup Center can preview and install separate Hyprland shortcuts for dictation and meetings, with a backup before each change.
+1. On Linux, run `audetic setup` or visit `http://127.0.0.1:3737/settings/setup` to check your transcription provider, capture tools, and shortcuts.
+2. The Setup Center can install microphone-only and microphone-plus-system-audio shortcuts. Both create Audio Notes.
 3. Press the configured shortcut to start/stop recording.
+4. Choose your signed-in local AI agent in **Settings → Capture & delivery**. Enable automatic paste there only if you want it.
 
 ## Web UI
 
 The daemon serves a web UI at `http://127.0.0.1:3737/` for onboarding, provider
-configuration, and browsing transcription history. The HTTP API lives under
-`http://127.0.0.1:3737/api/*` (e.g. `POST /api/toggle`, `GET /api/status`).
+configuration, and the unified `/audio-notes` stream. Search or filter by inferred
+classification, play audio, edit titles, copy raw text, and inspect generated artifacts.
+The HTTP API lives under `http://127.0.0.1:3737/api/*` (e.g.
+`POST /api/audio-notes/toggle`, `GET /api/audio-notes`). OpenAPI is available at
+`/api/openapi.json`. See [Audio Notes architecture and workflows](./docs/audio-notes.md).
 
 ## Configuration
 
@@ -69,48 +78,25 @@ audetic provider configure   # interactive wizard (requires a TTY)
 audetic provider test        # validate the stored provider
 ```
 
-## Transcribe Media Files
+## Capture and Import from the CLI
 
-Transcribe audio or video files using the audetic cloud transcription service:
+The CLI uses the same daemon-owned pipeline and configured transcription provider as the UI:
 
 ```bash
-# Basic transcription (output to stdout)
-audetic transcribe recording.mp4
-
-# Specify language and output file
-audetic transcribe meeting.mkv -l en -o meeting.txt
-
-# JSON output with timestamps
-audetic transcribe podcast.mp3 -f json --timestamps -o podcast.json
-
-# SRT subtitle format
-audetic transcribe video.mp4 -f srt -o subtitles.srt
-
-# Copy result to clipboard
-audetic transcribe voice-memo.m4a --copy
-
-# Use custom API endpoint
-audetic transcribe audio.wav --api-url http://localhost:3141/api/v1/jobs
+audetic notes start                       # microphone; paste off unless configured
+audetic notes stop                        # persist and transcribe
+audetic notes import recording.mp4 --title "Project planning"
+audetic notes list --query planning       # newest first
+audetic notes show 42                     # transcript, classification, processing state
+audetic notes process 42                  # retry pending/failed AI processing
+audetic notes copy 42                     # explicitly copy the raw transcript
 ```
 
-**Supported formats:**
-
-- Audio: wav, mp3, m4a, flac, ogg, opus
-- Video: mp4, mkv, webm, avi, mov
-
-Files are automatically compressed to MP3 before upload for efficient transfer.
-Files already in MP3 or Opus format are sent as-is. Use `--no-compress` to skip.
-
-**Options:**
-
-- `-l, --language <LANG>` - Language code (e.g., 'en', 'es', or 'auto' for detection)
-- `-o, --output <FILE>` - Write transcription to file (default: stdout)
-- `-f, --format <FORMAT>` - Output format: text (default), json, srt
-- `--timestamps` - Include timestamps in text output
-- `--no-progress` - Disable progress indicator
-- `-c, --copy` - Copy result to clipboard
-- `--no-compress` - Skip compression (send file in original format)
-- `--api-url <URL>` - Override transcription API URL
+Use `audetic notes start --help` for system-audio, review, and per-recording
+delivery options. Review supports playback and trimming before transcription.
+Audio/video imports are staged durably and processed in the background; the
+returned note ID can immediately be opened in the UI. The old `meeting`, `history`,
+and standalone `transcribe` commands have been replaced by `notes`.
 
 ## Updating
 

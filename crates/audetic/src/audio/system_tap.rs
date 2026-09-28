@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use super::audio_source::{AudioSource, MeetingSystemSource};
+use super::audio_source::{AudioSource, CaptureSystemSource};
 use super::capture_recovery::{start_capture_with_retries, CaptureRecovery};
 use super::mic_source::MonotonicClock;
 use super::resample::{push_mono_f32, resample_mono_f32};
@@ -79,7 +79,7 @@ pub(crate) struct SystemTapAudioSource {
     live_generation: Arc<AtomicU64>,
     stream_event_sink: StreamEventSink,
     clock: Arc<dyn MonotonicClock>,
-    meeting_started_at: Option<Duration>,
+    audio_note_started_at: Option<Duration>,
     pending_gap_started_at: Option<Duration>,
     session_active: bool,
     captured_audio: bool,
@@ -102,7 +102,7 @@ impl SystemTapAudioSource {
             live_generation: Arc::new(AtomicU64::new(0)),
             stream_event_sink,
             clock,
-            meeting_started_at: None,
+            audio_note_started_at: None,
             pending_gap_started_at: None,
             session_active: false,
             captured_audio: false,
@@ -275,7 +275,7 @@ impl SystemTapAudioSource {
         let native = std::mem::take(&mut *segment.native_samples.lock().unwrap());
         if native.is_empty() {
             let ended_at = segment.gap_before.unwrap_or_else(|| {
-                self.meeting_started_at
+                self.audio_note_started_at
                     .map(|started_at| started_at.max(segment.attempt_started_at))
                     .unwrap_or(segment.attempt_started_at)
             });
@@ -402,7 +402,7 @@ impl AudioSource for SystemTapAudioSource {
         self.close_current_segment()
             .context("Failed to reset previous System Tap Segment")?;
         self.canonical_samples.clear();
-        self.meeting_started_at = None;
+        self.audio_note_started_at = None;
         self.pending_gap_started_at = None;
         self.session_active = true;
         self.captured_audio = false;
@@ -467,14 +467,14 @@ impl AudioSource for SystemTapAudioSource {
 }
 
 #[async_trait::async_trait(?Send)]
-impl MeetingSystemSource for SystemTapAudioSource {
+impl CaptureSystemSource for SystemTapAudioSource {
     fn supports_hot_swap(&self) -> bool {
         true
     }
 
-    fn mark_meeting_started(&mut self) {
+    fn mark_capture_started(&mut self) {
         let started_at = self.clock.now();
-        self.meeting_started_at = Some(started_at);
+        self.audio_note_started_at = Some(started_at);
         if self.session_active && !self.has_live_stream() {
             self.pending_gap_started_at = Some(started_at);
         }
@@ -778,7 +778,7 @@ mod tests {
         );
 
         tap.start().unwrap();
-        tap.mark_meeting_started();
+        tap.mark_capture_started();
         tap.default_output_switched().await.unwrap();
         tap.default_output_switched().await.unwrap();
         let samples = tap.stop().unwrap();
@@ -950,7 +950,7 @@ mod tests {
         );
 
         assert!(tap.start().is_err());
-        tap.mark_meeting_started();
+        tap.mark_capture_started();
         clock.advance(Duration::from_secs(1));
 
         assert!(tap.stop().unwrap().is_empty());

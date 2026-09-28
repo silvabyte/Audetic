@@ -53,7 +53,6 @@ pub struct WaylandConfig {
 pub struct BehaviorConfig {
     pub auto_paste: bool,
     pub preserve_clipboard: bool,
-    pub delete_audio_files: bool,
     #[serde(default = "default_audio_feedback")]
     pub audio_feedback: bool,
 }
@@ -107,9 +106,8 @@ impl Default for WaylandConfig {
 impl Default for BehaviorConfig {
     fn default() -> Self {
         Self {
-            auto_paste: true,
+            auto_paste: false,
             preserve_clipboard: false,
-            delete_audio_files: true,
             audio_feedback: true,
         }
     }
@@ -153,5 +151,23 @@ impl Config {
 
     fn config_path() -> Result<PathBuf> {
         global::config_file()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivery_is_opt_in_and_legacy_explicit_preference_is_preserved() {
+        assert!(!Config::default().behavior.auto_paste);
+        let empty: Config = toml::from_str("").unwrap();
+        assert!(!empty.behavior.auto_paste);
+        let legacy: Config =
+            toml::from_str("[behavior]\nauto_paste = true\ndelete_audio_files = true\n").unwrap();
+        assert!(legacy.behavior.auto_paste);
+        assert!(!toml::to_string(&legacy)
+            .unwrap()
+            .contains("delete_audio_files"));
     }
 }

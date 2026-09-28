@@ -3,7 +3,7 @@
 //! Reports whether external tools the daemon depends on (FFmpeg today) are
 //! available on PATH. The desktop UI uses this to drive its onboarding flow
 //! so the user is prompted to install missing tools before they hit an
-//! in-band failure (e.g. starting a meeting only to have compression fail).
+//! in-band failure (e.g. starting capture only to have compression fail).
 
 use crate::system::ffmpeg::{install_blocking, InstallProgress};
 use audetic_core::compression::check_ffmpeg_available;
@@ -27,7 +27,7 @@ const MACOS_SERVICE: &str = "ai.audetic.daemon";
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SystemDeps {
     /// Whether `ffmpeg` resolves — either app-local sidecar or on PATH.
-    /// Required for meeting audio compression before upload.
+    /// Required for captured audio compression before upload.
     pub ffmpeg: bool,
 }
 
