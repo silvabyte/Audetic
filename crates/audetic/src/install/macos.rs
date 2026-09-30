@@ -240,15 +240,19 @@ fn write_plist(paths: &InstallPaths) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow!("$HOME contains non-UTF8 bytes"))?;
 
-    let plist = PLIST_TEMPLATE
-        .replace("__EXEC_START__", exec)
-        .replace("__LOG_PATH__", log)
-        .replace("__HOME__", home);
+    let plist = render_daemon_plist(exec, log, home);
 
     fs::write(&paths.plist_path, plist)
         .with_context(|| format!("Failed to write {}", paths.plist_path.display()))?;
     println!("  · Wrote {}", paths.plist_path.display());
     Ok(())
+}
+
+fn render_daemon_plist(exec: &str, log: &str, home: &str) -> String {
+    PLIST_TEMPLATE
+        .replace("__EXEC_START__", exec)
+        .replace("__LOG_PATH__", log)
+        .replace("__HOME__", home)
 }
 
 fn current_uid() -> Result<String> {
@@ -497,5 +501,24 @@ fn bootout_agents() {
         if !wait_for_service_gone(&target, TEARDOWN_TIMEOUT) {
             println!("  · {target} did not unload within {TEARDOWN_TIMEOUT:?}; continuing");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_daemon_plist;
+
+    #[test]
+    fn daemon_path_includes_the_standard_opencode_install_directory() {
+        let plist = render_daemon_plist(
+            "/Users/test/Applications/Audetic.app/Contents/MacOS/audeticd",
+            "/Users/test/Library/Logs/Audetic/audetic.log",
+            "/Users/test",
+        );
+
+        assert!(plist.contains(
+            "<string>/Users/test/.opencode/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>"
+        ));
+        assert!(!plist.contains("__HOME__"));
     }
 }
