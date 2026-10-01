@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import createClient from "openapi-fetch";
 import type { paths } from "../src/api/schema";
+import { authorizationHeaderValue } from "../src/routes/settings/integrations";
 import { IntegrationsStore } from "../src/stores/integrations-store";
 
 function clientWith(handler: (request: Request) => Response | Promise<Response>) {
@@ -46,4 +47,11 @@ test("failed integration loads do not claim the store is loaded", async () => {
   await store.load();
   assert.equal(store.state, "error");
   assert.match(store.error ?? "", /Integration database unavailable/);
+});
+
+test("ingress keys are presented as complete bearer header values", () => {
+  assert.equal(
+    authorizationHeaderValue("audetic_ingress_one-time-secret"),
+    "Bearer audetic_ingress_one-time-secret",
+  );
 });

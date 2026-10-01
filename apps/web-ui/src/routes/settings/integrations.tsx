@@ -83,10 +83,14 @@ function SettingsIntegrations() {
               {store.issuedKey ? (
                 <div role="status" aria-label="One-time ingress key ready" className="space-y-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
                   <div className="flex items-center justify-between gap-3">
-                    <div><p className="text-sm font-medium">Save this key now</p><p className="text-xs text-muted-foreground">It cannot be recovered after this panel closes.</p></div>
-                    <Button size="sm" variant="outline" onClick={async () => { try { await navigator.clipboard.writeText(store.issuedKey?.secret ?? ""); toast.success("Access key copied"); } catch { toast.error("Clipboard access failed; select the key manually"); } }}><Clipboard className="h-3.5 w-3.5" /> Copy</Button>
+                    <div><p className="text-sm font-medium">Configure this header now</p><p className="text-xs text-muted-foreground">The header value cannot be recovered after this panel closes.</p></div>
+                    <Button size="sm" variant="outline" onClick={async () => { try { await navigator.clipboard.writeText(authorizationHeaderValue(store.issuedKey?.secret ?? "")); toast.success("Authorization value copied"); } catch { toast.error("Clipboard access failed; select the value manually"); } }}><Clipboard className="h-3.5 w-3.5" /> Copy value</Button>
                   </div>
-                  <code className="block overflow-x-auto rounded bg-background p-2 text-xs">{store.issuedKey.secret}</code>
+                  <div className="grid gap-2 rounded bg-background p-2 text-xs sm:grid-cols-[11rem_1fr]">
+                    <span className="font-medium text-muted-foreground">Header name</span><code>Authorization</code>
+                    <span className="font-medium text-muted-foreground">Header value</span><code className="overflow-x-auto">{authorizationHeaderValue(store.issuedKey.secret)}</code>
+                    {store.issuedKey.scope === "index" ? <><span className="font-medium text-muted-foreground">Index header name</span><code>X-Index-Webhook-Version</code><span className="font-medium text-muted-foreground">Index header value</span><code>1</code></> : null}
+                  </div>
                   <Button size="sm" variant="ghost" onClick={() => store.clearIssuedKey()}><Check className="h-3.5 w-3.5" /> I saved it</Button>
                 </div>
               ) : null}
@@ -153,4 +157,8 @@ function formatDate(value: string | null | undefined): string {
   const normalized = value.includes("T") ? value : `${value.replace(" ", "T")}Z`;
   const date = new Date(normalized);
   return Number.isNaN(date.valueOf()) ? value : date.toLocaleString();
+}
+
+export function authorizationHeaderValue(secret: string): string {
+  return `Bearer ${secret}`;
 }

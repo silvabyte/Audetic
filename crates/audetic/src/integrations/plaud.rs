@@ -61,12 +61,24 @@ impl PlaudCli {
             .await
             .context("Plaud CLI timed out after 60 seconds")?
             .context("Failed to run Plaud CLI")?;
-        if !output.status.success() {
+        if !plaud_output_succeeded(&output.status, &output.stdout, &output.stderr) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("Plaud CLI failed: {}", stderr.trim());
         }
         String::from_utf8(output.stdout).context("Plaud CLI returned non-UTF-8 output")
     }
+}
+
+fn plaud_output_succeeded(status: &std::process::ExitStatus, stdout: &[u8], stderr: &[u8]) -> bool {
+    if status.success() {
+        return true;
+    }
+
+    let stderr = String::from_utf8_lossy(stderr);
+    status.code() == Some(13)
+        && !stdout.is_empty()
+        && stderr.contains("Warning: Detected unsettled top-level await at ")
+        && stderr.contains("@plaud-ai/cli/dist/index.js:")
 }
 
 fn parse_file_ids(output: &str) -> Result<Vec<String>> {
@@ -140,6 +152,24 @@ fn parse_audio_url(output: &str) -> Result<reqwest::Url> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn accepts_official_cli_unsettled_await_exit_after_valid_output() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let status = std::process::ExitStatus::from_raw(13 << 8);
+        assert!(plaud_output_succeeded(
+            &status,
+            b"plaud 0.3.14\n",
+            b"Warning: Detected unsettled top-level await at file:///opt/homebrew/lib/node_modules/@plaud-ai/cli/dist/index.js:22271\n",
+        ));
+        assert!(!plaud_output_succeeded(
+            &status,
+            b"",
+            b"Warning: Detected unsettled top-level await at file:///opt/homebrew/lib/node_modules/@plaud-ai/cli/dist/index.js:22271\n",
+        ));
+    }
 
     #[test]
     fn parses_documented_human_readable_cli_output() {
