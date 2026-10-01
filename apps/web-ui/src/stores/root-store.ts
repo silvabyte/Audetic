@@ -5,6 +5,7 @@ import { AudioNotesStore } from "./audio-notes-store";
 import { AudioNoteSettingsStore } from "./audio-note-settings-store";
 import { NoteArtifactsStore } from "./note-artifacts-store";
 import { MetaStore } from "./meta-store";
+import { IntegrationsStore } from "./integrations-store";
 import { OnboardingStore } from "./onboarding-store";
 import { PostProcessingStore } from "./post-processing-store";
 import { SetupStore } from "./setup-store";
@@ -24,6 +25,7 @@ export class RootStore {
   postProcessing: PostProcessingStore;
   onboarding: OnboardingStore;
   setup: SetupStore;
+  integrations: IntegrationsStore;
   ui: UiStore;
 
   constructor() {
@@ -35,6 +37,7 @@ export class RootStore {
     this.postProcessing = new PostProcessingStore(this);
     this.onboarding = new OnboardingStore(this);
     this.setup = new SetupStore(this);
+    this.integrations = new IntegrationsStore();
     this.ui = new UiStore(this);
     makeAutoObservable(this);
   }

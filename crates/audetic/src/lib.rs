@@ -7,6 +7,7 @@ pub mod audio_note_migration;
 pub mod audio_notes;
 pub mod db;
 pub mod install;
+pub mod integrations;
 pub mod note_intelligence;
 
 // Lightweight, daemon-independent modules live in `audetic-core` and are

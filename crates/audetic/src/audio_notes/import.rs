@@ -35,6 +35,14 @@ pub struct ImportArgs {
     pub original_filename: Option<String>,
     /// Optional user-supplied Manual Title.
     pub title: Option<String>,
+    /// Acquisition provider shown in the Audio Note provenance metadata.
+    pub source_provider: Option<String>,
+    /// Stable provider-owned recording identifier used for traceability.
+    pub source_external_id: Option<String>,
+    /// Original UTC recording time, normalized to SQLite timestamp text.
+    pub source_recorded_at: Option<String>,
+    /// Claimed external-import row committed atomically with the Audio Note.
+    pub external_import_id: Option<i64>,
     /// Shared pipeline dependencies (transcription + post-processing dispatch).
     pub services: ProcessingServices,
     /// How to read media duration. Production wires up `FfprobeMediaInspector`.
@@ -64,6 +72,10 @@ pub async fn import_audio_note_file(args: ImportArgs) -> Result<ImportResult> {
         source_path,
         original_filename,
         title,
+        source_provider,
+        source_external_id,
+        source_recorded_at,
+        external_import_id,
         services,
         inspector,
         audio_notes_dir,
@@ -85,6 +97,7 @@ pub async fn import_audio_note_file(args: ImportArgs) -> Result<ImportResult> {
     let destination = imported_destination(&audio_notes_dir, &extension);
     move_file(&source_path, &destination)
         .with_context(|| format!("Failed to move imported file into {:?}", destination))?;
+    let mut destination_cleanup = ImportedFileCleanup::new(destination.clone());
 
     let resolved_title = title
         .map(|title| title.trim().to_string())
@@ -100,25 +113,20 @@ pub async fn import_audio_note_file(args: ImportArgs) -> Result<ImportResult> {
 
     let note_id = match insert_audio_note_row(
         &services.db_path,
-        &destination,
-        resolved_title.as_deref(),
-        source_filename,
+        ImportedNoteRow {
+            audio_path: &destination,
+            title: resolved_title.as_deref(),
+            source_filename,
+            source_provider: source_provider.as_deref(),
+            source_external_id: source_external_id.as_deref(),
+            source_recorded_at: source_recorded_at.as_deref(),
+            external_import_id,
+        },
     ) {
         Ok(id) => id,
-        Err(e) => {
-            // The DB row is the only thing tying this file to the meeting
-            // surface — if insert failed, the file is orphaned. Remove it
-            // so we don't leak storage on every failed import.
-            if let Err(cleanup_err) = std::fs::remove_file(&destination) {
-                tracing::warn!(
-                    "Failed to clean up orphaned import at {:?}: {}",
-                    destination,
-                    cleanup_err
-                );
-            }
-            return Err(e);
-        }
+        Err(e) => return Err(e),
     };
+    destination_cleanup.persist();
 
     info!(
         "Imported Audio Note {} from file: {:?} ({}s)",
@@ -148,6 +156,36 @@ fn imported_destination(audio_notes_dir: &Path, extension: &str) -> PathBuf {
     let timestamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
     let unique = uuid::Uuid::new_v4().simple();
     audio_notes_dir.join(format!("imported-{timestamp}-{unique}.{extension}"))
+}
+
+struct ImportedFileCleanup {
+    path: PathBuf,
+    persist: bool,
+}
+
+impl ImportedFileCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            persist: false,
+        }
+    }
+
+    fn persist(&mut self) {
+        self.persist = true;
+    }
+}
+
+impl Drop for ImportedFileCleanup {
+    fn drop(&mut self) {
+        if !self.persist {
+            if let Err(error) = std::fs::remove_file(&self.path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = ?self.path, %error, "Failed to clean up orphaned import");
+                }
+            }
+        }
+    }
 }
 
 /// Pick the extension to use. Prefers the original filename (which is what
@@ -183,22 +221,39 @@ fn move_file(source: &Path, destination: &Path) -> std::io::Result<()> {
 
 /// Insert the meeting row with `status = compressing` so the list UI shows
 /// it as in-flight rather than recording.
-fn insert_audio_note_row(
-    db_path: &Path,
-    audio_path: &Path,
-    title: Option<&str>,
-    source_filename: Option<&str>,
-) -> Result<i64> {
+struct ImportedNoteRow<'a> {
+    audio_path: &'a Path,
+    title: Option<&'a str>,
+    source_filename: Option<&'a str>,
+    source_provider: Option<&'a str>,
+    source_external_id: Option<&'a str>,
+    source_recorded_at: Option<&'a str>,
+    external_import_id: Option<i64>,
+}
+
+fn insert_audio_note_row(db_path: &Path, row: ImportedNoteRow<'_>) -> Result<i64> {
     let mut conn = db::init_db_at(db_path).context("Failed to open audetic database")?;
     let conn = conn.transaction()?;
     let id = AudioNoteRepository::insert_import(
         &conn,
-        title,
-        &audio_path.to_string_lossy(),
-        source_filename,
+        row.title,
+        &row.audio_path.to_string_lossy(),
+        row.source_filename,
     )?;
     AudioNoteRepository::update_status(&conn, id, AudioNotePhase::Compressing)?;
     AudioNoteRepository::set_capture_source(&conn, id, "import")?;
+    AudioNoteRepository::set_source_metadata(
+        &conn,
+        id,
+        row.source_provider,
+        row.source_external_id,
+        row.source_recorded_at,
+    )?;
+    if let Some(import_id) = row.external_import_id {
+        crate::db::integrations::IntegrationRepository::accept_external_import(
+            &conn, import_id, id,
+        )?;
+    }
     conn.commit()?;
     Ok(id)
 }
@@ -261,5 +316,69 @@ mod tests {
             .probe_duration_seconds(Path::new("/tmp/x.mp3"))
             .await;
         assert_eq!(dur, Some(42));
+    }
+
+    #[test]
+    fn external_import_acceptance_commits_with_the_audio_note() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("audetic.db");
+        let conn = crate::db::init_db_at(&db_path).unwrap();
+        let claim = crate::db::integrations::IntegrationRepository::claim_external_import(
+            &conn,
+            "generic_webhook",
+            "key-id",
+            "recording-id",
+            None,
+            Some("recording.m4a"),
+        )
+        .unwrap();
+        let crate::db::integrations::ImportClaim::Claimed(import_id) = claim else {
+            panic!("first import should be claimed")
+        };
+
+        let note_id = insert_audio_note_row(
+            &db_path,
+            ImportedNoteRow {
+                audio_path: Path::new("/tmp/recording.m4a"),
+                title: None,
+                source_filename: Some("recording.m4a"),
+                source_provider: Some("generic_webhook"),
+                source_external_id: Some("recording-id"),
+                source_recorded_at: None,
+                external_import_id: Some(import_id),
+            },
+        )
+        .unwrap();
+        let accepted_note =
+            crate::db::integrations::IntegrationRepository::accepted_external_import_note_id(
+                &conn,
+                "generic_webhook",
+                "key-id",
+                "recording-id",
+            )
+            .unwrap();
+        assert_eq!(accepted_note, Some(note_id));
+
+        assert!(insert_audio_note_row(
+            &db_path,
+            ImportedNoteRow {
+                audio_path: Path::new("/tmp/orphan.m4a"),
+                title: None,
+                source_filename: Some("orphan.m4a"),
+                source_provider: Some("generic_webhook"),
+                source_external_id: Some("orphan-id"),
+                source_recorded_at: None,
+                external_import_id: Some(i64::MAX),
+            },
+        )
+        .is_err());
+        let orphan_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audio_notes WHERE source_external_id = 'orphan-id'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(orphan_count, 0);
     }
 }

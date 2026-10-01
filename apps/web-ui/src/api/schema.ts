@@ -404,6 +404,118 @@ export interface paths {
         patch: operations["update_audio_note_title"];
         trace?: never;
     };
+    "/integrations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_overview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/integrations/imports": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_imports"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/integrations/keys": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_access_keys"];
+        put?: never;
+        post: operations["create_access_key"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/integrations/keys/{id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete: operations["revoke_access_key"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/integrations/plaud": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["get_plaud_status"];
+        put: operations["update_plaud_settings"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/integrations/plaud/backfill": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["backfill_plaud"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/integrations/plaud/sync": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post: operations["sync_plaud"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/keybind": {
         parameters: {
             query?: never;
@@ -864,6 +976,19 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        AccessKeyInfo: {
+            created_at: string;
+            id: string;
+            last_used_at?: string | null;
+            name: string;
+            revoked_at?: string | null;
+            scope: components["schemas"]["AccessKeyScope"];
+        };
+        AccessKeyListResponse: {
+            keys: components["schemas"]["AccessKeyInfo"][];
+        };
+        /** @enum {string} */
+        AccessKeyScope: "index" | "generic";
         /**
          * @description What a job does when matched.
          *
@@ -903,6 +1028,10 @@ export interface components {
         };
         AgentProfilesResponse: {
             profiles: components["schemas"]["AgentProfile"][];
+        };
+        ApiErrorResponse: {
+            error: boolean;
+            message: string;
         };
         /** @enum {string} */
         ArtifactStatus: "pending" | "running" | "completed" | "error";
@@ -972,7 +1101,10 @@ export interface components {
             error?: string | null;
             /** Format: int64 */
             id: number;
+            source_external_id?: string | null;
             source_filename?: string | null;
+            source_provider?: string | null;
+            source_recorded_at?: string | null;
             started_at: string;
             status: string;
             title?: string | null;
@@ -1086,7 +1218,10 @@ export interface components {
             enrichment_status: string;
             /** Format: int64 */
             id: number;
+            source_external_id?: string | null;
             source_filename?: string | null;
+            source_provider?: string | null;
+            source_recorded_at?: string | null;
             started_at: string;
             status: string;
             title?: string | null;
@@ -1133,6 +1268,10 @@ export interface components {
         AudioNotesListResponse: {
             notes: components["schemas"]["AudioNoteSummary"][];
         };
+        CreateAccessKeyRequest: {
+            name: string;
+            scope: components["schemas"]["AccessKeyScope"];
+        };
         DeleteArtifactResponse: {
             /** Format: int64 */
             id: number;
@@ -1175,6 +1314,25 @@ export interface components {
         EventKind: "audio_note.completed";
         EventsListResponse: {
             events: components["schemas"]["EventDescriptor"][];
+        };
+        ExternalImportInfo: {
+            /** Format: int64 */
+            attempt_count: number;
+            /** Format: int64 */
+            audio_note_id?: number | null;
+            created_at: string;
+            error?: string | null;
+            external_id: string;
+            /** Format: int64 */
+            id: number;
+            provider: string;
+            recorded_at?: string | null;
+            source_filename?: string | null;
+            status: string;
+            updated_at: string;
+        };
+        ExternalImportListResponse: {
+            imports: components["schemas"]["ExternalImportInfo"][];
         };
         GenerateArtifactRequest: {
             /** Format: int64 */
@@ -1242,6 +1400,18 @@ export interface components {
              * @description Set during `Downloading`. May be 0 before headers arrive.
              */
             totalBytes?: number | null;
+        };
+        IntegrationOverview: {
+            generic_audio_url: string;
+            index_webhook_url: string;
+            ingress_origin: string;
+            public_base_url: string;
+            /** Format: int64 */
+            upload_limit_bytes: number;
+        };
+        IssuedAccessKey: components["schemas"]["AccessKeyInfo"] & {
+            /** @description Displayed exactly once. Only its SHA-256 digest is persisted. */
+            secret: string;
         };
         /** @description A row from `post_processing_jobs`, materialized into a strong type. */
         Job: {
@@ -1340,6 +1510,23 @@ export interface components {
             architecture: string;
             distribution?: string | null;
             os: string;
+        };
+        PlaudStatus: {
+            authenticated: boolean;
+            available: boolean;
+            enabled: boolean;
+            import_after?: string | null;
+            /** Format: int64 */
+            interval_minutes: number;
+            last_completed_at?: string | null;
+            last_error?: string | null;
+            last_started_at?: string | null;
+            running: boolean;
+            version?: string | null;
+        };
+        PlaudSyncAccepted: {
+            message: string;
+            scheduled: boolean;
         };
         /**
          * @description How an Audio Note processing prompt is delivered to the agent CLI.
@@ -1529,6 +1716,11 @@ export interface components {
             enabled?: boolean | null;
             event?: null | components["schemas"]["EventKind"];
             name?: string | null;
+        };
+        UpdatePlaudSettingsRequest: {
+            enabled: boolean;
+            /** Format: int64 */
+            interval_minutes: number;
         };
         /** @description Response for GET /version. */
         VersionInfo: {
@@ -2347,6 +2539,289 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    get_overview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description External integration endpoints */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IntegrationOverview"];
+                };
+            };
+        };
+    };
+    list_imports: {
+        parameters: {
+            query?: {
+                limit?: number | null;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Recent external imports */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ExternalImportListResponse"];
+                };
+            };
+        };
+    };
+    list_access_keys: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Ingress access keys without secrets or hashes */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessKeyListResponse"];
+                };
+            };
+        };
+    };
+    create_access_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateAccessKeyRequest"];
+            };
+        };
+        responses: {
+            /** @description Access key created; secret is returned exactly once */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IssuedAccessKey"];
+                };
+            };
+            /** @description Invalid key name */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Access key could not be created */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    revoke_access_key: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Access key ID */
+                id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Access key revoked */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AccessKeyInfo"];
+                };
+            };
+            /** @description Access key not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Access key could not be revoked */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    get_plaud_status: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Plaud CLI and synchronization status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlaudStatus"];
+                };
+            };
+        };
+    };
+    update_plaud_settings: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdatePlaudSettingsRequest"];
+            };
+        };
+        responses: {
+            /** @description Plaud synchronization settings updated */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlaudStatus"];
+                };
+            };
+            /** @description Invalid synchronization interval */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Plaud settings could not be updated */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    backfill_plaud: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Historical Plaud synchronization scheduled */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlaudSyncAccepted"];
+                };
+            };
+            /** @description Plaud synchronization is already running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Plaud synchronization could not be scheduled */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+        };
+    };
+    sync_plaud: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Incremental Plaud synchronization scheduled */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["PlaudSyncAccepted"];
+                };
+            };
+            /** @description Plaud synchronization is already running */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
+            };
+            /** @description Plaud synchronization could not be scheduled */
+            500: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ApiErrorResponse"];
+                };
             };
         };
     };

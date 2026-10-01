@@ -59,6 +59,7 @@ pub(crate) struct ProcessInstanceId(String);
 pub struct ApiServer {
     audio_note_state: routes::audio_notes::AudioNoteState,
     post_processing_state: routes::post_processing::PostProcessingApiState,
+    integration_state: routes::integrations::IntegrationApiState,
     runtime_provider: crate::config::WhisperConfig,
     instance_id: ProcessInstanceId,
 }
@@ -68,18 +69,22 @@ impl ApiServer {
         audio_note_state: routes::audio_notes::AudioNoteState,
         config: &Config,
         post_processing: std::sync::Arc<PostProcessingService>,
+        integrations: crate::integrations::IntegrationService,
     ) -> Self {
         Self {
             audio_note_state,
             post_processing_state: routes::post_processing::PostProcessingApiState {
                 service: post_processing,
             },
+            integration_state: routes::integrations::IntegrationApiState {
+                service: integrations,
+            },
             runtime_provider: config.whisper.clone(),
             instance_id: ProcessInstanceId(uuid::Uuid::new_v4().to_string()),
         }
     }
 
-    pub async fn start(self) -> Result<()> {
+    pub async fn start(self, listener: tokio::net::TcpListener) -> Result<()> {
         let db_path = self.audio_note_state.services.db_path.clone();
         // Build the API surface. All routes nest under `/api` so the daemon
         // can serve the bundled web-ui at `/` without colliding with API
@@ -106,6 +111,7 @@ impl ApiServer {
             .merge(routes::summary_templates::router())
             .merge(routes::audio_note_artifacts::router(db_path))
             .merge(routes::post_processing::router(self.post_processing_state))
+            .merge(routes::integrations::router(self.integration_state))
             .layer(Extension(self.instance_id))
             .fallback(|| async {
                 (
@@ -120,8 +126,7 @@ impl ApiServer {
             .layer(cors_layer())
             .layer(middleware::from_fn(reject_disallowed_origin));
 
-        let port = url::port()?;
-        let listener = tokio::net::TcpListener::bind(&format!("{}:{}", url::HOST, port)).await?;
+        let port = listener.local_addr()?.port();
 
         info!("API server listening on http://{}:{}", url::HOST, port);
         info!("API spec: {}", url::api_url("/openapi.json"));

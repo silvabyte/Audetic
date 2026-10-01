@@ -202,6 +202,9 @@ pub struct AudioNoteStatusResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AudioNoteSummary {
     pub capture_source: String,
+    pub source_provider: Option<String>,
+    pub source_external_id: Option<String>,
+    pub source_recorded_at: Option<String>,
     pub classification: Option<Value>,
     pub enrichment_status: String,
     pub enrichment_error: Option<String>,
@@ -228,6 +231,9 @@ pub struct AudioNotesListResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AudioNoteDetailResponse {
     pub capture_source: String,
+    pub source_provider: Option<String>,
+    pub source_external_id: Option<String>,
+    pub source_recorded_at: Option<String>,
     pub classification: Option<Value>,
     pub enrichment_status: String,
     pub enrichment_error: Option<String>,
@@ -784,6 +790,9 @@ pub async fn list_audio_notes(
         .into_iter()
         .map(|m| AudioNoteSummary {
             capture_source: m.capture_source,
+            source_provider: m.source_provider,
+            source_external_id: m.source_external_id,
+            source_recorded_at: m.source_recorded_at,
             classification: m.classification,
             enrichment_status: m.enrichment_status,
             enrichment_error: m.enrichment_error,
@@ -955,6 +964,9 @@ pub async fn get_audio_note(
     match meeting {
         Some(m) => Ok(Json(AudioNoteDetailResponse {
             capture_source: m.capture_source,
+            source_provider: m.source_provider,
+            source_external_id: m.source_external_id,
+            source_recorded_at: m.source_recorded_at,
             classification: m.classification,
             enrichment_status: m.enrichment_status,
             enrichment_error: m.enrichment_error,
@@ -1477,6 +1489,10 @@ pub async fn import_audio_note(
         source_path: source_path.clone(),
         original_filename,
         title,
+        source_provider: Some("manual_import".to_string()),
+        source_external_id: None,
+        source_recorded_at: None,
+        external_import_id: None,
         services: state.services.clone(),
         inspector: state.inspector.clone(),
         audio_notes_dir: state.audio_notes_dir.clone(),

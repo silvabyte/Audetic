@@ -18,7 +18,7 @@ Routes / surface:
 - `/audio-notes/:id` — raw transcript, audio playback and segment seeking, title editing/regeneration,
   classification/enrichment progress and retries, templates/artifacts, and soft deletion.
   Transcription and enrichment are independent: failed AI processing never hides the raw transcript.
-- `/settings/{setup,provider,capture,keybind,post-processing,appearance,config-file}` — Setup Center is the
+- `/settings/{setup,provider,capture,keybind,post-processing,integrations,appearance,config-file}` — Setup Center is the
   read-only machine capability overview; Provider offers typed validation, save, and daemon restart
 - `components/command-bar.tsx` — one capture control and status stream, owned by `AudioNotesStore`.
   Microphone capture is the default; optional system audio and review/trim are acquisition options,
@@ -32,6 +32,9 @@ Routes / surface:
 - `components/audio-review-panel.tsx`, `transcript-player.tsx`, `note-title-header.tsx`, and
   `note-artifacts-panel.tsx` are reusable note components. There are no separate dictation/meeting
   stores, routes, or status polls, and background completions do not unexpectedly change routes.
+- `stores/integrations-store.ts` and Settings → Integrations manage one-time scoped webhook keys,
+  display the isolated public ingress endpoints, configure the official Plaud CLI sync, and show recent
+  delivery outcomes. The browser never talks to the public ingress listener directly.
 - `stores/setup-store.ts` — consumes `GET /api/setup` for workflow and machine readiness. Missing
   FFmpeg never blocks the application; Settings → Setup offers the app-local installer using
   `onboarding-store`'s existing `POST /api/system/install-ffmpeg` status polling.

@@ -9,6 +9,7 @@
 
 mod args;
 mod client;
+mod integrations;
 mod keybind;
 mod logs;
 mod models;
@@ -47,6 +48,9 @@ async fn main() -> Result<()> {
         Some(CliCommand::Notes(args)) => notes::handle_notes_command(args).await,
         Some(CliCommand::PostProcessing(args)) => {
             post_processing::handle_post_processing_command(args).await
+        }
+        Some(CliCommand::Integrations(args)) => {
+            integrations::handle_integrations_command(args).await
         }
         None => {
             use clap::CommandFactory;

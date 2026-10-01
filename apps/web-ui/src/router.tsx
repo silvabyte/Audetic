@@ -7,6 +7,7 @@ import { settingsConfigFileRoute } from "./routes/settings/config-file";
 import { settingsCaptureRoute } from "./routes/settings/capture";
 import { settingsKeybindRoute } from "./routes/settings/keybind";
 import { settingsLayoutRoute } from "./routes/settings/layout";
+import { settingsIntegrationsRoute } from "./routes/settings/integrations";
 import { settingsPostProcessingRoute } from "./routes/settings/post-processing";
 import { settingsProviderRoute } from "./routes/settings/provider";
 import { settingsSetupRoute } from "./routes/settings/setup";
@@ -31,6 +32,7 @@ export function createRouter(): ReturnType<typeof createBrowserRouter> {
           settingsCaptureRoute,
           settingsKeybindRoute,
           settingsPostProcessingRoute,
+          settingsIntegrationsRoute,
           settingsAppearanceRoute,
           settingsConfigFileRoute,
         ]),
