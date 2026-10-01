@@ -26,6 +26,8 @@ use crate::db::integrations::{
 };
 
 const ACCESS_KEY_PREFIX: &str = "audetic_ingress_";
+const MAX_PLAUD_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
+const PLAUD_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -461,10 +463,7 @@ impl IntegrationService {
                 .map(parse_db_timestamp)
                 .transpose()?
         };
-        let overlap_cursor = chrono::Utc::now() - chrono::Duration::hours(24);
-        let next_cursor = import_after
-            .map(|boundary| boundary.max(overlap_cursor))
-            .unwrap_or(overlap_cursor);
+        let import_boundary = plaud_import_boundary(backfill, import_after, chrono::Utc::now());
 
         for page in 1..=1000 {
             let ids = cli.list_ids(page).await?;
@@ -476,10 +475,9 @@ impl IntegrationService {
             for id in ids {
                 let recording = cli.file(&id).await?;
                 let recorded_at = recording.start_at.as_ref().unwrap_or(&recording.created_at);
-                let recorded_at = chrono::DateTime::parse_from_rfc3339(recorded_at)
-                    .with_context(|| format!("Plaud recording {id} has an invalid timestamp"))?
-                    .with_timezone(&chrono::Utc);
-                if import_after.is_some_and(|boundary| recorded_at < boundary) {
+                let recorded_at = parse_plaud_timestamp(recorded_at)
+                    .with_context(|| format!("Plaud recording {id} has an invalid timestamp"))?;
+                if import_boundary.is_some_and(|boundary| recorded_at < boundary) {
                     reached_boundary = true;
                     continue;
                 }
@@ -506,7 +504,7 @@ impl IntegrationService {
                 anyhow::bail!("Plaud synchronization exceeded the 100,000-recording safety limit");
             }
         }
-        if !backfill {
+        if let Some(next_cursor) = import_boundary {
             let db_path = self.db_path.clone();
             let next_cursor = next_cursor.format("%Y-%m-%d %H:%M:%S").to_string();
             tokio::task::spawn_blocking(move || {
@@ -561,15 +559,15 @@ impl IntegrationService {
         let path = uploads_dir.join(format!("plaud-{}", Uuid::new_v4().simple()));
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(120))
+            .timeout(PLAUD_DOWNLOAD_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()?;
         let mut response = client.get(url).send().await?.error_for_status()?;
         if response
             .content_length()
-            .is_some_and(|length| length > ingress::MAX_UPLOAD_BYTES)
+            .is_some_and(|length| length > MAX_PLAUD_AUDIO_BYTES)
         {
-            anyhow::bail!("Plaud audio exceeds the 50 MiB limit");
+            anyhow::bail!("Plaud audio exceeds the 1 GiB limit");
         }
         let download_result = async {
             let mut file = tokio::fs::File::create(&path).await?;
@@ -577,8 +575,8 @@ impl IntegrationService {
             while let Some(chunk) = response.chunk().await? {
                 written = written.saturating_add(chunk.len() as u64);
                 anyhow::ensure!(
-                    written <= ingress::MAX_UPLOAD_BYTES,
-                    "Plaud audio exceeds the 50 MiB limit"
+                    written <= MAX_PLAUD_AUDIO_BYTES,
+                    "Plaud audio exceeds the 1 GiB limit"
                 );
                 file.write_all(&chunk).await?;
             }
@@ -694,6 +692,30 @@ fn parse_db_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
     Ok(naive.and_utc())
 }
 
+fn parse_plaud_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return Ok(timestamp.with_timezone(&chrono::Utc));
+    }
+    let naive = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")?;
+    Ok(naive.and_utc())
+}
+
+fn plaud_import_boundary(
+    backfill: bool,
+    import_after: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if backfill {
+        return None;
+    }
+    let overlap_boundary = now - chrono::Duration::hours(24);
+    Some(
+        import_after
+            .map(|boundary| boundary.max(overlap_boundary))
+            .unwrap_or(overlap_boundary),
+    )
+}
+
 fn plaud_sync_is_due(state: &PlaudSyncState) -> bool {
     let Some(last_started) = state.last_started_at.as_deref() else {
         return true;
@@ -722,5 +744,37 @@ mod tests {
         ] {
             assert!(token_id(invalid).is_none(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn plaud_timestamp_parser_accepts_official_naive_utc_format() {
+        assert_eq!(
+            parse_plaud_timestamp("2026-09-30T13:01:11").unwrap(),
+            chrono::DateTime::parse_from_rfc3339("2026-09-30T13:01:11Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        );
+        assert_eq!(
+            parse_plaud_timestamp("2026-09-12T13:35:45.446000").unwrap(),
+            chrono::DateTime::parse_from_rfc3339("2026-09-12T13:35:45.446000Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        );
+    }
+
+    #[test]
+    fn first_incremental_plaud_sync_only_scans_the_last_day() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T16:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(
+            plaud_import_boundary(false, None, now),
+            Some(now - chrono::Duration::hours(24))
+        );
+        assert_eq!(
+            plaud_import_boundary(false, Some(now - chrono::Duration::hours(48)), now),
+            Some(now - chrono::Duration::hours(24))
+        );
+        assert_eq!(plaud_import_boundary(true, None, now), None);
     }
 }

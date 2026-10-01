@@ -45,7 +45,12 @@ the `ingest.audetic.link` tunnel to target port 3739 only.
 Create and revoke scoped, one-time bearer keys in Settings → Integrations or
 with `audetic integrations keys`. The generic endpoint accepts multipart fields
 `audio`, `external_id`, and optional RFC 3339 `recorded_at` and `title`. Repeated
-provider/key/external-ID deliveries are idempotent. Uploads are limited to 50 MiB.
+provider/key/external-ID deliveries are idempotent. Public webhook uploads are
+limited to 50 MiB.
+
+For Pebble Index, configure the generated key as an `Authorization` header with
+the value `Bearer <key>`, and add `X-Index-Webhook-Version` with the value `1`.
+Use `https://ingest.audetic.link/v1/index` as the webhook URL and enable audio.
 
 Plaud synchronization uses the official `@plaud-ai/cli`. Install it, run
 `plaud login`, then enable incremental sync or explicitly import history:
@@ -56,6 +61,9 @@ audetic integrations plaud enable --interval-minutes 15
 audetic integrations plaud sync
 audetic integrations plaud backfill
 ```
+
+Plaud downloads stream to disk with a 1 GiB limit and a 30-minute timeout so
+long recordings do not inherit the public webhook limit.
 
 External recordings enter the same import, transcription, enrichment, and
 post-processing pipeline as manual imports. Their provider, external ID, and
