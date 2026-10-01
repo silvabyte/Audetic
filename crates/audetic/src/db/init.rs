@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::time::Duration;
 
-pub(crate) const SCHEMA_VERSION: i64 = 1;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 pub fn init_db() -> Result<Connection> {
     init_db_at(&crate::global::db_file()?)
@@ -47,6 +47,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             [],
             |row| row.get(0),
         )?;
+        if version == 1 {
+            migrate_v1_to_v2(conn)?;
+            return Ok(());
+        }
         if version != SCHEMA_VERSION {
             bail!("Unsupported Audio Notes schema version {version}; expected {SCHEMA_VERSION}");
         }
@@ -77,6 +81,9 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
             deleted_at TIMESTAMP,
             capture_source TEXT NOT NULL DEFAULT 'microphone',
+            source_provider TEXT,
+            source_external_id TEXT,
+            source_recorded_at TIMESTAMP,
             classification TEXT CHECK(classification IS NULL OR json_valid(classification)),
             enrichment_status TEXT NOT NULL DEFAULT 'pending'
                 CHECK(enrichment_status IN ('pending', 'running', 'completed', 'error')),
@@ -86,6 +93,50 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             WHERE deleted_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_audio_notes_status ON audio_notes(status);
         CREATE INDEX IF NOT EXISTS idx_audio_notes_kind ON audio_notes(json_extract(classification, '$.kind'));
+        CREATE INDEX IF NOT EXISTS idx_audio_notes_source ON audio_notes(source_provider, source_external_id);
+        CREATE TABLE IF NOT EXISTS ingress_access_keys (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL CHECK(trim(name) <> ''),
+            scope TEXT NOT NULL CHECK(scope IN ('index', 'generic')),
+            secret_hash BLOB NOT NULL UNIQUE
+                CHECK(typeof(secret_hash) = 'blob' AND length(secret_hash) = 32),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_used_at TIMESTAMP,
+            revoked_at TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_ingress_access_keys_active
+            ON ingress_access_keys(scope, revoked_at);
+        CREATE TABLE IF NOT EXISTS external_imports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL CHECK(trim(provider) <> ''),
+            source_instance TEXT NOT NULL CHECK(trim(source_instance) <> ''),
+            external_id TEXT NOT NULL CHECK(trim(external_id) <> ''),
+            status TEXT NOT NULL CHECK(status IN ('pending', 'accepted', 'failed')),
+            audio_note_id INTEGER REFERENCES audio_notes(id),
+            recorded_at TIMESTAMP,
+            source_filename TEXT,
+            error TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 1 CHECK(attempt_count > 0),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(provider, source_instance, external_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_external_imports_recent
+            ON external_imports(created_at DESC, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_external_imports_note
+            ON external_imports(audio_note_id);
+        CREATE TABLE IF NOT EXISTS plaud_sync_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+            interval_minutes INTEGER NOT NULL DEFAULT 15 CHECK(interval_minutes BETWEEN 5 AND 1440),
+            import_after TIMESTAMP,
+            running INTEGER NOT NULL DEFAULT 0 CHECK(running IN (0, 1)),
+            last_started_at TIMESTAMP,
+            last_completed_at TIMESTAMP,
+            last_error TEXT,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        INSERT OR IGNORE INTO plaud_sync_state(singleton) VALUES(1);
         CREATE TABLE IF NOT EXISTS post_processing_jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL, event TEXT NOT NULL, action_type TEXT NOT NULL,
@@ -121,9 +172,67 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             version INTEGER NOT NULL, migrated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        INSERT OR IGNORE INTO audio_notes_schema(singleton, version) VALUES(1, 1);",
+        INSERT OR IGNORE INTO audio_notes_schema(singleton, version) VALUES(1, 2);",
     ).context("Failed to create unified Audio Notes schema")?;
     Ok(())
+}
+
+fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE audio_notes ADD COLUMN source_provider TEXT;
+         ALTER TABLE audio_notes ADD COLUMN source_external_id TEXT;
+         ALTER TABLE audio_notes ADD COLUMN source_recorded_at TIMESTAMP;
+         CREATE INDEX idx_audio_notes_source ON audio_notes(source_provider, source_external_id);
+         CREATE TABLE ingress_access_keys (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL CHECK(trim(name) <> ''),
+            scope TEXT NOT NULL CHECK(scope IN ('index', 'generic')),
+            secret_hash BLOB NOT NULL UNIQUE
+                CHECK(typeof(secret_hash) = 'blob' AND length(secret_hash) = 32),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            last_used_at TIMESTAMP,
+            revoked_at TIMESTAMP
+         );
+         CREATE INDEX idx_ingress_access_keys_active
+            ON ingress_access_keys(scope, revoked_at);
+         CREATE TABLE external_imports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            provider TEXT NOT NULL CHECK(trim(provider) <> ''),
+            source_instance TEXT NOT NULL CHECK(trim(source_instance) <> ''),
+            external_id TEXT NOT NULL CHECK(trim(external_id) <> ''),
+            status TEXT NOT NULL CHECK(status IN ('pending', 'accepted', 'failed')),
+            audio_note_id INTEGER REFERENCES audio_notes(id),
+            recorded_at TIMESTAMP,
+            source_filename TEXT,
+            error TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 1 CHECK(attempt_count > 0),
+            created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(provider, source_instance, external_id)
+         );
+         CREATE INDEX idx_external_imports_recent
+            ON external_imports(created_at DESC, id DESC);
+         CREATE INDEX idx_external_imports_note ON external_imports(audio_note_id);
+         CREATE TABLE plaud_sync_state (
+            singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+            enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+            interval_minutes INTEGER NOT NULL DEFAULT 15 CHECK(interval_minutes BETWEEN 5 AND 1440),
+            import_after TIMESTAMP,
+            running INTEGER NOT NULL DEFAULT 0 CHECK(running IN (0, 1)),
+            last_started_at TIMESTAMP,
+            last_completed_at TIMESTAMP,
+            last_error TEXT,
+            updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+         );
+         INSERT INTO plaud_sync_state(singleton) VALUES(1);
+         UPDATE audio_notes_schema
+            SET version = 2, migrated_at = CURRENT_TIMESTAMP
+            WHERE singleton = 1;",
+    )
+    .context("Failed to migrate Audio Notes schema from version 1 to 2")?;
+    tx.commit()
+        .context("Failed to commit Audio Notes schema version 2 migration")
 }
 
 #[cfg(test)]
@@ -181,5 +290,57 @@ mod tests {
             .to_string()
             .contains("Unversioned"));
         assert!(!table_exists(&conn, "audio_notes_schema").unwrap());
+    }
+
+    #[test]
+    fn version_one_database_migrates_without_losing_audio_notes() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audio_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT, title_source TEXT, title_updated_at TIMESTAMP,
+                title_version INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'recording',
+                audio_path TEXT NOT NULL,
+                source_filename TEXT,
+                transcript_path TEXT, transcript_text TEXT, transcript_segments TEXT,
+                duration_seconds INTEGER,
+                started_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP, error TEXT,
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TIMESTAMP,
+                capture_source TEXT NOT NULL DEFAULT 'microphone',
+                classification TEXT,
+                enrichment_status TEXT NOT NULL DEFAULT 'pending',
+                enrichment_error TEXT
+            );
+            CREATE TABLE audio_notes_schema (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                version INTEGER NOT NULL, migrated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO audio_notes_schema(singleton, version) VALUES(1, 1);
+            INSERT INTO audio_notes(title, audio_path) VALUES('Keep me', '/tmp/keep.wav');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row(
+                "SELECT version FROM audio_notes_schema WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let title: String = conn
+            .query_row("SELECT title FROM audio_notes WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, 2);
+        assert_eq!(title, "Keep me");
+        assert!(table_exists(&conn, "ingress_access_keys").unwrap());
+        assert!(table_exists(&conn, "external_imports").unwrap());
+        assert!(table_exists(&conn, "plaud_sync_state").unwrap());
     }
 }

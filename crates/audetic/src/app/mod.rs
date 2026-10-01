@@ -6,6 +6,9 @@ mod command;
 pub use command::DaemonCommand;
 
 use anyhow::{anyhow, Context, Result};
+use fs2::FileExt;
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, Notify};
@@ -129,6 +132,15 @@ pub async fn run_service() -> Result<()> {
     // Refuse legacy schemas before opening devices, requesting permissions, or
     // accepting HTTP requests. The error contains offline migration instructions.
     let db_path = crate::global::db_file()?;
+    let _instance_lock = acquire_instance_lock(&db_path)?;
+    let api_listener =
+        tokio::net::TcpListener::bind((audetic_core::url::HOST, audetic_core::url::port()?))
+            .await
+            .context("The Audetic API port is already in use; another daemon may be running")?;
+    let ingress_listener =
+        tokio::net::TcpListener::bind(crate::integrations::ingress::ingress_bind_addr()?)
+            .await
+            .context("The Audetic ingress port is already in use")?;
     {
         let conn = crate::db::init_db_at(&db_path)?;
         crate::db::agent_profiles::AgentProfileRepository::ensure_builtin_profiles(&conn)?;
@@ -171,23 +183,40 @@ pub async fn run_service() -> Result<()> {
         audio_notes_dir.clone(),
         db_path.clone(),
     );
+    let processing_services = ProcessingServices::new(transcription.clone(), db_path.clone());
+    let inspector = Arc::new(FfprobeMediaInspector);
     let state = crate::api::routes::audio_notes::AudioNoteState {
         config_path: crate::global::config_file()?,
         tx,
         status,
         transcription: transcription.clone(),
-        services: ProcessingServices::new(transcription, db_path.clone()),
-        inspector: Arc::new(FfprobeMediaInspector),
-        audio_notes_dir,
+        services: processing_services.clone(),
+        inspector: inspector.clone(),
+        audio_notes_dir: audio_notes_dir.clone(),
     };
+    let integration_service = crate::integrations::IntegrationService::new(
+        db_path.clone(),
+        audio_notes_dir,
+        processing_services,
+        inspector,
+    );
+    integration_service.recover_interrupted_work().await?;
+    integration_service.spawn_plaud_scheduler();
     let server = ApiServer::new(
         state,
         &config,
         Arc::new(crate::post_processing::PostProcessingService::new(db_path)),
+        integration_service.clone(),
     );
     tokio::spawn(async move {
-        if let Err(error) = server.start().await {
+        if let Err(error) = server.start(api_listener).await {
             error!("API server failed: {error:#}");
+        }
+    });
+    let ingress = crate::integrations::ingress::IngressServer::new(integration_service);
+    tokio::spawn(async move {
+        if let Err(error) = ingress.serve(ingress_listener).await {
+            error!("External audio ingress server failed: {error:#}");
         }
     });
     info!("Audetic Audio Notes ready");
@@ -221,6 +250,23 @@ pub async fn run_service() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn acquire_instance_lock(db_path: &Path) -> Result<File> {
+    if let Some(parent) = db_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let lock_path = db_path.with_extension("lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open daemon lock at {}", lock_path.display()))?;
+    FileExt::try_lock_exclusive(&lock)
+        .context("Another Audetic daemon is already using this data directory")?;
+    Ok(lock)
 }
 
 /// The adapter runs the configured provider, not a silent cloud fallback. It
@@ -411,5 +457,15 @@ mod tests {
         let mut config = Config::default();
         config.whisper.provider = Some("not-a-provider".to_string());
         assert!(build_transcription_service(&config).is_err());
+    }
+
+    #[test]
+    fn database_lock_rejects_a_second_daemon() {
+        let directory = tempfile::tempdir().unwrap();
+        let db_path = directory.path().join("audetic.db");
+        let first = acquire_instance_lock(&db_path).unwrap();
+        assert!(acquire_instance_lock(&db_path).is_err());
+        drop(first);
+        assert!(acquire_instance_lock(&db_path).is_ok());
     }
 }

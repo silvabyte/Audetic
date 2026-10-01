@@ -7,8 +7,8 @@
 use utoipa::OpenApi;
 
 use super::routes::{
-    agents, audio_note_artifacts, audio_notes, keybind, logs, models, post_processing, provider,
-    setup, summary_templates, system,
+    agents, audio_note_artifacts, audio_notes, integrations, keybind, logs, models,
+    post_processing, provider, setup, summary_templates, system,
 };
 
 #[derive(OpenApi)]
@@ -70,6 +70,16 @@ use super::routes::{
         audio_notes::retry_audio_note,
         audio_notes::process_audio_note,
         audio_notes::import_audio_note,
+        // External integrations
+        integrations::get_overview,
+        integrations::list_access_keys,
+        integrations::create_access_key,
+        integrations::revoke_access_key,
+        integrations::list_imports,
+        integrations::get_plaud_status,
+        integrations::update_plaud_settings,
+        integrations::sync_plaud,
+        integrations::backfill_plaud,
         // AudioNote intelligence
         agents::list_agent_profiles,
         agents::test_agent_profile,
@@ -147,6 +157,19 @@ use super::routes::{
         audio_notes::AudioNoteRetryResponse,
         audio_notes::AudioNoteDeleteResponse,
         audio_notes::AudioNoteImportResponse,
+        // External integrations
+        integrations::IntegrationOverview,
+        integrations::CreateAccessKeyRequest,
+        integrations::AccessKeyListResponse,
+        integrations::ExternalImportListResponse,
+        crate::integrations::AccessKeyScope,
+        crate::integrations::AccessKeyInfo,
+        crate::integrations::IssuedAccessKey,
+        crate::integrations::ExternalImportInfo,
+        integrations::UpdatePlaudSettingsRequest,
+        crate::integrations::PlaudStatus,
+        crate::integrations::PlaudSyncAccepted,
+        crate::api::error::ApiErrorResponse,
         // AudioNote intelligence
         crate::db::agent_profiles::AgentProfile,
         crate::db::agent_profiles::PromptMode,
@@ -187,6 +210,7 @@ use super::routes::{
         (name = "update", description = "Daemon self-update"),
         (name = "logs", description = "Application and transcription logs"),
         (name = "post_processing", description = "User-defined commands fired on daemon events"),
+        (name = "integrations", description = "External audio integrations and ingress credentials"),
     ),
 )]
 pub struct ApiDoc;
@@ -233,6 +257,12 @@ mod tests {
             paths::VERSION,
             paths::AUDIO_NOTES_TOGGLE,
             paths::AUDIO_NOTES_IMPORT,
+            paths::INTEGRATIONS,
+            paths::INTEGRATION_KEYS,
+            paths::INTEGRATION_IMPORTS,
+            paths::INTEGRATION_PLAUD,
+            paths::INTEGRATION_PLAUD_SYNC,
+            paths::INTEGRATION_PLAUD_BACKFILL,
             paths::AGENT_PROFILES,
             paths::SUMMARY_TEMPLATES,
             paths::POST_PROCESSING_JOBS,

@@ -20,11 +20,32 @@ pub const HOST: &str = "127.0.0.1";
 /// Default TCP port. WHSP in numbers (W=23, H=8, S=19, P=16 → 3737).
 pub const DEFAULT_PORT: u16 = 3737;
 
+/// Dedicated loopback listener for authenticated third-party audio ingress.
+/// It intentionally does not serve the local API or SPA.
+pub const INGRESS_PORT: u16 = 3739;
+
 /// Alternate loopback port for an isolated development installation. Both the
 /// daemon and CLI validate this before starting, so a typo never targets the
 /// normal installation accidentally.
 pub fn port() -> anyhow::Result<u16> {
     parse_port(std::env::var("AUDETIC_PORT").ok().as_deref())
+}
+
+pub fn ingress_port() -> anyhow::Result<u16> {
+    let value = std::env::var("AUDETIC_INGRESS_PORT").ok();
+    let port = value
+        .as_deref()
+        .map(str::parse::<u16>)
+        .transpose()
+        .map_err(|_| {
+            anyhow::anyhow!("AUDETIC_INGRESS_PORT must be a TCP port between 1 and 65535")
+        })?
+        .unwrap_or(INGRESS_PORT);
+    anyhow::ensure!(
+        port != 0,
+        "AUDETIC_INGRESS_PORT must be between 1 and 65535"
+    );
+    Ok(port)
 }
 
 fn parse_port(value: Option<&str>) -> anyhow::Result<u16> {
@@ -63,6 +84,12 @@ pub mod paths {
     pub const AUDIO_NOTES_SETTINGS: &str = "/audio-notes/settings";
     pub const AUDIO_NOTES_IMPORT: &str = "/audio-notes/import";
     pub const AUDIO_NOTES_RECENT_TITLES: &str = "/audio-notes/recent-titles";
+    pub const INTEGRATIONS: &str = "/integrations";
+    pub const INTEGRATION_KEYS: &str = "/integrations/keys";
+    pub const INTEGRATION_IMPORTS: &str = "/integrations/imports";
+    pub const INTEGRATION_PLAUD: &str = "/integrations/plaud";
+    pub const INTEGRATION_PLAUD_SYNC: &str = "/integrations/plaud/sync";
+    pub const INTEGRATION_PLAUD_BACKFILL: &str = "/integrations/plaud/backfill";
     pub const AGENT_PROFILES: &str = "/agent-profiles";
     pub const SUMMARY_TEMPLATES: &str = "/summary/templates";
     pub const POST_PROCESSING_JOBS: &str = "/post-processing/jobs";
@@ -118,6 +145,10 @@ pub fn audio_note_artifacts_path(id: i64) -> String {
 
 pub fn audio_note_artifact_path(id: i64, artifact_id: i64) -> String {
     format!("{}/{artifact_id}", audio_note_artifacts_path(id))
+}
+
+pub fn integration_key_path(id: &str) -> String {
+    format!("{}/{id}", paths::INTEGRATION_KEYS)
 }
 
 /// Path to one model's status: `MODELS/{id}`.

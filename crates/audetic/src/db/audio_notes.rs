@@ -33,6 +33,9 @@ pub struct AudioNoteRecord {
     pub created_at: String,
     pub deleted_at: Option<String>,
     pub capture_source: String,
+    pub source_provider: Option<String>,
+    pub source_external_id: Option<String>,
+    pub source_recorded_at: Option<String>,
     pub classification: Option<Value>,
     pub enrichment_status: String,
     pub enrichment_error: Option<String>,
@@ -40,14 +43,15 @@ pub struct AudioNoteRecord {
 
 const COLUMNS: &str = "id, title, title_source, title_version, status, audio_path, source_filename, \
     transcript_path, transcript_text, transcript_segments, duration_seconds, started_at, completed_at, \
-    error, created_at, deleted_at, capture_source, classification, enrichment_status, enrichment_error";
+    error, created_at, deleted_at, capture_source, source_provider, source_external_id, \
+    source_recorded_at, classification, enrichment_status, enrichment_error";
 
 // SQLite trim() defaults to ASCII space only. Match Rust's Unicode White_Space
 // trimming so the atomic claim rejects the same blank transcripts as domain validation.
 const TRANSCRIPT_WHITESPACE: &str = "\t\n\u{b}\u{c}\r \u{85}\u{a0}\u{1680}\u{2000}\u{2001}\u{2002}\u{2003}\u{2004}\u{2005}\u{2006}\u{2007}\u{2008}\u{2009}\u{200a}\u{2028}\u{2029}\u{202f}\u{205f}\u{3000}";
 
 fn decode_row(row: &Row<'_>) -> rusqlite::Result<AudioNoteRecord> {
-    let classification = row.get::<_, Option<String>>(17)?;
+    let classification = row.get::<_, Option<String>>(20)?;
     Ok(AudioNoteRecord {
         id: row.get(0)?,
         title: row.get(1)?,
@@ -70,18 +74,21 @@ fn decode_row(row: &Row<'_>) -> rusqlite::Result<AudioNoteRecord> {
         created_at: row.get(14)?,
         deleted_at: row.get(15)?,
         capture_source: row.get(16)?,
+        source_provider: row.get(17)?,
+        source_external_id: row.get(18)?,
+        source_recorded_at: row.get(19)?,
         classification: classification
             .map(|s| serde_json::from_str(&s))
             .transpose()
             .map_err(|e| {
                 rusqlite::Error::FromSqlConversionFailure(
-                    17,
+                    20,
                     rusqlite::types::Type::Text,
                     Box::new(e),
                 )
             })?,
-        enrichment_status: row.get(18)?,
-        enrichment_error: row.get(19)?,
+        enrichment_status: row.get(21)?,
+        enrichment_error: row.get(22)?,
     })
 }
 
@@ -150,6 +157,29 @@ impl AudioNoteRepository {
         conn.execute(
             "UPDATE audio_notes SET capture_source=?1 WHERE id=?2",
             params![source, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn set_source_metadata(
+        conn: &Connection,
+        id: i64,
+        provider: Option<&str>,
+        external_id: Option<&str>,
+        recorded_at: Option<&str>,
+    ) -> Result<()> {
+        let provider = provider.map(str::trim).filter(|value| !value.is_empty());
+        let external_id = external_id.map(str::trim).filter(|value| !value.is_empty());
+        if external_id.is_some() && provider.is_none() {
+            bail!("Audio Note source provider is required with an external ID");
+        }
+        conn.execute(
+            "UPDATE audio_notes
+             SET source_provider = ?1, source_external_id = ?2,
+                 source_recorded_at = ?3,
+                 started_at = COALESCE(?3, started_at)
+             WHERE id = ?4",
+            params![provider, external_id, recorded_at, id],
         )?;
         Ok(())
     }

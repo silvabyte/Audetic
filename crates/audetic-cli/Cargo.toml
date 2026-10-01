@@ -35,3 +35,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 indicatif = "0.17"
 chrono = "0.4"
 which = "6.0"
+uuid = "1.6"

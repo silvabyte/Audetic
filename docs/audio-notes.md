@@ -35,6 +35,32 @@ Each capture can override it. If enabled, the persisted raw transcript is pasted
 immediately; later AI results never replace it or get pasted into another window.
 Clipboard copying is a separate opt-in capture option or explicit note action.
 
+### External imports
+
+Audetic accepts external recordings through a dedicated loopback listener on
+`127.0.0.1:3739`. It serves only authenticated `POST /v1/index` and
+`POST /v1/audio`; the local API and SPA remain on `127.0.0.1:3737`. Configure
+the `ingest.audetic.link` tunnel to target port 3739 only.
+
+Create and revoke scoped, one-time bearer keys in Settings → Integrations or
+with `audetic integrations keys`. The generic endpoint accepts multipart fields
+`audio`, `external_id`, and optional RFC 3339 `recorded_at` and `title`. Repeated
+provider/key/external-ID deliveries are idempotent. Uploads are limited to 50 MiB.
+
+Plaud synchronization uses the official `@plaud-ai/cli`. Install it, run
+`plaud login`, then enable incremental sync or explicitly import history:
+
+```sh
+audetic integrations plaud status
+audetic integrations plaud enable --interval-minutes 15
+audetic integrations plaud sync
+audetic integrations plaud backfill
+```
+
+External recordings enter the same import, transcription, enrichment, and
+post-processing pipeline as manual imports. Their provider, external ID, and
+original recording time remain attached to the Audio Note.
+
 Raw capture/transcription status and enrichment status are independent. A missing
 or failed agent does not hide a successful transcription. The note exposes the
 error and a **Retry AI processing** action. Restart marks interrupted processing
@@ -110,7 +136,9 @@ storage before starting the updated daemon. Old `/meetings`, `/history`, `/toggl
 and `/transcribe` API routes and meeting/history/transcribe CLI commands are removed.
 
 For an isolated Linux development instance, set separate `XDG_CONFIG_HOME` and
-`XDG_DATA_HOME`, and set `AUDETIC_PORT=3837` for both daemon and CLI. Create its
+`XDG_DATA_HOME`, and set `AUDETIC_PORT=3837` for both daemon and CLI. Set
+`AUDETIC_INGRESS_PORT=3839` on the daemon when the production ingress listener
+is already running. Create its
 provider configuration and install/provide model assets there before recording.
 The alternate port remains loopback-only. Never point QA fixtures or migrations
 at your personal database. Without the environment override the port is 3737.

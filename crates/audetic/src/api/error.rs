@@ -5,7 +5,14 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
+use serde::Serialize;
+use utoipa::ToSchema;
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApiErrorResponse {
+    pub error: bool,
+    pub message: String,
+}
 
 /// API error type that converts to JSON responses.
 #[derive(Debug)]
@@ -37,10 +44,10 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        let body = Json(json!({
-            "error": true,
-            "message": self.message,
-        }));
+        let body = Json(ApiErrorResponse {
+            error: true,
+            message: self.message,
+        });
         (self.status, body).into_response()
     }
 }

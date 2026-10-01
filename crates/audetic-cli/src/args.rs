@@ -32,6 +32,88 @@ pub enum CliCommand {
     Notes(NotesCliArgs),
     /// Manage post-processing jobs (run commands on daemon events)
     PostProcessing(PostProcessingCliArgs),
+    /// Manage external audio integrations
+    Integrations(IntegrationsCliArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct IntegrationsCliArgs {
+    #[command(subcommand)]
+    pub command: IntegrationsCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IntegrationsCommand {
+    /// Show external ingress endpoints
+    Status,
+    /// Manage one-time ingress access keys
+    Keys(IntegrationKeysArgs),
+    /// Inspect recent external imports
+    Imports {
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    /// Configure and run Plaud synchronization
+    Plaud(PlaudArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct IntegrationKeysArgs {
+    #[command(subcommand)]
+    pub command: IntegrationKeysCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum IntegrationKeysCommand {
+    /// Create a key; its plaintext is displayed exactly once
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_enum)]
+        scope: IntegrationKeyScope,
+    },
+    /// List key metadata without secrets or hashes
+    List,
+    /// Revoke a key immediately
+    Revoke { id: String },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum IntegrationKeyScope {
+    Index,
+    Generic,
+}
+
+impl IntegrationKeyScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Index => "index",
+            Self::Generic => "generic",
+        }
+    }
+}
+
+#[derive(ClapArgs, Debug)]
+pub struct PlaudArgs {
+    #[command(subcommand)]
+    pub command: PlaudCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PlaudCommand {
+    /// Show CLI readiness and synchronization state
+    Status,
+    /// Enable periodic synchronization for new recordings
+    Enable {
+        #[arg(long, default_value = "15")]
+        interval_minutes: i64,
+    },
+    /// Disable periodic synchronization
+    Disable,
+    /// Schedule an incremental synchronization
+    Sync,
+    /// Schedule a historical backfill
+    Backfill,
 }
 
 #[derive(ClapArgs, Debug)]
