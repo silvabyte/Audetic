@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Processor {
-    pub artifact_kind: String,
     pub template_id: String,
 }
 
@@ -17,27 +16,25 @@ pub struct ProcessorRegistry {
 impl Default for ProcessorRegistry {
     fn default() -> Self {
         let fallback = Processor {
-            artifact_kind: "summary".into(),
             template_id: "general_note".into(),
         };
         let mut registry = Self {
             entries: BTreeMap::new(),
             fallback,
         };
-        for (kind, artifact, template) in [
-            ("meeting", "summary", "standard_meeting"),
-            ("dictation", "cleaned_text", "cleaned_dictation"),
-            ("conversation", "summary", "conversation"),
-            ("request", "intent", "request_intent"),
-            ("shopping-list", "shopping_items", "request_intent"),
-            ("shopping_list", "shopping_items", "request_intent"),
-            ("general", "summary", "general_note"),
+        for (kind, template) in [
+            ("meeting", "standard_meeting"),
+            ("dictation", "cleaned_dictation"),
+            ("conversation", "conversation"),
+            ("request", "request_intent"),
+            ("shopping-list", "shopping_items"),
+            ("shopping_list", "shopping_items"),
+            ("general", "general_note"),
         ] {
             registry
                 .register(
                     kind,
                     Processor {
-                        artifact_kind: artifact.into(),
                         template_id: template.into(),
                     },
                 )
@@ -52,10 +49,6 @@ impl ProcessorRegistry {
         anyhow::ensure!(
             super::classification::valid_kind(kind),
             "processor kind must be a slug"
-        );
-        anyhow::ensure!(
-            !processor.artifact_kind.trim().is_empty(),
-            "processor artifact kind cannot be blank"
         );
         crate::summary_templates::get_template(&processor.template_id)?.validate()?;
         self.entries.insert(kind.into(), processor);
@@ -73,11 +66,14 @@ mod tests {
     fn routes_builtins_and_extensible_unknown_kind() {
         let mut registry = ProcessorRegistry::default();
         assert_eq!(registry.resolve("meeting").template_id, "standard_meeting");
-        assert_eq!(registry.resolve("dictation").artifact_kind, "cleaned_text");
-        assert_eq!(registry.resolve("conversation").template_id, "conversation");
-        assert_eq!(registry.resolve("request").artifact_kind, "intent");
         assert_eq!(
-            registry.resolve("shopping-list").artifact_kind,
+            registry.resolve("dictation").template_id,
+            "cleaned_dictation"
+        );
+        assert_eq!(registry.resolve("conversation").template_id, "conversation");
+        assert_eq!(registry.resolve("request").template_id, "request_intent");
+        assert_eq!(
+            registry.resolve("shopping-list").template_id,
             "shopping_items"
         );
         assert_eq!(registry.resolve("new-kind").template_id, "general_note");
@@ -85,7 +81,6 @@ mod tests {
             .register(
                 "new-kind",
                 Processor {
-                    artifact_kind: "tasks".into(),
                     template_id: "action_items".into(),
                 },
             )

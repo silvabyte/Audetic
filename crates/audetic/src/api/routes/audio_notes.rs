@@ -5,7 +5,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Router,
 };
 use serde::{Deserialize, Serialize};
@@ -206,6 +206,8 @@ pub struct AudioNoteSummary {
     pub source_external_id: Option<String>,
     pub source_recorded_at: Option<String>,
     pub classification: Option<Value>,
+    pub classification_kind: Option<String>,
+    pub classification_kind_override: Option<String>,
     pub enrichment_status: String,
     pub enrichment_error: Option<String>,
     /// Persisted raw transcript, not enriched output.
@@ -235,6 +237,8 @@ pub struct AudioNoteDetailResponse {
     pub source_external_id: Option<String>,
     pub source_recorded_at: Option<String>,
     pub classification: Option<Value>,
+    pub classification_kind: Option<String>,
+    pub classification_kind_override: Option<String>,
     pub enrichment_status: String,
     pub enrichment_error: Option<String>,
     pub id: i64,
@@ -331,6 +335,24 @@ pub struct AudioNoteTitleRegenerationResponse {
     pub message: String,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AudioNoteClassificationsResponse {
+    pub kinds: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct AudioNoteClassificationUpdateRequest {
+    pub kind: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AudioNoteClassificationResponse {
+    pub note_id: i64,
+    pub classification_kind: Option<String>,
+    pub classification_kind_override: Option<String>,
+}
+
 pub fn router(state: AudioNoteState) -> Router {
     Router::new()
         .route(
@@ -344,6 +366,10 @@ pub fn router(state: AudioNoteState) -> Router {
         .route("/audio-notes/toggle", post(toggle_audio_note))
         .route("/audio-notes/status", get(audio_note_status))
         .route("/audio-notes/recent-titles", get(recent_audio_note_titles))
+        .route(
+            "/audio-notes/classifications",
+            get(list_audio_note_classifications),
+        )
         .route("/audio-notes", get(list_audio_notes))
         .route(
             "/audio-notes/import",
@@ -360,6 +386,10 @@ pub fn router(state: AudioNoteState) -> Router {
         .route(
             "/audio-notes/:id/title",
             axum::routing::patch(update_audio_note_title),
+        )
+        .route(
+            "/audio-notes/:id/classification",
+            put(set_audio_note_classification).delete(clear_audio_note_classification),
         )
         .route(
             "/audio-notes/:id/regenerate-title",
@@ -788,24 +818,29 @@ pub async fn list_audio_notes(
 
     let entries: Vec<AudioNoteSummary> = audio_notes
         .into_iter()
-        .map(|m| AudioNoteSummary {
-            capture_source: m.capture_source,
-            source_provider: m.source_provider,
-            source_external_id: m.source_external_id,
-            source_recorded_at: m.source_recorded_at,
-            classification: m.classification,
-            enrichment_status: m.enrichment_status,
-            enrichment_error: m.enrichment_error,
-            transcript_text: m.transcript_text,
-            id: m.id,
-            title: m.title,
-            title_source: AudioNoteTitleSource::from_stored(m.title_source.as_deref()),
-            source_filename: m.source_filename,
-            status: m.status,
-            duration_seconds: m.duration_seconds,
-            started_at: m.started_at,
-            audio_path: m.audio_path,
-            transcript_path: m.transcript_path,
+        .map(|m| {
+            let classification_kind = m.effective_classification_kind().map(str::to_string);
+            AudioNoteSummary {
+                capture_source: m.capture_source,
+                source_provider: m.source_provider,
+                source_external_id: m.source_external_id,
+                source_recorded_at: m.source_recorded_at,
+                classification: m.classification,
+                classification_kind,
+                classification_kind_override: m.classification_kind_override,
+                enrichment_status: m.enrichment_status,
+                enrichment_error: m.enrichment_error,
+                transcript_text: m.transcript_text,
+                id: m.id,
+                title: m.title,
+                title_source: AudioNoteTitleSource::from_stored(m.title_source.as_deref()),
+                source_filename: m.source_filename,
+                status: m.status,
+                duration_seconds: m.duration_seconds,
+                started_at: m.started_at,
+                audio_path: m.audio_path,
+                transcript_path: m.transcript_path,
+            }
         })
         .collect();
 
@@ -835,6 +870,96 @@ pub async fn recent_audio_note_titles(
     .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
     .map_err(ApiError::from)?;
     Ok(Json(RecentAudioNoteTitlesResponse { titles }))
+}
+
+#[utoipa::path(
+    get,
+    path = "/audio-notes/classifications",
+    tag = "audio_notes",
+    responses(
+        (status = 200, description = "Distinct effective Audio Note classification kinds", body = AudioNoteClassificationsResponse),
+    ),
+)]
+pub async fn list_audio_note_classifications(
+    State(state): State<AudioNoteState>,
+) -> ApiResult<Json<AudioNoteClassificationsResponse>> {
+    let db_path = state.services.db_path.clone();
+    let kinds = tokio::task::spawn_blocking(move || {
+        let conn = crate::db::init_db_at(&db_path)?;
+        crate::db::audio_notes::AudioNoteRepository::list_classification_kinds(&conn)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
+    .map_err(ApiError::from)?;
+    Ok(Json(AudioNoteClassificationsResponse { kinds }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/audio-notes/{id}/classification",
+    tag = "audio_notes",
+    params(("id" = i64, Path, description = "AudioNote id")),
+    request_body = AudioNoteClassificationUpdateRequest,
+    responses(
+        (status = 200, description = "Manual classification override saved", body = AudioNoteClassificationResponse),
+        (status = 400, description = "Classification kind is not a valid slug"),
+        (status = 404, description = "AudioNote not found"),
+    ),
+)]
+pub async fn set_audio_note_classification(
+    Path(id): Path<i64>,
+    State(state): State<AudioNoteState>,
+    Json(request): Json<AudioNoteClassificationUpdateRequest>,
+) -> ApiResult<Json<AudioNoteClassificationResponse>> {
+    let kind = request.kind.trim().to_string();
+    crate::note_intelligence::classification::validate_kind(&kind)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    update_audio_note_classification(state, id, Some(kind)).await
+}
+
+#[utoipa::path(
+    delete,
+    path = "/audio-notes/{id}/classification",
+    tag = "audio_notes",
+    params(("id" = i64, Path, description = "AudioNote id")),
+    responses(
+        (status = 200, description = "Manual classification override cleared", body = AudioNoteClassificationResponse),
+        (status = 404, description = "AudioNote not found"),
+    ),
+)]
+pub async fn clear_audio_note_classification(
+    Path(id): Path<i64>,
+    State(state): State<AudioNoteState>,
+) -> ApiResult<Json<AudioNoteClassificationResponse>> {
+    update_audio_note_classification(state, id, None).await
+}
+
+async fn update_audio_note_classification(
+    state: AudioNoteState,
+    id: i64,
+    kind: Option<String>,
+) -> ApiResult<Json<AudioNoteClassificationResponse>> {
+    let db_path = state.services.db_path.clone();
+    let note = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = crate::db::init_db_at(&db_path)?;
+        if !crate::db::audio_notes::AudioNoteRepository::set_classification_kind_override(
+            &conn,
+            id,
+            kind.as_deref(),
+        )? {
+            return Ok(None);
+        }
+        crate::db::audio_notes::AudioNoteRepository::get(&conn, id)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("db task panicked: {error}")))?
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::not_found(format!("AudioNote {id} not found")))?;
+    Ok(Json(AudioNoteClassificationResponse {
+        note_id: id,
+        classification_kind: note.effective_classification_kind().map(str::to_string),
+        classification_kind_override: note.classification_kind_override,
+    }))
 }
 
 #[utoipa::path(
@@ -962,29 +1087,34 @@ pub async fn get_audio_note(
     })?;
 
     match meeting {
-        Some(m) => Ok(Json(AudioNoteDetailResponse {
-            capture_source: m.capture_source,
-            source_provider: m.source_provider,
-            source_external_id: m.source_external_id,
-            source_recorded_at: m.source_recorded_at,
-            classification: m.classification,
-            enrichment_status: m.enrichment_status,
-            enrichment_error: m.enrichment_error,
-            id: m.id,
-            title: m.title,
-            title_source: AudioNoteTitleSource::from_stored(m.title_source.as_deref()),
-            source_filename: m.source_filename,
-            status: m.status,
-            audio_path: m.audio_path,
-            transcript_path: m.transcript_path,
-            transcript_text: m.transcript_text,
-            transcript_segments: m.transcript_segments,
-            duration_seconds: m.duration_seconds,
-            started_at: m.started_at,
-            completed_at: m.completed_at,
-            error: m.error,
-            created_at: m.created_at,
-        })),
+        Some(m) => {
+            let classification_kind = m.effective_classification_kind().map(str::to_string);
+            Ok(Json(AudioNoteDetailResponse {
+                capture_source: m.capture_source,
+                source_provider: m.source_provider,
+                source_external_id: m.source_external_id,
+                source_recorded_at: m.source_recorded_at,
+                classification: m.classification,
+                classification_kind,
+                classification_kind_override: m.classification_kind_override,
+                enrichment_status: m.enrichment_status,
+                enrichment_error: m.enrichment_error,
+                id: m.id,
+                title: m.title,
+                title_source: AudioNoteTitleSource::from_stored(m.title_source.as_deref()),
+                source_filename: m.source_filename,
+                status: m.status,
+                audio_path: m.audio_path,
+                transcript_path: m.transcript_path,
+                transcript_text: m.transcript_text,
+                transcript_segments: m.transcript_segments,
+                duration_seconds: m.duration_seconds,
+                started_at: m.started_at,
+                completed_at: m.completed_at,
+                error: m.error,
+                created_at: m.created_at,
+            }))
+        }
         None => Err((
             StatusCode::NOT_FOUND,
             Json(json!({
@@ -1794,9 +1924,132 @@ mod tests {
         assert_eq!(body["notes"][0]["id"], first);
         assert_eq!(body["notes"][0]["transcript_text"], "buy apples");
         assert_eq!(body["notes"][0]["classification"]["kind"], "shopping-list");
+        assert_eq!(body["notes"][0]["classification_kind"], "shopping-list");
+        assert!(body["notes"][0]["classification_kind_override"].is_null());
         assert_eq!(body["notes"][0]["capture_source"], "microphone");
         assert_eq!(body["notes"][0]["enrichment_status"], "pending");
         assert!(body["notes"][0].get("enrichment_error").is_some());
+    }
+
+    #[tokio::test]
+    async fn classification_routes_set_clear_list_and_validate_manual_overrides() {
+        let (_dir, router, first, _) = fixture();
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/audio-notes/classifications")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_response(response).await,
+            json!({"kinds":["shopping-list"]})
+        );
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put(format!("/audio-notes/{first}/classification"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"kind":"  project-update  "}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_response(response).await,
+            json!({
+                "note_id": first,
+                "classification_kind": "project-update",
+                "classification_kind_override": "project-update"
+            })
+        );
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get(format!("/audio-notes/{first}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let detail = json_response(response).await;
+        assert_eq!(detail["classification"]["kind"], "shopping-list");
+        assert_eq!(detail["classification_kind"], "project-update");
+        assert_eq!(detail["classification_kind_override"], "project-update");
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/audio-notes/classifications")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            json_response(response).await,
+            json!({"kinds":["project-update"]})
+        );
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::get("/audio-notes?kind=shopping-list")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(json_response(response).await["notes"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let response = router
+            .clone()
+            .oneshot(
+                Request::put(format!("/audio-notes/{first}/classification"))
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"kind":"Not a slug"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::delete(format!("/audio-notes/{first}/classification"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            json_response(response).await,
+            json!({
+                "note_id": first,
+                "classification_kind": "shopping-list",
+                "classification_kind_override": null
+            })
+        );
+
+        let response = router
+            .oneshot(
+                Request::delete("/audio-notes/999/classification")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

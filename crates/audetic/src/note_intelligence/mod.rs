@@ -59,10 +59,10 @@ async fn enrich_with_runner(
         if matches!(note.enrichment_status.as_str(), "running" | "completed") {
             return Ok(());
         }
-        if !note
+        if note
             .transcript_text
             .as_deref()
-            .is_some_and(|text| !text.trim().is_empty())
+            .is_none_or(|text| text.trim().is_empty())
         {
             AudioNoteRepository::set_enrichment_state(
                 &tx,
@@ -168,7 +168,6 @@ async fn enrich_claimed(
     generate_with_runner(
         note_id,
         GenerateArtifactRequest {
-            kind: processor.artifact_kind.clone(),
             template_id: processor.template_id.clone(),
             agent_profile_id: Some(profile.id),
             custom_context: Some(format!(

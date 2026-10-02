@@ -37,14 +37,26 @@ pub struct AudioNoteRecord {
     pub source_external_id: Option<String>,
     pub source_recorded_at: Option<String>,
     pub classification: Option<Value>,
+    pub classification_kind_override: Option<String>,
     pub enrichment_status: String,
     pub enrichment_error: Option<String>,
+}
+
+impl AudioNoteRecord {
+    pub fn effective_classification_kind(&self) -> Option<&str> {
+        self.classification_kind_override.as_deref().or_else(|| {
+            self.classification
+                .as_ref()
+                .and_then(|classification| classification.get("kind"))
+                .and_then(Value::as_str)
+        })
+    }
 }
 
 const COLUMNS: &str = "id, title, title_source, title_version, status, audio_path, source_filename, \
     transcript_path, transcript_text, transcript_segments, duration_seconds, started_at, completed_at, \
     error, created_at, deleted_at, capture_source, source_provider, source_external_id, \
-    source_recorded_at, classification, enrichment_status, enrichment_error";
+    source_recorded_at, classification, classification_kind_override, enrichment_status, enrichment_error";
 
 // SQLite trim() defaults to ASCII space only. Match Rust's Unicode White_Space
 // trimming so the atomic claim rejects the same blank transcripts as domain validation.
@@ -77,18 +89,12 @@ fn decode_row(row: &Row<'_>) -> rusqlite::Result<AudioNoteRecord> {
         source_provider: row.get(17)?,
         source_external_id: row.get(18)?,
         source_recorded_at: row.get(19)?,
-        classification: classification
-            .map(|s| serde_json::from_str(&s))
-            .transpose()
-            .map_err(|e| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    20,
-                    rusqlite::types::Type::Text,
-                    Box::new(e),
-                )
-            })?,
-        enrichment_status: row.get(21)?,
-        enrichment_error: row.get(22)?,
+        // Version-one databases did not constrain this column. Preserve the row
+        // and treat malformed legacy metadata as unclassified.
+        classification: classification.and_then(|s| serde_json::from_str(&s).ok()),
+        classification_kind_override: row.get(21)?,
+        enrichment_status: row.get(22)?,
+        enrichment_error: row.get(23)?,
     })
 }
 
@@ -192,6 +198,39 @@ impl AudioNoteRepository {
             params![serde_json::to_string(classification)?, id],
         )?;
         Ok(())
+    }
+
+    pub fn set_classification_kind_override(
+        conn: &Connection,
+        id: i64,
+        kind: Option<&str>,
+    ) -> Result<bool> {
+        Ok(conn.execute(
+            "UPDATE audio_notes SET classification_kind_override=?1
+             WHERE id=?2 AND deleted_at IS NULL",
+            params![kind, id],
+        )? > 0)
+    }
+
+    pub fn list_classification_kinds(conn: &Connection) -> Result<Vec<String>> {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT kind
+             FROM (
+                SELECT COALESCE(
+                    classification_kind_override,
+                    CASE WHEN json_type(
+                        CASE WHEN json_valid(classification) THEN classification END,
+                        '$.kind'
+                    ) = 'text' THEN json_extract(classification, '$.kind') END
+                ) AS kind
+                FROM audio_notes
+                WHERE deleted_at IS NULL
+             )
+             WHERE kind IS NOT NULL
+             ORDER BY kind",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     pub fn set_enrichment_state(
@@ -372,7 +411,10 @@ impl AudioNoteRepository {
         // instr treats user text literally (including SQL LIKE wildcard chars).
         let mut stmt = conn.prepare(&format!("SELECT {COLUMNS} FROM audio_notes WHERE deleted_at IS NULL \
             AND (?1 IS NULL OR instr(lower(coalesce(title,'') || ' ' || coalesce(transcript_text,'')), lower(?1)) > 0) \
-            AND (?2 IS NULL OR json_extract(classification,'$.kind')=?2) \
+            AND (?2 IS NULL OR COALESCE(
+                classification_kind_override,
+                json_extract(CASE WHEN json_valid(classification) THEN classification END, '$.kind')
+            )=?2) \
             ORDER BY started_at DESC,id DESC LIMIT ?3 OFFSET ?4"))?;
         let rows = stmt.query_map(
             params![query, kind, i64::try_from(limit)?, i64::try_from(offset)?],
@@ -434,6 +476,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
+            AudioNoteRepository::get(&conn, second)
+                .unwrap()
+                .unwrap()
+                .effective_classification_kind(),
+            Some("shopping-list")
+        );
+        assert_eq!(
             AudioNoteRepository::search(&conn, Some("20%"), Some("shopping-list"), 10, 0).unwrap()
                 [0]
             .id,
@@ -446,6 +495,82 @@ mod tests {
         AudioNoteRepository::soft_delete(&conn, second).unwrap();
         assert!(AudioNoteRepository::get(&conn, second).unwrap().is_none());
         assert_eq!(AudioNoteRepository::list(&conn, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn classification_override_controls_effective_search_and_distinct_kinds() {
+        let conn = db();
+        let meeting = completed(&conn, "Planning");
+        AudioNoteRepository::set_classification(
+            &conn,
+            meeting,
+            &serde_json::json!({"kind":"meeting"}),
+        )
+        .unwrap();
+        let unclassified = completed(&conn, "Idea");
+
+        assert!(AudioNoteRepository::set_classification_kind_override(
+            &conn,
+            meeting,
+            Some("project-update")
+        )
+        .unwrap());
+        assert!(AudioNoteRepository::set_classification_kind_override(
+            &conn,
+            unclassified,
+            Some("idea")
+        )
+        .unwrap());
+        let note = AudioNoteRepository::get(&conn, meeting).unwrap().unwrap();
+        assert_eq!(
+            note.classification_kind_override.as_deref(),
+            Some("project-update")
+        );
+        assert_eq!(note.effective_classification_kind(), Some("project-update"));
+        assert!(
+            AudioNoteRepository::search(&conn, None, Some("meeting"), 10, 0)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            AudioNoteRepository::search(&conn, None, Some("project-update"), 10, 0).unwrap()[0].id,
+            meeting
+        );
+        assert_eq!(
+            AudioNoteRepository::list_classification_kinds(&conn).unwrap(),
+            vec!["idea", "project-update"]
+        );
+
+        AudioNoteRepository::set_classification(
+            &conn,
+            unclassified,
+            &serde_json::json!({"kind": 7}),
+        )
+        .unwrap();
+        AudioNoteRepository::set_classification_kind_override(&conn, unclassified, None).unwrap();
+        assert_eq!(
+            AudioNoteRepository::list_classification_kinds(&conn).unwrap(),
+            vec!["project-update"]
+        );
+
+        assert!(
+            AudioNoteRepository::set_classification_kind_override(&conn, meeting, None).unwrap()
+        );
+        assert_eq!(
+            AudioNoteRepository::get(&conn, meeting)
+                .unwrap()
+                .unwrap()
+                .effective_classification_kind(),
+            Some("meeting")
+        );
+        AudioNoteRepository::soft_delete(&conn, meeting).unwrap();
+        assert!(!AudioNoteRepository::set_classification_kind_override(
+            &conn,
+            meeting,
+            Some("deleted")
+        )
+        .unwrap());
+        assert!(!AudioNoteRepository::set_classification_kind_override(&conn, 999, None).unwrap());
     }
 
     #[test]

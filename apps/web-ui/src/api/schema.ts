@@ -100,6 +100,22 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/audio-notes/classifications": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get: operations["list_audio_note_classifications"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/audio-notes/confirm": {
         parameters: {
             query?: never;
@@ -323,6 +339,22 @@ export interface paths {
         put?: never;
         post?: never;
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/audio-notes/{id}/classification": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put: operations["set_audio_note_classification"];
+        post?: never;
+        delete: operations["clear_audio_note_classification"];
         options?: never;
         head?: never;
         patch?: never;
@@ -1034,6 +1066,8 @@ export interface components {
             message: string;
         };
         /** @enum {string} */
+        ArtifactKind: "meeting_minutes" | "summary" | "action_items" | "talking_points" | "mind_map" | "cleaned_text" | "intent" | "shopping_items";
+        /** @enum {string} */
         ArtifactStatus: "pending" | "running" | "completed" | "error";
         AudioNoteArtifact: {
             /** Format: int64 */
@@ -1060,6 +1094,18 @@ export interface components {
         };
         /** @enum {string} */
         AudioNoteCaptureSource: "microphone" | "microphone_and_system";
+        AudioNoteClassificationResponse: {
+            classification_kind?: string | null;
+            classification_kind_override?: string | null;
+            /** Format: int64 */
+            note_id: number;
+        };
+        AudioNoteClassificationUpdateRequest: {
+            kind: string;
+        };
+        AudioNoteClassificationsResponse: {
+            kinds: string[];
+        };
         /**
          * @description Request body for the confirm endpoint. Both bounds are optional; omitting
          *     one keeps that edge of the recording. Both omitted sends it untouched.
@@ -1092,6 +1138,8 @@ export interface components {
             audio_path: string;
             capture_source: string;
             classification?: unknown;
+            classification_kind?: string | null;
+            classification_kind_override?: string | null;
             completed_at?: string | null;
             created_at: string;
             /** Format: int64 */
@@ -1212,6 +1260,8 @@ export interface components {
             audio_path: string;
             capture_source: string;
             classification?: unknown;
+            classification_kind?: string | null;
+            classification_kind_override?: string | null;
             /** Format: int64 */
             duration_seconds?: number | null;
             enrichment_error?: string | null;
@@ -1338,7 +1388,6 @@ export interface components {
             /** Format: int64 */
             agent_profile_id?: number | null;
             custom_context?: string | null;
-            kind?: string;
             template_id?: string;
         };
         GenerateArtifactResponse: {
@@ -1654,7 +1703,9 @@ export interface components {
         SummaryTemplate: {
             description: string;
             id: string;
+            kind: components["schemas"]["ArtifactKind"];
             name: string;
+            requires_timestamps: boolean;
             sections: components["schemas"]["SummaryTemplateSection"][];
         };
         SummaryTemplateSection: {
@@ -1908,6 +1959,26 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content?: never;
+            };
+        };
+    };
+    list_audio_note_classifications: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Distinct effective Audio Note classification kinds */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteClassificationsResponse"];
+                };
             };
         };
     };
@@ -2382,6 +2453,77 @@ export interface operations {
                 content?: never;
             };
             /** @description AudioNote or audio file not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    set_audio_note_classification: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description AudioNote id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AudioNoteClassificationUpdateRequest"];
+            };
+        };
+        responses: {
+            /** @description Manual classification override saved */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteClassificationResponse"];
+                };
+            };
+            /** @description Classification kind is not a valid slug */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description AudioNote not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    clear_audio_note_classification: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description AudioNote id */
+                id: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Manual classification override cleared */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AudioNoteClassificationResponse"];
+                };
+            };
+            /** @description AudioNote not found */
             404: {
                 headers: {
                     [name: string]: unknown;
