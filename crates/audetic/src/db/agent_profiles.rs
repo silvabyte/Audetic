@@ -84,17 +84,27 @@ impl AgentProfileRepository {
             .context("Failed to insert built-in agent profile")?;
         }
 
-        // Older persisted OpenCode built-ins hard-coded artifact output in
-        // argv. Upgrade only that exact built-in value so user-edited profiles
-        // remain untouched and every task can define its own output contract.
-        let legacy_opencode_args = vec![
-            "run".to_string(),
-            "--dir".to_string(),
-            "{run_dir}".to_string(),
-            "--file".to_string(),
-            "{prompt_path}".to_string(),
-            "Follow the attached prompt exactly. Return only the requested Markdown artifact."
-                .to_string(),
+        // OpenCode's array-valued --file option consumes trailing positionals.
+        // Upgrade only known built-in values so user-edited profiles remain
+        // untouched while moving the message before the attachment option.
+        let legacy_opencode_args = [
+            vec![
+                "run".to_string(),
+                "--dir".to_string(),
+                "{run_dir}".to_string(),
+                "--file".to_string(),
+                "{prompt_path}".to_string(),
+                "Follow the attached prompt exactly. Return only the requested Markdown artifact."
+                    .to_string(),
+            ],
+            vec![
+                "run".to_string(),
+                "--dir".to_string(),
+                "{run_dir}".to_string(),
+                "--file".to_string(),
+                "{prompt_path}".to_string(),
+                "Follow the attached prompt exactly. Return only the requested output.".to_string(),
+            ],
         ];
         let current_opencode_args = builtin_profiles()
             .into_iter()
@@ -103,14 +113,16 @@ impl AgentProfileRepository {
             .args;
         let current_opencode_args = serde_json::to_string(&current_opencode_args)
             .context("Failed to serialize current OpenCode profile arguments")?;
-        let legacy_opencode_args = serde_json::to_string(&legacy_opencode_args)
-            .context("Failed to serialize legacy OpenCode profile arguments")?;
-        conn.execute(
-            "UPDATE agent_profiles SET args_json = ?1, updated_at = CURRENT_TIMESTAMP \
-             WHERE kind = 'opencode' AND executable = 'opencode' AND args_json = ?2",
-            params![current_opencode_args, legacy_opencode_args],
-        )
-        .context("Failed to upgrade built-in OpenCode profile")?;
+        for legacy_args in legacy_opencode_args {
+            let legacy_args = serde_json::to_string(&legacy_args)
+                .context("Failed to serialize legacy OpenCode profile arguments")?;
+            conn.execute(
+                "UPDATE agent_profiles SET args_json = ?1, updated_at = CURRENT_TIMESTAMP \
+                 WHERE kind = 'opencode' AND executable = 'opencode' AND args_json = ?2",
+                params![current_opencode_args, legacy_args],
+            )
+            .context("Failed to upgrade built-in OpenCode profile")?;
+        }
         conn.execute(
             "UPDATE agent_profiles SET args_json = ?1 WHERE kind = 'codex' \
              AND executable = 'codex' AND args_json = ?2",
@@ -275,11 +287,11 @@ fn builtin_profiles() -> Vec<NewAgentProfile> {
             executable: "opencode".to_string(),
             args: vec![
                 "run".into(),
+                "Follow the attached prompt exactly. Return only the requested output.".into(),
                 "--dir".into(),
                 "{run_dir}".into(),
                 "--file".into(),
                 "{prompt_path}".into(),
-                "Follow the attached prompt exactly. Return only the requested output.".into(),
             ],
             prompt_mode: PromptMode::FileArg,
             default_profile: false,
@@ -388,6 +400,65 @@ mod tests {
                 "{} argv should defer output format to the task prompt",
                 profile.name
             );
+        }
+    }
+
+    #[test]
+    fn opencode_message_precedes_the_array_valued_file_option() {
+        let profile = builtin_profiles()
+            .into_iter()
+            .find(|profile| profile.kind == "opencode")
+            .unwrap();
+        assert_eq!(
+            profile.args,
+            vec![
+                "run",
+                "Follow the attached prompt exactly. Return only the requested output.",
+                "--dir",
+                "{run_dir}",
+                "--file",
+                "{prompt_path}",
+            ]
+        );
+    }
+
+    #[test]
+    fn startup_upgrades_known_broken_opencode_argument_order() {
+        for message in [
+            "Follow the attached prompt exactly. Return only the requested Markdown artifact.",
+            "Follow the attached prompt exactly. Return only the requested output.",
+        ] {
+            let conn = Connection::open_in_memory().unwrap();
+            migrate(&conn).unwrap();
+            let broken_args = serde_json::to_string(&vec![
+                "run",
+                "--dir",
+                "{run_dir}",
+                "--file",
+                "{prompt_path}",
+                message,
+            ])
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_profiles \
+                 (name, kind, executable, args_json, prompt_mode, default_profile, enabled) \
+                 VALUES ('OpenCode', 'opencode', 'opencode', ?1, 'file_arg', 0, 1)",
+                [broken_args],
+            )
+            .unwrap();
+
+            AgentProfileRepository::ensure_builtin_profiles(&conn).unwrap();
+
+            let profile = AgentProfileRepository::list(&conn)
+                .unwrap()
+                .into_iter()
+                .find(|profile| profile.kind == "opencode")
+                .unwrap();
+            assert_eq!(
+                profile.args[1],
+                "Follow the attached prompt exactly. Return only the requested output."
+            );
+            assert_eq!(profile.args.last().unwrap(), "{prompt_path}");
         }
     }
 }
