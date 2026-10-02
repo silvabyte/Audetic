@@ -61,8 +61,11 @@ use super::routes::{
         audio_notes::toggle_audio_note,
         audio_notes::audio_note_status,
         audio_notes::list_audio_notes,
+        audio_notes::list_audio_note_classifications,
         audio_notes::recent_audio_note_titles,
         audio_notes::get_audio_note,
+        audio_notes::set_audio_note_classification,
+        audio_notes::clear_audio_note_classification,
         audio_notes::update_audio_note_title,
         audio_notes::regenerate_audio_note_title,
         audio_notes::delete_audio_note,
@@ -148,6 +151,9 @@ use super::routes::{
         audio_notes::AudioNoteSummary,
         audio_notes::AudioNotesListResponse,
         audio_notes::AudioNoteDetailResponse,
+        audio_notes::AudioNoteClassificationsResponse,
+        audio_notes::AudioNoteClassificationUpdateRequest,
+        audio_notes::AudioNoteClassificationResponse,
         audio_notes::AudioNoteTitleSource,
         audio_notes::RecentAudioNoteTitlesResponse,
         audio_notes::AudioNoteTitleUpdateRequest,
@@ -175,6 +181,7 @@ use super::routes::{
         crate::db::agent_profiles::PromptMode,
         agents::AgentProfilesResponse,
         agents::AgentProfileTestResponse,
+        crate::summary_templates::ArtifactKind,
         crate::summary_templates::SummaryTemplate,
         crate::summary_templates::SummaryTemplateSection,
         summary_templates::SummaryTemplatesResponse,
@@ -386,6 +393,30 @@ mod tests {
                 assert!(properties[field].is_object(), "{schema_name} lacks {field}");
             }
         }
+    }
+
+    #[test]
+    fn audio_note_classifications_and_artifact_intent_are_public() {
+        let spec = serde_json::to_value(ApiDoc::openapi()).unwrap();
+
+        assert!(spec["paths"]["/audio-notes/classifications"]["get"].is_object());
+        assert!(spec["paths"]["/audio-notes/{id}/classification"]["put"].is_object());
+        assert!(spec["paths"]["/audio-notes/{id}/classification"]["delete"].is_object());
+        for schema_name in ["AudioNoteSummary", "AudioNoteDetailResponse"] {
+            let properties = &spec["components"]["schemas"][schema_name]["properties"];
+            assert!(properties["classification_kind"].is_object());
+            assert!(properties["classification_kind_override"].is_object());
+        }
+
+        let request = &spec["components"]["schemas"]["GenerateArtifactRequest"]["properties"];
+        assert!(request.get("kind").is_none());
+        assert!(request["template_id"].is_object());
+        let template = &spec["components"]["schemas"]["SummaryTemplate"]["properties"];
+        assert_eq!(
+            template["kind"]["$ref"],
+            "#/components/schemas/ArtifactKind"
+        );
+        assert_eq!(template["requires_timestamps"]["type"], "boolean");
     }
 
     #[test]

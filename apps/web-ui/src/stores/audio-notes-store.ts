@@ -1,13 +1,15 @@
 import { makeAutoObservable, runInAction } from "mobx";
 import { daemon } from "@/api/client";
 import type { components } from "@/api/schema";
-import { errorMessage, noteNeedsRefresh } from "@/lib/audio-notes";
+import { errorMessage, isClassificationSlug, noteNeedsRefresh } from "@/lib/audio-notes";
 import { DEFAULT_CAPTURE_OPTIONS } from "@/lib/capture-options";
 
 export type AudioNoteSummary = components["schemas"]["AudioNoteSummary"];
 export type AudioNoteDetail = components["schemas"]["AudioNoteDetailResponse"];
 export type CaptureOptions = components["schemas"]["AudioNoteStartRequest"];
+type ClassificationResponse = components["schemas"]["AudioNoteClassificationResponse"];
 type LoadState = "idle" | "loading" | "loaded" | "error";
+type ClassificationMutationState = "idle" | "saving" | "error";
 
 /** The sole capture/status owner. Meaning is inferred after the raw transcript is saved. */
 export class AudioNotesStore {
@@ -38,17 +40,23 @@ export class AudioNotesStore {
   titleMutationStatus: Record<number, "idle" | "saving" | "generating" | "error"> = {};
   titleMutationError: Record<number, string | null> = {};
   processing: Record<number, boolean> = {};
+  classificationKinds: string[] = [];
+  classificationKindsStatus: LoadState = "idle";
+  classificationKindsError: string | null = null;
+  classificationMutationStatus: Record<number, ClassificationMutationState> = {};
+  classificationMutationError: Record<number, string | null> = {};
   private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
   private polling = false;
   private listEpoch = 0;
   private listPending = 0;
   private detailEpoch = new Map<number, number>();
+  private classificationKindsEpoch = 0;
   private deletedIds = new Set<number>();
 
   constructor(private client = daemon) {
-    makeAutoObservable<this, "client" | "timer" | "running" | "polling" | "listEpoch" | "listPending" | "detailEpoch" | "deletedIds">(
-      this, { client: false, timer: false, running: false, polling: false, listEpoch: false, listPending: false, detailEpoch: false, deletedIds: false },
+    makeAutoObservable<this, "client" | "timer" | "running" | "polling" | "listEpoch" | "listPending" | "detailEpoch" | "classificationKindsEpoch" | "deletedIds">(
+      this, { client: false, timer: false, running: false, polling: false, listEpoch: false, listPending: false, detailEpoch: false, classificationKindsEpoch: false, deletedIds: false },
     );
   }
 
@@ -144,6 +152,77 @@ export class AudioNotesStore {
     } catch (error) {
       if (this.deletedIds.has(id) || epoch !== this.detailEpoch.get(id)) return;
       runInAction(() => { this.detailStatus[id] = "error"; this.detailError[id] = errorMessage(error); });
+    }
+  }
+  async loadClassificationKinds(force = false): Promise<void> {
+    if (!force && this.classificationKindsStatus === "loading") return;
+    const epoch = ++this.classificationKindsEpoch;
+    this.classificationKindsStatus = "loading";
+    this.classificationKindsError = null;
+    try {
+      const { data, error } = await this.client.GET("/audio-notes/classifications");
+      if (epoch !== this.classificationKindsEpoch) return;
+      if (error || !data) throw new Error(errorMessage(error ?? "Empty response"));
+      runInAction(() => {
+        this.classificationKinds = data.kinds;
+        this.classificationKindsStatus = "loaded";
+      });
+    } catch (error) {
+      if (epoch !== this.classificationKindsEpoch) return;
+      runInAction(() => {
+        this.classificationKindsError = errorMessage(error);
+        this.classificationKindsStatus = "error";
+      });
+    }
+  }
+  async setClassification(id: number, kind: string): Promise<boolean> {
+    const normalized = kind.trim();
+    if (this.classificationMutationStatus[id] === "saving") return false;
+    this.classificationMutationError[id] = null;
+    if (!isClassificationSlug(normalized)) {
+      this.classificationMutationStatus[id] = "error";
+      this.classificationMutationError[id] = "Use 1-64 lowercase letters, numbers, hyphens, or underscores; begin with a letter.";
+      return false;
+    }
+    return this.mutateClassification(id, async () => this.client.PUT("/audio-notes/{id}/classification", {
+      params: { path: { id } },
+      body: { kind: normalized },
+    }));
+  }
+  async clearClassification(id: number): Promise<boolean> {
+    if (this.classificationMutationStatus[id] === "saving") return false;
+    this.classificationMutationError[id] = null;
+    return this.mutateClassification(id, async () => this.client.DELETE("/audio-notes/{id}/classification", { params: { path: { id } } }));
+  }
+  private async mutateClassification(id: number, command: () => Promise<{ data?: ClassificationResponse; error?: unknown }>): Promise<boolean> {
+    this.classificationMutationStatus[id] = "saving";
+    try {
+      const { data, error } = await command();
+      if (error || !data) throw new Error(errorMessage(error ?? "Empty response"));
+      runInAction(() => {
+        const detail = this.detailCache[id];
+        if (detail) {
+          detail.classification_kind = data.classification_kind;
+          detail.classification_kind_override = data.classification_kind_override;
+        }
+        const summary = this.list.find((note) => note.id === id);
+        if (summary) {
+          summary.classification_kind = data.classification_kind;
+          summary.classification_kind_override = data.classification_kind_override;
+        }
+        this.classificationMutationStatus[id] = "idle";
+      });
+      // Reconciliation advances epochs so older reads cannot restore stale classification state.
+      void this.loadDetail(id, true);
+      void this.loadClassificationKinds(true);
+      void this.loadList();
+      return true;
+    } catch (error) {
+      runInAction(() => {
+        this.classificationMutationStatus[id] = "error";
+        this.classificationMutationError[id] = errorMessage(error);
+      });
+      return false;
     }
   }
   async retryTranscription(id: number): Promise<boolean> {

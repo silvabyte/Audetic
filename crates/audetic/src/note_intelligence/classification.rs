@@ -30,10 +30,7 @@ impl Classification {
             "unsupported classification version {}",
             self.version
         );
-        anyhow::ensure!(
-            valid_kind(&self.kind),
-            "classification kind must be a lowercase slug (1-64 characters)"
-        );
+        validate_kind(&self.kind)?;
         anyhow::ensure!(
             self.confidence.is_finite() && (0.0..=1.0).contains(&self.confidence),
             "classification confidence must be between 0 and 1"
@@ -63,6 +60,14 @@ pub(crate) fn valid_kind(kind: &str) -> bool {
         && kind
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+}
+
+pub(crate) fn validate_kind(kind: &str) -> Result<()> {
+    anyhow::ensure!(
+        valid_kind(kind),
+        "classification kind must be a lowercase slug (1-64 characters)"
+    );
+    Ok(())
 }
 
 pub(crate) fn prompt(transcript: &str) -> String {
@@ -109,6 +114,25 @@ mod tests {
                 Classification::parse(&value.to_string()).is_err(),
                 "{field}"
             );
+        }
+    }
+
+    #[test]
+    fn kind_validator_accepts_only_the_persisted_slug_contract() {
+        for kind in ["a", "shopping-list", "shopping_list-2", &"a".repeat(64)] {
+            validate_kind(kind).unwrap();
+        }
+        for kind in [
+            "",
+            "Meeting",
+            "two words",
+            " leading",
+            "trailing ",
+            "-leading",
+            "ümlaut",
+            &"a".repeat(65),
+        ] {
+            assert!(validate_kind(kind).is_err(), "{kind}");
         }
     }
 }

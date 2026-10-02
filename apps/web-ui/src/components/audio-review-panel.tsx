@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { NOTE_INTENTS } from "@/routes/audio-notes";
+import { audioNoteAudioUrl } from "@/api/client";
 import { noteDisplayTitle } from "@/lib/note-title";
 
 /**
@@ -35,9 +36,6 @@ export function AudioReviewPanel({
   const cancelFetcher = useFetcher();
   const sending = confirmFetcher.state !== "idle";
   const discarding = cancelFetcher.state !== "idle";
-
-  // The recording's URL is served same-origin by the daemon under /api.
-  const audioSrc = `/api/audio-notes/${noteId}/audio`;
 
   const trimmed = startSec > 0.001 || endSec < durationSeconds - 0.001;
   const valid = Number.isFinite(startSec) && Number.isFinite(endSec) && startSec >= 0 && endSec > startSec && endSec <= durationSeconds + 0.5;
@@ -77,7 +75,7 @@ export function AudioReviewPanel({
 
         <audio
           ref={audioRef}
-          src={audioSrc}
+          src={audioNoteAudioUrl(noteId)}
           controls
           preload="metadata"
           className="w-full"

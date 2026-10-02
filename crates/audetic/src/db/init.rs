@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use std::path::Path;
 use std::time::Duration;
 
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 pub fn init_db() -> Result<Connection> {
     init_db_at(&crate::global::db_file()?)
@@ -47,12 +47,16 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             [],
             |row| row.get(0),
         )?;
-        if version == 1 {
-            migrate_v1_to_v2(conn)?;
-            return Ok(());
-        }
-        if version != SCHEMA_VERSION {
-            bail!("Unsupported Audio Notes schema version {version}; expected {SCHEMA_VERSION}");
+        match version {
+            1 => {
+                migrate_v1_to_v2(conn)?;
+                migrate_v2_to_v3(conn)?;
+            }
+            2 => migrate_v2_to_v3(conn)?,
+            SCHEMA_VERSION => {}
+            _ => {
+                bail!("Unsupported Audio Notes schema version {version}; expected {SCHEMA_VERSION}")
+            }
         }
         return Ok(());
     }
@@ -85,6 +89,13 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             source_external_id TEXT,
             source_recorded_at TIMESTAMP,
             classification TEXT CHECK(classification IS NULL OR json_valid(classification)),
+            classification_kind_override TEXT CHECK(
+                classification_kind_override IS NULL OR (
+                    length(classification_kind_override) BETWEEN 1 AND 64
+                    AND substr(classification_kind_override, 1, 1) GLOB '[a-z]'
+                    AND classification_kind_override NOT GLOB '*[^a-z0-9_-]*'
+                )
+            ),
             enrichment_status TEXT NOT NULL DEFAULT 'pending'
                 CHECK(enrichment_status IN ('pending', 'running', 'completed', 'error')),
             enrichment_error TEXT
@@ -92,7 +103,12 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_audio_notes_stream ON audio_notes(started_at DESC, id DESC)
             WHERE deleted_at IS NULL;
         CREATE INDEX IF NOT EXISTS idx_audio_notes_status ON audio_notes(status);
-        CREATE INDEX IF NOT EXISTS idx_audio_notes_kind ON audio_notes(json_extract(classification, '$.kind'));
+        CREATE INDEX IF NOT EXISTS idx_audio_notes_effective_kind ON audio_notes(
+            COALESCE(
+                classification_kind_override,
+                json_extract(CASE WHEN json_valid(classification) THEN classification END, '$.kind')
+            )
+        );
         CREATE INDEX IF NOT EXISTS idx_audio_notes_source ON audio_notes(source_provider, source_external_id);
         CREATE TABLE IF NOT EXISTS ingress_access_keys (
             id TEXT PRIMARY KEY,
@@ -172,7 +188,7 @@ pub(crate) fn create_schema(conn: &Connection) -> Result<()> {
             singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
             version INTEGER NOT NULL, migrated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        INSERT OR IGNORE INTO audio_notes_schema(singleton, version) VALUES(1, 2);",
+        INSERT OR IGNORE INTO audio_notes_schema(singleton, version) VALUES(1, 3);",
     ).context("Failed to create unified Audio Notes schema")?;
     Ok(())
 }
@@ -233,6 +249,32 @@ fn migrate_v1_to_v2(conn: &Connection) -> Result<()> {
     .context("Failed to migrate Audio Notes schema from version 1 to 2")?;
     tx.commit()
         .context("Failed to commit Audio Notes schema version 2 migration")
+}
+
+fn migrate_v2_to_v3(conn: &Connection) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE audio_notes ADD COLUMN classification_kind_override TEXT CHECK(
+            classification_kind_override IS NULL OR (
+                length(classification_kind_override) BETWEEN 1 AND 64
+                AND substr(classification_kind_override, 1, 1) GLOB '[a-z]'
+                AND classification_kind_override NOT GLOB '*[^a-z0-9_-]*'
+            )
+         );
+         DROP INDEX IF EXISTS idx_audio_notes_kind;
+         CREATE INDEX idx_audio_notes_effective_kind ON audio_notes(
+            COALESCE(
+                classification_kind_override,
+                json_extract(CASE WHEN json_valid(classification) THEN classification END, '$.kind')
+            )
+         );
+         UPDATE audio_notes_schema
+            SET version = 3, migrated_at = CURRENT_TIMESTAMP
+            WHERE singleton = 1;",
+    )
+    .context("Failed to migrate Audio Notes schema from version 2 to 3")?;
+    tx.commit()
+        .context("Failed to commit Audio Notes schema version 3 migration")
 }
 
 #[cfg(test)]
@@ -319,7 +361,8 @@ mod tests {
                 version INTEGER NOT NULL, migrated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             INSERT INTO audio_notes_schema(singleton, version) VALUES(1, 1);
-            INSERT INTO audio_notes(title, audio_path) VALUES('Keep me', '/tmp/keep.wav');",
+            INSERT INTO audio_notes(title, audio_path, classification)
+                VALUES('Keep me', '/tmp/keep.wav', 'legacy-not-json');",
         )
         .unwrap();
 
@@ -337,10 +380,70 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
         assert_eq!(title, "Keep me");
+        assert!(crate::db::audio_notes::AudioNoteRepository::get(&conn, 1)
+            .unwrap()
+            .unwrap()
+            .classification
+            .is_none());
         assert!(table_exists(&conn, "ingress_access_keys").unwrap());
         assert!(table_exists(&conn, "external_imports").unwrap());
         assert!(table_exists(&conn, "plaud_sync_state").unwrap());
+    }
+
+    #[test]
+    fn version_two_database_migrates_classification_override_without_losing_inference() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE audio_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                audio_path TEXT NOT NULL,
+                classification TEXT CHECK(classification IS NULL OR json_valid(classification)),
+                deleted_at TIMESTAMP
+            );
+            CREATE INDEX idx_audio_notes_kind ON audio_notes(json_extract(classification, '$.kind'));
+            CREATE TABLE audio_notes_schema (
+                singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                version INTEGER NOT NULL, migrated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO audio_notes_schema(singleton, version) VALUES(1, 2);
+            INSERT INTO audio_notes(audio_path, classification)
+                VALUES('/tmp/keep.wav', '{\"kind\":\"meeting\"}');",
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let row: (i64, String, Option<String>) = conn
+            .query_row(
+                "SELECT s.version, n.classification, n.classification_kind_override
+                 FROM audio_notes_schema s CROSS JOIN audio_notes n",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (3, r#"{"kind":"meeting"}"#.into(), None));
+        assert!(conn
+            .execute(
+                "UPDATE audio_notes SET classification_kind_override='custom-kind' WHERE id=1",
+                [],
+            )
+            .is_ok());
+        assert!(conn
+            .execute(
+                "UPDATE audio_notes SET classification_kind_override='Not valid' WHERE id=1",
+                [],
+            )
+            .is_err());
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='index' AND name='idx_audio_notes_effective_kind'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
     }
 }

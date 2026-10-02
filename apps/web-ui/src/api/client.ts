@@ -15,3 +15,7 @@ import type { paths } from "./schema";
 export const daemon = createClient<paths>({
   baseUrl: "/api",
 });
+
+export function audioNoteAudioUrl(id: number): string {
+  return `/api/audio-notes/${encodeURIComponent(String(id))}/audio`;
+}

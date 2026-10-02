@@ -1,5 +1,6 @@
-use super::*;
 use async_trait::async_trait;
+use audetic_core::jobs_client::Segment;
+
 use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -9,10 +10,13 @@ use std::sync::{
 use crate::agents::{AgentRunOutput, AgentRunRequest};
 use crate::db::audio_note_artifacts::{ArtifactStatus, AudioNoteArtifactRepository};
 
+use super::*;
+
 struct FakeAgent {
     outputs: Mutex<VecDeque<AgentRunOutput>>,
     calls: AtomicUsize,
     templates: Mutex<Vec<String>>,
+    transcripts: Mutex<Vec<String>>,
 }
 
 impl FakeAgent {
@@ -21,6 +25,7 @@ impl FakeAgent {
             outputs: Mutex::new(outputs.into()),
             calls: AtomicUsize::new(0),
             templates: Mutex::new(vec![]),
+            transcripts: Mutex::new(vec![]),
         }
     }
 }
@@ -37,6 +42,10 @@ impl AgentRunner for FakeAgent {
                 .unwrap_or("classification")
                 .to_string(),
         );
+        self.transcripts
+            .lock()
+            .unwrap()
+            .push(std::fs::read_to_string(request.paths.transcript_path)?);
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         self.outputs
             .lock()
@@ -118,12 +127,9 @@ async fn successful_enrichment_routes_and_dispatches_once_under_concurrency() {
         note.transcript_text.as_deref(),
         Some("Original raw transcript")
     );
-    assert_eq!(
-        AudioNoteArtifactRepository::list_for_note(&conn, id)
-            .unwrap()
-            .len(),
-        1
-    );
+    let artifacts = AudioNoteArtifactRepository::list_for_note(&conn, id).unwrap();
+    assert_eq!(artifacts.len(), 1);
+    assert_eq!(artifacts[0].kind, "meeting_minutes");
     let events = events.lock().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].note_id, id);
@@ -248,9 +254,87 @@ async fn shopping_produces_structured_data_not_execution() {
     let conn = crate::db::init_db_at(&path).unwrap();
     let artifacts = AudioNoteArtifactRepository::list_for_note(&conn, id).unwrap();
     assert_eq!(artifacts[0].kind, "shopping_items");
+    assert_eq!(artifacts[0].template_id.as_deref(), Some("shopping_items"));
     assert_eq!(artifacts[0].content_json.as_ref(), Some(&intent));
     assert_eq!(artifacts[0].status, ArtifactStatus::Completed);
     assert_eq!(runner.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn artifact_kind_and_timestamped_input_come_from_the_template() {
+    let (dir, path, id) = setup(true, None);
+    let conn = crate::db::init_db_at(&path).unwrap();
+    let transcript_path = dir.path().join("note.txt");
+    let segments = vec![
+        Segment {
+            start: 3.8,
+            end: 8.0,
+            text: " Opening context ".into(),
+        },
+        Segment {
+            start: 3661.2,
+            end: 3665.0,
+            text: "Closing thought".into(),
+        },
+    ];
+    AudioNoteRepository::complete(
+        &conn,
+        id,
+        &transcript_path.to_string_lossy(),
+        "Original raw transcript",
+        Some(&segments),
+        3666,
+    )
+    .unwrap();
+    drop(conn);
+    let runner = FakeAgent::new(vec![output(
+        "# Topics\n\n## Talking Points\n\n- [00:03] Opening - Context",
+    )]);
+
+    let artifact = generate_with_runner(
+        id,
+        GenerateArtifactRequest {
+            template_id: "talking_points".into(),
+            agent_profile_id: None,
+            custom_context: None,
+        },
+        &path,
+        &runner,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(artifact.kind, "talking_points");
+    assert_eq!(artifact.template_id.as_deref(), Some("talking_points"));
+    let transcripts = runner.transcripts.lock().unwrap();
+    assert!(transcripts[0].contains("[00:03] Opening context"));
+    assert!(transcripts[0].contains("[1:01:01] Closing thought"));
+}
+
+#[tokio::test]
+async fn timestamp_requirement_is_enforced_before_artifact_insertion() {
+    let (_dir, path, id) = setup(true, None);
+    let runner = FakeAgent::new(vec![]);
+
+    let error = generate_with_runner(
+        id,
+        GenerateArtifactRequest {
+            template_id: "talking_points".into(),
+            agent_profile_id: None,
+            custom_context: None,
+        },
+        &path,
+        &runner,
+    )
+    .await
+    .unwrap_err();
+
+    assert!(error.to_string().contains("requires timestamped"));
+    assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
+    let conn = crate::db::init_db_at(&path).unwrap();
+    assert!(AudioNoteArtifactRepository::list_for_note(&conn, id)
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -404,7 +488,6 @@ async fn custom_registry_routes_without_changing_note_or_classification_schema()
         .register(
             "project-handoff",
             registry::Processor {
-                artifact_kind: "followups".into(),
                 template_id: "action_items".into(),
             },
         )
@@ -415,7 +498,7 @@ async fn custom_registry_routes_without_changing_note_or_classification_schema()
         .unwrap();
     let conn = crate::db::init_db_at(&path).unwrap();
     let artifacts = AudioNoteArtifactRepository::list_for_note(&conn, id).unwrap();
-    assert_eq!(artifacts[0].kind, "followups");
+    assert_eq!(artifacts[0].kind, "action_items");
     assert_eq!(artifacts[0].template_id.as_deref(), Some("action_items"));
     assert_eq!(
         AudioNoteRepository::get(&conn, id)

@@ -16,7 +16,10 @@ Routes / surface:
 - `/audio-notes` — one chronological stream of captured and imported audio notes (`/` redirects here).
   Search titles/transcripts, filter by inferred classification (including future kinds), and paginate.
 - `/audio-notes/:id` — raw transcript, audio playback and segment seeking, title editing/regeneration,
-  classification/enrichment progress and retries, templates/artifacts, and soft deletion.
+  classification/enrichment progress and retries, templates/artifacts, and soft deletion. The detail
+  workspace keeps playback mounted across Transcript, Generated, and Details tabs; generated talking
+  points add seekable chapter markers. Manual Classification is edited under Details and remains
+  separate from the visible AI suggestion.
   Transcription and enrichment are independent: failed AI processing never hides the raw transcript.
 - `/settings/{setup,provider,capture,keybind,post-processing,integrations,appearance,config-file}` — Setup Center is the
   read-only machine capability overview; Provider offers typed validation, save, and daemon restart

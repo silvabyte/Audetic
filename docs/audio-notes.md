@@ -86,19 +86,30 @@ choose another agent/template.
 `note_intelligence/classification.rs` validates a version-1 JSON contract with
 `kind`, `confidence`, `title`, `topics`, `participants`, and extensible `metadata`.
 Kinds are lowercase slugs, not a closed Rust enum. Unknown kinds remain valid and
-use the general-note processor. Manual titles take precedence over generated titles.
+use the general-note processor. A person can assign any valid slug, such as
+`creative-art`, as the note's Manual Classification. The inferred classification
+JSON remains intact; the manual override becomes the Effective Classification used
+for display, discovery, and `kind` filtering. Clearing the override returns the note
+to its inferred kind. AI retries never erase a manual override. Manual titles take
+precedence over generated titles.
 
-`note_intelligence/registry.rs` maps classification kinds to artifact kinds and
-templates. Defaults cover meeting summaries/participants/decisions/actions,
+`note_intelligence/registry.rs` maps inferred classification kinds to templates;
+each server-owned template defines its own artifact kind and timestamp requirement.
+Defaults cover meeting minutes, concise summaries, timestamped talking points,
+mind maps, decisions/actions,
 cleaned dictation, conversation summaries, general notes, task intent, and shopping
-items. `enrich_audio_note_with_registry` accepts an alternative registry. To add a
-processor, register its kind/template and output contract; do not add a new core
-entity or duplicate the capture pipeline.
+items. Timed transcript segments are passed to agents with recording timestamps,
+and templates that require timestamps fail before creating an artifact when those
+segments are unavailable. `enrich_audio_note_with_registry` accepts an alternative
+registry. To add a processor, register its inferred kind and template; do not add a
+new core entity or duplicate the capture pipeline.
 
 Artifacts retain Markdown, optional structured JSON, status, agent/template
 provenance, and diagnostic output. Request artifacts contain extracted intent,
 items, or actions. They do not themselves execute an inferred command or update
-an external shopping application. Configured post-processing jobs receive
+an external shopping application. The browser renders generated Markdown and GFM
+as documents and Mermaid diagrams in strict mode; raw HTML remains inert. Configured
+post-processing jobs receive
 `audio_note.completed` with the note ID, transcript, audio references, duration,
 title, and classification and can route these results onward.
 
@@ -123,7 +134,10 @@ The collection is `GET /api/audio-notes`, with `query`, `kind`, `limit`, and
 `offset`; ordering is descending capture time, then ID. Detail, playback, titles,
 retry, AI processing, and artifacts live under `/api/audio-notes/{id}`. Capture
 operations are `/start`, `/stop`, `/toggle`, `/confirm`, `/cancel`, `/status`;
-multipart imports use `/import`. See `/api/openapi.json` for exact contracts.
+multipart imports use `/import`. Available Effective Classifications are listed at
+`GET /api/audio-notes/classifications`; `PUT` and `DELETE` on
+`/api/audio-notes/{id}/classification` set or clear a Manual Classification. See
+`/api/openapi.json` for exact contracts.
 
 ```sh
 audetic notes import call.wav --title "Planning discussion"
