@@ -116,10 +116,10 @@ pub fn list_templates() -> Vec<SummaryTemplate> {
     vec![
         SummaryTemplate {
             id: "general_note".into(), name: "General Note".into(),
-            description: "A faithful concise summary of an audio note.".into(),
+            description: "A thoughtful brief: the big picture, key ideas, decisions, and grounded next steps.".into(),
             kind: ArtifactKind::Summary,
             requires_timestamps: false,
-            sections: vec![section("Summary", "Summarize the content without inventing facts.", "paragraph")],
+            sections: briefing_sections(),
         },
         SummaryTemplate {
             id: "cleaned_dictation".into(), name: "Cleaned Dictation".into(),
@@ -130,10 +130,10 @@ pub fn list_templates() -> Vec<SummaryTemplate> {
         },
         SummaryTemplate {
             id: "conversation".into(), name: "Conversation".into(),
-            description: "Conversation summary and topics.".into(),
+            description: "A topic-led account that preserves context, differing views, and follow-ups.".into(),
             kind: ArtifactKind::Summary,
             requires_timestamps: false,
-            sections: vec![section("Summary", "Summarize the conversation faithfully.", "paragraph"), section("Topics", "List topics discussed.", "list")],
+            sections: briefing_sections(),
         },
         SummaryTemplate {
             id: "request_intent".into(), name: "Request Intent".into(),
@@ -155,18 +155,7 @@ pub fn list_templates() -> Vec<SummaryTemplate> {
             description: "A complete record of the discussion, decisions, and follow-ups.".into(),
             kind: ArtifactKind::MeetingMinutes,
             requires_timestamps: false,
-            sections: vec![
-                section("Attendees & Context", "Identify participants when the transcript supports it, then state the purpose and context of the meeting.", "paragraph"),
-                section("Discussion", "Record the major topics in the order they were discussed, preserving important rationale and disagreement.", "paragraph"),
-                section("Decisions", "List decisions made or clearly proposed during the meeting.", "list"),
-                SummaryTemplateSection {
-                    title: "Action Items".into(),
-                    instruction: "List tasks, owners, due dates, and evidence from the transcript. If unknown, write `Unassigned` or `No due date`.".into(),
-                    format: "table".into(),
-                    item_format: Some("| Owner | Task | Due | Evidence |".into()),
-                },
-                section("Open Questions", "List unresolved questions, risks, and items that need a later decision.", "list"),
-            ],
+            sections: briefing_sections(),
         },
         SummaryTemplate {
             id: "concise_summary".into(),
@@ -188,7 +177,7 @@ pub fn list_templates() -> Vec<SummaryTemplate> {
             sections: vec![
                 SummaryTemplateSection {
                     title: "Action Items".into(),
-                    instruction: "Extract every explicit or implied follow-up. Include owner, task, due date, priority, and transcript evidence.".into(),
+                    instruction: "Extract explicit commitments and requested follow-ups with transcript evidence. Label suggested tasks as proposed; do not turn possibilities into commitments. Include owner, task, due date, and priority only when stated; otherwise use Unassigned, Not stated, or No due date. Preserve relative deadlines as spoken.".into(),
                     format: "table".into(),
                     item_format: Some("| Priority | Owner | Task | Due | Evidence |".into()),
                 },
@@ -216,7 +205,7 @@ pub fn list_templates() -> Vec<SummaryTemplate> {
             requires_timestamps: false,
             sections: vec![SummaryTemplateSection {
                 title: "Mind Map".into(),
-                instruction: "Return one valid Mermaid `mindmap` diagram in a fenced `mermaid` block. Use a concise topic as the root, 3-7 major branches, and short transcript-grounded child labels. Do not use HTML, click directives, icons, or paragraph-length nodes.".into(),
+                instruction: "Return one valid Mermaid `mindmap` diagram in a fenced `mermaid` block. Use a concise topic as the root and 3-7 distinct topic branches (fewer for a short note). Keep each label to 2-8 words, use at most 3 levels below the root and at most 30 nodes total. Prioritize relationships, decisions, constraints, and next steps over a chronological transcript dump. Distinguish proposals from agreed decisions. Preserve important numbers and names only when evidenced. Use simple plain-text labels with no embedded newlines or special shape syntax. Do not use HTML, click directives, icons, initialization directives, or paragraph-length nodes.".into(),
                 format: "mermaid".into(),
                 item_format: None,
             }],
@@ -267,6 +256,21 @@ pub fn get_template(id: &str) -> anyhow::Result<SummaryTemplate> {
         .into_iter()
         .find(|t| t.id == id)
         .ok_or_else(|| anyhow::anyhow!("unknown summary template `{id}`"))
+}
+
+fn briefing_sections() -> Vec<SummaryTemplateSection> {
+    vec![
+        section("At a glance", "Write 2-4 sentences explaining what this note is about, why it matters, and its actual outcome or current state. Identify participants or roles only when supported. Lead with substance, not 'This meeting discussed'. Scale the whole brief to the source: a short voice note needs only a few sentences; a complex conversation needs a detailed, scannable record. Do not pad short notes to fill every section.", "paragraph"),
+        section("Key ideas", "Replace this placeholder heading with specific, descriptive H2 topic headings, one per substantive theme. Group related discussion even when it occurred at different times. Under each heading, give concise context and reasoning, then selective bullets for important facts, numbers, constraints, trade-offs, or disagreement. Retain consequential detail and who said what. Preserve conditions and uncertainty; reported claims are not verified facts. Avoid repeating the overview or retelling every exchange.", "paragraph"),
+        section("Decisions & direction", "List only settled decisions as decisions, including rationale when stated. Clearly label proposals, recommendations, and conditional possibilities as such; never promote them to agreements. If no decisions or direction are evidenced, omit this section entirely.", "list"),
+        SummaryTemplateSection {
+            title: "Next steps".into(),
+            instruction: "Extract explicit commitments and requested follow-ups. Start each task with a concrete verb, retain its owner and timing only when evidenced, and attach a short supporting quote or source timestamp. Use Unassigned or No due date for missing fields; preserve relative deadlines as spoken rather than inventing a calendar date. Label proposed follow-ups as proposed. Do not infer tasks merely to make the note actionable. Omit the section when there are none.".into(),
+            format: "table".into(),
+            item_format: Some("| Owner | Next step | When | Evidence |".into()),
+        },
+        section("Open questions", "Capture unresolved questions, blockers, contradictions, or dependencies that matter to the outcome. Distinguish what is unknown from what someone intends to investigate. Do not invent risks or advice. Omit the section when none are evidenced.", "list"),
+    ]
 }
 
 fn section(title: &str, instruction: &str, format: &str) -> SummaryTemplateSection {

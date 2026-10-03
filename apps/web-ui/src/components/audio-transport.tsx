@@ -60,7 +60,7 @@ export function AudioTransport({
     />
     <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap sm:gap-3">
       <Button type="button" variant="ghost" size="icon" aria-label="Rewind 10 seconds" onClick={() => seek(currentTime - 10)}><Rewind /></Button>
-      <Button type="button" variant="outline" size="icon" aria-label={playing ? "Pause" : "Play"} onClick={() => void togglePlayback()}>{playing ? <Pause /> : <Play />}</Button>
+      <Button type="button" size="icon" className="rounded-full" aria-label={playing ? "Pause" : "Play"} onClick={() => void togglePlayback()}>{playing ? <Pause /> : <Play />}</Button>
       <Button type="button" variant="ghost" size="icon" aria-label="Forward 10 seconds" onClick={() => seek(currentTime + 10)}><FastForward /></Button>
       <span className="w-24 shrink-0 text-center font-mono text-xs tabular-nums text-muted-foreground">{formatDuration(currentTime)} / {formatDuration(boundedDuration)}</span>
       <div className="relative order-last basis-full py-2 sm:order-none sm:min-w-20 sm:flex-1 sm:basis-auto">
