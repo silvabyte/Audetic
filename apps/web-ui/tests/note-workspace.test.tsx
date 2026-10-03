@@ -1,7 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
-import { readNoteDocument, shortMapLabel } from "../src/lib/note-document";
+import { readNoteDocument } from "../src/lib/note-document";
+import { readNoteMap, toMarkmapData, type NoteMapNode } from "../src/lib/note-map";
 import { ArtifactContent } from "../src/components/artifact-content";
 import { NoteMindMap } from "../src/components/note-mind-map";
 import { TranscriptPlayer } from "../src/components/transcript-player";
@@ -37,12 +38,46 @@ test("transcript search treats punctuation literally and preserves original seek
   assert.match(html, /<mark[^>]*>C\+\+<\/mark>/);
 });
 
-test("summary maps bound visible detail and link readers back to the full source section", () => {
+test("summary maps retain every point and its full wording, with source navigation and an outline fallback", () => {
   const points = Array.from({ length: 8 }, (_, i) => `Point ${i}: ${"A long grounded explanation. ".repeat(10)}`);
-  const html = renderToStaticMarkup(<NoteMindMap title="Release review" sections={[{ line: 3, title: "Scope", points }]} onReadSection={() => {}} />);
-  assert.match(html, /Read all 8 points/);
-  assert.match(html, /aria-expanded="true"/);
-  assert.doesNotMatch(html, /Point 5/);
-  assert.ok(shortMapLabel(points[0]!).length <= 140);
-  assert.equal(shortMapLabel("Short idea"), "Short idea");
+  const markdown = `# Release review\n\n## Scope\n\n${points.map((point) => `- ${point}`).join("\n")}`;
+  const tree = readNoteMap(markdown);
+  assert.deepEqual(tree.children[0]?.children.map((node) => node.label), points.map((point) => point.trim()));
+  const html = renderToStaticMarkup(<NoteMindMap markdown={markdown} theme="light" onReadSection={() => {}} />);
+  assert.match(html, /Browse as an outline/);
+  assert.match(html, /Point 7/);
+  assert.match(html, /Read in summary/);
+  assert.match(html, /Expand all/);
+});
+
+test("map preserves nested topics, lists, bold lead-ins and labeled action-table fields", () => {
+  const markdown = "# Launch\n\nIntro context.\n\n## Delivery\n\n### Constraints\n\n- **Capacity:** Two engineers.\n  - No weekend work.\n\n## Next steps\n\n| Owner | Next step | When | Evidence |\n| --- | --- | --- | --- |\n| Ana | Ship pilot | Friday | Confirmed at 02:15 |\n\n## Delivery\n\nA second topic with the same name.";
+  const tree = readNoteMap(markdown);
+  assert.equal(tree.children[0]?.label, "Intro context.");
+  const constraint = tree.children[1]?.children[0];
+  assert.equal(constraint?.label, "Constraints");
+  assert.equal(constraint?.children[0]?.label, "Capacity:");
+  assert.deepEqual(constraint?.children[0]?.children.map((node) => node.label), ["Two engineers.", "No weekend work."]);
+  const task = tree.children[2]?.children[0];
+  assert.equal(task?.label, "Ship pilot");
+  assert.deepEqual(task?.children.map((node) => node.label), ["Owner: Ana", "When: Friday", "Evidence: Confirmed at 02:15"]);
+  assert.notEqual(tree.children[1]?.line, tree.children[3]?.line);
+  const html = renderToStaticMarkup(<ArtifactContent markdown={markdown} documentId="source" />);
+  function checkAnchors(node: NoteMapNode): void {
+    assert.ok(html.includes(`id="source-section-${node.line}"`) || html.includes(`data-source-line="${node.line}"`), `Missing source line ${node.line}`);
+    node.children.forEach(checkAnchors);
+  }
+  checkAnchors(tree);
+});
+
+test("map handles heading-free documents and never passes source HTML or link URLs to the canvas", () => {
+  const tree = readNoteMap('A note with <img src=x onerror=alert(1)> and [unsafe](javascript:alert).\n\n- Literal `<script>` & "quotes".\n\n```md\n## Not a topic\n```\n\n<script>alert(1)</script>');
+  assert.equal(tree.label, "Audio note");
+  assert.equal(tree.children.length, 2);
+  const data = toMarkmapData(tree);
+  const content = [data.content, ...data.children.map((child) => child.content)].join("");
+  assert.doesNotMatch(content, /<script>|<img|javascript:/);
+  assert.match(content, /&lt;script&gt;/);
+  assert.match(content, /&amp;/);
+  assert.match(content, /data-source-line/);
 });

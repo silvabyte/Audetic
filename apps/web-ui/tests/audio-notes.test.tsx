@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { renderToStaticMarkup } from "react-dom/server";
 import { MemoryRouter } from "react-router-dom";
 import createClient from "openapi-fetch";
+import { runInAction } from "mobx";
 import type { paths } from "../src/api/schema";
 import { audioNoteAudioUrl } from "../src/api/client";
 import { ArtifactContent } from "../src/components/artifact-content";
@@ -11,7 +12,7 @@ import { AudioNoteRow } from "../src/routes/audio-notes";
 import { NoteEnrichment } from "../src/components/note-enrichment";
 import { TranscriptPlayer } from "../src/components/transcript-player";
 import { AudioTransport } from "../src/components/audio-transport";
-import { ArtifactCard, artifactKindLabel } from "../src/components/note-artifacts-panel";
+import { ArtifactCard, artifactKindLabel, NoteArtifactsPanel } from "../src/components/note-artifacts-panel";
 import type { AudioNoteArtifact } from "../src/stores/note-artifacts-store";
 import { RootStore, RootStoreProvider } from "../src/stores/root-store";
 import { classificationKind, effectiveClassificationKind, isClassificationSlug, noteNeedsRefresh } from "../src/lib/audio-notes";
@@ -257,6 +258,22 @@ test("mermaid fences use a standalone render surface without invalid pre nesting
   const html = renderToStaticMarkup(<ArtifactContent markdown={'```mermaid\ngraph TD\n  A --> B\n```'} />);
   assert.match(html, /Rendering diagram/);
   assert.doesNotMatch(html, /<pre[^>]*><div/);
+});
+
+test("mind-map tab defaults to the saved summary even when a newer standalone diagram exists", () => {
+  const root = new RootStore();
+  const summary: AudioNoteArtifact = { id: 1, note_id: 7, kind: "summary", title: "Summary", template_id: "general_note", agent_profile_id: 1, status: "completed", content_markdown: "# Garden plan\n\n## Planting\n\n- Sow basil after the frost.", content_json: null, error: null, stdout: null, stderr: null, created_at: note.started_at, updated_at: note.started_at, completed_at: note.started_at };
+  const diagram: AudioNoteArtifact = { ...summary, id: 2, kind: "mind_map", content_markdown: "```mermaid\nmindmap\n  root((Garden))\n```" };
+  runInAction(() => { root.noteArtifacts.byNote[7] = [diagram, summary]; });
+  const html = renderToStaticMarkup(<RootStoreProvider value={root}><NoteArtifactsPanel noteId={7} canGenerate view="map" /></RootStoreProvider>);
+  assert.match(html, /Explore the conversation/);
+  assert.match(html, /Sow basil after the frost/);
+  assert.doesNotMatch(html, /Rendering diagram/);
+  assert.match(html, /<option value="2">Mind map/);
+  // Notes that have only a standalone diagram keep their existing renderer.
+  runInAction(() => { root.noteArtifacts.byNote[7] = [diagram]; });
+  const diagramHtml = renderToStaticMarkup(<RootStoreProvider value={root}><NoteArtifactsPanel noteId={7} canGenerate view="map" /></RootStoreProvider>);
+  assert.match(diagramHtml, /Rendering diagram/);
 });
 
 test("talking points use the newest completed artifact and produce sorted bounded chapters", () => {
