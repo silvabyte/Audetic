@@ -17,8 +17,12 @@ Routes / surface:
   Search titles/transcripts, filter by inferred classification (including future kinds), and paginate.
 - `/audio-notes/:id` — raw transcript, audio playback and segment seeking, title editing/regeneration,
   classification/enrichment progress and retries, templates/artifacts, and soft deletion. The detail
-  workspace keeps playback mounted across Transcript, Generated, and Details tabs; generated talking
-  points add seekable chapter markers. Manual Classification is edited under Details and remains
+  workspace opens on Summary, with Transcript, Mind map, and Details tabs. Playback stays mounted;
+  generated talking points add seekable chapter markers. Saved documents have an in-page outline,
+  copy/download controls, and timestamp citations that seek the audio. Mind map builds expandable,
+  source-linked topic branches from a summary, or shows a generated Mermaid diagram with zoom,
+  expand, and SVG export. Transcript search highlights literal matches and preserves segment seeking;
+  following playback is opt-in. Manual Classification is edited under Details and remains
   separate from the visible AI suggestion.
   Transcription and enrichment are independent: failed AI processing never hides the raw transcript.
 - `/settings/{setup,provider,capture,keybind,post-processing,integrations,appearance,config-file}` — Setup Center is the
