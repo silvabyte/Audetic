@@ -12,7 +12,7 @@ import type { AudioNoteArtifact } from "@/stores/note-artifacts-store";
 import type { EffectiveTheme } from "@/stores/ui-store";
 import { copyText } from "@/lib/clipboard";
 import { downloadText } from "@/lib/download";
-import { readNoteDocument, sectionId } from "@/lib/note-document";
+import { sectionId } from "@/lib/note-document";
 
 export const NoteArtifactsPanel = memo(function NoteArtifactsPanel({ noteId, canGenerate, hasSegments = false, view = "document", onChangeView, onSeek, duration }: {
   noteId: number;
@@ -41,11 +41,11 @@ export const NoteArtifactsPanel = memo(function NoteArtifactsPanel({ noteId, can
     const saved = artifacts.byNote[noteId] ?? [];
     const candidates = saved.filter((artifact) => view === "map" ? ["mind_map", "summary", "meeting_minutes"].includes(artifact.kind) : artifact.kind !== "mind_map");
     const selected = candidates.find((artifact) => artifact.id === selection[view])
-      ?? candidates.find((artifact) => artifact.status === "completed" && (view === "map" ? artifact.kind === "mind_map" : ["summary", "meeting_minutes"].includes(artifact.kind)))
+      ?? (view === "map" ? candidates.find((artifact) => artifact.id === selection.document && artifact.status === "completed") : undefined)
+      ?? candidates.find((artifact) => artifact.status === "completed" && ["summary", "meeting_minutes"].includes(artifact.kind))
       ?? candidates.find((artifact) => artifact.status === "completed") ?? candidates[0];
     const generating = artifacts.generatingByNote[noteId] || saved.some((artifact) => artifact.status === "pending" || artifact.status === "running");
     const theme = store.ui.effectiveTheme;
-    const document = selected?.content_markdown ? readNoteDocument(selected.content_markdown) : null;
     const generatorVisible = showGenerator || !selected;
 
     async function deleteSelected(): Promise<void> {
@@ -62,7 +62,8 @@ export const NoteArtifactsPanel = memo(function NoteArtifactsPanel({ noteId, can
       onChangeView?.("document");
       // The document panel is mounted on the next React commit.
       window.requestAnimationFrame(() => window.requestAnimationFrame(() => {
-        const heading = window.document.getElementById(sectionId(`artifact-${selected.id}`, line));
+        const heading = window.document.getElementById(sectionId(`artifact-${selected.id}`, line))
+          ?? window.document.querySelector<HTMLElement>(`[data-document-id="artifact-${selected.id}"] [data-source-line="${line}"]`);
         heading?.focus({ preventScroll: true });
         heading?.scrollIntoView({ block: "start" });
       }));
@@ -72,7 +73,11 @@ export const NoteArtifactsPanel = memo(function NoteArtifactsPanel({ noteId, can
       <div className="mb-9 flex flex-wrap items-center justify-between gap-3">
         <div className="flex min-w-0 items-center gap-3">
           {view === "map" ? <Network className="size-4 text-muted-foreground" /> : <FileText className="size-4 text-muted-foreground" />}
-          {selected ? <label className="min-w-0"><span className="sr-only">Saved view</span><select value={selected.id} onChange={(event) => setSelection((previous) => ({ ...previous, [view]: Number(event.target.value) }))} className="max-w-full truncate rounded-md bg-transparent py-2 pr-6 text-xs text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{candidates.map((artifact) => <option key={artifact.id} value={artifact.id}>{artifactKindLabel(artifact.kind)} · {new Date(artifact.created_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })} · #{artifact.id}{artifact.status !== "completed" ? ` · ${artifact.status}` : ""}</option>)}</select></label> : <span className="text-xs text-muted-foreground">{view === "map" ? "See the connections" : "The important parts, together"}</span>}
+          {selected ? <label className="min-w-0"><span className="sr-only">Saved view</span><select value={selected.id} onChange={(event) => {
+            const id = Number(event.target.value);
+            const artifact = candidates.find((candidate) => candidate.id === id);
+            setSelection((previous) => artifact && ["summary", "meeting_minutes"].includes(artifact.kind) ? { document: id, map: id } : { ...previous, [view]: id });
+          }} className="max-w-full truncate rounded-md bg-transparent py-2 pr-6 text-xs text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">{candidates.map((artifact) => <option key={artifact.id} value={artifact.id}>{artifactKindLabel(artifact.kind)} · {new Date(artifact.created_at).toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })} · #{artifact.id}{artifact.status !== "completed" ? ` · ${artifact.status}` : ""}</option>)}</select></label> : <span className="text-xs text-muted-foreground">{view === "map" ? "See the connections" : "The important parts, together"}</span>}
         </div>
         <div className="flex flex-wrap gap-1">{selected ? <ArtifactActions artifact={selected} onDelete={deleteSelected} /> : null}<Button size="sm" variant="ghost" onClick={() => { setTemplateId(defaultTemplate); setShowGenerator(!generatorVisible); }} aria-expanded={generatorVisible} aria-controls="note-generator"><Plus data-icon="inline-start" />New view</Button><Button size="icon" variant="ghost" aria-label="Refresh generated views" disabled={artifacts.noteState[noteId] === "loading"} onClick={() => { void artifacts.loadArtifacts(noteId); void artifacts.loadPrerequisites(); }}><RefreshCcw className="size-3.5" /></Button></div>
       </div>
@@ -109,8 +114,8 @@ export const NoteArtifactsPanel = memo(function NoteArtifactsPanel({ noteId, can
       </form> : null}
 
       {artifacts.noteState[noteId] === "loading" && !saved.length ? <Skeleton className="h-72 w-full" /> : selected ? <>
-        {view === "map" && selected.kind !== "mind_map" && document?.sections.length ? <NoteMindMap key={selected.id} title={document.title ?? "Audio note"} sections={document.sections} onReadSection={readSection} />
-          : view === "map" && selected.kind !== "mind_map" && selected.status === "completed" ? <div className="py-16 text-center"><Network className="mx-auto mb-4 size-6 text-muted-foreground" /><h3 className="font-serif text-2xl">Give this note a little perspective.</h3><p className="mx-auto mt-3 max-w-sm text-sm leading-relaxed text-muted-foreground">This view has no topic headings to map. Generate a Mind Map from the transcript to explore its connections.</p><Button className="mt-5" variant="outline" onClick={() => { setTemplateId("mind_map"); setShowGenerator(true); }}>Create mind map</Button></div>
+        {view === "map" && selected.kind !== "mind_map" && selected.content_markdown ? <NoteMindMap key={selected.id} markdown={selected.content_markdown} theme={theme} onReadSection={readSection} />
+          : view === "map" && selected.kind !== "mind_map" && selected.status === "completed" ? <div className="py-16 text-center"><Network className="mx-auto mb-4 size-6 text-muted-foreground" /><h3 className="font-serif text-2xl">Give this note a little perspective.</h3><p className="mx-auto mt-3 max-w-sm text-sm leading-relaxed text-muted-foreground">This view has no summary text to map. Generate a Mind Map from the transcript to explore its connections.</p><Button className="mt-5" variant="outline" onClick={() => { setTemplateId("mind_map"); setShowGenerator(true); }}>Create mind map</Button></div>
           : <ArtifactCard artifact={selected} theme={theme} onSeek={onSeek} duration={duration} showToolbar={false} onDelete={deleteSelected} />}
       </> : <div className="py-12 text-center"><FileText className="mx-auto mb-4 size-6 text-muted-foreground" /><h3 className="font-serif text-2xl">Make room for the important things.</h3><p className="mx-auto mt-3 max-w-sm text-sm leading-relaxed text-muted-foreground">{view === "map" ? "Generate a summary with topic headings or a dedicated mind map to see how the ideas connect." : "A summary brings the context, key ideas, and next steps into focus. Your original transcript is always one tab away."}</p></div>}
     </section>;

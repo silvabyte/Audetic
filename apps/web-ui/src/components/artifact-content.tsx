@@ -16,17 +16,21 @@ export function ArtifactContent({ markdown, theme = "light", documentId, outline
   const outlineLinks = <ol className="mt-4 space-y-3 border-l pl-4">{document.sections.map((section) => <li key={section.line}><a href={`#${sectionId(prefix, section.line)}`} className="block text-xs leading-relaxed text-muted-foreground transition-colors hover:text-foreground">{section.title}</a></li>)}</ol>;
   return <div className={hasOutline ? "grid min-w-0 gap-10 lg:grid-cols-[minmax(0,1fr)_10rem] lg:gap-14" : "min-w-0"}>
     {hasOutline ? <div className="order-first lg:order-last"><nav aria-label="On this page" className="sticky top-24 hidden lg:block"><p className="text-[0.6875rem] font-medium uppercase tracking-[0.16em] text-muted-foreground">On this page</p>{outlineLinks}<p className="mt-6 text-[0.6875rem] text-muted-foreground">{Math.max(1, Math.ceil(document.words / 220))} min read</p></nav><details className="rounded-lg border px-4 py-3 lg:hidden"><summary className="cursor-pointer text-xs text-muted-foreground">On this page<span className="ml-2 opacity-70">· {Math.max(1, Math.ceil(document.words / 220))} min read</span></summary><nav aria-label="Document sections">{outlineLinks}</nav></details></div> : null}
-    <div className="min-w-0 text-[0.9375rem] leading-7 text-foreground">
+    <div data-document-id={prefix} className="min-w-0 text-[0.9375rem] leading-7 text-foreground">
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       skipHtml
       components={{
-        h1: ({ children }) => <h2 className="mb-8 mt-1 text-balance font-serif text-[1.75rem] leading-snug tracking-tight">{children}</h2>,
+        h1: ({ children, node }) => <h2 id={sectionId(prefix, node?.position?.start.line ?? 0)} tabIndex={-1} className="mb-8 mt-1 scroll-mt-40 text-balance font-serif text-[1.75rem] leading-snug tracking-tight">{children}</h2>,
         h2: ({ children, node }) => <h3 id={sectionId(prefix, node?.position?.start.line ?? 0)} tabIndex={-1} className="mb-4 mt-10 scroll-mt-40 text-lg font-semibold tracking-tight first:mt-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring sm:scroll-mt-28">{children}</h3>,
-        h3: ({ children }) => <h3 className="mb-2 mt-6 font-semibold">{children}</h3>,
-        p: ({ children }) => <p className="my-3 leading-7">{children}</p>,
+        h3: ({ children, node }) => <h3 id={sectionId(prefix, node?.position?.start.line ?? 0)} tabIndex={-1} className="mb-2 mt-6 scroll-mt-40 font-semibold">{children}</h3>,
+        h4: ({ children, node }) => <h4 id={sectionId(prefix, node?.position?.start.line ?? 0)} tabIndex={-1} className="mb-2 mt-5 scroll-mt-40 font-semibold">{children}</h4>,
+        h5: ({ children, node }) => <h5 id={sectionId(prefix, node?.position?.start.line ?? 0)} tabIndex={-1} className="mb-2 mt-5 scroll-mt-40 font-semibold">{children}</h5>,
+        h6: ({ children, node }) => <h6 id={sectionId(prefix, node?.position?.start.line ?? 0)} tabIndex={-1} className="mb-2 mt-5 scroll-mt-40 font-semibold">{children}</h6>,
+        p: ({ children, node }) => <p id={sectionId(prefix, node?.position?.start.line ?? 0)} tabIndex={-1} className="my-3 scroll-mt-40 leading-7">{children}</p>,
         ul: ({ children }) => <ul className="my-3 list-disc space-y-1 pl-6">{children}</ul>,
         ol: ({ children }) => <ol className="my-3 list-decimal space-y-1 pl-6">{children}</ol>,
+        li: ({ children, node }) => <li data-source-line={node?.position?.start.line} tabIndex={-1} className="scroll-mt-40">{children}</li>,
         blockquote: ({ children }) => <blockquote className="my-4 border-l-2 pl-4 text-muted-foreground">{children}</blockquote>,
         a: ({ href, children }) => {
           const match = /^#t=(\d+(?:\.\d+)?)$/.exec(href ?? "");
@@ -39,9 +43,10 @@ export function ArtifactContent({ markdown, theme = "light", documentId, outline
           const external = Boolean(href && /^(?:https?:)?\/\//i.test(href));
           return <a href={href} target={external ? "_blank" : undefined} rel={external ? "noreferrer noopener" : undefined} className="underline decoration-border underline-offset-4 hover:decoration-foreground">{children}</a>;
         },
-        table: ({ children }) => <div className="my-5 overflow-x-auto border-y"><table className="w-full min-w-max border-collapse text-sm">{children}</table></div>,
+        table: ({ children }) => <div className="my-5 overflow-x-auto border-y"><table className="w-full min-w-[32rem] border-collapse text-sm">{children}</table></div>,
         th: ({ children }) => <th className="border-b px-3 py-2 text-left font-medium">{children}</th>,
-        td: ({ children }) => <td className="border-b px-3 py-2 align-top">{children}</td>,
+        tr: ({ children, node }) => <tr id={sectionId(prefix, node?.position?.start.line ?? 0)} tabIndex={-1} className="scroll-mt-40">{children}</tr>,
+        td: ({ children }) => <td className="max-w-96 break-words border-b px-3 py-3 align-top leading-relaxed">{children}</td>,
         code: ({ className, children }) => <code className={className ? `${className} font-mono text-xs` : "rounded bg-muted px-1.5 py-0.5 font-mono text-[0.85em]"}>{children}</code>,
         pre: ({ children }) => {
           const mermaid = mermaidSource(children);

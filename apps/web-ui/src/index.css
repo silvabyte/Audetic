@@ -109,30 +109,11 @@
   }
 }
 
-/* Quiet, readable branches rather than a whole document shrunk onto a canvas. */
-.note-workspace {
-  --map-sage: #47745e;
-  --map-blue: #52758f;
-  --map-ochre: #997539;
+.note-map-viewport {
+  background-image: radial-gradient(hsl(var(--border)) 0.75px, transparent 0.75px);
+  background-size: 20px 20px;
+  cursor: grab;
 }
-.dark .note-workspace {
-  --map-sage: #92bca3;
-  --map-blue: #94b4cf;
-  --map-ochre: #d1b17a;
-}
-.note-map-root { position: relative; }
-.note-map-root::after {
-  content: "";
-  position: absolute;
-  top: calc(100% + 12px);
-  height: 24px;
-  border-left: 1px solid hsl(var(--border));
-}
-.note-map-leaf::before {
-  content: "";
-  position: absolute;
-  left: -21px;
-  top: 0.65em;
-  width: 12px;
-  border-top: 1px solid color-mix(in srgb, var(--branch-color) 30%, transparent);
+.note-map-viewport:active {
+  cursor: grabbing;
 }

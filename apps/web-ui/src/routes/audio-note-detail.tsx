@@ -87,7 +87,7 @@ export function AudioNoteDetailRoute() {
     event.currentTarget.parentElement?.querySelectorAll<HTMLButtonElement>("[role=tab]")[nextIndex]?.focus();
   }
 
-  return <div className="note-workspace mx-auto flex w-full max-w-6xl flex-col px-5 py-6 sm:px-10 sm:py-10 lg:px-14">
+  return <div className={cn("note-workspace mx-auto flex w-full flex-col px-5 py-6 sm:px-10 sm:py-10 lg:px-14", activeTab === "mind-map" ? "max-w-[1600px]" : "max-w-6xl")}>
     <Link to="/audio-notes" className="mb-10 inline-flex w-fit items-center gap-2 text-xs text-muted-foreground hover:text-foreground"><ArrowLeft className="size-3.5" />All audio notes</Link>
     <Observer>{() => {
       const notes = store.audioNotes;

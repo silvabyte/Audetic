@@ -19,9 +19,13 @@ Routes / surface:
   classification/enrichment progress and retries, templates/artifacts, and soft deletion. The detail
   workspace opens on Summary, with Transcript, Mind map, and Details tabs. Playback stays mounted;
   generated talking points add seekable chapter markers. Saved documents have an in-page outline,
-  copy/download controls, and timestamp citations that seek the audio. Mind map builds expandable,
-  source-linked topic branches from a summary, or shows a generated Mermaid diagram with zoom,
-  expand, and SVG export. Transcript search highlights literal matches and preserves segment seeking;
+  copy/download controls, and timestamp citations that seek the audio. Mind map defaults to the
+  selected summary, using a lazy-loaded Markmap canvas with colored, connected branches, pan/zoom,
+  keyboard-accessible expand/collapse, a full-screen dialog, and SVG export. Its Markdown tree retains
+  nested headings/lists and labeled action-table fields without point caps or truncated prose. Text
+  links back to the exact source block; an expandable HTML outline is also available. Canvas labels
+  are escaped text, never source HTML. Dedicated generated Mermaid diagrams remain selectable.
+  Transcript search highlights literal matches and preserves segment seeking;
   following playback is opt-in. Manual Classification is edited under Details and remains
   separate from the visible AI suggestion.
   Transcription and enrichment are independent: failed AI processing never hides the raw transcript.

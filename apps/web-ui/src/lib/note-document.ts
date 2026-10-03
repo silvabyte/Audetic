@@ -36,9 +36,3 @@ export function readNoteDocument(markdown: string): { title: string | null; sect
 export function sectionId(documentId: string, line: number): string {
   return `${documentId}-section-${line}`;
 }
-
-export function shortMapLabel(text: string): string {
-  if (text.length <= 140) return text;
-  const end = text.lastIndexOf(" ", 137);
-  return `${text.slice(0, end > 80 ? end : 137)}…`;
-}
