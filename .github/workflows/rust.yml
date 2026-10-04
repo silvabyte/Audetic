@@ -48,7 +48,9 @@ jobs:
       - name: Install bun
         uses: oven-sh/setup-bun@v2
       - name: Install web-ui dependencies
-        run: cd apps/web-ui && bun install
+        run: cd apps/web-ui && bun install --frozen-lockfile
+      - name: Test source build and install contracts
+        run: make install-test
       - name: Typecheck web-ui
         run: cd apps/web-ui && bun run typecheck
       - name: Lint web-ui

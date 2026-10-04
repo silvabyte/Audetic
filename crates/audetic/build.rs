@@ -2,9 +2,8 @@
 //!
 //! The compiled assets land at `apps/web-ui/dist/` and are pulled in via
 //! `include_dir!` from `src/api/static_assets.rs`. Re-runs only when the SPA
-//! source changes. If `apps/web-ui/node_modules` is missing (fresh clone),
-//! this runs `bun install` first, so a plain `cargo build` / `make build` /
-//! the release pipeline don't require a separate `make ui-install`.
+//! source changes. Every UI rebuild first synchronizes dependencies with the
+//! committed lockfile, including in existing checkouts after `git pull`.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -31,26 +30,30 @@ fn main() {
 
     // Escape hatch: `AUDETIC_SKIP_UI_BUILD=1 cargo build` for environments
     // without bun (e.g. minimal docker images that fetch a prebuilt dist).
-    if std::env::var_os("AUDETIC_SKIP_UI_BUILD").is_some() {
-        ensure_dist_exists(&web_ui.join("dist"));
-        return;
-    }
-
-    if !has_command("bun") {
-        eprintln!(
-            "cargo:warning=`bun` not in PATH; skipping web-ui build. \
-             Install bun (https://bun.sh) or set AUDETIC_SKIP_UI_BUILD=1."
+    if std::env::var("AUDETIC_SKIP_UI_BUILD").as_deref() == Ok("1") {
+        println!(
+            "cargo:warning=AUDETIC_SKIP_UI_BUILD=1: using existing UI assets or a placeholder"
         );
         ensure_dist_exists(&web_ui.join("dist"));
         return;
     }
 
-    // `bun run build` needs node_modules; install on a fresh clone so callers
-    // don't have to remember `make ui-install` first.
-    if !web_ui.join("node_modules").exists() {
-        println!("cargo:warning=apps/web-ui/node_modules missing — running `bun install`");
-        run_bun(&web_ui, &["install"], "bun install");
+    if !has_command("bun") {
+        panic!(
+            "Bun is required to build the bundled web UI. \
+             Install Bun (https://bun.sh) and ensure `bun --version` works. \
+             For an intentional backend-only/prebuilt-UI build, set AUDETIC_SKIP_UI_BUILD=1."
+        );
     }
+
+    // Directory existence says nothing about freshness after a source upgrade.
+    // Bun's incremental install is cheap when current; frozen mode prevents a
+    // build from silently changing the dependency graph committed by the author.
+    run_bun(
+        &web_ui,
+        &["install", "--frozen-lockfile"],
+        "bun install --frozen-lockfile",
+    );
 
     run_bun(&web_ui, &["run", "build"], "bun run build");
 }
@@ -107,10 +110,10 @@ fn has_command(cmd: &str) -> bool {
 }
 
 /// `include_dir!` panics at compile time if the directory is missing. When
-/// we skip the build (no bun, or AUDETIC_SKIP_UI_BUILD), drop a placeholder
+/// we explicitly skip the build (AUDETIC_SKIP_UI_BUILD=1), drop a placeholder
 /// so the macro still resolves.
 fn ensure_dist_exists(dist: &Path) {
-    if dist.exists() {
+    if dist.join("index.html").is_file() {
         return;
     }
     if let Err(err) = std::fs::create_dir_all(dist) {

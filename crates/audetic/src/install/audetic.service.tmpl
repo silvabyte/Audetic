@@ -1,7 +1,10 @@
 [Unit]
 Description=Audetic Voice Transcription Service
 Documentation=https://github.com/silvabyte/Audetic
-After=graphical-session.target
+# Start only once the desktop has imported its Wayland/X11 environment.
+# Ordering after a target alone does not pull it in or wait for a future login.
+After=graphical-session-pre.target
+PartOf=graphical-session.target
 
 [Service]
 Type=simple
@@ -26,4 +29,4 @@ MemoryMax=6G
 CPUQuota=80%
 
 [Install]
-WantedBy=default.target
+WantedBy=graphical-session.target

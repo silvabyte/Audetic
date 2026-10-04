@@ -16,6 +16,8 @@ make install
 `make install` dispatches on `uname -s` and:
 
 - Builds the workspace in release mode (on macOS, also assembles and ad-hoc signs `Audetic.app`).
+- Synchronizes the web UI dependencies with `bun install --frozen-lockfile` before
+  each UI rebuild, including when an older `node_modules` directory already exists.
 - Hands off to `audeticd install`, which copies the daemon to `~/.local/share/audetic/bin/audeticd` (macOS: `~/Applications/Audetic.app`) and puts the standalone `audetic` CLI on your PATH at `~/.local/bin/audetic`.
 - Registers the background service — a systemd **user** unit at `~/.config/systemd/user/audeticd.service` on Linux, a LaunchAgent (`ai.audetic.daemon`) on macOS — and starts it.
 - Waits for the daemon to bind `127.0.0.1:3737`, then offers the terminal setup flow (`audetic setup`), the web Setup Center (`http://127.0.0.1:3737/settings/setup`), or setup later. Non-interactive installs print both follow-up paths.
@@ -39,21 +41,29 @@ After install:
 ### Prerequisites
 
 All systems require:
-- **Rust toolchain** (1.70+)
+- **Current stable Rust toolchain** (`rustup update stable`; older distribution toolchains may not build current dependencies)
 - **Bun** (builds the bundled web Setup Center)
-- **CMake, pkg-config, and a C/C++ build toolchain**
-- **Whisper implementation** (see [Whisper Installation Options](#whisper-installation-options))
-- **Text injection tool**: `ydotool` (recommended) or `wtype`
-- **Clipboard tools**: `wl-clipboard` (Wayland) or `xclip`/`xsel` (X11)
-- **Audio dependencies**: ALSA libraries
+- **CMake, pkg-config, a C/C++ build toolchain, and Clang/libclang** (native bindings)
+- **Linux development libraries**: ALSA and libxkbcommon headers
 - **curl** for API communication
+
+Linux service installation also needs a running **systemd user manager**. Run it
+from a terminal in your logged-in desktop session. Prerequisites are checked
+before compilation, including with `make -j install`.
+
+Transcription provider setup, text injection (`wtype` / `ydotool`), clipboard
+tools (`wl-clipboard` on Wayland; `xclip` / `xsel` on X11), FFmpeg, and system-audio
+tools are diagnosed in Setup Center. These are capability-specific, not all
+mandatory to install or use Audetic. A separate Whisper CLI is needed only when
+choosing that provider; on-device engines are built into Audetic.
 
 ### System Dependencies
 
-#### Arch Linux
+#### Omarchy / Arch Linux
 
 ```bash
-sudo pacman -S --needed base-devel rustup bun cmake pkgconf alsa-lib libxkbcommon curl
+sudo pacman -S --needed base-devel rustup bun cmake clang pkgconf alsa-lib libxkbcommon curl
+rustup default stable   # first-time Rust setup, if no default toolchain is selected
 ```
 
 Optional text-delivery and system-audio tools (`wtype` or `ydotool`, `wl-clipboard`,
@@ -65,26 +75,32 @@ never runs that privileged command from the browser.
 
 ```bash
 sudo apt update
-sudo apt install cargo libasound2-dev wl-clipboard curl cmake build-essential
-
-# Install ydotool (may need to compile from source)
-sudo apt install ydotool || {
-    git clone https://github.com/ReimuNotMoe/ydotool.git
-    cd ydotool && mkdir build && cd build
-    cmake .. && make -j$(nproc)
-    sudo make install
-}
+sudo apt install libasound2-dev libxkbcommon-dev clang libclang-dev pkg-config curl cmake build-essential
 ```
+
+Install current stable Rust with [rustup](https://rustup.rs/) and
+[Bun](https://bun.sh/docs/installation), then check `rustc --version`,
+`cargo --version`, and `bun --version` in the terminal that will run `make install`.
 
 #### Fedora
 
 ```bash
-sudo dnf install rust cargo ydotool cmake gcc-c++ alsa-lib-devel curl openssl-devel
+sudo dnf install clang clang-devel cmake gcc-c++ pkgconf-pkg-config alsa-lib-devel libxkbcommon-devel curl
 ```
+
+Install current stable Rust and Bun as above. `xdg-utils` is optional for opening
+the browser automatically; the installer always prints the setup URL.
+
+The default Linux build is CPU-only. Opting into `--features vulkan` (also enabled
+by `cargo clippy --all-targets --all-features -- -D warnings`) additionally needs
+Vulkan headers, the Vulkan loader, and `glslc`. On Arch: `sudo pacman -S --needed
+vulkan-headers vulkan-icd-loader shaderc`. GPU use also needs the driver for your
+hardware; none of these are prerequisites for the default `make install`.
 
 ### Text Injection Setup
 
-Audetic requires a text injection method. See the [Text Injection Setup Guide](./text-injection-setup.md) for detailed configuration.
+Text injection is optional and off by default. To enable automatic paste, see the
+[Text Injection Setup Guide](./text-injection-setup.md) for detailed configuration.
 
 **Quick setup for ydotool (recommended):**
 
@@ -214,10 +230,38 @@ audio_feedback = true
 `make install` (via `audeticd install`) sets this up for you: it writes a
 systemd **user** unit to `~/.config/systemd/user/audeticd.service` with
 `ExecStart` pointed at `~/.local/share/audetic/bin/audeticd`, runs
-`systemctl --user daemon-reload`, and `systemctl --user enable --now
-audeticd.service`. The unit template lives at
+`systemctl --user daemon-reload`, imports the current desktop environment, and
+re-enables/restarts `audeticd.service`. Re-enabling removes the legacy
+`default.target.wants` link on upgrades. The unit template lives at
 `crates/audetic/src/install/audetic.service.tmpl` — edit it there, not by hand
 in `~/.config`, or the next `make install` will overwrite your changes.
+
+Autostart is attached to **`graphical-session.target`**, with
+`PartOf=graphical-session.target` to stop at logout. This matters on Wayland:
+starting at the user manager's `default.target` can precede the compositor and
+leave the daemon without `WAYLAND_DISPLAY` for its entire lifetime. An
+`After=graphical-session.target` ordering line alone cannot wait for a target
+that is not part of the startup transaction. Omarchy's UWSM session (and
+systemd-integrated GNOME/KDE sessions) imports the environment before starting
+the graphical session target.
+
+For a manually launched compositor that does **not** manage that target, use
+its session-start hook to import the available desktop variables and then
+`systemctl --user restart audeticd.service`; stop Audetic in the session-exit
+hook. For example, run these inside the compositor session (omit variables that
+are unset):
+
+```sh
+systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE
+systemctl --user restart audeticd.service
+```
+
+Include `DISPLAY`/`XAUTHORITY` for X11, `HYPRLAND_INSTANCE_SIGNATURE` for raw
+Hyprland, and any custom `YDOTOOL_SOCKET`, `PULSE_SERVER`, or `PIPEWIRE_REMOTE`.
+Omarchy/UWSM users do not need an extra Hyprland startup hook. A headless daemon
+can still be started explicitly with `make start`; persistent headless startup
+can be opted into with `systemctl --user add-wants default.target audeticd.service`
+(reapply after reinstalling). Desktop delivery requires a graphical session.
 
 Day to day, use the Make targets rather than `systemctl` directly; they
 dispatch to systemd or launchd so the same words work on both platforms:
@@ -315,6 +359,16 @@ input_method = "ydotool"  # Recommended (auto-detected first)
 
 ## Troubleshooting
 
+### Source build cannot resolve a web UI package
+
+`make install` and plain `cargo build` synchronize locked dependencies before
+building the UI. For a standalone Vite build, use `make ui-build` (also syncs
+dependencies), or `make ui-install` before `bun run build`. A frozen-lockfile
+failure indicates a manifest/lockfile mismatch or an install/download failure;
+resolve that error rather than externalizing the missing package in Vite.
+Missing Bun is a build error. `AUDETIC_SKIP_UI_BUILD=1` is an explicit
+backend-only/prebuilt-UI escape hatch, not a desktop installation workaround.
+
 ### Service fails to start
 - Check logs: `make logs` or `journalctl --user -u audeticd.service -e`
 - Check status: `make status`
@@ -327,6 +381,9 @@ input_method = "ydotool"  # Recommended (auto-detected first)
 - Ensure the desired input device is set as the system default (Audetic uses whatever CPAL reports as default)
 
 ### Text injection fails
+- Check `systemctl --user is-active graphical-session.target` and reinstall with
+  `make install` to migrate older boot-time units. Importing variables into the
+  user manager does not update an already running daemon; restart it afterwards.
 - Verify ydotool service: `systemctl --user status ydotool.service`
 - Check socket: `ls -la /run/user/$(id -u)/.ydotool_socket`
 - See [Text Injection Setup](./text-injection-setup.md)
