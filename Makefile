@@ -12,7 +12,7 @@ LAUNCH_LABEL  ?= ai.audetic.daemon
 .PHONY: help build release check test clean run lint fmt fix quality \
         install install-linux install-macos install-preflight-linux uninstall \
         logs start restart stop status \
-        ui-install ui-dev ui-build ui-preview ui-typecheck ui-lint codegen \
+        ui-install ui-dev ui-build ui-preview ui-typecheck ui-lint install-test codegen \
         macos-sign macos-sign-release macos-app macos-app-debug macos-menubar
 
 # Default target
@@ -79,6 +79,7 @@ fix:
 # One-shot gate for both projects: Rust (fmt + clippy + tests) and the
 # bun web-ui (typecheck). Run before committing or in CI.
 quality:
+	python3 -m unittest discover -s scripts/tests -v
 	cargo fmt --all -- --check
 	cargo clippy --all-targets --all-features -- -D warnings
 	cargo test
@@ -104,12 +105,13 @@ install:
 	  *) echo "✗ Unsupported platform: $$(uname -s)"; exit 1 ;; \
 	esac
 
-install-linux: install-preflight-linux release
+install-linux: install-preflight-linux
+	$(MAKE) release
 	./target/release/audeticd install
 
 install-preflight-linux:
 	@missing=""; \
-	for command in bun cmake pkg-config curl systemctl cc; do \
+	for command in cargo rustc bun cmake pkg-config clang curl systemctl cc c++; do \
 	  command -v "$$command" >/dev/null 2>&1 || missing="$$missing $$command"; \
 	done; \
 	if ! pkg-config --exists alsa 2>/dev/null; then missing="$$missing alsa"; fi; \
@@ -117,10 +119,14 @@ install-preflight-linux:
 	if [ -n "$$missing" ]; then \
 	  echo "✗ Missing source-build prerequisites:$$missing"; \
 	  if command -v pacman >/dev/null 2>&1; then \
-	    echo "  Omarchy / Arch: sudo pacman -S --needed base-devel rustup bun cmake pkgconf alsa-lib libxkbcommon curl"; \
+	    echo "  Omarchy / Arch: sudo pacman -S --needed base-devel rustup bun cmake clang pkgconf alsa-lib libxkbcommon curl"; \
 	  else \
 	    echo "  See docs/installation.md#prerequisites-and-system-dependencies"; \
 	  fi; \
+	  exit 1; \
+	fi; \
+	if ! systemctl --user show-environment >/dev/null 2>&1; then \
+	  echo "✗ No systemd user manager available. Run make install from your logged-in desktop session, without sudo."; \
 	  exit 1; \
 	fi
 
@@ -203,13 +209,17 @@ status:
 
 # Web UI (apps/web-ui) — current SPA. Daemon must be running for ui-dev.
 ui-install:
-	cd apps/web-ui && bun install
+	cd apps/web-ui && bun install --frozen-lockfile
 
 ui-dev:
 	cd apps/web-ui && bun run dev
 
-ui-build:
+ui-build: ui-install
 	cd apps/web-ui && bun run build
+
+# Fast source-build regressions; no daemon compilation, network, or live service changes.
+install-test:
+	python3 -m unittest discover -s scripts/tests -v
 
 ui-preview:
 	cd apps/web-ui && bun run preview

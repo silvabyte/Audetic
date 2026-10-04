@@ -1,5 +1,5 @@
 //! Linux install: systemd user unit at `~/.config/systemd/user/audeticd.service`,
-//! `enable --now`, readiness probe, `xdg-open` the UI. Also places the standalone
+//! graphical-session autostart, readiness probe, `xdg-open` the UI. Also places the standalone
 //! `audetic` CLI on PATH (`~/.local/bin/audetic`).
 //!
 //! Uninstall stops and disables the unit, then removes what install wrote —
@@ -26,6 +26,8 @@ const SESSION_ENVIRONMENT: &[&str] = &[
     "DISPLAY",
     "HYPRLAND_INSTANCE_SIGNATURE",
     "PATH",
+    "PIPEWIRE_REMOTE",
+    "PULSE_SERVER",
     "WAYLAND_DISPLAY",
     "XAUTHORITY",
     "XDG_CONFIG_HOME",
@@ -33,6 +35,7 @@ const SESSION_ENVIRONMENT: &[&str] = &[
     "XDG_DATA_HOME",
     "XDG_RUNTIME_DIR",
     "XDG_SESSION_TYPE",
+    "YDOTOOL_SOCKET",
 ];
 
 pub async fn run(opts: InstallOptions) -> Result<()> {
@@ -277,7 +280,7 @@ fn daemon_reload() -> Result<()> {
     Ok(())
 }
 
-/// Enable the unit at boot and make sure the *new* binary is the one running.
+/// Enable the unit for graphical login and run the *new* binary immediately.
 ///
 /// `enable --now` is not enough here. `--now` only *starts* the unit, and
 /// starting an already-active unit is a no-op — so reinstalling over a running
@@ -288,13 +291,16 @@ fn daemon_reload() -> Result<()> {
 /// `restart` is the honest verb: it picks up the new `ExecStart` inode, and it
 /// also starts a unit that isn't running, which covers first install.
 fn enable_and_restart() -> Result<()> {
-    println!("  · systemctl --user enable {CURRENT_SERVICE}");
+    // Re-enable removes the old default.target.wants link on upgrades. Merely
+    // enabling the new WantedBy leaves that link in place and preserves the
+    // boot-before-Wayland race even with a corrected unit template.
+    println!("  · systemctl --user reenable {CURRENT_SERVICE}");
     let status = Command::new("systemctl")
-        .args(["--user", "enable", CURRENT_SERVICE])
+        .args(["--user", "reenable", CURRENT_SERVICE])
         .status()
-        .context("Failed to run systemctl enable")?;
+        .context("Failed to run systemctl reenable")?;
     if !status.success() {
-        bail!("`systemctl --user enable {CURRENT_SERVICE}` exited with {status}");
+        bail!("`systemctl --user reenable {CURRENT_SERVICE}` exited with {status}");
     }
 
     import_session_environment()?;
@@ -547,6 +553,18 @@ mod tests {
         });
 
         assert_eq!(variables, ["WAYLAND_DISPLAY", "XDG_RUNTIME_DIR"]);
+    }
+
+    #[test]
+    fn session_environment_preserves_custom_audio_and_input_sockets() {
+        let present = ["PIPEWIRE_REMOTE", "PULSE_SERVER", "YDOTOOL_SOCKET"];
+        let variables = present_session_environment(|name| {
+            present
+                .contains(&name)
+                .then(|| OsString::from("custom-socket"))
+        });
+
+        assert_eq!(variables, present);
     }
 
     #[test]

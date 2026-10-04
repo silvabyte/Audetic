@@ -52,18 +52,23 @@ Routes / surface:
 
 ## How it's built and embedded
 
-`crates/audetic/build.rs` runs `bun run build` in this directory at compile time; the output lands
+`crates/audetic/build.rs` runs `bun install --frozen-lockfile` followed by `bun run build`
+in this directory at compile time; the output lands
 in `apps/web-ui/dist/`, which `crates/audetic/src/api/static_assets.rs` pulls in via
 `include_dir!("$CARGO_MANIFEST_DIR/../../apps/web-ui/dist")`. `crates/audetic/src/api/mod.rs` mounts
 the API under `/api` and uses `serve_static` as the fallback, so the SPA is served at `/` with a
 history fallback to `index.html` (hashed `/assets/*` get a long cache; `index.html` is `no-cache`).
 
-- `bun install` must have been run once in this checkout before `cargo build` works (the build script
-  invokes `bun run build`, which needs `node_modules`). `make ui-install` does this.
+- Dependencies are synchronized on every Cargo-triggered UI rebuild, including after `git pull`
+  when `node_modules` already exists. Bun's incremental install uses the committed lockfile and
+  refuses manifest/lockfile drift. `make ui-install` performs the same frozen install manually;
+  use `bun add` / `bun install` when deliberately changing dependencies and commit `bun.lock`.
 - Escape hatch: `AUDETIC_SKIP_UI_BUILD=1 cargo build` skips the SPA build (and `build.rs` also
-  silently skips if `bun` isn't on PATH). In either case it drops a placeholder `dist/index.html` so
-  `include_dir!` still resolves — the daemon builds but serves a "UI not built" stub. Use this only
-  for environments without `bun`; CI builds the real bundle.
+  preserves a prebuilt `dist/index.html`). Without prebuilt assets it writes a "UI not built"
+  placeholder so `include_dir!` still resolves. Missing Bun otherwise fails with an installation
+  hint; it never silently produces a broken desktop install. `0` does not enable the escape hatch.
+- `make install-test` exercises the actual build script against fresh/stale dependency trees,
+  install failures, missing Bun, and the explicit skip path without network access.
 
 ## Run it in dev
 
@@ -96,14 +101,15 @@ not browser QA; verify microphone/system capture and clipboard delivery against 
 
 `make ui-typecheck` (`bun run typecheck`) is the only check unique to this package; `make quality`
 runs it alongside the Rust gate. CI (`.github/workflows/rust.yml`) installs `bun`, runs
-`bun install` + `bun run typecheck`, then builds/tests the daemon — which exercises the real
+`bun install --frozen-lockfile` + `bun run typecheck`, then builds/tests the daemon — which exercises the real
 `bun run build` + `include_dir!` embedding.
 
 ## Install story
 
 Build from source: `make install` → `audeticd install`
 (`crates/audetic/src/install/mod.rs`) — user-local, no sudo: copies the daemon to
-`~/.local/share/audetic/bin/`, writes `~/.config/systemd/user/audeticd.service`, `enable --now`s it,
+`~/.local/share/audetic/bin/`, writes `~/.config/systemd/user/audeticd.service`, re-enables it
+under `graphical-session.target` and restarts it with the current desktop environment,
 waits for `127.0.0.1:3737`, and opens `http://127.0.0.1:3737/` in the browser.
 There is no hosted installer and no auto-updater — see
 `docs/adr/0001-source-only-distribution.md`. `make uninstall` reverses it.

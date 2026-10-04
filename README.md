@@ -37,9 +37,13 @@ creates a backup and preserves existing transcripts, titles, artifacts, and audi
 
 ### Linux
 
-Needs a Rust toolchain, Bun, CMake, pkg-config, and ALSA/XKB headers. Copies the
+Needs a current stable Rust toolchain, Bun, CMake, Clang/libclang, a C/C++ compiler,
+pkg-config, and ALSA/XKB headers. UI dependencies are synchronized from the lockfile
+on build, including upgrades. Copies the
 binary to `~/.local/share/audetic/bin/`, installs a systemd **user** service at
-`~/.config/systemd/user/audeticd.service`, and `enable --now`s it.
+`~/.config/systemd/user/audeticd.service`, and starts it. Autostart follows the
+graphical session so Wayland clipboard and input tools receive the desktop
+environment. See the [Linux/Omarchy installation guide](./docs/installation.md).
 
 ### macOS
 

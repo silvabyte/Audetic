@@ -33,6 +33,9 @@ crates/audetic/tests/fixtures/large_video.mp4
 node_modules/
 apps/web-ui/dist/
 
+# Python build/install regression tests
+__pycache__/
+
 # Swift (menu-bar agent) build artifacts
 apps/menubar-macos/.build/
 

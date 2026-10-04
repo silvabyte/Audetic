@@ -157,7 +157,7 @@ test("manual classification mutations use typed endpoints and stale detail/list 
   assert.deepEqual(putBody, { kind: "creative-art" });
   assert.equal(store.detailCache[7]?.classification_kind_override, "creative-art");
   assert.equal(store.list[0]?.classification_kind_override, "creative-art");
-  assert.deepEqual(store.classificationKinds, ["creative-art", "shopping-list"]);
+  assert.deepEqual([...store.classificationKinds], ["creative-art", "shopping-list"]);
   assert.ok(releaseDetail);
   assert.ok(releaseList);
   releaseDetail(Response.json(detail));
