@@ -14,7 +14,9 @@ MobX (`<Observer>` only, strict mode — see `feedback_mobx.md`), `react-router-
 Routes / surface:
 
 - `/audio-notes` — one chronological stream of captured and imported audio notes (`/` redirects here).
-  Search titles/transcripts, filter by inferred classification (including future kinds), and paginate.
+  A full-width, local-date-grouped library with compact transcript previews. Search titles/transcripts
+  as you type (250ms debounce; `/` focuses search, Escape clears it), filter immediately by classification
+  (including future kinds), and paginate. Search previews bring distant transcript matches into view.
 - `/audio-notes/:id` — raw transcript, audio playback and segment seeking, title editing/regeneration,
   classification/enrichment progress and retries, templates/artifacts, and soft deletion. The detail
   workspace opens on Summary, with Transcript, Mind map, and Details tabs. Playback stays mounted;
