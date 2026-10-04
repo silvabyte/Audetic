@@ -266,7 +266,7 @@ test("mind-map tab defaults to the saved summary even when a newer standalone di
   const diagram: AudioNoteArtifact = { ...summary, id: 2, kind: "mind_map", content_markdown: "```mermaid\nmindmap\n  root((Garden))\n```" };
   runInAction(() => { root.noteArtifacts.byNote[7] = [diagram, summary]; });
   const html = renderToStaticMarkup(<RootStoreProvider value={root}><NoteArtifactsPanel noteId={7} canGenerate view="map" /></RootStoreProvider>);
-  assert.match(html, /Explore the conversation/);
+  assert.match(html, /aria-label="Summary mind map"/);
   assert.match(html, /Sow basil after the frost/);
   assert.doesNotMatch(html, /Rendering diagram/);
   assert.match(html, /<option value="2">Mind map/);

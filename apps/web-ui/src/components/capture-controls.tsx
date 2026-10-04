@@ -38,7 +38,7 @@ export function CaptureControls() {
     const disabled = !store.daemonReachable || store.audioNotes.commandPending || store.audioNotes.active || store.audioNotes.phase === "review" || store.noteSettings.saving;
     const autoPaste = autoPasteOverride ?? store.noteSettings.effectiveDefault;
     return <div className="flex items-center gap-1">
-      <Button onClick={() => void start()} disabled={disabled} size="sm"><Mic data-icon="inline-start" />Record note</Button>
+      <Button onClick={() => void start()} disabled={disabled} size="sm" className="gap-1.5" aria-label="Record note" title="Record note"><Mic className="size-4" /><span>Record<span className="hidden sm:inline"> note</span></span></Button>
       {autoPaste && <span className="text-xs text-muted-foreground">Auto-paste on</span>}
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild><Button variant="outline" size="icon" disabled={disabled} aria-label="Capture options"><SlidersHorizontal /></Button></PopoverTrigger>

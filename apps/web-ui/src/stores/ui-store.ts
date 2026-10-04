@@ -5,10 +5,10 @@ export type ThemeMode = "system" | "light" | "dark";
 export type EffectiveTheme = "light" | "dark";
 
 const THEME_STORAGE_KEY = "audetic.themeMode";
+const SIDEBAR_STORAGE_KEY = "audetic.sidebarCollapsed";
 
 /**
- * UiStore owns renderer-level presentation preferences. Today that's
- * theme mode only; as we grow (collapsed sidebar, etc.) those land here.
+ * UiStore owns renderer-level presentation preferences: theme and sidebar width.
  *
  * Theme application uses a `reaction` to toggle `.dark` on <html>
  * whenever the effective theme changes. We listen to the system
@@ -21,6 +21,7 @@ const THEME_STORAGE_KEY = "audetic.themeMode";
  */
 export class UiStore {
   themeMode: ThemeMode = "system";
+  sidebarCollapsed = false;
   private systemPrefersDark = false;
   private root: RootStore;
 
@@ -51,11 +52,13 @@ export class UiStore {
     const systemDark = mq?.matches ?? false;
 
     let persistedMode: ThemeMode = "system";
+    let sidebarCollapsed = false;
     try {
       const raw = window.localStorage.getItem(THEME_STORAGE_KEY);
       if (raw === "light" || raw === "dark" || raw === "system") {
         persistedMode = raw;
       }
+      sidebarCollapsed = window.localStorage.getItem(SIDEBAR_STORAGE_KEY) === "true";
     } catch {
       // localStorage can throw in private mode / disabled storage.
       // Fall back to "system".
@@ -64,6 +67,7 @@ export class UiStore {
     runInAction(() => {
       this.systemPrefersDark = systemDark;
       this.themeMode = persistedMode;
+      this.sidebarCollapsed = sidebarCollapsed;
     });
 
     // Apply the resolved theme AND re-apply whenever it changes.
@@ -101,6 +105,15 @@ export class UiStore {
       window.localStorage.setItem(THEME_STORAGE_KEY, mode);
     } catch {
       // Persist failure is not worth blocking the UI on.
+    }
+  }
+
+  toggleSidebar(): void {
+    this.sidebarCollapsed = !this.sidebarCollapsed;
+    try {
+      window.localStorage.setItem(SIDEBAR_STORAGE_KEY, String(this.sidebarCollapsed));
+    } catch {
+      // The current session still works when browser storage is unavailable.
     }
   }
 }

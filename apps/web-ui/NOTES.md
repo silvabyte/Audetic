@@ -19,8 +19,13 @@ Routes / surface:
   (including future kinds), and paginate. Search previews bring distant transcript matches into view.
 - `/audio-notes/:id` — raw transcript, audio playback and segment seeking, title editing/regeneration,
   classification/enrichment progress and retries, templates/artifacts, and soft deletion. The detail
-  workspace opens on Summary, with Transcript, Mind map, and Details tabs. Playback stays mounted;
-  generated talking points add seekable chapter markers. Saved documents have an in-page outline,
+  workspace opens on Summary, with Transcript, Mind map, and Details tabs. A compact title/metadata
+  row and contextual tab actions keep the document near the top; note management is in Note actions,
+  and saved-view creation/download/deletion is in Saved view actions. Long titles occupy at most two
+  lines (the full title is available on hover and in the editor). Playback stays mounted in a bottom dock;
+  chapters open beside the player. Container queries adapt controls to the width remaining beside the
+  sidebar, rather than the viewport. Empty summaries offer creation or a shortcut to the transcript.
+  Generated talking points add seekable chapter markers. Saved documents have an in-page outline,
   copy/download controls, and timestamp citations that seek the audio. Mind map defaults to the
   selected summary, using a lazy-loaded Markmap canvas with colored, connected branches, pan/zoom,
   keyboard-accessible expand/collapse, a full-screen dialog, and SVG export. Its Markdown tree retains
@@ -34,6 +39,7 @@ Routes / surface:
 - `/settings/{setup,provider,capture,keybind,post-processing,integrations,appearance,config-file}` — Setup Center is the
   read-only machine capability overview; Provider offers typed validation, save, and daemon restart
 - `components/command-bar.tsx` — one capture control and status stream, owned by `AudioNotesStore`.
+  Uses the existing light/dark Audetic brand assets; only active capture/review/processing adds status copy.
   Microphone capture is the default; optional system audio and review/trim are acquisition options,
   not a choice of meaning. Automatic paste and clipboard copying default off. Settings → Capture &
   delivery reads/writes the daemon-persisted preference through `GET`/`PUT /audio-notes/settings`.
@@ -45,6 +51,11 @@ Routes / surface:
 - `components/audio-review-panel.tsx`, `transcript-player.tsx`, `note-title-header.tsx`, and
   `note-artifacts-panel.tsx` are reusable note components. There are no separate dictation/meeting
   stores, routes, or status polls, and background completions do not unexpectedly change routes.
+- `components/app-sidebar.tsx` — collapses to a 56px icon rail with tooltips, an edge toggle, and
+  Ctrl/⌘ B (outside editable fields). `UiStore` remembers the choice in localStorage; animation respects
+  reduced motion. Small screens retain the compact horizontal navigation. Uses shadcn's icon-sidebar
+  patterns with the existing Radix primitives. `NavLink` styling uses `aria-current` selectors so Radix
+  `asChild` receives a string className rather than a render callback.
 - `stores/integrations-store.ts` and Settings → Integrations manage one-time scoped webhook keys,
   display the isolated public ingress endpoints, configure the official Plaud CLI sync, and show recent
   delivery outcomes. The browser never talks to the public ingress listener directly.
