@@ -38,6 +38,7 @@
 }
 
 :root {
+  color-scheme: light;
   --background: 0 0% 100%;
   --foreground: 240 10% 3.9%;
 
@@ -70,6 +71,7 @@
 }
 
 .dark {
+  color-scheme: dark;
   --background: 240 10% 3.9%;
   --foreground: 0 0% 98%;
 
@@ -116,4 +118,40 @@
 }
 .note-map-viewport:active {
   cursor: grabbing;
+}
+
+/* A quiet timeline with a full-height pointer target and native keyboard seeking. */
+.note-playback-range {
+  appearance: none;
+  background: transparent;
+}
+.note-playback-range::-webkit-slider-runnable-track {
+  height: 2px;
+  border-radius: 2px;
+  background: hsl(var(--border));
+}
+.note-playback-range::-moz-range-track {
+  height: 2px;
+  border-radius: 2px;
+  background: hsl(var(--border));
+}
+.note-playback-range::-webkit-slider-thumb {
+  appearance: none;
+  width: 10px;
+  height: 10px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: hsl(var(--foreground));
+}
+.note-playback-range::-moz-range-thumb {
+  width: 10px;
+  height: 10px;
+  border: 0;
+  border-radius: 50%;
+  background: hsl(var(--foreground));
+}
+.note-playback-range:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 3px;
+  border-radius: 2px;
 }

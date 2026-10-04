@@ -1,7 +1,8 @@
 import { useState, type RefObject } from "react";
-import { FastForward, Pause, Play, Rewind } from "lucide-react";
+import { List, Pause, Play, RotateCcw, RotateCw } from "lucide-react";
 import { audioNoteAudioUrl } from "@/api/client";
 import { Button } from "@/components/ui/button";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { formatDuration } from "@/lib/audio-notes";
 import type { TalkingPoint } from "@/lib/talking-points";
 
@@ -24,6 +25,7 @@ export function AudioTransport({
   const [duration, setDuration] = useState(durationHint ?? 0);
   const [speed, setSpeed] = useState(1);
   const [audioError, setAudioError] = useState(false);
+  const [chaptersOpen, setChaptersOpen] = useState(false);
   const boundedDuration = Number.isFinite(duration) && duration > 0 ? duration : durationHint ?? 0;
 
   function seek(seconds: number): void {
@@ -44,7 +46,7 @@ export function AudioTransport({
     }
   }
 
-  return <section aria-label="Audio transport" className="border-y bg-background/95 py-4 backdrop-blur supports-[backdrop-filter]:bg-background/85">
+  return <section aria-label="Audio transport" className="bg-background/95 py-2 backdrop-blur supports-[backdrop-filter]:bg-background/85">
     <audio
       key={noteId}
       ref={audioRef}
@@ -58,12 +60,13 @@ export function AudioTransport({
       onError={() => setAudioError(true)}
       onCanPlay={() => setAudioError(false)}
     />
-    <div className="flex flex-wrap items-center gap-2 sm:flex-nowrap sm:gap-3">
-      <Button type="button" variant="ghost" size="icon" aria-label="Rewind 10 seconds" onClick={() => seek(currentTime - 10)}><Rewind /></Button>
-      <Button type="button" size="icon" className="rounded-full" aria-label={playing ? "Pause" : "Play"} onClick={() => void togglePlayback()}>{playing ? <Pause /> : <Play />}</Button>
-      <Button type="button" variant="ghost" size="icon" aria-label="Forward 10 seconds" onClick={() => seek(currentTime + 10)}><FastForward /></Button>
-      <span className="w-24 shrink-0 text-center font-mono text-xs tabular-nums text-muted-foreground">{formatDuration(currentTime)} / {formatDuration(boundedDuration)}</span>
-      <div className="relative order-last basis-full py-2 sm:order-none sm:min-w-20 sm:flex-1 sm:basis-auto">
+    <div className="flex flex-wrap items-center gap-1 @xl:flex-nowrap @xl:gap-2">
+      <Button type="button" size="icon" className="shrink-0 rounded-full" aria-label={playing ? "Pause" : "Play"} title={playing ? "Pause" : "Play"} onClick={() => void togglePlayback()}>{playing ? <Pause className="size-4" /> : <Play className="size-4" />}</Button>
+      <Button type="button" variant="ghost" size="icon" className="shrink-0 text-muted-foreground" aria-label="Rewind 10 seconds" title="Rewind 10 seconds" disabled={audioError} onClick={() => seek(currentTime - 10)}><RotateCcw className="size-3.5" /></Button>
+      <Button type="button" variant="ghost" size="icon" className="shrink-0 text-muted-foreground" aria-label="Forward 10 seconds" title="Forward 10 seconds" disabled={audioError} onClick={() => seek(currentTime + 10)}><RotateCw className="size-3.5" /></Button>
+      <span className="hidden shrink-0 px-1 font-mono text-[0.6875rem] tabular-nums text-muted-foreground @xl:block">{formatDuration(currentTime)} <span className="opacity-50">/</span> {formatDuration(boundedDuration)}</span>
+      <div className="order-last flex basis-full items-center gap-3 py-2 @xl:order-none @xl:mx-2 @xl:min-w-12 @xl:flex-1 @xl:basis-auto">
+        <div className="relative min-w-0 flex-1">
         <input
           type="range"
           min={0}
@@ -72,7 +75,9 @@ export function AudioTransport({
           value={Math.min(currentTime, boundedDuration || 0)}
           onChange={(event) => seek(Number(event.target.value))}
           aria-label="Playback position"
-          className="block w-full accent-foreground"
+          aria-valuetext={`${formatDuration(currentTime)} of ${formatDuration(boundedDuration)}`}
+          disabled={audioError || boundedDuration <= 0}
+          className="note-playback-range block h-5 w-full cursor-pointer accent-foreground disabled:cursor-default disabled:opacity-40"
         />
         {boundedDuration > 0 ? markers.map((marker, index) => {
           const next = markers[index + 1];
@@ -88,9 +93,11 @@ export function AudioTransport({
             style={{ left: `${Math.min((marker.seconds / boundedDuration) * 100, 100)}%` }}
           ><span className={active ? "h-3.5 w-1 rounded-full bg-foreground" : "h-2.5 w-0.5 bg-foreground"} /></button>;
         }) : null}
+        </div>
+        <span className="shrink-0 font-mono text-[0.6875rem] tabular-nums text-muted-foreground @xl:hidden">{formatDuration(currentTime)} / {formatDuration(boundedDuration)}</span>
       </div>
-      <label className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
-        <span className="sr-only sm:not-sr-only">Speed</span>
+      <label className="ml-auto flex shrink-0 items-center text-xs text-muted-foreground @xl:ml-0">
+        <span className="sr-only">Speed</span>
         <select
           aria-label="Playback speed"
           value={speed}
@@ -99,11 +106,12 @@ export function AudioTransport({
             setSpeed(next);
             if (audioRef.current) audioRef.current.playbackRate = next;
           }}
-          className="h-8 rounded-md border bg-background px-2 text-xs text-foreground"
+          className="h-9 rounded-md bg-transparent px-1 text-xs text-muted-foreground hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
         >
           {[0.75, 1, 1.25, 1.5, 2].map((value) => <option key={value} value={value}>{value}×</option>)}
         </select>
       </label>
+      {markers.length ? <Popover open={chaptersOpen} onOpenChange={setChaptersOpen}><PopoverTrigger asChild><Button variant="ghost" size="icon" aria-label={`${markers.length} recording chapters`} title="Recording chapters" className="shrink-0 text-muted-foreground"><List className="size-4" /></Button></PopoverTrigger><PopoverContent align="end" className="w-80 max-w-[calc(100vw-2rem)] p-2"><h2 className="px-2 py-2 text-xs font-medium">Recording chapters</h2><ol className="max-h-72 overflow-auto">{markers.map((point) => <li key={point.seconds}><button type="button" onClick={() => { seek(point.seconds); setChaptersOpen(false); }} className="flex min-h-10 w-full gap-3 rounded px-2 py-2.5 text-left text-xs leading-relaxed text-muted-foreground hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"><span className="font-mono tabular-nums">{point.timestamp}</span>{point.label}</button></li>)}</ol></PopoverContent></Popover> : null}
     </div>
     {audioError ? <p role="status" className="mt-2 text-xs text-muted-foreground">Audio is unavailable or could not play. The saved transcript remains available.</p> : null}
   </section>;
