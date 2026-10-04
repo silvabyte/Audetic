@@ -39,7 +39,15 @@ Routes / surface:
 - `/settings/{setup,provider,capture,keybind,post-processing,integrations,appearance,config-file}` — Setup Center is the
   read-only machine capability overview; Provider offers typed validation, save, and daemon restart
 - `components/command-bar.tsx` — one capture control and status stream, owned by `AudioNotesStore`.
-  Uses the existing light/dark Audetic brand assets; only active capture/review/processing adds status copy.
+  A quiet action bar pairs a labeled source/options control with Record; active recording groups the
+  timer, Stop, and an accessible discard dialog. The options popover presents audio sources and review
+  first, with optional title and transcript delivery in disclosures. Session choices remain mounted
+  across capture states; local capture actions preserve keyboard focus and external state changes
+  close the options panel. Offline status includes a Setup shortcut. Review/processing have explicit
+  status copy and processing links to the note. Background processing keeps Record available.
+  `components/audetic-mark.tsx` reuses the original icon silhouette as a mask: only its smaller arc
+  changes tint for recording, processing, review, or errors; offline dims the mark. It is entirely
+  static (no rotation or pulse), decorative, and always accompanied by textual state feedback.
   Microphone capture is the default; optional system audio and review/trim are acquisition options,
   not a choice of meaning. Automatic paste and clipboard copying default off. Settings → Capture &
   delivery reads/writes the daemon-persisted preference through `GET`/`PUT /audio-notes/settings`.
