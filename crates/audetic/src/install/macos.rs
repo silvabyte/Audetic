@@ -49,7 +49,6 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     // respawned by launchd into a half-deleted bundle. Booting them out first
     // makes the replacement quiet. No-op on a first install.
     bootout_agents();
-    super::migrate_legacy_database(|| {})?;
 
     place_bundle(&paths)?;
     place_cli(&paths);

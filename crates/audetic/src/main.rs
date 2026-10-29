@@ -17,7 +17,7 @@
 //! Day-to-day commands (meeting, history, transcribe, provider, …) live in the
 //! separate `audetic` binary, which talks to this daemon over its REST API.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use audetic::{app, install};
 use clap::{Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
@@ -61,10 +61,12 @@ enum Command {
     /// `codegen` against a freshly built daemon without starting the service
     /// or contending for port 3737.
     Openapi,
-    /// Offline migration of a stopped daemon's legacy database to Audio Notes.
-    MigrateAudioNotes {
+    /// Upgrade the database schema now. The daemon also does this at startup.
+    #[command(alias = "migrate-audio-notes")]
+    Migrate {
         #[arg(long)]
         database: Option<std::path::PathBuf>,
+        /// Report what would change, using an in-memory copy.
         #[arg(long)]
         dry_run: bool,
     },
@@ -101,13 +103,21 @@ async fn main() -> Result<()> {
             println!("{}", spec.to_pretty_json()?);
             Ok(())
         }
-        Some(Command::MigrateAudioNotes { database, dry_run }) => {
+        Some(Command::Migrate { database, dry_run }) => {
             let path = match database {
                 Some(path) => path,
                 None => audetic::global::db_file()?,
             };
-            let report = audetic::audio_note_migration::migrate_audio_notes(&path, dry_run)?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            let _lock = if dry_run {
+                None
+            } else {
+                Some(
+                    app::acquire_instance_lock(&path)
+                        .context("Stop the Audetic daemon before migrating manually")?,
+                )
+            };
+            let outcome = audetic::db::migrations::migrate_database(&path, dry_run)?;
+            println!("{outcome}");
             Ok(())
         }
         None => app::run_service().await,

@@ -186,66 +186,6 @@ pub(crate) fn set_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Convert a legacy database to Audio Notes so the new daemon can start.
-///
-/// The daemon bails at startup on a legacy schema, so skipping this leaves the
-/// supervisor crash-looping it. `stop_daemon` runs only when a conversion is
-/// needed; the instance lock then proves no daemon is still writing.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn migrate_legacy_database(stop_daemon: impl FnOnce()) -> Result<()> {
-    let db_path = crate::global::db_file()?;
-    migrate_legacy_database_at(&db_path, stop_daemon)
-}
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn migrate_legacy_database_at(db_path: &Path, stop_daemon: impl FnOnce()) -> Result<()> {
-    use crate::audio_note_migration::migrate_audio_notes;
-    use rusqlite::{Connection, OpenFlags};
-
-    if !db_path.exists() {
-        return Ok(());
-    }
-    let is_legacy = {
-        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-            .with_context(|| format!("Failed to open {}", db_path.display()))?;
-        crate::db::init::has_legacy_schema(&conn)?
-    };
-    if !is_legacy {
-        return Ok(());
-    }
-
-    println!(
-        "  · Migrating legacy audio database to Audio Notes ({})",
-        db_path.display()
-    );
-    stop_daemon();
-    let _lock = crate::app::acquire_instance_lock(db_path)
-        .context("Stop every running Audetic daemon, then re-run the install")?;
-    let report = migrate_audio_notes(db_path, false)
-        .context("Automatic Audio Notes migration failed; see docs/audio-notes-migration.md")?;
-
-    println!(
-        "    Migrated {} notes ({} meetings, {} dictations)",
-        report.notes, report.meetings, report.workflows
-    );
-    if let Some(backup) = &report.backup_path {
-        println!("    Backup: {}", backup.display());
-    }
-    if !report.missing_audio.is_empty() {
-        println!(
-            "    {} notes have no audio file on disk; their transcripts were kept",
-            report.missing_audio.len()
-        );
-    }
-    if !report.disabled_subscriptions.is_empty() {
-        println!("    Disabled event hooks that need recreating for `audio_note.completed`:");
-        for sub in &report.disabled_subscriptions {
-            println!("      - {} ({})", sub.name, sub.event);
-        }
-    }
-    Ok(())
-}
-
 /// Poll the daemon's HTTP API until the newly installed version responds.
 ///
 /// Shared between Linux and macOS — the readiness check is identical once
@@ -273,12 +213,75 @@ async fn wait_for_daemon(timeout: Duration) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
+    let recent = recent_service_log()
+        .map(|log| summarize_log_tail(&log, 10))
+        .filter(|tail| !tail.is_empty())
+        .map(|tail| format!("\nRecent service log:\n{tail}\n"))
+        .unwrap_or_default();
     bail!(
-        "Daemon did not respond on {bind_addr} within {}s. \
-         Check service logs for the failure ({}).",
+        "Daemon did not respond on {bind_addr} within {}s.{recent}\nFull service log: {}.",
         timeout.as_secs(),
         log_hint(),
     );
+}
+
+/// The last `max` log lines, with consecutive repeats collapsed: a supervisor
+/// restart loop prints the same startup error on every attempt.
+fn summarize_log_tail(log: &str, max: usize) -> String {
+    let mut lines: Vec<(&str, usize)> = Vec::new();
+    for line in log.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
+        match lines.last_mut() {
+            Some((last, count)) if *last == line => *count += 1,
+            _ => lines.push((line, 1)),
+        }
+    }
+    let start = lines.len().saturating_sub(max);
+    lines[start..]
+        .iter()
+        .map(|(line, count)| match count {
+            1 => format!("  {line}"),
+            n => format!("  {line}  (×{n})"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(target_os = "linux")]
+fn recent_service_log() -> Option<String> {
+    let output = std::process::Command::new("journalctl")
+        .args([
+            "--user",
+            "-u",
+            "audeticd.service",
+            "-n",
+            "200",
+            "--no-pager",
+            "-o",
+            "cat",
+        ])
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn recent_service_log() -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const TAIL_BYTES: u64 = 16 * 1024;
+    let path = dirs::home_dir()?.join("Library/Logs/Audetic/audetic.log");
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn recent_service_log() -> Option<String> {
+    None
 }
 
 fn daemon_version_is_current(info: &crate::api::VersionInfo, expected: &str) -> bool {
@@ -555,57 +558,16 @@ mod tests {
         assert!(!daemon_version_is_current(&info, "1.2.2"));
     }
 
-    fn legacy_database(path: &Path) {
-        rusqlite::Connection::open(path)
-            .unwrap()
-            .execute_batch(
-                "CREATE TABLE workflows(id INTEGER PRIMARY KEY, workflow_type TEXT, text TEXT, audio_path TEXT, created_at TEXT);
-                 INSERT INTO workflows VALUES(1,'VoiceToText','Dictation text','/missing/quick.wav','2024-01-01 00:00:00');",
-            )
-            .unwrap();
-    }
-
-    fn is_legacy(path: &Path) -> bool {
-        let conn = rusqlite::Connection::open(path).unwrap();
-        crate::db::init::has_legacy_schema(&conn).unwrap()
-    }
-
     #[test]
-    fn install_migration_skips_missing_and_current_databases() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("audetic.db");
-        migrate_legacy_database_at(&db_path, || panic!("no daemon stop needed")).unwrap();
-        assert!(!db_path.exists());
+    fn log_tail_collapses_restart_loop_repeats_and_keeps_the_newest_lines() {
+        let log =
+            "old line\nstarting\nError: boom\nError: boom\nError: boom\n\nstarting\nError: boom\n";
 
-        crate::db::init::init_db_at(&db_path).unwrap();
-        migrate_legacy_database_at(&db_path, || panic!("no daemon stop needed")).unwrap();
-    }
-
-    #[test]
-    fn install_migration_stops_daemon_and_converts_legacy_database() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("audetic.db");
-        legacy_database(&db_path);
-        let stopped = Cell::new(false);
-
-        migrate_legacy_database_at(&db_path, || stopped.set(true)).unwrap();
-
-        assert!(stopped.get());
-        assert!(!is_legacy(&db_path));
-        crate::db::init::init_db_at(&db_path).unwrap();
-    }
-
-    #[test]
-    fn install_migration_refuses_while_a_daemon_holds_the_lock() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("audetic.db");
-        legacy_database(&db_path);
-        let _daemon = crate::app::acquire_instance_lock(&db_path).unwrap();
-
-        let err = migrate_legacy_database_at(&db_path, || {}).unwrap_err();
-
-        assert!(format!("{err:#}").contains("Stop every running Audetic daemon"));
-        assert!(is_legacy(&db_path));
+        assert_eq!(
+            summarize_log_tail(log, 3),
+            "  Error: boom  (×3)\n  starting\n  Error: boom"
+        );
+        assert_eq!(summarize_log_tail("", 3), "");
     }
 
     #[test]

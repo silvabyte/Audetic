@@ -47,7 +47,6 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     place_cli();
     ensure_runtime_dirs(&paths)?;
     retire_superseded_services(&paths)?;
-    super::migrate_legacy_database(stop_current_service)?;
     write_unit(&paths)?;
     daemon_reload()?;
     enable_and_restart()?;
@@ -291,14 +290,6 @@ fn daemon_reload() -> Result<()> {
 ///
 /// `restart` is the honest verb: it picks up the new `ExecStart` inode, and it
 /// also starts a unit that isn't running, which covers first install.
-/// Best-effort: the unit may not exist yet on a first install.
-fn stop_current_service() {
-    println!("  · systemctl --user stop {CURRENT_SERVICE}");
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", CURRENT_SERVICE])
-        .output();
-}
-
 fn enable_and_restart() -> Result<()> {
     // Re-enable removes the old default.target.wants link on upgrades. Merely
     // enabling the new WantedBy leaves that link in place and preserves the

@@ -129,10 +129,18 @@ async fn handle_capture_stream_died(capture: &mut impl CaptureCommandTarget, dea
 
 pub async fn run_service() -> Result<()> {
     audetic_core::url::port()?;
-    // Refuse legacy schemas before opening devices, requesting permissions, or
-    // accepting HTTP requests. The error contains offline migration instructions.
+    // Upgrade the schema before opening devices, requesting permissions, or
+    // accepting HTTP requests. The instance lock makes this the only writer.
     let db_path = crate::global::db_file()?;
     let _instance_lock = acquire_instance_lock(&db_path)?;
+    if db_path.exists() {
+        let outcome = crate::db::migrations::migrate_database(&db_path, false)?;
+        if !outcome.steps.is_empty() {
+            for line in outcome.to_string().lines() {
+                info!("{line}");
+            }
+        }
+    }
     let api_listener =
         tokio::net::TcpListener::bind((audetic_core::url::HOST, audetic_core::url::port()?))
             .await
@@ -252,7 +260,7 @@ pub async fn run_service() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn acquire_instance_lock(db_path: &Path) -> Result<File> {
+pub fn acquire_instance_lock(db_path: &Path) -> Result<File> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
