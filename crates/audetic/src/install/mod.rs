@@ -186,41 +186,64 @@ pub(crate) fn set_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Refuse to install over a database the new daemon will refuse to open.
+/// Convert a legacy database to Audio Notes so the new daemon can start.
 ///
-/// The daemon bails at startup on a legacy schema, so without this check the
-/// supervisor crash-loops it and the install surfaces only as a readiness
-/// timeout. Running before any service teardown leaves the old install intact.
+/// The daemon bails at startup on a legacy schema, so skipping this leaves the
+/// supervisor crash-looping it. `stop_daemon` runs only when a conversion is
+/// needed; the instance lock then proves no daemon is still writing.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) fn ensure_database_is_current() -> Result<()> {
+pub(crate) fn migrate_legacy_database(stop_daemon: impl FnOnce()) -> Result<()> {
     let db_path = crate::global::db_file()?;
-    ensure_database_is_current_at(&db_path)
+    migrate_legacy_database_at(&db_path, stop_daemon)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-fn ensure_database_is_current_at(db_path: &Path) -> Result<()> {
+fn migrate_legacy_database_at(db_path: &Path, stop_daemon: impl FnOnce()) -> Result<()> {
+    use crate::audio_note_migration::migrate_audio_notes;
     use rusqlite::{Connection, OpenFlags};
 
     if !db_path.exists() {
         return Ok(());
     }
-    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("Failed to open {} for preflight", db_path.display()))?;
-    if !crate::db::init::has_legacy_schema(&conn)? {
+    let is_legacy = {
+        let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("Failed to open {}", db_path.display()))?;
+        crate::db::init::has_legacy_schema(&conn)?
+    };
+    if !is_legacy {
         return Ok(());
     }
 
-    let audeticd = std::env::current_exe()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "audeticd".into());
-    let db = db_path.display();
-    bail!(
-        "Legacy audio database detected at {db}; the new daemon will not start until it is migrated.\n\
-         Stop the running daemon, then run:\n\
-         \n  \"{audeticd}\" migrate-audio-notes --database \"{db}\" --dry-run\
-         \n  \"{audeticd}\" migrate-audio-notes --database \"{db}\"\n\
-         \nThen re-run the install. See docs/audio-notes-migration.md."
+    println!(
+        "  · Migrating legacy audio database to Audio Notes ({})",
+        db_path.display()
     );
+    stop_daemon();
+    let _lock = crate::app::acquire_instance_lock(db_path)
+        .context("Stop every running Audetic daemon, then re-run the install")?;
+    let report = migrate_audio_notes(db_path, false)
+        .context("Automatic Audio Notes migration failed; see docs/audio-notes-migration.md")?;
+
+    println!(
+        "    Migrated {} notes ({} meetings, {} dictations)",
+        report.notes, report.meetings, report.workflows
+    );
+    if let Some(backup) = &report.backup_path {
+        println!("    Backup: {}", backup.display());
+    }
+    if !report.missing_audio.is_empty() {
+        println!(
+            "    {} notes have no audio file on disk; their transcripts were kept",
+            report.missing_audio.len()
+        );
+    }
+    if !report.disabled_subscriptions.is_empty() {
+        println!("    Disabled event hooks that need recreating for `audio_note.completed`:");
+        for sub in &report.disabled_subscriptions {
+            println!("      - {} ({})", sub.name, sub.event);
+        }
+    }
+    Ok(())
 }
 
 /// Poll the daemon's HTTP API until the newly installed version responds.
@@ -532,32 +555,57 @@ mod tests {
         assert!(!daemon_version_is_current(&info, "1.2.2"));
     }
 
-    #[test]
-    fn database_preflight_allows_missing_and_current_databases() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("audetic.db");
-        ensure_database_is_current_at(&db_path).unwrap();
-        assert!(!db_path.exists());
+    fn legacy_database(path: &Path) {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE workflows(id INTEGER PRIMARY KEY, workflow_type TEXT, text TEXT, audio_path TEXT, created_at TEXT);
+                 INSERT INTO workflows VALUES(1,'VoiceToText','Dictation text','/missing/quick.wav','2024-01-01 00:00:00');",
+            )
+            .unwrap();
+    }
 
-        crate::db::init::init_db_at(&db_path).unwrap();
-        ensure_database_is_current_at(&db_path).unwrap();
+    fn is_legacy(path: &Path) -> bool {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        crate::db::init::has_legacy_schema(&conn).unwrap()
     }
 
     #[test]
-    fn database_preflight_rejects_legacy_schema_with_migration_commands() {
+    fn install_migration_skips_missing_and_current_databases() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("audetic.db");
-        rusqlite::Connection::open(&db_path)
-            .unwrap()
-            .execute_batch("CREATE TABLE workflows(id INTEGER PRIMARY KEY);")
-            .unwrap();
+        migrate_legacy_database_at(&db_path, || panic!("no daemon stop needed")).unwrap();
+        assert!(!db_path.exists());
 
-        let err = ensure_database_is_current_at(&db_path)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains(&db_path.display().to_string()));
-        assert!(err.contains("migrate-audio-notes"));
-        assert!(err.contains("--dry-run"));
+        crate::db::init::init_db_at(&db_path).unwrap();
+        migrate_legacy_database_at(&db_path, || panic!("no daemon stop needed")).unwrap();
+    }
+
+    #[test]
+    fn install_migration_stops_daemon_and_converts_legacy_database() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("audetic.db");
+        legacy_database(&db_path);
+        let stopped = Cell::new(false);
+
+        migrate_legacy_database_at(&db_path, || stopped.set(true)).unwrap();
+
+        assert!(stopped.get());
+        assert!(!is_legacy(&db_path));
+        crate::db::init::init_db_at(&db_path).unwrap();
+    }
+
+    #[test]
+    fn install_migration_refuses_while_a_daemon_holds_the_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("audetic.db");
+        legacy_database(&db_path);
+        let _daemon = crate::app::acquire_instance_lock(&db_path).unwrap();
+
+        let err = migrate_legacy_database_at(&db_path, || {}).unwrap_err();
+
+        assert!(format!("{err:#}").contains("Stop every running Audetic daemon"));
+        assert!(is_legacy(&db_path));
     }
 
     #[test]

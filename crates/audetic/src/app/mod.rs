@@ -252,7 +252,7 @@ pub async fn run_service() -> Result<()> {
     Ok(())
 }
 
-fn acquire_instance_lock(db_path: &Path) -> Result<File> {
+pub(crate) fn acquire_instance_lock(db_path: &Path) -> Result<File> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
     }

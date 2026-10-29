@@ -39,7 +39,7 @@ pub(crate) fn has_legacy_schema(conn: &Connection) -> Result<bool> {
 pub fn migrate(conn: &Connection) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", true)?;
     if has_legacy_schema(conn)? {
-        bail!("Legacy audio database detected. Stop Audetic, then run `audeticd migrate-audio-notes --database <PATH> --dry-run` and `audeticd migrate-audio-notes --database <PATH>`. See docs/audio-notes-migration.md.");
+        bail!("Legacy audio database detected. Re-run `audeticd install` (or `make install`) to migrate it automatically, or stop Audetic and run `audeticd migrate-audio-notes --database <PATH> --dry-run` and `audeticd migrate-audio-notes --database <PATH>`. See docs/audio-notes-migration.md.");
     }
     if table_exists(conn, "audio_notes_schema")? {
         let version: i64 = conn.query_row(
