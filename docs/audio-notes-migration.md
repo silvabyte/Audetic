@@ -5,6 +5,12 @@ durable note stream. **Stop the daemon before migration.** Normal startup refuse
 legacy databases and prints the offline migration command; merely opening a
 database connection never converts legacy data or resets active processing.
 
+`audeticd install` (and `make install`) does this for you: after stopping the
+old service it converts a legacy database, holding the daemon's instance lock,
+and prints the note count, backup path, missing audio, and any disabled event
+hooks. The manual steps below remain for custom database paths or when you want
+to review the dry-run first.
+
 Fresh installations create only `audio_notes`, `audio_note_artifacts`, the schema
 marker, and the existing agent-profile and post-processing tables. They do not
 need this migration.
