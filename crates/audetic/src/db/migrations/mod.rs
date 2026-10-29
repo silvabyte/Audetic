@@ -1,131 +1,270 @@
-//! Explicit, offline conversion of the former meetings/workflows database.
+//! Versioned schema migrations.
 //!
-//! No service or repository calls this on connection open. A SQLite-consistent
-//! backup precedes an exclusive transaction; data_version closes the gap
-//! between the backup snapshot and acquiring the migration writer lock.
+//! `detect_version` is the only place that decides what version a database is
+//! at. `MIGRATIONS` lists every step in order; the runner applies the steps
+//! between the detected version and `LATEST`. Released steps are frozen:
+//! change the schema by appending a step. Fresh databases replay the whole
+//! chain, so no second copy of the schema can drift from it.
+//!
+//! Databases holding data are upgraded only by [`migrate_database`], which the
+//! daemon runs at startup under its instance lock. It takes a SQLite-consistent
+//! backup, then applies every pending step in one exclusive transaction, so a
+//! failure leaves the database exactly as it was.
+
+mod v1;
+mod v2;
+mod v3;
 
 use anyhow::{ensure, Context, Result};
-use base64::Engine;
-use rusqlite::{params, types::ValueRef, Connection, OpenFlags, Transaction, TransactionBehavior};
-use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use rusqlite::{Connection, OpenFlags, Transaction, TransactionBehavior};
 use std::fmt;
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::db::init::{create_schema, has_legacy_schema, table_exists, SCHEMA_VERSION};
+use crate::db::init::table_exists;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SourceMapping {
-    pub source_table: String,
-    pub source_id: i64,
-    pub note_id: i64,
+struct Migration {
+    version: i64,
+    description: &'static str,
+    /// Returns human-readable notes about what the step changed.
+    apply: fn(&Connection) -> Result<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct MissingAudio {
-    pub source_table: String,
-    pub source_id: i64,
-    pub audio_path: String,
-}
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        description: "Create Audio Notes and import legacy meetings and dictations",
+        apply: v1::apply,
+    },
+    Migration {
+        version: 2,
+        description: "Add external imports, ingress keys, and Plaud sync",
+        apply: v2::apply,
+    },
+    Migration {
+        version: 3,
+        description: "Add classification kind override",
+        apply: v3::apply,
+    },
+];
 
-#[derive(Debug, Clone, Serialize)]
-pub struct DisabledSubscription {
-    pub id: i64,
-    pub name: String,
-    pub event: String,
-}
+pub const LATEST: i64 = MIGRATIONS[MIGRATIONS.len() - 1].version;
 
-#[derive(Debug, Clone, Serialize)]
-pub struct MigrationReport {
+#[derive(Debug)]
+pub struct MigrationOutcome {
     pub database: PathBuf,
     pub dry_run: bool,
-    pub already_migrated: bool,
-    pub schema_version: i64,
+    pub from: i64,
+    pub to: i64,
     pub backup_path: Option<PathBuf>,
-    pub meetings: usize,
-    pub workflows: usize,
-    pub artifacts: usize,
-    pub notes: usize,
-    pub source_mappings: Vec<SourceMapping>,
-    pub missing_audio: Vec<MissingAudio>,
-    pub disabled_subscriptions: Vec<DisabledSubscription>,
-    pub warnings: Vec<String>,
+    pub steps: Vec<StepOutcome>,
 }
 
-impl fmt::Display for MigrationReport {
+#[derive(Debug)]
+pub struct StepOutcome {
+    pub version: i64,
+    pub description: &'static str,
+    pub notes: Vec<String>,
+}
+
+impl fmt::Display for MigrationOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let json = serde_json::to_string_pretty(self).map_err(|_| fmt::Error)?;
-        f.write_str(&json)
+        if self.steps.is_empty() {
+            return write!(
+                f,
+                "Database schema is current (version {}): {}",
+                self.to,
+                self.database.display()
+            );
+        }
+        let verb = if self.dry_run {
+            "Would migrate"
+        } else {
+            "Migrated"
+        };
+        write!(
+            f,
+            "{verb} database schema from version {} to {}: {}",
+            self.from,
+            self.to,
+            self.database.display()
+        )?;
+        for step in &self.steps {
+            write!(f, "\n  v{}: {}", step.version, step.description)?;
+            for note in &step.notes {
+                write!(f, "\n      {note}")?;
+            }
+        }
+        if let Some(backup) = &self.backup_path {
+            write!(f, "\n  Backup: {}", backup.display())?;
+        }
+        Ok(())
     }
 }
 
-/// Convert a stopped daemon's database. Dry-run opens SQLite read-only and
-/// takes one read snapshot; it never creates a backup or changes source rows.
-pub fn migrate_audio_notes(database: &Path, dry_run: bool) -> Result<MigrationReport> {
+/// Version 0 means no Audio Notes marker: an empty database, or one written by
+/// a pre-Audio-Notes release. Step 1 imports whatever legacy tables exist.
+fn detect_version(conn: &Connection) -> Result<i64> {
+    if table_exists(conn, "audio_notes_schema")? {
+        ensure!(
+            !v1::has_legacy_tables(conn)?,
+            "Mixed legacy and Audio Notes schemas detected; refusing an ambiguous migration"
+        );
+        let version: i64 = conn.query_row(
+            "SELECT version FROM audio_notes_schema WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        ensure!(
+            (1..=LATEST).contains(&version),
+            "Unsupported Audio Notes schema version {version}; this build supports up to {LATEST}"
+        );
+        return Ok(version);
+    }
     ensure!(
-        database.is_file(),
+        !table_exists(conn, "audio_notes")? && !table_exists(conn, "audio_note_artifacts")?,
+        "Unversioned Audio Notes tables detected; refusing to guess their schema. Restore a known database backup or inspect the schema offline."
+    );
+    Ok(0)
+}
+
+fn is_empty(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
+/// Per-connection check. An empty database is brought to `LATEST` in place
+/// (there is nothing to back up); any other outdated database is refused, so
+/// opening a connection never rewrites existing data.
+pub(crate) fn ensure_current(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "foreign_keys", true)?;
+    let version = detect_version(conn)?;
+    if version == LATEST {
+        return Ok(());
+    }
+    ensure!(
+        is_empty(conn)?,
+        "Database schema is at version {version}, but this build needs version {LATEST}. \
+         Restart the Audetic daemon to upgrade it; it backs the database up first."
+    );
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)?;
+    run_steps(&tx, version, LATEST)?;
+    tx.commit().context("Failed to commit new database schema")
+}
+
+/// Upgrade the database at `path` to `LATEST`. The caller must hold the daemon
+/// instance lock. A dry run applies the steps to an in-memory copy instead, so
+/// it reports exactly what the real run would do without writing anything.
+pub fn migrate_database(path: &Path, dry_run: bool) -> Result<MigrationOutcome> {
+    ensure!(
+        path.is_file(),
         "Database does not exist: {}",
-        database.display()
+        path.display()
     );
     let flags = if dry_run {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     } else {
         OpenFlags::SQLITE_OPEN_READ_WRITE
     };
-    let conn = Connection::open_with_flags(database, flags)
-        .context("Failed to open migration database")?;
+    let conn = Connection::open_with_flags(path, flags).context("Failed to open database")?;
     conn.busy_timeout(Duration::from_secs(5))?;
     conn.pragma_update(None, "foreign_keys", true)?;
-    if dry_run {
-        let tx = conn.unchecked_transaction()?;
-        validate_integrity(&tx)?;
-        return inspect(&tx, database, true);
+    validate_integrity(&conn)?;
+    let from = detect_version(&conn)?;
+    let mut outcome = MigrationOutcome {
+        database: path.to_path_buf(),
+        dry_run,
+        from,
+        to: LATEST,
+        backup_path: None,
+        steps: Vec::new(),
+    };
+    if from == LATEST {
+        return Ok(outcome);
     }
 
-    // Snapshot inspection is short and read-only. Recheck everything after
-    // obtaining the migration lock; an old daemon may still be writing.
-    {
-        let tx = conn.unchecked_transaction()?;
-        validate_integrity(&tx)?;
-        let report = inspect(&tx, database, false)?;
-        if report.already_migrated {
-            return Ok(report);
+    if dry_run {
+        let mut scratch = Connection::open_in_memory()?;
+        copy_snapshot(&conn, &mut scratch)?;
+        scratch.pragma_update(None, "foreign_keys", true)?;
+        let tx = Transaction::new_unchecked(&scratch, TransactionBehavior::Exclusive)?;
+        outcome.steps = run_steps(&tx, from, LATEST)?;
+        return Ok(outcome);
+    }
+
+    let version_before: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
+    let backup = if is_empty(&conn)? {
+        None
+    } else {
+        Some(backup_database(&conn, path)?)
+    };
+    match apply_backed_up(&conn, from, version_before) {
+        Ok(steps) => {
+            outcome.steps = steps;
+            outcome.backup_path = backup;
+            Ok(outcome)
+        }
+        Err(err) => {
+            // The transaction rolled back, so the backup duplicates the
+            // database. Dropping it keeps a crash-looping daemon from filling
+            // the disk with one backup per restart.
+            if let Some(backup) = &backup {
+                if detect_version(&conn).ok() == Some(from) {
+                    let _ = std::fs::remove_file(backup);
+                }
+            }
+            Err(err.context(format!(
+                "Schema migration from version {from} to {LATEST} failed and was rolled back; the database is unchanged"
+            )))
         }
     }
-    let version_before: i64 = conn.query_row("PRAGMA data_version", [], |r| r.get(0))?;
-    let backup = backup_database(&conn, database)?;
-    let result = convert_backed_up(&conn, database, version_before).map(|mut report| {
-        report.backup_path = Some(backup.clone());
-        report
-    });
-    result.with_context(|| format!("Audio Notes migration failed; conversion transaction rolled back. Pre-migration backup: {}", backup.display()))
 }
 
-/// Keep the lock and version check in one seam so no caller can accidentally
-/// convert against a source newer than the snapshot that was backed up.
-fn convert_backed_up(
-    conn: &Connection,
-    database: &Path,
-    version_before: i64,
-) -> Result<MigrationReport> {
-    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Exclusive)
-            .context("Cannot acquire exclusive SQLite migration transaction. Stop all Audetic processes and retry")?;
+/// Keep the lock and version check in one seam so no caller can migrate a
+/// database that changed after its backup was taken.
+fn apply_backed_up(conn: &Connection, from: i64, version_before: i64) -> Result<Vec<StepOutcome>> {
+    let tx = Transaction::new_unchecked(conn, TransactionBehavior::Exclusive).context(
+        "Cannot acquire exclusive SQLite migration transaction. Stop all Audetic processes and retry",
+    )?;
     let version_locked: i64 = tx.query_row("PRAGMA data_version", [], |r| r.get(0))?;
-    ensure!(version_locked == version_before,
-            "Another process wrote to the database while backing it up. No conversion was performed; stop the writer and retry");
-    validate_integrity(&tx)?;
-    let report = inspect(&tx, database, false)?;
     ensure!(
-        !report.already_migrated,
-        "Database changed while migration was preparing"
+        version_locked == version_before,
+        "Another process wrote to the database while backing it up. No migration was performed; stop the writer and retry"
     );
-    convert(&tx, &report)?;
+    ensure!(
+        detect_version(&tx)? == from,
+        "Database changed while the migration was preparing"
+    );
+    let steps = run_steps(&tx, from, LATEST)?;
     validate_integrity(&tx)?;
-    tx.commit()
-        .context("Failed to commit Audio Notes conversion")?;
-    Ok(report)
+    tx.commit().context("Failed to commit schema migration")?;
+    Ok(steps)
+}
+
+fn run_steps(conn: &Connection, from: i64, to: i64) -> Result<Vec<StepOutcome>> {
+    MIGRATIONS
+        .iter()
+        .filter(|m| m.version > from && m.version <= to)
+        .map(|m| {
+            let notes = (m.apply)(conn)
+                .with_context(|| format!("Migration to schema version {} failed", m.version))?;
+            conn.execute(
+                "INSERT INTO audio_notes_schema(singleton, version) VALUES(1, ?1)
+                 ON CONFLICT(singleton) DO UPDATE
+                 SET version = excluded.version, migrated_at = CURRENT_TIMESTAMP",
+                [m.version],
+            )?;
+            Ok(StepOutcome {
+                version: m.version,
+                description: m.description,
+                notes,
+            })
+        })
+        .collect()
 }
 
 fn backup_database(conn: &Connection, database: &Path) -> Result<PathBuf> {
@@ -134,7 +273,7 @@ fn backup_database(conn: &Connection, database: &Path) -> Result<PathBuf> {
         .context("Database has no filename")?
         .to_string_lossy();
     let backup = database.with_file_name(format!(
-        "{filename}.pre-audio-notes-{}.sqlite3",
+        "{filename}.pre-v{LATEST}-{}.sqlite3",
         uuid::Uuid::new_v4()
     ));
     let mut options = OpenOptions::new();
@@ -174,17 +313,22 @@ fn copy_sqlite_snapshot(source: &Connection, destination: &Path) -> Result<()> {
         Connection::open_with_flags(destination, OpenFlags::SQLITE_OPEN_READ_WRITE)
             .context("Failed to open reserved backup database")?;
     destination.busy_timeout(Duration::from_secs(5))?;
-    let result = rusqlite::backup::Backup::new(source, &mut destination)?.step(-1)?;
-    // This is offline tooling: copy all pages under one source read lock and
-    // fail on contention instead of retrying indefinitely against a live writer.
-    ensure!(
-        result == rusqlite::backup::StepResult::Done,
-        "Cannot finish SQLite backup ({result:?}). Stop all Audetic processes and retry"
-    );
+    copy_snapshot(source, &mut destination)?;
     // The copied header can carry WAL mode from the source. Materialize a
     // standalone rollback-journal backup while it is still writable: macOS's
     // SQLite cannot always reopen a WAL-mode file read-only without sidecars.
     destination.pragma_update(None, "journal_mode", "DELETE")?;
+    Ok(())
+}
+
+fn copy_snapshot(source: &Connection, destination: &mut Connection) -> Result<()> {
+    let result = rusqlite::backup::Backup::new(source, destination)?.step(-1)?;
+    // Copy all pages under one source read lock and fail on contention
+    // instead of retrying indefinitely against a live writer.
+    ensure!(
+        result == rusqlite::backup::StepResult::Done,
+        "Cannot finish SQLite backup ({result:?}). Stop all Audetic processes and retry"
+    );
     Ok(())
 }
 
@@ -201,346 +345,8 @@ fn validate_integrity(conn: &Connection) -> Result<()> {
     let mut stmt = conn.prepare("PRAGMA foreign_key_check")?;
     ensure!(
         stmt.query([])?.next()?.is_none(),
-        "SQLite foreign-key check failed; repair dangling legacy references before migrating"
+        "SQLite foreign-key check failed; repair dangling references before migrating"
     );
-    Ok(())
-}
-
-fn count(conn: &Connection, table: &str) -> Result<usize> {
-    if !table_exists(conn, table)? {
-        return Ok(0);
-    }
-    let count: i64 =
-        conn.query_row(&format!("SELECT COUNT(*) FROM {}", quote(table)), [], |r| {
-            r.get(0)
-        })?;
-    Ok(usize::try_from(count)?)
-}
-
-fn inspect(conn: &Connection, database: &Path, dry_run: bool) -> Result<MigrationReport> {
-    let legacy = has_legacy_schema(conn)?;
-    let unified = table_exists(conn, "audio_notes_schema")?;
-    ensure!(
-        !(legacy && unified),
-        "Mixed legacy and unified schemas detected; refusing an ambiguous conversion"
-    );
-    ensure!(
-        legacy || unified,
-        "No recognized legacy or Audio Notes schema in {}",
-        database.display()
-    );
-    if unified {
-        let version: i64 = conn.query_row(
-            "SELECT version FROM audio_notes_schema WHERE singleton=1",
-            [],
-            |r| r.get(0),
-        )?;
-        ensure!(
-            version == SCHEMA_VERSION,
-            "Unsupported Audio Notes schema version {version}"
-        );
-    } else {
-        ensure!(
-            !table_exists(conn, "audio_notes")? && !table_exists(conn, "audio_note_artifacts")?,
-            "Unmarked unified tables already exist; refusing to overwrite them"
-        );
-    }
-    let meetings = count(conn, "meetings")?;
-    let workflows = count(conn, "workflows")?;
-    let artifacts = count(
-        conn,
-        if unified {
-            "audio_note_artifacts"
-        } else {
-            "meeting_artifacts"
-        },
-    )?;
-    let mut report = MigrationReport {
-        database: database.to_path_buf(),
-        dry_run,
-        already_migrated: unified,
-        schema_version: SCHEMA_VERSION,
-        backup_path: None,
-        meetings,
-        workflows,
-        artifacts,
-        notes: if unified {
-            count(conn, "audio_notes")?
-        } else {
-            meetings + workflows
-        },
-        source_mappings: Vec::new(),
-        missing_audio: Vec::new(),
-        disabled_subscriptions: Vec::new(),
-        warnings: Vec::new(),
-    };
-    if unified {
-        return Ok(report);
-    }
-    let mut max_id = 0;
-    for table in ["meetings", "workflows"] {
-        if !table_exists(conn, table)? {
-            continue;
-        }
-        let mut stmt = conn.prepare(&format!("SELECT id,audio_path FROM {table} ORDER BY id"))?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?))
-        })?;
-        for row in rows {
-            let (id, path) = row?;
-            let note_id = if table == "meetings" {
-                max_id = max_id.max(id);
-                id
-            } else {
-                max_id = max_id
-                    .checked_add(1)
-                    .context("Audio Note ID space exhausted")?;
-                max_id
-            };
-            report.source_mappings.push(SourceMapping {
-                source_table: table.into(),
-                source_id: id,
-                note_id,
-            });
-            let path = path.unwrap_or_default();
-            if path.is_empty() || !Path::new(&path).is_file() {
-                report.missing_audio.push(MissingAudio {
-                    source_table: table.into(),
-                    source_id: id,
-                    audio_path: path,
-                });
-            }
-        }
-    }
-    if table_exists(conn, "meeting_artifacts")? {
-        ensure!(
-            table_exists(conn, "meetings")?,
-            "Legacy artifacts exist without their meetings table"
-        );
-        let orphaned: i64 = conn.query_row("SELECT COUNT(*) FROM meeting_artifacts a LEFT JOIN meetings m ON m.id=a.meeting_id WHERE m.id IS NULL",[],|r|r.get(0))?;
-        ensure!(
-            orphaned == 0,
-            "{orphaned} legacy artifacts have missing parents; refusing data loss"
-        );
-    }
-    if table_exists(conn, "post_processing_jobs")? {
-        let mut stmt = conn.prepare("SELECT id,name,event FROM post_processing_jobs WHERE enabled<>0 AND event IN ('dictation.completed','meeting.completed') ORDER BY id")?;
-        report.disabled_subscriptions = stmt
-            .query_map([], |r| {
-                Ok(DisabledSubscription {
-                    id: r.get(0)?,
-                    name: r.get(1)?,
-                    event: r.get(2)?,
-                })
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-    }
-    if !report.missing_audio.is_empty() {
-        report.warnings.push("Missing audio is reported only: every transcript and original path is retained; no audio is moved.".into());
-    }
-    if !report.disabled_subscriptions.is_empty() {
-        report.warnings.push("Legacy event subscriptions will be disabled, not retargeted. Review commands and explicitly subscribe to audio_note.completed with its new payload.".into());
-    }
-    Ok(report)
-}
-
-fn quote(identifier: &str) -> String {
-    format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-fn columns(conn: &Connection, table: &str) -> Result<HashSet<String>> {
-    let mut stmt = conn.prepare(&format!("PRAGMA table_info({})", quote(table)))?;
-    let rows = stmt.query_map([], |r| r.get(1))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
-}
-
-fn select_column(columns: &HashSet<String>, name: &str, fallback: &str) -> String {
-    if columns.contains(name) {
-        quote(name)
-    } else {
-        fallback.into()
-    }
-}
-
-fn convert(conn: &Connection, report: &MigrationReport) -> Result<()> {
-    create_schema(conn)?;
-    // Lossless provenance (including columns unknown to this release) survives
-    // removal of the legacy runtime tables. Blobs use an explicit base64 tag.
-    conn.execute_batch(
-        "CREATE TABLE audio_note_migration_sources (
-        source_table TEXT NOT NULL, source_id INTEGER NOT NULL,
-        note_id INTEGER REFERENCES audio_notes(id), source_json TEXT NOT NULL,
-        PRIMARY KEY(source_table,source_id)
-    );",
-    )?;
-    for table in ["meetings", "workflows"] {
-        if !table_exists(conn, table)? {
-            continue;
-        }
-        let cols = columns(conn, table)?;
-        if table == "meetings" {
-            let names = [
-                "id",
-                "title",
-                "title_source",
-                "title_updated_at",
-                "title_version",
-                "status",
-                "audio_path",
-                "source_filename",
-                "transcript_path",
-                "transcript_text",
-                "transcript_segments",
-                "duration_seconds",
-                "started_at",
-                "completed_at",
-                "error",
-                "created_at",
-                "deleted_at",
-            ];
-            let projections = names
-                .iter()
-                .map(|name| match *name {
-                    "title" => format!("NULLIF(trim({}), '')", select_column(&cols, name, "NULL")),
-                    "title_source" if !cols.contains(*name) => {
-                        "CASE WHEN title IS NULL OR trim(title)='' THEN NULL ELSE 'manual' END"
-                            .into()
-                    }
-                    "title_version" => format!("COALESCE({},0)", select_column(&cols, name, "0")),
-                    "started_at" | "created_at" => format!(
-                        "COALESCE({},CURRENT_TIMESTAMP)",
-                        select_column(&cols, name, "NULL")
-                    ),
-                    "audio_path" => "COALESCE(audio_path,'')".into(),
-                    _ => select_column(&cols, name, "NULL"),
-                })
-                .collect::<Vec<_>>();
-            let source = if cols.contains("source_filename") {
-                "CASE WHEN source_filename IS NOT NULL THEN 'import' ELSE 'microphone_and_system' END"
-            } else {
-                "'microphone_and_system'"
-            };
-            conn.execute(
-                &format!(
-                    "INSERT INTO audio_notes({},capture_source) SELECT {},{source} FROM meetings",
-                    names.join(","),
-                    projections.join(",")
-                ),
-                [],
-            )?;
-        } else {
-            let created = select_column(&cols, "created_at", "NULL");
-            for mapping in report
-                .source_mappings
-                .iter()
-                .filter(|m| m.source_table == table)
-            {
-                conn.execute(&format!("INSERT INTO audio_notes(id,status,audio_path,transcript_text,started_at,completed_at,created_at,capture_source) \
-                    SELECT ?1,'completed',COALESCE(audio_path,''),text,COALESCE({created},CURRENT_TIMESTAMP),{created},COALESCE({created},CURRENT_TIMESTAMP),'microphone' \
-                    FROM workflows WHERE id=?2"),params![mapping.note_id,mapping.source_id])?;
-            }
-        }
-        archive_rows(conn, table, report)?;
-    }
-    if table_exists(conn, "meeting_artifacts")? {
-        let cols = columns(conn, "meeting_artifacts")?;
-        let names = [
-            "id",
-            "kind",
-            "title",
-            "template_id",
-            "agent_profile_id",
-            "status",
-            "content_markdown",
-            "error",
-            "stdout",
-            "stderr",
-            "created_at",
-            "updated_at",
-            "completed_at",
-        ];
-        let projection = names
-            .iter()
-            .map(|name| {
-                select_column(
-                    &cols,
-                    name,
-                    if matches!(*name, "created_at" | "updated_at") {
-                        "CURRENT_TIMESTAMP"
-                    } else {
-                        "NULL"
-                    },
-                )
-            })
-            .collect::<Vec<_>>();
-        conn.execute(&format!("INSERT INTO audio_note_artifacts(note_id,{}) SELECT meeting_id,{} FROM meeting_artifacts",names.join(","),projection.join(",")),[])?;
-        archive_rows(conn, "meeting_artifacts", report)?;
-        let changed_relationships: i64 = conn.query_row("SELECT COUNT(*) FROM meeting_artifacts old LEFT JOIN audio_note_artifacts new ON new.id=old.id AND new.note_id=old.meeting_id WHERE new.id IS NULL",[],|r|r.get(0))?;
-        ensure!(
-            changed_relationships == 0,
-            "Artifact relationships were not preserved"
-        );
-    }
-    // Preserve all hook definitions, including the original enabled state in
-    // the archive; do not silently broaden a shell command's subscriptions.
-    archive_rows(conn, "post_processing_jobs", report)?;
-    conn.execute("UPDATE post_processing_jobs SET enabled=0,updated_at=CURRENT_TIMESTAMP WHERE event IN ('dictation.completed','meeting.completed') AND enabled<>0",[])?;
-    ensure!(
-        count(conn, "audio_notes")? == report.notes,
-        "Audio Note count mismatch"
-    );
-    ensure!(
-        count(conn, "audio_note_artifacts")? == report.artifacts,
-        "Artifact count mismatch"
-    );
-    let mappings: i64 = conn.query_row("SELECT COUNT(*) FROM audio_note_migration_sources WHERE source_table IN ('meetings','workflows') AND note_id IS NOT NULL",[],|r|r.get(0))?;
-    ensure!(
-        usize::try_from(mappings)? == report.notes,
-        "Source mapping count mismatch"
-    );
-    for table in ["meeting_artifacts", "meetings", "workflows"] {
-        conn.execute(&format!("DROP TABLE IF EXISTS {table}"), [])?;
-    }
-    Ok(())
-}
-
-fn archive_rows(conn: &Connection, table: &str, report: &MigrationReport) -> Result<()> {
-    let note_ids: HashMap<i64, i64> = report
-        .source_mappings
-        .iter()
-        .filter(|mapping| mapping.source_table == table)
-        .map(|mapping| (mapping.source_id, mapping.note_id))
-        .collect();
-    let mut stmt = conn.prepare(&format!("SELECT * FROM {}", quote(table)))?;
-    let names = stmt
-        .column_names()
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        let id: i64 = row.get("id")?;
-        let mut object = serde_json::Map::new();
-        for (i, name) in names.iter().enumerate() {
-            let value = match row.get_ref(i)? {
-                ValueRef::Null => serde_json::Value::Null,
-                ValueRef::Integer(n) => n.into(),
-                ValueRef::Real(n) if n.is_finite() => serde_json::json!(n),
-                ValueRef::Real(n) => serde_json::json!({"sqlite_real": n.to_string()}),
-                ValueRef::Text(bytes) => std::str::from_utf8(bytes)?.into(),
-                ValueRef::Blob(bytes) => {
-                    serde_json::json!({"sqlite_blob_base64":base64::engine::general_purpose::STANDARD.encode(bytes)})
-                }
-            };
-            object.insert(name.clone(), value);
-        }
-        let note_id = if table == "meeting_artifacts" {
-            Some(row.get::<_, i64>("meeting_id")?)
-        } else {
-            note_ids.get(&id).copied()
-        };
-        conn.execute("INSERT INTO audio_note_migration_sources(source_table,source_id,note_id,source_json) VALUES(?1,?2,?3,?4)",params![table,id,note_id,serde_json::to_string(&object)?])?;
-    }
     Ok(())
 }
 
@@ -548,6 +354,7 @@ fn archive_rows(conn: &Connection, table: &str, report: &MigrationReport) -> Res
 mod tests {
     use super::*;
     use crate::db::audio_notes::AudioNoteRepository;
+    use v1::count;
 
     fn fixture(path: &Path) -> Connection {
         let conn = Connection::open(path).unwrap();
@@ -566,23 +373,170 @@ mod tests {
         conn
     }
 
+    fn schema_version(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT version FROM audio_notes_schema WHERE singleton = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn backups_in(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.to_string_lossy().contains(".pre-v"))
+            .collect()
+    }
+
+    #[test]
+    fn migrations_are_contiguous_from_one() {
+        let versions: Vec<i64> = MIGRATIONS.iter().map(|m| m.version).collect();
+        assert_eq!(versions, (1..=LATEST).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn fresh_connection_replays_the_chain_without_a_backup() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_current(&conn).unwrap();
+        assert_eq!(schema_version(&conn), LATEST);
+        assert!(!v1::has_legacy_tables(&conn).unwrap());
+        for table in [
+            "audio_note_artifacts",
+            "post_processing_jobs",
+            "external_imports",
+            "plaud_sync_state",
+        ] {
+            assert!(table_exists(&conn, table).unwrap(), "{table}");
+        }
+        assert!(!table_exists(&conn, "audio_note_migration_sources").unwrap());
+    }
+
+    #[test]
+    fn every_older_version_upgrades_to_latest() {
+        for start in 1..LATEST {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("audetic.db");
+            let conn = Connection::open(&path).unwrap();
+            run_steps(&conn, 0, start).unwrap();
+            conn.execute(
+                "INSERT INTO audio_notes(title, audio_path) VALUES('Keep me', '/tmp/keep.wav')",
+                [],
+            )
+            .unwrap();
+            drop(conn);
+
+            let outcome = migrate_database(&path, false).unwrap();
+
+            assert_eq!((outcome.from, outcome.to), (start, LATEST));
+            assert!(outcome.backup_path.unwrap().is_file());
+            let conn = crate::db::init_db_at(&path).unwrap();
+            assert_eq!(schema_version(&conn), LATEST);
+            let title: String = conn
+                .query_row("SELECT title FROM audio_notes WHERE id = 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(title, "Keep me");
+        }
+    }
+
+    #[test]
+    fn connection_open_refuses_outdated_data_without_changing_it() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE workflows(id INTEGER PRIMARY KEY);")
+            .unwrap();
+        let err = ensure_current(&conn).unwrap_err().to_string();
+        assert!(err.contains("version 0"), "{err}");
+        assert!(err.contains("Restart the Audetic daemon"), "{err}");
+        assert!(!table_exists(&conn, "audio_notes").unwrap());
+    }
+
+    #[test]
+    fn unknown_schema_versions_are_not_silently_accepted() {
+        let conn = Connection::open_in_memory().unwrap();
+        ensure_current(&conn).unwrap();
+        conn.execute("UPDATE audio_notes_schema SET version=999", [])
+            .unwrap();
+        assert!(ensure_current(&conn)
+            .unwrap_err()
+            .to_string()
+            .contains("Unsupported"));
+        conn.execute("DROP TABLE audio_notes_schema", []).unwrap();
+        assert!(ensure_current(&conn)
+            .unwrap_err()
+            .to_string()
+            .contains("Unversioned"));
+        assert!(!table_exists(&conn, "audio_notes_schema").unwrap());
+    }
+
+    #[test]
+    fn version_two_classification_survives_kind_override_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("audetic.db");
+        let conn = Connection::open(&path).unwrap();
+        run_steps(&conn, 0, 2).unwrap();
+        conn.execute(
+            "INSERT INTO audio_notes(audio_path, classification) VALUES('/tmp/keep.wav', '{\"kind\":\"meeting\"}')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+
+        migrate_database(&path, false).unwrap();
+
+        let conn = crate::db::init_db_at(&path).unwrap();
+        let row: (String, Option<String>) = conn
+            .query_row(
+                "SELECT classification, classification_kind_override FROM audio_notes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (r#"{"kind":"meeting"}"#.into(), None));
+        assert!(conn
+            .execute(
+                "UPDATE audio_notes SET classification_kind_override='custom-kind' WHERE id=1",
+                [],
+            )
+            .is_ok());
+        assert!(conn
+            .execute(
+                "UPDATE audio_notes SET classification_kind_override='Not valid' WHERE id=1",
+                [],
+            )
+            .is_err());
+        let index_count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type='index' AND name='idx_audio_notes_effective_kind'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_count, 1);
+    }
+
     #[test]
     fn old_vintage_mixed_ids_preserves_text_timestamps_and_provenance() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sqlite3");
         drop(fixture(&path));
-        let report = migrate_audio_notes(&path, false).unwrap();
-        assert_eq!((report.meetings, report.workflows, report.notes), (2, 2, 4));
-        assert_eq!(report.missing_audio.len(), 4);
-        assert_eq!(
-            report
-                .source_mappings
-                .iter()
-                .map(|m| m.note_id)
-                .collect::<Vec<_>>(),
-            vec![1, 8, 9, 10]
-        );
+        let outcome = migrate_database(&path, false).unwrap();
+        assert_eq!((outcome.from, outcome.to), (0, LATEST));
+        let notes = &outcome.steps[0].notes;
+        assert!(notes[0].contains("Imported 4 notes (2 meetings, 2 dictations)"));
+        assert!(notes[1].contains("4 notes have no audio file"));
         let conn = crate::db::init_db_at(&path).unwrap();
+        let ids: Vec<i64> = conn
+            .prepare("SELECT id FROM audio_notes ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ids, vec![1, 8, 9, 10]);
         let note = AudioNoteRepository::get(&conn, 1).unwrap().unwrap();
         assert_eq!(note.title.as_deref(), Some("Legacy title"));
         assert_eq!(note.title_source.as_deref(), Some("manual"));
@@ -596,14 +550,14 @@ mod tests {
             .unwrap()
             .title
             .is_none());
-        assert!(!has_legacy_schema(&conn).unwrap());
+        assert!(!v1::has_legacy_tables(&conn).unwrap());
         let raw: String = conn.query_row("SELECT source_json FROM audio_note_migration_sources WHERE source_table='workflows' AND source_id=7",[],|r|r.get(0)).unwrap();
         assert!(raw.contains("FutureLegacyType"));
-        assert!(report.backup_path.as_ref().unwrap().is_file());
-        let second = migrate_audio_notes(&path, false).unwrap();
-        assert!(second.already_migrated);
+        assert!(outcome.backup_path.as_ref().unwrap().is_file());
+        let second = migrate_database(&path, false).unwrap();
+        assert!(second.steps.is_empty());
         assert!(second.backup_path.is_none());
-        assert_eq!(second.notes, 4);
+        assert_eq!(count(&conn, "audio_notes").unwrap(), 4);
     }
 
     #[test]
@@ -612,9 +566,10 @@ mod tests {
         let path = dir.path().join("legacy.sqlite3");
         drop(fixture(&path));
         let before = std::fs::read(&path).unwrap();
-        let report = migrate_audio_notes(&path, true).unwrap();
-        assert_eq!(report.notes, 4);
-        assert!(report.backup_path.is_none());
+        let outcome = migrate_database(&path, true).unwrap();
+        assert_eq!(outcome.steps.len(), LATEST as usize);
+        assert!(outcome.steps[0].notes[0].contains("Imported 4 notes"));
+        assert!(outcome.backup_path.is_none());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         let conn = Connection::open(&path).unwrap();
@@ -642,8 +597,14 @@ mod tests {
             INSERT INTO post_processing_jobs VALUES(1,'old hook','meeting.completed','shell','{\"command\":\"true\"}',1,'then','then');
             INSERT INTO post_processing_jobs VALUES(2,'new hook','audio_note.completed','shell','{}',1,'then','then');").unwrap();
         drop(conn);
-        let report = migrate_audio_notes(&path, false).unwrap();
-        assert_eq!(report.disabled_subscriptions.len(), 1);
+        let outcome = migrate_database(&path, false).unwrap();
+        let disabled: Vec<_> = outcome.steps[0]
+            .notes
+            .iter()
+            .filter(|n| n.starts_with("Disabled hook"))
+            .collect();
+        assert_eq!(disabled.len(), 1);
+        assert!(disabled[0].contains("old hook"));
         let conn = crate::db::init_db_at(&path).unwrap();
         assert!(AudioNoteRepository::get(&conn, 1).unwrap().is_none());
         let row: (i64,i64,String) = conn.query_row("SELECT note_id,agent_profile_id,content_markdown FROM audio_note_artifacts WHERE id=42",[],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
@@ -672,7 +633,7 @@ mod tests {
     }
 
     #[test]
-    fn conversion_failure_rolls_back_and_backup_is_restorable() {
+    fn failed_migration_rolls_back_and_drops_its_redundant_backup() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sqlite3");
         let conn = fixture(&path);
@@ -681,27 +642,16 @@ mod tests {
         conn.execute_batch("CREATE TABLE meeting_artifacts(id INTEGER PRIMARY KEY,meeting_id INTEGER,kind TEXT,title TEXT,status TEXT);
             INSERT INTO meeting_artifacts VALUES(1,1,'summary',NULL,'completed');").unwrap();
         drop(conn);
-        let error = migrate_audio_notes(&path, false).unwrap_err();
+        let error = migrate_database(&path, false).unwrap_err();
         assert!(format!("{error:#}").contains("rolled back"));
         let conn = Connection::open(&path).unwrap();
         assert_eq!(count(&conn, "meetings").unwrap(), 2);
         assert_eq!(count(&conn, "workflows").unwrap(), 2);
+        assert_eq!(count(&conn, "meeting_artifacts").unwrap(), 1);
         assert!(!table_exists(&conn, "audio_notes").unwrap());
         assert!(!table_exists(&conn, "audio_notes_schema").unwrap());
-        let backup_path = std::fs::read_dir(dir.path())
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .find(|p| p.to_string_lossy().contains("pre-audio-notes"))
-            .unwrap();
-        let backup = Connection::open(&backup_path).unwrap();
-        let restore = dir.path().join("restored.sqlite3");
-        backup
-            .execute("VACUUM INTO ?1", [restore.to_str().unwrap()])
-            .unwrap();
-        let restored = Connection::open(&restore).unwrap();
-        assert_eq!(count(&restored, "workflows").unwrap(), 2);
-        assert_eq!(count(&restored, "meeting_artifacts").unwrap(), 1);
-        validate_integrity(&restored).unwrap();
+        validate_integrity(&conn).unwrap();
+        assert!(backups_in(dir.path()).is_empty());
     }
 
     #[test]
@@ -717,8 +667,8 @@ mod tests {
         .unwrap();
         // Keep the source connection open so SQLite cannot remove/checkpoint
         // the WAL on last-close before the backup is taken.
-        let report = migrate_audio_notes(&path, false).unwrap();
-        let backup_path = report.backup_path.unwrap();
+        let outcome = migrate_database(&path, false).unwrap();
+        let backup_path = outcome.backup_path.unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -744,7 +694,7 @@ mod tests {
             .query_row("SELECT text FROM workflows WHERE id=99", [], |r| r.get(0))
             .unwrap();
         assert_eq!(text, "WAL text");
-        assert_eq!(report.notes, 5);
+        assert!(outcome.steps[0].notes[0].contains("Imported 5 notes"));
         // Verify independence from sidecars by restoring ONLY the backup file.
         // Some SQLite builds retain an inert journal after closing it; mere
         // presence does not tell us whether the backup depends on that file.
@@ -808,21 +758,21 @@ mod tests {
         let conn = fixture(&path);
         conn.execute_batch("CREATE TABLE meeting_artifacts(id INTEGER PRIMARY KEY,meeting_id INTEGER); INSERT INTO meeting_artifacts VALUES(1,999);").unwrap();
         for dry_run in [true, false] {
-            assert!(migrate_audio_notes(&path, dry_run)
-                .unwrap_err()
-                .to_string()
-                .contains("missing parents"));
+            assert!(
+                format!("{:#}", migrate_database(&path, dry_run).unwrap_err())
+                    .contains("missing parents")
+            );
         }
         assert_eq!(count(&conn, "meeting_artifacts").unwrap(), 1);
     }
 
     #[test]
-    fn active_writer_prevents_conversion() {
+    fn active_writer_prevents_migration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sqlite3");
         let conn = fixture(&path);
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let error = migrate_audio_notes(&path, false).unwrap_err();
+        let error = migrate_database(&path, false).unwrap_err();
         assert!(format!("{error:#}").contains("exclusive SQLite migration transaction"));
         assert!(!table_exists(&conn, "audio_notes").unwrap());
         conn.execute_batch("ROLLBACK").unwrap();
@@ -835,10 +785,8 @@ mod tests {
         let conn = fixture(&path);
         conn.execute("DROP TABLE meetings", []).unwrap();
         drop(conn);
-        let report = migrate_audio_notes(&path, false).unwrap();
-        assert_eq!(report.notes, 2);
-        assert_eq!(report.meetings, 0);
-        assert_eq!(report.source_mappings[0].note_id, 1);
+        let outcome = migrate_database(&path, false).unwrap();
+        assert!(outcome.steps[0].notes[0].contains("Imported 2 notes (0 meetings, 2 dictations)"));
         let conn = crate::db::init_db_at(&path).unwrap();
         assert_eq!(
             AudioNoteRepository::get(&conn, 1)
@@ -857,16 +805,14 @@ mod tests {
         let conn = fixture(&path);
         conn.execute("UPDATE meetings SET id=?1 WHERE id=8", [i64::MAX])
             .unwrap();
-        assert!(migrate_audio_notes(&path, false)
-            .unwrap_err()
-            .to_string()
+        assert!(format!("{:#}", migrate_database(&path, false).unwrap_err())
             .contains("ID space exhausted"));
         assert!(!table_exists(&conn, "audio_notes").unwrap());
         assert_eq!(count(&conn, "workflows").unwrap(), 2);
     }
 
     #[test]
-    fn external_commit_after_backup_rejects_conversion() {
+    fn external_commit_after_backup_rejects_migration() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("legacy.sqlite3");
         let conn = fixture(&path);
@@ -881,7 +827,7 @@ mod tests {
                 [],
             )
             .unwrap();
-        let error = convert_backed_up(&conn, &path, before).unwrap_err();
+        let error = apply_backed_up(&conn, 0, before).unwrap_err();
         assert!(error.to_string().contains("Another process wrote"));
         assert!(!table_exists(&conn, "audio_notes").unwrap());
         let current: String = conn
@@ -902,7 +848,7 @@ mod tests {
         let invalid = b"Not a SQLite database; preserve these bytes for recovery";
         std::fs::write(&path, invalid).unwrap();
         for dry_run in [true, false] {
-            assert!(migrate_audio_notes(&path, dry_run).is_err());
+            assert!(migrate_database(&path, dry_run).is_err());
             assert_eq!(std::fs::read(&path).unwrap(), invalid);
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
@@ -918,7 +864,7 @@ mod tests {
             UPDATE workflows SET unexpected=CAST(X'80' AS TEXT) WHERE id=1;",
         )
         .unwrap();
-        let error = migrate_audio_notes(&path, false).unwrap_err();
+        let error = migrate_database(&path, false).unwrap_err();
         assert!(format!("{error:#}").contains("utf-8"));
         assert!(!table_exists(&conn, "audio_notes_schema").unwrap());
         assert!(!table_exists(&conn, "audio_notes").unwrap());
@@ -944,7 +890,7 @@ mod tests {
             UPDATE workflows SET future_blob=X'0080FF',future_real=1e999 WHERE id=1;",
         )
         .unwrap();
-        migrate_audio_notes(&path, false).unwrap();
+        migrate_database(&path, false).unwrap();
         let raw: String = conn.query_row("SELECT source_json FROM audio_note_migration_sources WHERE source_table='workflows' AND source_id=1", [], |r| r.get(0)).unwrap();
         let archived: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(archived["future_blob"]["sqlite_blob_base64"], "AID/");

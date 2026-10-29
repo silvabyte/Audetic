@@ -213,12 +213,75 @@ async fn wait_for_daemon(timeout: Duration) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
+    let recent = recent_service_log()
+        .map(|log| summarize_log_tail(&log, 10))
+        .filter(|tail| !tail.is_empty())
+        .map(|tail| format!("\nRecent service log:\n{tail}\n"))
+        .unwrap_or_default();
     bail!(
-        "Daemon did not respond on {bind_addr} within {}s. \
-         Check service logs for the failure ({}).",
+        "Daemon did not respond on {bind_addr} within {}s.{recent}\nFull service log: {}.",
         timeout.as_secs(),
         log_hint(),
     );
+}
+
+/// The last `max` log lines, with consecutive repeats collapsed: a supervisor
+/// restart loop prints the same startup error on every attempt.
+fn summarize_log_tail(log: &str, max: usize) -> String {
+    let mut lines: Vec<(&str, usize)> = Vec::new();
+    for line in log.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
+        match lines.last_mut() {
+            Some((last, count)) if *last == line => *count += 1,
+            _ => lines.push((line, 1)),
+        }
+    }
+    let start = lines.len().saturating_sub(max);
+    lines[start..]
+        .iter()
+        .map(|(line, count)| match count {
+            1 => format!("  {line}"),
+            n => format!("  {line}  (×{n})"),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(target_os = "linux")]
+fn recent_service_log() -> Option<String> {
+    let output = std::process::Command::new("journalctl")
+        .args([
+            "--user",
+            "-u",
+            "audeticd.service",
+            "-n",
+            "200",
+            "--no-pager",
+            "-o",
+            "cat",
+        ])
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(target_os = "macos")]
+fn recent_service_log() -> Option<String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    const TAIL_BYTES: u64 = 16 * 1024;
+    let path = dirs::home_dir()?.join("Library/Logs/Audetic/audetic.log");
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .ok()?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn recent_service_log() -> Option<String> {
+    None
 }
 
 fn daemon_version_is_current(info: &crate::api::VersionInfo, expected: &str) -> bool {
@@ -288,6 +351,7 @@ impl UninstallPlan {
     /// Record a supervisor action that has no on-disk artifact. This keeps
     /// registered legacy services visible in the confirmation plan and makes
     /// confirmation happen before stop/disable side effects.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn action(&mut self, description: impl Into<String>) {
         self.actions.push(description.into());
     }
@@ -492,6 +556,18 @@ mod tests {
 
         assert!(daemon_version_is_current(&info, "1.2.3"));
         assert!(!daemon_version_is_current(&info, "1.2.2"));
+    }
+
+    #[test]
+    fn log_tail_collapses_restart_loop_repeats_and_keeps_the_newest_lines() {
+        let log =
+            "old line\nstarting\nError: boom\nError: boom\nError: boom\n\nstarting\nError: boom\n";
+
+        assert_eq!(
+            summarize_log_tail(log, 3),
+            "  Error: boom  (×3)\n  starting\n  Error: boom"
+        );
+        assert_eq!(summarize_log_tail("", 3), "");
     }
 
     #[test]
