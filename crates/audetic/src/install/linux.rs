@@ -43,6 +43,7 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     let app_url = url::app_url();
 
     println!("→ Installing audeticd as a systemd user service");
+    super::ensure_database_is_current()?;
     place_binary(&paths)?;
     place_cli();
     ensure_runtime_dirs(&paths)?;

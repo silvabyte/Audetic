@@ -41,6 +41,7 @@ pub async fn run(opts: InstallOptions) -> Result<()> {
     let app_url = url::app_url();
 
     println!("→ Installing audeticd as a LaunchAgent");
+    super::ensure_database_is_current()?;
     ensure_runtime_dirs(&paths)?;
 
     // Stop the agents before touching the bundle they're running out of.

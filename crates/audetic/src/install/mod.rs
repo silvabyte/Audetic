@@ -186,6 +186,43 @@ pub(crate) fn set_executable(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuse to install over a database the new daemon will refuse to open.
+///
+/// The daemon bails at startup on a legacy schema, so without this check the
+/// supervisor crash-loops it and the install surfaces only as a readiness
+/// timeout. Running before any service teardown leaves the old install intact.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn ensure_database_is_current() -> Result<()> {
+    let db_path = crate::global::db_file()?;
+    ensure_database_is_current_at(&db_path)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn ensure_database_is_current_at(db_path: &Path) -> Result<()> {
+    use rusqlite::{Connection, OpenFlags};
+
+    if !db_path.exists() {
+        return Ok(());
+    }
+    let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("Failed to open {} for preflight", db_path.display()))?;
+    if !crate::db::init::has_legacy_schema(&conn)? {
+        return Ok(());
+    }
+
+    let audeticd = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "audeticd".into());
+    let db = db_path.display();
+    bail!(
+        "Legacy audio database detected at {db}; the new daemon will not start until it is migrated.\n\
+         Stop the running daemon, then run:\n\
+         \n  \"{audeticd}\" migrate-audio-notes --database \"{db}\" --dry-run\
+         \n  \"{audeticd}\" migrate-audio-notes --database \"{db}\"\n\
+         \nThen re-run the install. See docs/audio-notes-migration.md."
+    );
+}
+
 /// Poll the daemon's HTTP API until the newly installed version responds.
 ///
 /// Shared between Linux and macOS — the readiness check is identical once
@@ -288,6 +325,7 @@ impl UninstallPlan {
     /// Record a supervisor action that has no on-disk artifact. This keeps
     /// registered legacy services visible in the confirmation plan and makes
     /// confirmation happen before stop/disable side effects.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn action(&mut self, description: impl Into<String>) {
         self.actions.push(description.into());
     }
@@ -492,6 +530,34 @@ mod tests {
 
         assert!(daemon_version_is_current(&info, "1.2.3"));
         assert!(!daemon_version_is_current(&info, "1.2.2"));
+    }
+
+    #[test]
+    fn database_preflight_allows_missing_and_current_databases() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("audetic.db");
+        ensure_database_is_current_at(&db_path).unwrap();
+        assert!(!db_path.exists());
+
+        crate::db::init::init_db_at(&db_path).unwrap();
+        ensure_database_is_current_at(&db_path).unwrap();
+    }
+
+    #[test]
+    fn database_preflight_rejects_legacy_schema_with_migration_commands() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("audetic.db");
+        rusqlite::Connection::open(&db_path)
+            .unwrap()
+            .execute_batch("CREATE TABLE workflows(id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let err = ensure_database_is_current_at(&db_path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(&db_path.display().to_string()));
+        assert!(err.contains("migrate-audio-notes"));
+        assert!(err.contains("--dry-run"));
     }
 
     #[test]
