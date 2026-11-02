@@ -14,11 +14,15 @@ final class AppState {
     private let client = DaemonClient()
     private var poller: StatusPoller?
 
+    /// Polling starts here rather than from the App's `init`: reading `@State`
+    /// before SwiftUI installs it yields a throwaway instance, whose weakly
+    /// held poller stops as soon as that instance is freed.
     init() {
         registerShortcutListeners()
+        startPolling()
     }
 
-    func startPolling() {
+    private func startPolling() {
         let poller = StatusPoller { [weak self] in
             await self?.refresh()
         }
