@@ -36,15 +36,46 @@ pub enum ImportClaim {
     InProgress { import_id: i64 },
 }
 
+/// How a recording source delivers audio. A later provider picks one of these;
+/// the table already stores both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncMode {
+    Poll,
+    Webhook,
+}
+
+impl SyncMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Poll => "poll",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "poll" => Ok(Self::Poll),
+            "webhook" => Ok(Self::Webhook),
+            other => bail!("Unknown recording source sync mode {other}"),
+        }
+    }
+}
+
+/// One configured recording source. Provider-specific settings live in `config`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaudSyncState {
+pub struct RecordingSource {
+    pub provider: String,
+    pub source_instance: String,
+    pub sync_mode: SyncMode,
     pub enabled: bool,
-    pub interval_minutes: i64,
+    pub interval_minutes: Option<i64>,
     pub import_after: Option<String>,
+    pub config: Option<String>,
     pub running: bool,
     pub last_started_at: Option<String>,
     pub last_completed_at: Option<String>,
     pub last_error: Option<String>,
+    pub updated_at: String,
 }
 
 pub struct IntegrationRepository;
@@ -249,75 +280,111 @@ impl IntegrationRepository {
         .context("Failed to check external import identity")
     }
 
-    pub fn plaud_state(conn: &Connection) -> Result<PlaudSyncState> {
+    pub fn recording_source(
+        conn: &Connection,
+        provider: &str,
+        source_instance: &str,
+    ) -> Result<RecordingSource> {
+        validate_recording_identity(provider, source_instance)?;
         conn.query_row(
-            "SELECT enabled, interval_minutes, import_after, running,
-                    last_started_at, last_completed_at, last_error
-             FROM plaud_sync_state WHERE singleton = 1",
-            [],
-            |row| {
-                Ok(PlaudSyncState {
-                    enabled: row.get(0)?,
-                    interval_minutes: row.get(1)?,
-                    import_after: row.get(2)?,
-                    running: row.get(3)?,
-                    last_started_at: row.get(4)?,
-                    last_completed_at: row.get(5)?,
-                    last_error: row.get(6)?,
-                })
-            },
+            &format!("SELECT {RECORDING_SOURCE_COLUMNS} FROM recording_sources WHERE provider = ?1 AND source_instance = ?2"),
+            params![provider, source_instance],
+            row_to_recording_source,
         )
-        .context("Failed to read Plaud synchronization state")
+        .optional()
+        .context("Failed to read recording source")?
+        .with_context(|| format!("Recording source {provider}/{source_instance} is not configured"))
     }
 
-    pub fn update_plaud_settings(
+    pub fn enabled_poll_sources(conn: &Connection) -> Result<Vec<RecordingSource>> {
+        let mut statement = conn.prepare(&format!(
+            "SELECT {RECORDING_SOURCE_COLUMNS} FROM recording_sources
+             WHERE sync_mode = 'poll' AND enabled = 1
+             ORDER BY provider, source_instance"
+        ))?;
+        let sources = statement
+            .query_map([], row_to_recording_source)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to list recording sources")?;
+        Ok(sources)
+    }
+
+    pub fn update_recording_source_settings(
         conn: &Connection,
+        provider: &str,
+        source_instance: &str,
         enabled: bool,
-        interval_minutes: i64,
+        interval_minutes: Option<i64>,
         import_after: Option<&str>,
-    ) -> Result<PlaudSyncState> {
-        if !(5..=1440).contains(&interval_minutes) {
-            bail!("Plaud sync interval must be between 5 and 1440 minutes");
+    ) -> Result<RecordingSource> {
+        validate_recording_identity(provider, source_instance)?;
+        if interval_minutes.is_some_and(|minutes| minutes <= 0) {
+            bail!("Recording source poll interval must be greater than zero");
         }
         conn.execute(
-            "UPDATE plaud_sync_state
+            "UPDATE recording_sources
              SET enabled = ?1, interval_minutes = ?2, import_after = ?3,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1",
-            params![enabled, interval_minutes, import_after],
+             WHERE provider = ?4 AND source_instance = ?5",
+            params![
+                enabled,
+                interval_minutes,
+                import_after,
+                provider,
+                source_instance
+            ],
         )?;
-        Self::plaud_state(conn)
+        Self::recording_source(conn, provider, source_instance)
     }
 
-    pub fn start_plaud_sync(conn: &Connection) -> Result<bool> {
+    pub fn start_sync(conn: &Connection, provider: &str, source_instance: &str) -> Result<bool> {
+        validate_recording_identity(provider, source_instance)?;
         Ok(conn.execute(
-            "UPDATE plaud_sync_state
+            "UPDATE recording_sources
              SET running = 1, last_started_at = CURRENT_TIMESTAMP,
                  last_error = NULL, updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1 AND running = 0",
-            [],
+             WHERE provider = ?1 AND source_instance = ?2 AND running = 0",
+            params![provider, source_instance],
         )? == 1)
     }
 
-    pub fn update_plaud_cursor(conn: &Connection, import_after: &str) -> Result<()> {
-        conn.execute(
-            "UPDATE plaud_sync_state
+    pub fn update_import_cursor(
+        conn: &Connection,
+        provider: &str,
+        source_instance: &str,
+        import_after: &str,
+    ) -> Result<()> {
+        validate_recording_identity(provider, source_instance)?;
+        let changed = conn.execute(
+            "UPDATE recording_sources
              SET import_after = ?1, updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1",
-            [import_after],
+             WHERE provider = ?2 AND source_instance = ?3",
+            params![import_after, provider, source_instance],
         )?;
+        if changed != 1 {
+            bail!("Recording source {provider}/{source_instance} is not configured");
+        }
         Ok(())
     }
 
-    pub fn finish_plaud_sync(conn: &Connection, error: Option<&str>) -> Result<()> {
-        conn.execute(
-            "UPDATE plaud_sync_state
+    pub fn finish_sync(
+        conn: &Connection,
+        provider: &str,
+        source_instance: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        validate_recording_identity(provider, source_instance)?;
+        let changed = conn.execute(
+            "UPDATE recording_sources
              SET running = 0,
                  last_completed_at = CASE WHEN ?1 IS NULL THEN CURRENT_TIMESTAMP ELSE last_completed_at END,
                  last_error = ?1, updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1",
-            [error],
+             WHERE provider = ?2 AND source_instance = ?3",
+            params![error, provider, source_instance],
         )?;
+        if changed != 1 {
+            bail!("Recording source {provider}/{source_instance} is not configured");
+        }
         Ok(())
     }
 
@@ -332,18 +399,22 @@ impl IntegrationRepository {
         Ok(())
     }
 
-    pub fn sweep_interrupted_plaud_sync(conn: &Connection) -> Result<()> {
+    pub fn sweep_interrupted_syncs(conn: &Connection) -> Result<()> {
         conn.execute(
-            "UPDATE plaud_sync_state
+            "UPDATE recording_sources
              SET running = 0,
-                 last_error = 'Interrupted: the Audetic daemon stopped during Plaud synchronization',
+                 last_error = 'Interrupted: the Audetic daemon stopped during synchronization',
                  updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1 AND running = 1",
+             WHERE running = 1",
             [],
         )?;
         Ok(())
     }
 }
+
+const RECORDING_SOURCE_COLUMNS: &str =
+    "provider, source_instance, sync_mode, enabled, interval_minutes, \
+     import_after, config, running, last_started_at, last_completed_at, last_error, updated_at";
 
 fn external_import_by_identity(
     conn: &Connection,
@@ -389,6 +460,33 @@ fn row_to_external_import(row: &Row<'_>) -> rusqlite::Result<ExternalImport> {
         created_at: row.get(10)?,
         updated_at: row.get(11)?,
     })
+}
+
+fn row_to_recording_source(row: &Row<'_>) -> rusqlite::Result<RecordingSource> {
+    let sync_mode: String = row.get(2)?;
+    Ok(RecordingSource {
+        provider: row.get(0)?,
+        source_instance: row.get(1)?,
+        sync_mode: SyncMode::parse(&sync_mode).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, error.into())
+        })?,
+        enabled: row.get(3)?,
+        interval_minutes: row.get(4)?,
+        import_after: row.get(5)?,
+        config: row.get(6)?,
+        running: row.get(7)?,
+        last_started_at: row.get(8)?,
+        last_completed_at: row.get(9)?,
+        last_error: row.get(10)?,
+        updated_at: row.get(11)?,
+    })
+}
+
+fn validate_recording_identity(provider: &str, source_instance: &str) -> Result<()> {
+    if provider.trim().is_empty() || source_instance.trim().is_empty() {
+        bail!("Recording source provider and source instance must not be empty");
+    }
+    Ok(())
 }
 
 fn validate_scope(scope: &str) -> Result<()> {
@@ -518,17 +616,18 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(IntegrationRepository::start_plaud_sync(&conn).unwrap());
+        assert!(IntegrationRepository::start_sync(&conn, "plaud", "default").unwrap());
 
         IntegrationRepository::sweep_interrupted_imports(&conn).unwrap();
-        IntegrationRepository::sweep_interrupted_plaud_sync(&conn).unwrap();
+        IntegrationRepository::sweep_interrupted_syncs(&conn).unwrap();
 
         let import = external_import_by_identity(&conn, "plaud", "default", "recording-id")
             .unwrap()
             .unwrap();
         assert_eq!(import.status, "failed");
         assert!(import.error.unwrap().contains("daemon stopped"));
-        let state = IntegrationRepository::plaud_state(&conn).unwrap();
+        let state = IntegrationRepository::recording_source(&conn, "plaud", "default").unwrap();
+        assert_eq!(state.sync_mode, SyncMode::Poll);
         assert!(!state.running);
         assert!(state.last_error.unwrap().contains("daemon stopped"));
     }

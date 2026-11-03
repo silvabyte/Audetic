@@ -202,7 +202,7 @@ pub async fn run_service() -> Result<()> {
         inspector,
     );
     integration_service.recover_interrupted_work().await?;
-    integration_service.spawn_plaud_scheduler();
+    integration_service.spawn_recording_source_scheduler();
     let server = ApiServer::new(
         state,
         &config,

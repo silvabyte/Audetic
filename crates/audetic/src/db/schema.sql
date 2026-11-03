@@ -1,4 +1,4 @@
--- user_version 1
+-- user_version 2
 CREATE TABLE audio_notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT, title_source TEXT, title_updated_at TIMESTAMP,
@@ -69,17 +69,6 @@ CREATE INDEX idx_external_imports_recent
     ON external_imports(created_at DESC, id DESC);
 CREATE INDEX idx_external_imports_note
     ON external_imports(audio_note_id);
-CREATE TABLE plaud_sync_state (
-    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
-    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
-    interval_minutes INTEGER NOT NULL DEFAULT 15 CHECK(interval_minutes BETWEEN 5 AND 1440),
-    import_after TIMESTAMP,
-    running INTEGER NOT NULL DEFAULT 0 CHECK(running IN (0, 1)),
-    last_started_at TIMESTAMP,
-    last_completed_at TIMESTAMP,
-    last_error TEXT,
-    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
 CREATE TABLE post_processing_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL, event TEXT NOT NULL, action_type TEXT NOT NULL,
@@ -111,3 +100,18 @@ CREATE TABLE audio_note_artifacts (
 );
 CREATE INDEX idx_audio_note_artifacts_note_created ON audio_note_artifacts(note_id, created_at DESC);
 CREATE INDEX idx_audio_note_artifacts_status ON audio_note_artifacts(status);
+CREATE TABLE recording_sources (
+    provider TEXT NOT NULL CHECK(trim(provider) <> ''),
+    source_instance TEXT NOT NULL CHECK(trim(source_instance) <> ''),
+    sync_mode TEXT NOT NULL CHECK(sync_mode IN ('poll', 'webhook')),
+    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+    interval_minutes INTEGER CHECK(interval_minutes IS NULL OR interval_minutes > 0),
+    import_after TIMESTAMP,
+    config TEXT CHECK(config IS NULL OR json_valid(config)),
+    running INTEGER NOT NULL DEFAULT 0 CHECK(running IN (0, 1)),
+    last_started_at TIMESTAMP,
+    last_completed_at TIMESTAMP,
+    last_error TEXT,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (provider, source_instance)
+);

@@ -2,6 +2,7 @@
 
 pub mod ingress;
 pub mod plaud;
+pub mod recording_source;
 
 use anyhow::{Context, Result};
 use audetic_core::url::HOST;
@@ -10,7 +11,6 @@ use base64::Engine;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
-use tokio::io::AsyncWriteExt;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -22,12 +22,13 @@ use crate::audio_notes::import::{import_audio_note_file, ImportArgs};
 use crate::audio_notes::media_inspector::MediaInspector;
 use crate::audio_notes::processing::ProcessingServices;
 use crate::db::integrations::{
-    ExternalImport, ImportClaim, IngressAccessKey, IntegrationRepository, PlaudSyncState,
+    ExternalImport, ImportClaim, IngressAccessKey, IntegrationRepository, RecordingSource,
 };
 
+use self::plaud::PlaudSource;
+use self::recording_source::RecordingSource as RecordingSourceDriver;
+
 const ACCESS_KEY_PREFIX: &str = "audetic_ingress_";
-const MAX_PLAUD_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
-const PLAUD_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -168,7 +169,7 @@ impl IntegrationService {
         tokio::task::spawn_blocking(move || {
             let conn = crate::db::init_db_at(&db_path)?;
             IntegrationRepository::sweep_interrupted_imports(&conn)?;
-            IntegrationRepository::sweep_interrupted_plaud_sync(&conn)
+            IntegrationRepository::sweep_interrupted_syncs(&conn)
         })
         .await??;
         Ok(())
@@ -347,17 +348,81 @@ impl IntegrationService {
         .await?
     }
 
-    pub async fn plaud_state(&self) -> Result<PlaudSyncState> {
+    pub async fn recording_source(
+        &self,
+        provider: &str,
+        source_instance: &str,
+    ) -> Result<RecordingSource> {
+        let db_path = self.db_path.clone();
+        let provider = provider.to_string();
+        let source_instance = source_instance.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = crate::db::init_db_at(&db_path)?;
+            IntegrationRepository::recording_source(&conn, &provider, &source_instance)
+        })
+        .await?
+    }
+
+    pub async fn enabled_poll_sources(&self) -> Result<Vec<RecordingSource>> {
         let db_path = self.db_path.clone();
         tokio::task::spawn_blocking(move || {
             let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::plaud_state(&conn)
+            IntegrationRepository::enabled_poll_sources(&conn)
+        })
+        .await?
+    }
+
+    pub async fn update_recording_source(
+        &self,
+        provider: &str,
+        source_instance: &str,
+        enabled: bool,
+        interval_minutes: Option<i64>,
+        import_after: Option<String>,
+    ) -> Result<RecordingSource> {
+        let db_path = self.db_path.clone();
+        let provider = provider.to_string();
+        let source_instance = source_instance.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = crate::db::init_db_at(&db_path)?;
+            IntegrationRepository::update_recording_source_settings(
+                &conn,
+                &provider,
+                &source_instance,
+                enabled,
+                interval_minutes,
+                import_after.as_deref(),
+            )
+        })
+        .await?
+    }
+
+    pub(crate) async fn update_import_cursor(
+        &self,
+        provider: &str,
+        source_instance: &str,
+        import_after: &str,
+    ) -> Result<()> {
+        let db_path = self.db_path.clone();
+        let provider = provider.to_string();
+        let source_instance = source_instance.to_string();
+        let import_after = import_after.to_string();
+        tokio::task::spawn_blocking(move || {
+            let conn = crate::db::init_db_at(&db_path)?;
+            IntegrationRepository::update_import_cursor(
+                &conn,
+                &provider,
+                &source_instance,
+                &import_after,
+            )
         })
         .await?
     }
 
     pub async fn plaud_status(&self) -> Result<PlaudStatus> {
-        let state = self.plaud_state().await?;
+        let state = self
+            .recording_source(PlaudSource::PROVIDER, PlaudSource::SOURCE_INSTANCE)
+            .await?;
         let Some(cli) = plaud::PlaudCli::discover() else {
             return Ok(PlaudStatus::from_state(state, false, false, None));
         };
@@ -371,31 +436,20 @@ impl IntegrationService {
         ))
     }
 
-    pub async fn update_plaud_settings(
+    /// Claim the source, then run its poll entry point off the request thread.
+    pub async fn schedule_poll(
         &self,
-        enabled: bool,
-        interval_minutes: i64,
-        import_after: Option<String>,
-    ) -> Result<PlaudStatus> {
+        source: &dyn RecordingSourceDriver,
+        backfill: bool,
+    ) -> Result<bool> {
+        let provider = source.provider().to_string();
+        let source_instance = source.source_instance().to_string();
         let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::update_plaud_settings(
-                &conn,
-                enabled,
-                interval_minutes,
-                import_after.as_deref(),
-            )
-        })
-        .await??;
-        self.plaud_status().await
-    }
-
-    pub async fn schedule_plaud_sync(&self, backfill: bool) -> Result<bool> {
-        let db_path = self.db_path.clone();
+        let start_provider = provider.clone();
+        let start_instance = source_instance.clone();
         let claimed = tokio::task::spawn_blocking(move || {
             let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::start_plaud_sync(&conn)
+            IntegrationRepository::start_sync(&conn, &start_provider, &start_instance)
         })
         .await??;
         if !claimed {
@@ -403,120 +457,76 @@ impl IntegrationService {
         }
         let service = self.clone();
         tokio::spawn(async move {
-            let result = service.run_plaud_sync(backfill).await;
+            let result = async {
+                let source = recording_source::resolve(&provider, &source_instance)?;
+                source.poll(&service, backfill).await
+            }
+            .await;
             if let Err(error) = &result {
-                tracing::error!(%error, "Plaud synchronization failed");
+                tracing::error!(%error, "Recording source synchronization failed");
             }
             let db_path = service.db_path.clone();
             let error = result.as_ref().err().map(|error| error.to_string());
             let finish_result = tokio::task::spawn_blocking(move || -> Result<()> {
                 let conn = crate::db::init_db_at(&db_path)?;
-                IntegrationRepository::finish_plaud_sync(&conn, error.as_deref())
+                IntegrationRepository::finish_sync(
+                    &conn,
+                    &provider,
+                    &source_instance,
+                    error.as_deref(),
+                )
             })
             .await;
             match finish_result {
                 Ok(Ok(())) => {}
                 Ok(Err(finish_error)) => {
-                    tracing::error!(%finish_error, "failed to persist Plaud sync completion");
+                    tracing::error!(%finish_error, "failed to persist recording source completion");
                 }
                 Err(finish_error) => {
-                    tracing::error!(%finish_error, "Plaud sync completion task panicked");
+                    tracing::error!(%finish_error, "recording source completion task panicked");
                 }
             }
         });
         Ok(true)
     }
 
-    pub fn spawn_plaud_scheduler(&self) {
+    pub fn spawn_recording_source_scheduler(&self) {
         let service = self.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let Ok(state) = service.plaud_state().await else {
+                let Ok(sources) = service.enabled_poll_sources().await else {
                     continue;
                 };
-                if !state.enabled || state.running || !plaud_sync_is_due(&state) {
-                    continue;
-                }
-                if let Err(error) = service.schedule_plaud_sync(false).await {
-                    tracing::error!(%error, "Failed to schedule Plaud synchronization");
+                for record in sources {
+                    if record.running || !recording_source::poll_is_due(&record) {
+                        continue;
+                    }
+                    let Ok(source) =
+                        recording_source::resolve(&record.provider, &record.source_instance)
+                    else {
+                        tracing::error!(
+                            provider = %record.provider,
+                            source_instance = %record.source_instance,
+                            "Configured poll source has no implementation"
+                        );
+                        continue;
+                    };
+                    if let Err(error) = service.schedule_poll(source.as_ref(), false).await {
+                        tracing::error!(
+                            provider = source.provider(),
+                            %error,
+                            "Failed to schedule recording source sync"
+                        );
+                    }
                 }
             }
         });
     }
 
-    async fn run_plaud_sync(&self, backfill: bool) -> Result<()> {
-        let cli = plaud::PlaudCli::discover()
-            .context("Plaud CLI is not installed; install @plaud-ai/cli and run `plaud login`")?;
-        if !cli.authenticated().await {
-            anyhow::bail!("Plaud CLI is not authenticated; run `plaud login`");
-        }
-        let state = self.plaud_state().await?;
-        let import_after = if backfill {
-            None
-        } else {
-            state
-                .import_after
-                .as_deref()
-                .map(parse_db_timestamp)
-                .transpose()?
-        };
-        let import_boundary = plaud_import_boundary(backfill, import_after, chrono::Utc::now());
-
-        for page in 1..=1000 {
-            let ids = cli.list_ids(page).await?;
-            if ids.is_empty() {
-                break;
-            }
-            let page_len = ids.len();
-            let mut reached_boundary = false;
-            for id in ids {
-                let recording = cli.file(&id).await?;
-                let recorded_at = recording.start_at.as_ref().unwrap_or(&recording.created_at);
-                let recorded_at = parse_plaud_timestamp(recorded_at)
-                    .with_context(|| format!("Plaud recording {id} has an invalid timestamp"))?;
-                if import_boundary.is_some_and(|boundary| recorded_at < boundary) {
-                    reached_boundary = true;
-                    continue;
-                }
-                if self.external_imported("plaud", "default", &id).await? {
-                    continue;
-                }
-                let url = cli.audio_url(&id).await?;
-                let (staged_path, filename) = self.download_plaud_audio(&id, url).await?;
-                self.import_external(ExternalImportRequest {
-                    provider: "plaud".to_string(),
-                    source_instance: "default".to_string(),
-                    external_id: id,
-                    recorded_at: Some(recorded_at.format("%Y-%m-%d %H:%M:%S").to_string()),
-                    source_filename: Some(filename),
-                    title: Some(recording.name),
-                    staged_path,
-                })
-                .await?;
-            }
-            if reached_boundary || page_len < 100 {
-                break;
-            }
-            if page == 1000 {
-                anyhow::bail!("Plaud synchronization exceeded the 100,000-recording safety limit");
-            }
-        }
-        if let Some(next_cursor) = import_boundary {
-            let db_path = self.db_path.clone();
-            let next_cursor = next_cursor.format("%Y-%m-%d %H:%M:%S").to_string();
-            tokio::task::spawn_blocking(move || {
-                let conn = crate::db::init_db_at(&db_path)?;
-                IntegrationRepository::update_plaud_cursor(&conn, &next_cursor)
-            })
-            .await??;
-        }
-        Ok(())
-    }
-
-    async fn external_imported(
+    pub(crate) async fn external_imported(
         &self,
         provider: &str,
         source_instance: &str,
@@ -538,59 +548,6 @@ impl IntegrationService {
         })
         .await?
     }
-
-    async fn download_plaud_audio(&self, id: &str, url: reqwest::Url) -> Result<(PathBuf, String)> {
-        anyhow::ensure!(url.scheme() == "https", "Plaud audio URL must use HTTPS");
-        anyhow::ensure!(
-            url.username().is_empty(),
-            "Plaud audio URL must not contain user information"
-        );
-        let extension = Path::new(url.path())
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .filter(|extension| {
-                audetic_core::jobs_client::mime_type_for_extension(extension).is_some()
-            })
-            .unwrap_or("m4a")
-            .to_ascii_lowercase();
-        let filename = format!("plaud-{id}.{extension}");
-        let uploads_dir = self.uploads_dir();
-        tokio::fs::create_dir_all(&uploads_dir).await?;
-        let path = uploads_dir.join(format!("plaud-{}", Uuid::new_v4().simple()));
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(PLAUD_DOWNLOAD_TIMEOUT)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()?;
-        let mut response = client.get(url).send().await?.error_for_status()?;
-        if response
-            .content_length()
-            .is_some_and(|length| length > MAX_PLAUD_AUDIO_BYTES)
-        {
-            anyhow::bail!("Plaud audio exceeds the 1 GiB limit");
-        }
-        let download_result = async {
-            let mut file = tokio::fs::File::create(&path).await?;
-            let mut written = 0_u64;
-            while let Some(chunk) = response.chunk().await? {
-                written = written.saturating_add(chunk.len() as u64);
-                anyhow::ensure!(
-                    written <= MAX_PLAUD_AUDIO_BYTES,
-                    "Plaud audio exceeds the 1 GiB limit"
-                );
-                file.write_all(&chunk).await?;
-            }
-            file.flush().await?;
-            anyhow::ensure!(written > 0, "Plaud audio download was empty");
-            Ok::<_, anyhow::Error>(())
-        }
-        .await;
-        if let Err(error) = download_result {
-            remove_staged(&path).await;
-            return Err(error);
-        }
-        Ok((path, filename))
-    }
 }
 
 fn token_id(token: &str) -> Option<String> {
@@ -602,7 +559,7 @@ fn token_id(token: &str) -> Option<String> {
     Some(id.to_string())
 }
 
-async fn remove_staged(path: &Path) {
+pub(crate) async fn remove_staged(path: &Path) {
     if let Err(error) = tokio::fs::remove_file(path).await {
         if error.kind() != std::io::ErrorKind::NotFound {
             tracing::warn!(?path, %error, "Failed to clean up staged external import");
@@ -667,7 +624,7 @@ pub const PUBLIC_INGRESS_BASE_URL: &str = "https://ingest.audetic.link";
 
 impl PlaudStatus {
     fn from_state(
-        state: PlaudSyncState,
+        state: RecordingSource,
         available: bool,
         authenticated: bool,
         version: Option<String>,
@@ -677,7 +634,9 @@ impl PlaudStatus {
             authenticated,
             version,
             enabled: state.enabled,
-            interval_minutes: state.interval_minutes,
+            interval_minutes: state
+                .interval_minutes
+                .unwrap_or(PlaudSource::DEFAULT_INTERVAL_MINUTES),
             import_after: state.import_after,
             running: state.running,
             last_started_at: state.last_started_at,
@@ -685,45 +644,6 @@ impl PlaudStatus {
             last_error: state.last_error,
         }
     }
-}
-
-fn parse_db_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
-    let naive = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")?;
-    Ok(naive.and_utc())
-}
-
-fn parse_plaud_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
-    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
-        return Ok(timestamp.with_timezone(&chrono::Utc));
-    }
-    let naive = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")?;
-    Ok(naive.and_utc())
-}
-
-fn plaud_import_boundary(
-    backfill: bool,
-    import_after: Option<chrono::DateTime<chrono::Utc>>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    if backfill {
-        return None;
-    }
-    let overlap_boundary = now - chrono::Duration::hours(24);
-    Some(
-        import_after
-            .map(|boundary| boundary.max(overlap_boundary))
-            .unwrap_or(overlap_boundary),
-    )
-}
-
-fn plaud_sync_is_due(state: &PlaudSyncState) -> bool {
-    let Some(last_started) = state.last_started_at.as_deref() else {
-        return true;
-    };
-    let Ok(last_started) = parse_db_timestamp(last_started) else {
-        return true;
-    };
-    chrono::Utc::now() - last_started >= chrono::Duration::minutes(state.interval_minutes)
 }
 
 #[cfg(test)]
@@ -744,37 +664,5 @@ mod tests {
         ] {
             assert!(token_id(invalid).is_none(), "{invalid}");
         }
-    }
-
-    #[test]
-    fn plaud_timestamp_parser_accepts_official_naive_utc_format() {
-        assert_eq!(
-            parse_plaud_timestamp("2026-09-30T13:01:11").unwrap(),
-            chrono::DateTime::parse_from_rfc3339("2026-09-30T13:01:11Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc)
-        );
-        assert_eq!(
-            parse_plaud_timestamp("2026-09-12T13:35:45.446000").unwrap(),
-            chrono::DateTime::parse_from_rfc3339("2026-09-12T13:35:45.446000Z")
-                .unwrap()
-                .with_timezone(&chrono::Utc)
-        );
-    }
-
-    #[test]
-    fn first_incremental_plaud_sync_only_scans_the_last_day() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-10-01T16:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        assert_eq!(
-            plaud_import_boundary(false, None, now),
-            Some(now - chrono::Duration::hours(24))
-        );
-        assert_eq!(
-            plaud_import_boundary(false, Some(now - chrono::Duration::hours(48)), now),
-            Some(now - chrono::Duration::hours(24))
-        );
-        assert_eq!(plaud_import_boundary(true, None, now), None);
     }
 }

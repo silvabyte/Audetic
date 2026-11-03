@@ -12,7 +12,10 @@ use tracing::info;
 
 use std::path::{Path, PathBuf};
 
-const MIGRATIONS: &[&str] = &[include_str!("0001_baseline.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("0001_baseline.sql"),
+    include_str!("0002_recording_sources.sql"),
+];
 pub const LATEST: i64 = MIGRATIONS.len() as i64;
 
 pub fn ensure_current(conn: &Connection) -> Result<()> {
@@ -261,6 +264,11 @@ mod tests {
             !actual.contains("audio_notes_schema"),
             "baseline schema must not recreate the marker table"
         );
+        assert!(
+            !actual.contains("plaud_sync_state"),
+            "provider tables belong in a migration that removes them, not the snapshot"
+        );
+        assert!(actual.contains("CREATE TABLE recording_sources"));
         assert!(actual.starts_with(&format!("-- user_version {LATEST}\n")));
         let path = schema_snapshot_path();
         let expected = fs::read_to_string(&path).unwrap_or_default();
@@ -477,6 +485,121 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 1);
+    }
+
+    #[test]
+    fn upgrade_moves_plaud_sync_state_into_recording_sources_and_writes_a_backup() {
+        let (_dir, path) = temp_db();
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(MIGRATIONS[0]).unwrap();
+            conn.pragma_update(None, "user_version", 1).unwrap();
+            conn.execute(
+                "UPDATE plaud_sync_state
+                 SET enabled = 1, interval_minutes = 30,
+                     import_after = '2026-01-02 03:04:05',
+                     running = 1, last_started_at = '2026-01-02 03:00:00',
+                     last_completed_at = '2026-01-01 00:00:00',
+                     last_error = 'keep me', updated_at = '2026-01-02 03:00:01'
+                 WHERE singleton = 1",
+                [],
+            )
+            .unwrap();
+        }
+
+        upgrade(&path).unwrap();
+
+        let backup = pre_upgrade_backup_path(&path, LATEST);
+        assert!(backup.exists(), "pre-upgrade backup was not written");
+        let saved = Connection::open(&backup).unwrap();
+        assert_eq!(user_version(&saved).unwrap(), 1);
+        let saved_row: (i64, i64, String) = saved
+            .query_row(
+                "SELECT enabled, interval_minutes, last_error
+                 FROM plaud_sync_state WHERE singleton = 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(saved_row, (1, 30, "keep me".into()));
+        let saved_sources: i64 = saved
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'recording_sources'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(saved_sources, 0);
+
+        let live = Connection::open(&path).unwrap();
+        assert_eq!(user_version(&live).unwrap(), LATEST);
+        let old_table: i64 = live
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'plaud_sync_state'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(old_table, 0);
+        #[derive(Debug, PartialEq, Eq)]
+        struct Carried {
+            provider: String,
+            source_instance: String,
+            sync_mode: String,
+            enabled: i64,
+            interval_minutes: i64,
+            import_after: String,
+            running: i64,
+            last_started_at: String,
+            last_completed_at: String,
+            last_error: String,
+            updated_at: String,
+            config: Option<String>,
+        }
+        let row = live
+            .query_row(
+                "SELECT provider, source_instance, sync_mode, enabled, interval_minutes,
+                        import_after, running, last_started_at, last_completed_at, last_error,
+                        updated_at, config
+                 FROM recording_sources",
+                [],
+                |row| {
+                    Ok(Carried {
+                        provider: row.get(0)?,
+                        source_instance: row.get(1)?,
+                        sync_mode: row.get(2)?,
+                        enabled: row.get(3)?,
+                        interval_minutes: row.get(4)?,
+                        import_after: row.get(5)?,
+                        running: row.get(6)?,
+                        last_started_at: row.get(7)?,
+                        last_completed_at: row.get(8)?,
+                        last_error: row.get(9)?,
+                        updated_at: row.get(10)?,
+                        config: row.get(11)?,
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            Carried {
+                provider: "plaud".into(),
+                source_instance: "default".into(),
+                sync_mode: "poll".into(),
+                enabled: 1,
+                interval_minutes: 30,
+                import_after: "2026-01-02 03:04:05".into(),
+                running: 1,
+                last_started_at: "2026-01-02 03:00:00".into(),
+                last_completed_at: "2026-01-01 00:00:00".into(),
+                last_error: "keep me".into(),
+                updated_at: "2026-01-02 03:00:01".into(),
+                config: None,
+            }
+        );
     }
 
     #[test]

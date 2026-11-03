@@ -45,7 +45,8 @@ To change the schema:
 3. Run `cargo test` to regenerate `crates/audetic/src/db/schema.sql`.
 4. Commit the migration and the snapshot together.
 
-Never edit a released migration.
+Never edit a released migration. Schema and core types stay provider-agnostic;
+provider specifics live in config JSON and provider modules.
 
 ## Frontend (apps/web-ui)
 
