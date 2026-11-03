@@ -30,6 +30,23 @@
 - `src/transcription/` - Transcription providers
 - `src/db/` - SQLite database operations
 
+## Database migrations
+
+Schema changes are forward-only SQL files. `PRAGMA user_version` is the version:
+migration N is `MIGRATIONS[N - 1]` in `crates/audetic/src/db/migrations/mod.rs`,
+and `LATEST` is the length of that list. Fresh databases replay the same chain.
+Existing databases are upgraded only when the daemon starts, under the instance
+lock, after a `VACUUM INTO` backup.
+
+To change the schema:
+
+1. Add `crates/audetic/src/db/migrations/000N_description.sql`.
+2. Append it to `MIGRATIONS`.
+3. Run `cargo test` to regenerate `crates/audetic/src/db/schema.sql`.
+4. Commit the migration and the snapshot together.
+
+Never edit a released migration.
+
 ## Frontend (apps/web-ui)
 
 The browser SPA is a separate React/TypeScript package. **Before touching it,

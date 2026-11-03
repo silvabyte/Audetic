@@ -498,6 +498,7 @@ fn error_response(err: anyhow::Error, context: &str) -> Response {
 }
 
 /// Helper: send a daemon command and await the machine's reply.
+#[allow(clippy::result_large_err)]
 async fn dispatch<T>(
     tx: &mpsc::Sender<ApiCommand>,
     reply: oneshot::Receiver<anyhow::Result<T>>,
@@ -1060,6 +1061,7 @@ pub async fn regenerate_audio_note_title(
         (status = 404, description = "AudioNote not found"),
     ),
 )]
+#[allow(clippy::result_large_err)]
 pub async fn get_audio_note(
     Path(id): Path<i64>,
     State(state): State<AudioNoteState>,

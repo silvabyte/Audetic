@@ -411,7 +411,7 @@ mod tests {
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::db::migrate(&conn).unwrap();
+        crate::db::ensure_current(&conn).unwrap();
         conn
     }
 

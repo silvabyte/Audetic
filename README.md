@@ -30,10 +30,10 @@ For ordinary upgrades:
 git pull && make install
 ```
 
-**Upgrading from meeting/dictation storage:** first build the new binary, stop
-the old daemon, and run the explicit [Audio Notes migration](./docs/audio-notes-migration.md).
-The updated daemon refuses legacy databases until conversion; the migration
-creates a backup and preserves existing transcripts, titles, artifacts, and audio references.
+**Upgrading an existing install:** `git pull && make install` restarts the
+daemon, which upgrades its database on startup and writes a backup first.
+The old meeting/dictation importer has been removed. A non-empty database
+that was never stamped with `PRAGMA user_version` is refused.
 
 ### Linux
 

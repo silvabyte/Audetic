@@ -430,7 +430,7 @@ mod tests {
 
     fn db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::db::migrate(&conn).unwrap();
+        crate::db::ensure_current(&conn).unwrap();
         conn
     }
 
@@ -615,7 +615,7 @@ mod tests {
         AudioNoteRepository::complete(&conn, id, "t", "hello", None, 30).unwrap();
         assert!(AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
         assert!(!AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
-        crate::db::migrate(&conn).unwrap();
+        crate::db::ensure_current(&conn).unwrap();
         assert_eq!(
             AudioNoteRepository::get(&conn, id)
                 .unwrap()

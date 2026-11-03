@@ -204,7 +204,7 @@ mod tests {
     #[test]
     fn structured_outputs_and_hidden_parent() -> Result<()> {
         let conn = Connection::open_in_memory()?;
-        crate::db::migrate(&conn)?;
+        crate::db::ensure_current(&conn)?;
         let note = AudioNoteRepository::insert(&conn, None, "a.wav")?;
         AudioNoteRepository::complete(&conn, note, "t", "buy milk", None, 1)?;
         let artifact = AudioNoteArtifactRepository::insert_pending(

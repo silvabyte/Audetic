@@ -3,6 +3,8 @@ pub mod audio_note_artifacts;
 pub mod audio_notes;
 pub(crate) mod init;
 pub mod integrations;
+pub(crate) mod migrations;
 
 // Re-export public API
-pub use init::{init_db, init_db_at, migrate};
+pub use init::{init_db, init_db_at};
+pub use migrations::ensure_current;

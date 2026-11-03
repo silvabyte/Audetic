@@ -332,14 +332,14 @@ fn builtin_profiles() -> Vec<NewAgentProfile> {
 
 #[cfg(test)]
 mod tests {
-    use crate::db::migrate;
+    use crate::db::ensure_current;
 
     use super::*;
 
     #[test]
     fn startup_profiles_and_default_selection_preserve_user_choices() {
         let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        ensure_current(&conn).unwrap();
         AgentProfileRepository::ensure_builtin_profiles(&conn).unwrap();
         let codex = AgentProfileRepository::list(&conn)
             .unwrap()
@@ -368,7 +368,7 @@ mod tests {
     #[test]
     fn first_available_skips_an_unavailable_default_profile() {
         let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        ensure_current(&conn).unwrap();
         conn.execute(
             "INSERT INTO agent_profiles \
              (name, kind, executable, args_json, prompt_mode, default_profile, enabled) \
@@ -429,7 +429,7 @@ mod tests {
             "Follow the attached prompt exactly. Return only the requested output.",
         ] {
             let conn = Connection::open_in_memory().unwrap();
-            migrate(&conn).unwrap();
+            ensure_current(&conn).unwrap();
             let broken_args = serde_json::to_string(&vec![
                 "run",
                 "--dir",

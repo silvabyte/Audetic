@@ -129,10 +129,11 @@ async fn handle_capture_stream_died(capture: &mut impl CaptureCommandTarget, dea
 
 pub async fn run_service() -> Result<()> {
     audetic_core::url::port()?;
-    // Refuse legacy schemas before opening devices, requesting permissions, or
-    // accepting HTTP requests. The error contains offline migration instructions.
+    // Upgrade a database that already has data before opening devices, requesting
+    // permissions, or accepting HTTP requests. Opening a connection never rewrites it.
     let db_path = crate::global::db_file()?;
     let _instance_lock = acquire_instance_lock(&db_path)?;
+    crate::db::migrations::upgrade(&db_path)?;
     let api_listener =
         tokio::net::TcpListener::bind((audetic_core::url::HOST, audetic_core::url::port()?))
             .await

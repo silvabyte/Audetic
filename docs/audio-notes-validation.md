@@ -51,11 +51,9 @@ Real focused-desktop text injection was not exercised using synthetic speech.
 
 ## Migration and classification across former record types
 
-Ran the actual `audeticd migrate-audio-notes` CLI against a synthetic legacy
-SQLite fixture containing a meeting and workflow with colliding ID 1, plus an
-existing artifact. Dry-run reported two notes without modification; conversion
-created a private backup and mapped the workflow to note 2; rerun reported
-`already_migrated: true` without duplicates.
+The meeting/dictation importer this section originally exercised has been
+removed. What follows is the 2026-09-28 classification check against a database
+that had already been converted.
 
 Started the application against that migrated database and verified in Chrome:
 
@@ -68,11 +66,6 @@ Started the application against that migrated database and verified in Chrome:
   shopping action was executed.
 - Missing legacy audio produced the expected playback-unavailable message and
   404, while the transcript remained readable and successfully processable.
-
-Automated migration tests also cover old column vintages, deleted records,
-artifact foreign keys, missing audio, disabled retired hooks, WAL-consistent
-backup, rollback/restore, active writers, post-backup concurrent writes, corrupt
-databases, invalid text, unknown legacy columns, and idempotency.
 
 ## Findings resolved during QA
 
