@@ -187,11 +187,11 @@ fn row_to_job(row: &Row) -> rusqlite::Result<Result<Job>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::migrate;
+    use crate::db::ensure_current;
 
     fn setup_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        migrate(&conn).unwrap();
+        ensure_current(&conn).unwrap();
         conn
     }
 

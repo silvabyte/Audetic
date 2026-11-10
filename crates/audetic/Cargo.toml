@@ -41,7 +41,11 @@ rubato = "0.16"
 # option). GPU backends are opt-in: `whisper-metal` is enabled on macOS below;
 # Linux stays CPU by default with the workspace `vulkan` feature available for
 # users with a capable GPU. ONNX/Parakeet always runs on CPU.
-transcribe-rs = { version = "0.3.8", default-features = false, features = ["onnx", "whisper-cpp"] }
+#
+# Pinned: 0.3.12 calls `ort::Session::builder()` with no environment, which
+# does not compile against the `ort` 2.0.0-rc it resolves. `Cargo.lock` is not
+# committed, so an unpinned `0.3` requirement builds 0.3.12 and fails CI.
+transcribe-rs = { version = "=0.3.11", default-features = false, features = ["onnx", "whisper-cpp"] }
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
@@ -130,7 +134,7 @@ arboard = "3.3"
 [target.'cfg(target_os = "macos")'.dependencies]
 # Metal GPU acceleration for Whisper on macOS. Auto-applies to the same
 # transcribe-rs dependency declared above (cargo unions target features).
-transcribe-rs = { version = "0.3.8", default-features = false, features = ["whisper-metal"] }
+transcribe-rs = { version = "=0.3.11", default-features = false, features = ["whisper-metal"] }
 objc2 = "0.6"
 objc2-foundation = "0.3"
 block2 = "0.6"

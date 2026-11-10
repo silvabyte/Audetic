@@ -249,9 +249,8 @@ impl SystemAudioSource {
 
                     let remaining = n - cursor;
                     let complete = remaining - (remaining % 4);
-                    for chunk in buf[cursor..cursor + complete].chunks_exact(4) {
-                        new_samples
-                            .push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+                    for chunk in buf[cursor..cursor + complete].as_chunks::<4>().0 {
+                        new_samples.push(f32::from_le_bytes(*chunk));
                     }
 
                     // Save any trailing bytes that don't complete a sample

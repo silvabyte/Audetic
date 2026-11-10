@@ -3,7 +3,6 @@ pub mod api;
 pub mod app;
 pub mod audio;
 pub mod audio_note_artifacts;
-pub mod audio_note_migration;
 pub mod audio_notes;
 pub mod db;
 pub mod install;

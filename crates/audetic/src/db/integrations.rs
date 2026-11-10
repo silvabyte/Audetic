@@ -36,8 +36,11 @@ pub enum ImportClaim {
     InProgress { import_id: i64 },
 }
 
+/// One configured recording source.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PlaudSyncState {
+pub struct RecordingSource {
+    pub provider: String,
+    pub source_instance: String,
     pub enabled: bool,
     pub interval_minutes: i64,
     pub import_after: Option<String>,
@@ -249,75 +252,106 @@ impl IntegrationRepository {
         .context("Failed to check external import identity")
     }
 
-    pub fn plaud_state(conn: &Connection) -> Result<PlaudSyncState> {
+    pub fn recording_source(
+        conn: &Connection,
+        provider: &str,
+        source_instance: &str,
+    ) -> Result<RecordingSource> {
         conn.query_row(
-            "SELECT enabled, interval_minutes, import_after, running,
-                    last_started_at, last_completed_at, last_error
-             FROM plaud_sync_state WHERE singleton = 1",
-            [],
-            |row| {
-                Ok(PlaudSyncState {
-                    enabled: row.get(0)?,
-                    interval_minutes: row.get(1)?,
-                    import_after: row.get(2)?,
-                    running: row.get(3)?,
-                    last_started_at: row.get(4)?,
-                    last_completed_at: row.get(5)?,
-                    last_error: row.get(6)?,
-                })
-            },
+            &format!("SELECT {RECORDING_SOURCE_COLUMNS} FROM recording_sources WHERE provider = ?1 AND source_instance = ?2"),
+            params![provider, source_instance],
+            row_to_recording_source,
         )
-        .context("Failed to read Plaud synchronization state")
+        .optional()
+        .context("Failed to read recording source")?
+        .with_context(|| format!("Recording source {provider}/{source_instance} is not configured"))
     }
 
-    pub fn update_plaud_settings(
+    pub fn enabled_sources(conn: &Connection) -> Result<Vec<RecordingSource>> {
+        let mut statement = conn.prepare(&format!(
+            "SELECT {RECORDING_SOURCE_COLUMNS} FROM recording_sources
+             WHERE enabled = 1
+             ORDER BY provider, source_instance"
+        ))?;
+        let sources = statement
+            .query_map([], row_to_recording_source)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .context("Failed to list recording sources")?;
+        Ok(sources)
+    }
+
+    pub fn update_recording_source_settings(
         conn: &Connection,
+        provider: &str,
+        source_instance: &str,
         enabled: bool,
         interval_minutes: i64,
         import_after: Option<&str>,
-    ) -> Result<PlaudSyncState> {
-        if !(5..=1440).contains(&interval_minutes) {
-            bail!("Plaud sync interval must be between 5 and 1440 minutes");
-        }
-        conn.execute(
-            "UPDATE plaud_sync_state
+    ) -> Result<()> {
+        let changed = conn.execute(
+            "UPDATE recording_sources
              SET enabled = ?1, interval_minutes = ?2, import_after = ?3,
                  updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1",
-            params![enabled, interval_minutes, import_after],
+             WHERE provider = ?4 AND source_instance = ?5",
+            params![
+                enabled,
+                interval_minutes,
+                import_after,
+                provider,
+                source_instance
+            ],
         )?;
-        Self::plaud_state(conn)
-    }
-
-    pub fn start_plaud_sync(conn: &Connection) -> Result<bool> {
-        Ok(conn.execute(
-            "UPDATE plaud_sync_state
-             SET running = 1, last_started_at = CURRENT_TIMESTAMP,
-                 last_error = NULL, updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1 AND running = 0",
-            [],
-        )? == 1)
-    }
-
-    pub fn update_plaud_cursor(conn: &Connection, import_after: &str) -> Result<()> {
-        conn.execute(
-            "UPDATE plaud_sync_state
-             SET import_after = ?1, updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1",
-            [import_after],
-        )?;
+        if changed != 1 {
+            bail!("Recording source {provider}/{source_instance} is not configured");
+        }
         Ok(())
     }
 
-    pub fn finish_plaud_sync(conn: &Connection, error: Option<&str>) -> Result<()> {
-        conn.execute(
-            "UPDATE plaud_sync_state
+    pub fn start_sync(conn: &Connection, provider: &str, source_instance: &str) -> Result<bool> {
+        Ok(conn.execute(
+            "UPDATE recording_sources
+             SET running = 1, last_started_at = CURRENT_TIMESTAMP,
+                 last_error = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE provider = ?1 AND source_instance = ?2 AND running = 0",
+            params![provider, source_instance],
+        )? == 1)
+    }
+
+    pub fn update_import_cursor(
+        conn: &Connection,
+        provider: &str,
+        source_instance: &str,
+        import_after: &str,
+    ) -> Result<()> {
+        let changed = conn.execute(
+            "UPDATE recording_sources
+             SET import_after = ?1, updated_at = CURRENT_TIMESTAMP
+             WHERE provider = ?2 AND source_instance = ?3",
+            params![import_after, provider, source_instance],
+        )?;
+        if changed != 1 {
+            bail!("Recording source {provider}/{source_instance} is not configured");
+        }
+        Ok(())
+    }
+
+    pub fn finish_sync(
+        conn: &Connection,
+        provider: &str,
+        source_instance: &str,
+        error: Option<&str>,
+    ) -> Result<()> {
+        let changed = conn.execute(
+            "UPDATE recording_sources
              SET running = 0,
                  last_completed_at = CASE WHEN ?1 IS NULL THEN CURRENT_TIMESTAMP ELSE last_completed_at END,
                  last_error = ?1, updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1",
-            [error],
+             WHERE provider = ?2 AND source_instance = ?3",
+            params![error, provider, source_instance],
         )?;
+        if changed != 1 {
+            bail!("Recording source {provider}/{source_instance} is not configured");
+        }
         Ok(())
     }
 
@@ -332,18 +366,21 @@ impl IntegrationRepository {
         Ok(())
     }
 
-    pub fn sweep_interrupted_plaud_sync(conn: &Connection) -> Result<()> {
+    pub fn sweep_interrupted_syncs(conn: &Connection) -> Result<()> {
         conn.execute(
-            "UPDATE plaud_sync_state
+            "UPDATE recording_sources
              SET running = 0,
-                 last_error = 'Interrupted: the Audetic daemon stopped during Plaud synchronization',
+                 last_error = 'Interrupted: the Audetic daemon stopped during synchronization',
                  updated_at = CURRENT_TIMESTAMP
-             WHERE singleton = 1 AND running = 1",
+             WHERE running = 1",
             [],
         )?;
         Ok(())
     }
 }
+
+const RECORDING_SOURCE_COLUMNS: &str = "provider, source_instance, enabled, interval_minutes, \
+     import_after, running, last_started_at, last_completed_at, last_error";
 
 fn external_import_by_identity(
     conn: &Connection,
@@ -391,6 +428,20 @@ fn row_to_external_import(row: &Row<'_>) -> rusqlite::Result<ExternalImport> {
     })
 }
 
+fn row_to_recording_source(row: &Row<'_>) -> rusqlite::Result<RecordingSource> {
+    Ok(RecordingSource {
+        provider: row.get(0)?,
+        source_instance: row.get(1)?,
+        enabled: row.get(2)?,
+        interval_minutes: row.get(3)?,
+        import_after: row.get(4)?,
+        running: row.get(5)?,
+        last_started_at: row.get(6)?,
+        last_completed_at: row.get(7)?,
+        last_error: row.get(8)?,
+    })
+}
+
 fn validate_scope(scope: &str) -> Result<()> {
     if !matches!(scope, "index" | "generic") {
         bail!("Unknown ingress access key scope: {scope}");
@@ -411,7 +462,7 @@ mod tests {
 
     fn setup() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        crate::db::migrate(&conn).unwrap();
+        crate::db::ensure_current(&conn).unwrap();
         conn
     }
 
@@ -518,17 +569,17 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(IntegrationRepository::start_plaud_sync(&conn).unwrap());
+        assert!(IntegrationRepository::start_sync(&conn, "plaud", "default").unwrap());
 
         IntegrationRepository::sweep_interrupted_imports(&conn).unwrap();
-        IntegrationRepository::sweep_interrupted_plaud_sync(&conn).unwrap();
+        IntegrationRepository::sweep_interrupted_syncs(&conn).unwrap();
 
         let import = external_import_by_identity(&conn, "plaud", "default", "recording-id")
             .unwrap()
             .unwrap();
         assert_eq!(import.status, "failed");
         assert!(import.error.unwrap().contains("daemon stopped"));
-        let state = IntegrationRepository::plaud_state(&conn).unwrap();
+        let state = IntegrationRepository::recording_source(&conn, "plaud", "default").unwrap();
         assert!(!state.running);
         assert!(state.last_error.unwrap().contains("daemon stopped"));
     }
