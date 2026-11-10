@@ -280,7 +280,7 @@ async fn schedule_plaud(
     backfill: bool,
 ) -> ApiResult<(StatusCode, Json<PlaudSyncAccepted>)> {
     if !service
-        .schedule_poll(&PlaudSource, backfill)
+        .schedule_poll(Box::new(PlaudSource), backfill)
         .await
         .map_err(ApiError::from)?
     {

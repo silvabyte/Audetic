@@ -439,7 +439,7 @@ impl IntegrationService {
     /// Claim the source, then run its poll entry point off the request thread.
     pub async fn schedule_poll(
         &self,
-        source: &dyn RecordingSourceDriver,
+        source: Box<dyn RecordingSourceDriver>,
         backfill: bool,
     ) -> Result<bool> {
         let provider = source.provider().to_string();
@@ -457,11 +457,7 @@ impl IntegrationService {
         }
         let service = self.clone();
         tokio::spawn(async move {
-            let result = async {
-                let source = recording_source::resolve(&provider, &source_instance)?;
-                source.poll(&service, backfill).await
-            }
-            .await;
+            let result = source.poll(&service, backfill).await;
             if let Err(error) = &result {
                 tracing::error!(%error, "Recording source synchronization failed");
             }
@@ -514,9 +510,9 @@ impl IntegrationService {
                         );
                         continue;
                     };
-                    if let Err(error) = service.schedule_poll(source.as_ref(), false).await {
+                    if let Err(error) = service.schedule_poll(source, false).await {
                         tracing::error!(
-                            provider = source.provider(),
+                            provider = %record.provider,
                             %error,
                             "Failed to schedule recording source sync"
                         );
