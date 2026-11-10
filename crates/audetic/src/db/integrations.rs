@@ -307,9 +307,6 @@ impl IntegrationRepository {
         interval_minutes: Option<i64>,
         import_after: Option<&str>,
     ) -> Result<()> {
-        if interval_minutes.is_some_and(|minutes| minutes <= 0) {
-            bail!("Recording source poll interval must be greater than zero");
-        }
         let changed = conn.execute(
             "UPDATE recording_sources
              SET enabled = ?1, interval_minutes = ?2, import_after = ?3,
