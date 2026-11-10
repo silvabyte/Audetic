@@ -345,6 +345,12 @@ mod tests {
     }
 
     #[test]
+    fn stamp_script_creates_the_same_tracking_table() {
+        let script = include_str!("../../../../../scripts/stamp-legacy-db.sh");
+        assert!(script.contains(SCHEMA_MIGRATIONS_DDL));
+    }
+
+    #[test]
     fn opening_connection_does_not_normalize_or_recover_business_state() {
         let conn = Connection::open_in_memory().unwrap();
         ensure_current(&conn).unwrap();
