@@ -30,10 +30,10 @@ For ordinary upgrades:
 git pull && make install
 ```
 
-For a database from before checksummed migration tracking, run
-`scripts/stamp-legacy-db.sh --dry-run` and then `scripts/stamp-legacy-db.sh`
-after `git pull` and before `make install`. The daemon then upgrades it on
-startup after writing a backup.
+The daemon upgrades its database on startup after writing a backup. A database
+created before migrations were tracked (no `schema_migrations` table) is
+refused until it is stamped once: after `git pull` and before `make install`,
+run `scripts/stamp-legacy-db.sh --dry-run`, then `scripts/stamp-legacy-db.sh`.
 
 ### Linux
 
