@@ -30,7 +30,7 @@ For ordinary upgrades:
 git pull && make install
 ```
 
-For a database from before `PRAGMA user_version`, run
+For a database from before checksummed migration tracking, run
 `scripts/stamp-legacy-db.sh --dry-run` and then `scripts/stamp-legacy-db.sh`
 after `git pull` and before `make install`. The daemon then upgrades it on
 startup after writing a backup.

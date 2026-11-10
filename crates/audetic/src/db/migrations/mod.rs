@@ -1,5 +1,6 @@
-//! Schema version lives in `PRAGMA user_version`. Migration N is
-//! `MIGRATIONS[N - 1]`. Released entries are never edited.
+//! Applied migrations are recorded with SHA-256 checksums in
+//! `schema_migrations`. Migration N is `MIGRATIONS[N - 1]`. Released entries
+//! are never edited because startup refuses a changed applied migration.
 //!
 //! Opening a connection (`ensure_current`) creates an empty database and
 //! refuses anything else that is not already current. Rewriting a database
@@ -7,17 +8,37 @@
 //! under the instance lock.
 
 use anyhow::{bail, Context, Result};
-use rusqlite::Connection;
+use rusqlite::{params, Connection};
+use sha2::{Digest, Sha256};
 use tracing::info;
 
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
-const MIGRATIONS: &[&str] = &[
-    include_str!("0001_baseline.sql"),
-    include_str!("0002_recording_sources.sql"),
+const SCHEMA_MIGRATIONS_DDL: &str = "CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY CHECK(version > 0),
+    checksum TEXT NOT NULL CHECK(length(checksum) = 64),
+    applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);";
+
+#[derive(Clone, Copy)]
+struct Migration {
+    name: &'static str,
+    sql: &'static str,
+}
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        name: "0001_baseline.sql",
+        sql: include_str!("0001_baseline.sql"),
+    },
+    Migration {
+        name: "0002_recording_sources.sql",
+        sql: include_str!("0002_recording_sources.sql"),
+    },
 ];
 #[cfg(test)]
-const LATEST: i64 = MIGRATIONS.len() as i64;
+const LATEST: usize = MIGRATIONS.len();
 
 pub fn ensure_current(conn: &Connection) -> Result<()> {
     ensure_with(conn, MIGRATIONS)
@@ -27,91 +48,67 @@ pub(crate) fn upgrade(db_path: &Path) -> Result<()> {
     upgrade_with(db_path, MIGRATIONS)
 }
 
-fn ensure_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
-    let latest = migrations.len() as i64;
+fn ensure_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
     conn.pragma_update(None, "foreign_keys", true)
         .context("Failed to enable foreign keys")?;
-    let version = user_version(conn)?;
-    if version == latest {
-        return Ok(());
-    }
-    match migration_plan_for_version(conn, version, latest)? {
-        Plan::Ready => Ok(()),
-        Plan::Create => apply_migration_transaction(conn, version, migrations),
-        Plan::Upgrade => bail!(
-            "Database is at user_version {version} and this build supports {latest}. \
-             Restart the daemon to upgrade"
+    match applied_count(conn)? {
+        Some(applied) if applied == migrations.len() => Ok(()),
+        Some(applied) if applied > migrations.len() => bail!(
+            "Database was written by a newer build ({applied} migrations applied; this build supports {})",
+            migrations.len()
+        ),
+        Some(applied) => bail!(
+            "Database has {applied} migrations applied and this build requires {}. \
+             Restart the daemon to upgrade",
+            migrations.len()
+        ),
+        None if database_is_empty(conn)? => {
+            apply_migration_transaction(conn, 0, true, migrations)
+        }
+        None => bail!(
+            "Refusing to open a non-empty database without schema_migrations; run scripts/stamp-legacy-db.sh."
         ),
     }
 }
 
-fn upgrade_with(db_path: &Path, migrations: &[&str]) -> Result<()> {
-    let latest = migrations.len() as i64;
+fn upgrade_with(db_path: &Path, migrations: &[Migration]) -> Result<()> {
     if !db_path.exists() {
         return Ok(());
     }
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    let (version, pending) = migration_plan(&conn, latest)?;
-    match pending {
-        Plan::Ready => return Ok(()),
-        Plan::Create => return apply_migration_transaction(&conn, version, migrations),
-        Plan::Upgrade => {}
-    }
-    let backup = pre_upgrade_backup_path(db_path, latest);
-    write_backup(&conn, &backup, version)?;
-    apply_migration_transaction(&conn, version, migrations)
-}
-
-fn migration_plan(conn: &Connection, latest: i64) -> Result<(i64, Plan)> {
     conn.pragma_update(None, "foreign_keys", true)
         .context("Failed to enable foreign keys")?;
-    let version = user_version(conn)?;
-    Ok((version, migration_plan_for_version(conn, version, latest)?))
-}
-
-fn migration_plan_for_version(conn: &Connection, version: i64, latest: i64) -> Result<Plan> {
-    let empty = database_is_empty(conn)?;
-    plan(version, latest, empty)
-}
-
-/// What opening or startup may do with this file.
-enum Plan {
-    /// `user_version` is already this build's schema.
-    Ready,
-    /// No user tables yet, so the pending chain may be applied in place.
-    Create,
-    /// User tables exist at an older version. Only `upgrade` may rewrite them.
-    Upgrade,
-}
-
-fn plan(version: i64, latest: i64, empty: bool) -> Result<Plan> {
-    if version == latest {
-        return Ok(Plan::Ready);
-    }
-    if version > latest {
+    let Some(_) = applied_count(&conn)? else {
+        if database_is_empty(&conn)? {
+            return apply_migration_transaction(&conn, 0, true, migrations);
+        }
         bail!(
-            "Database was written by a newer build (user_version {version}; this build supports {latest})"
+            "Refusing to open a non-empty database without schema_migrations; run scripts/stamp-legacy-db.sh."
         );
+    };
+    let applied = verify_applied_migrations(&conn, migrations)?;
+    if applied == migrations.len() {
+        return Ok(());
     }
-    if empty {
-        return Ok(Plan::Create);
-    }
-    if version == 0 {
-        bail!("Refusing to open a non-empty database at user_version 0; run scripts/stamp-legacy-db.sh.");
-    }
-    Ok(Plan::Upgrade)
+    let backup = pre_upgrade_backup_path(db_path, migrations.len());
+    write_backup(&conn, &backup, applied)?;
+    apply_migration_transaction(&conn, applied, false, migrations)
 }
 
-fn apply_migration_transaction(conn: &Connection, from: i64, migrations: &[&str]) -> Result<()> {
-    let latest = migrations.len() as i64;
-    if from >= latest {
+fn apply_migration_transaction(
+    conn: &Connection,
+    from: usize,
+    create_tracking_table: bool,
+    migrations: &[Migration],
+) -> Result<()> {
+    if from >= migrations.len() && !create_tracking_table {
         return Ok(());
     }
     conn.execute_batch("BEGIN EXCLUSIVE")
         .context("Failed to begin exclusive migration transaction")?;
-    let applied = apply_in_open_transaction(conn, from, migrations);
+    let applied = apply_in_open_transaction(conn, from, create_tracking_table, migrations);
     match applied {
         Ok(versions) => {
             conn.execute_batch("COMMIT")
@@ -132,25 +129,101 @@ fn apply_migration_transaction(conn: &Connection, from: i64, migrations: &[&str]
 
 fn apply_in_open_transaction(
     conn: &Connection,
-    from: i64,
-    migrations: &[&str],
-) -> Result<Vec<i64>> {
-    let latest = migrations.len() as i64;
+    from: usize,
+    create_tracking_table: bool,
+    migrations: &[Migration],
+) -> Result<Vec<usize>> {
+    if create_tracking_table {
+        conn.execute_batch(SCHEMA_MIGRATIONS_DDL)
+            .context("Failed to create schema_migrations")?;
+    }
     let mut applied = Vec::new();
-    for version in (from + 1)..=latest {
-        let sql = migrations[(version - 1) as usize];
-        conn.execute_batch(sql)
+    for (index, migration) in migrations.iter().enumerate().skip(from) {
+        let version = index + 1;
+        conn.execute_batch(migration.sql)
             .with_context(|| format!("Failed to apply migration {version}"))?;
+        let checksum = migration_checksum(migration);
+        conn.execute(
+            "INSERT INTO schema_migrations(version, checksum) VALUES (?1, ?2)",
+            params![version as i64, checksum],
+        )
+        .with_context(|| format!("Failed to record migration {version}"))?;
         applied.push(version);
     }
     integrity_check(conn)?;
     foreign_key_check(conn)?;
-    conn.pragma_update(None, "user_version", latest)
-        .with_context(|| format!("Failed to set user_version to {latest}"))?;
     Ok(applied)
 }
 
-fn write_backup(conn: &Connection, backup: &Path, version: i64) -> Result<()> {
+fn applied_count(conn: &Connection) -> Result<Option<usize>> {
+    match conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+        row.get::<_, i64>(0)
+    }) {
+        Ok(count) => Ok(Some(
+            usize::try_from(count).context("schema_migrations row count is negative")?,
+        )),
+        Err(error) if missing_schema_migrations_error(&error) => {
+            if table_exists(conn, "schema_migrations")? {
+                Err(error).context("Failed to count applied migrations")
+            } else {
+                Ok(None)
+            }
+        }
+        Err(error) => Err(error).context("Failed to count applied migrations"),
+    }
+}
+
+fn missing_schema_migrations_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(_, Some(message))
+            if message.contains("no such table: schema_migrations")
+    )
+}
+
+fn verify_applied_migrations(conn: &Connection, migrations: &[Migration]) -> Result<usize> {
+    let mut stmt = conn
+        .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
+        .context("Failed to read applied migrations")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let applied = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    if applied.len() > migrations.len() {
+        bail!(
+            "Database was written by a newer build ({} migrations applied; this build supports {})",
+            applied.len(),
+            migrations.len()
+        );
+    }
+    for (index, (version, checksum)) in applied.iter().enumerate() {
+        let expected_version = index + 1;
+        if *version != expected_version as i64 {
+            bail!(
+                "Invalid schema_migrations sequence: expected version {expected_version}, found {version}"
+            );
+        }
+        let migration = &migrations[index];
+        if checksum != &migration_checksum(migration) {
+            bail!(
+                "migration {expected_version} ({}) changed after it was applied to this database",
+                migration.name
+            );
+        }
+    }
+    Ok(applied.len())
+}
+
+fn migration_checksum(migration: &Migration) -> String {
+    let digest = Sha256::digest(migration.sql.as_bytes());
+    let mut checksum = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut checksum, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    checksum
+}
+
+fn write_backup(conn: &Connection, backup: &Path, applied: usize) -> Result<()> {
     let mut temp = backup.as_os_str().to_os_string();
     temp.push(".tmp");
     let temp = PathBuf::from(temp);
@@ -165,7 +238,7 @@ fn write_backup(conn: &Connection, backup: &Path, version: i64) -> Result<()> {
     let text = temp.to_str().context("Backup path is not valid UTF-8")?;
     let literal = text.replace('\'', "''");
     info!(
-        "Backing up database at user_version {version} to {}",
+        "Backing up database with {applied} applied migrations to {}",
         backup.display()
     );
     conn.execute_batch(&format!("VACUUM INTO '{literal}'"))
@@ -174,17 +247,12 @@ fn write_backup(conn: &Connection, backup: &Path, version: i64) -> Result<()> {
         .with_context(|| format!("Failed to install database backup at {}", backup.display()))
 }
 
-fn pre_upgrade_backup_path(db_path: &Path, target_version: i64) -> PathBuf {
+fn pre_upgrade_backup_path(db_path: &Path, target_version: usize) -> PathBuf {
     let file_name = db_path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "audetic.db".to_string());
     db_path.with_file_name(format!("{file_name}.pre-v{target_version}.sqlite3"))
-}
-
-fn user_version(conn: &Connection) -> Result<i64> {
-    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
-        .context("Failed to read user_version")
 }
 
 fn database_is_empty(conn: &Connection) -> Result<bool> {
@@ -197,7 +265,6 @@ fn database_is_empty(conn: &Connection) -> Result<bool> {
     Ok(tables == 0)
 }
 
-#[cfg(test)]
 fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
@@ -241,28 +308,63 @@ mod tests {
 
     use std::fs;
 
+    const TEST_MIGRATIONS: &[Migration] = &[
+        Migration {
+            name: "0001_notes.sql",
+            sql: "CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT NOT NULL);",
+        },
+        Migration {
+            name: "0002_note_body.sql",
+            sql: "ALTER TABLE notes ADD COLUMN body TEXT;",
+        },
+    ];
+
     fn temp_db() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audetic.db");
         (dir, path)
     }
 
-    fn seed_version(path: &Path, sql: &str, version: i64) -> Connection {
+    fn seed_applied(path: &Path, migrations: &[Migration], count: usize) -> Connection {
         let conn = Connection::open(path).unwrap();
-        conn.execute_batch(sql).unwrap();
-        conn.pragma_update(None, "user_version", version).unwrap();
+        conn.execute_batch(SCHEMA_MIGRATIONS_DDL).unwrap();
+        for (index, migration) in migrations.iter().enumerate().take(count) {
+            conn.execute_batch(migration.sql).unwrap();
+            conn.execute(
+                "INSERT INTO schema_migrations(version, checksum) VALUES (?1, ?2)",
+                params![(index + 1) as i64, migration_checksum(migration)],
+            )
+            .unwrap();
+        }
         conn
     }
 
+    fn migration_rows(conn: &Connection) -> Vec<(i64, String)> {
+        let mut stmt = conn
+            .prepare("SELECT version, checksum FROM schema_migrations ORDER BY version")
+            .unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
     #[test]
-    fn fresh_replay_reaches_latest() {
+    fn fresh_replay_records_every_migration_checksum() {
         let (_dir, path) = temp_db();
         let conn = crate::db::init_db_at(&path).unwrap();
-        assert_eq!(user_version(&conn).unwrap(), LATEST);
         assert!(table_exists(&conn, "audio_notes").unwrap());
         assert!(table_exists(&conn, "recording_sources").unwrap());
         assert!(!table_exists(&conn, "audio_notes_schema").unwrap());
         assert!(!table_exists(&conn, "plaud_sync_state").unwrap());
+        assert_eq!(
+            migration_rows(&conn),
+            MIGRATIONS
+                .iter()
+                .enumerate()
+                .map(|(index, migration)| { ((index + 1) as i64, migration_checksum(migration)) })
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -283,32 +385,36 @@ mod tests {
             )
             .unwrap();
         assert_eq!(row, ("  untouched  ".into(), "running".into()));
-        assert_eq!(user_version(&conn).unwrap(), LATEST);
+        assert_eq!(migration_rows(&conn).len(), LATEST);
     }
 
     #[test]
-    fn refuses_database_written_by_a_newer_build() {
-        let conn = Connection::open_in_memory().unwrap();
-        ensure_current(&conn).unwrap();
-        conn.pragma_update(None, "user_version", LATEST + 1)
-            .unwrap();
-        let error = ensure_current(&conn).unwrap_err().to_string();
-        assert!(error.contains("written by a newer build"), "{error}");
-        assert_eq!(user_version(&conn).unwrap(), LATEST + 1);
-
+    fn refuses_gaps_extra_rows_and_newer_databases() {
         let (_dir, path) = temp_db();
-        let file = Connection::open(&path).unwrap();
-        file.execute_batch("CREATE TABLE notes(id INTEGER PRIMARY KEY);")
-            .unwrap();
-        file.pragma_update(None, "user_version", LATEST + 1)
-            .unwrap();
+        let file = seed_applied(&path, MIGRATIONS, LATEST);
+        file.execute(
+            "UPDATE schema_migrations SET version = 3 WHERE version = 2",
+            [],
+        )
+        .unwrap();
         drop(file);
         let error = upgrade(&path).unwrap_err().to_string();
+        assert!(error.contains("expected version 2, found 3"), "{error}");
+
+        let (_dir, path) = temp_db();
+        let file = seed_applied(&path, MIGRATIONS, LATEST);
+        file.execute(
+            "INSERT INTO schema_migrations(version, checksum) VALUES (3, ?1)",
+            ["0".repeat(64)],
+        )
+        .unwrap();
+        drop(file);
+        let opened = Connection::open(&path).unwrap();
+        let error = ensure_current(&opened).unwrap_err().to_string();
         assert!(error.contains("written by a newer build"), "{error}");
-        assert_eq!(
-            user_version(&Connection::open(&path).unwrap()).unwrap(),
-            LATEST + 1
-        );
+        drop(opened);
+        let error = upgrade(&path).unwrap_err().to_string();
+        assert!(error.contains("written by a newer build"), "{error}");
     }
 
     #[test]
@@ -325,11 +431,10 @@ mod tests {
         let opened = Connection::open(&path).unwrap();
         let error = ensure_current(&opened).unwrap_err().to_string();
         assert!(
-            error.contains("non-empty database at user_version 0"),
+            error.contains("non-empty database without schema_migrations"),
             "{error}"
         );
         assert!(error.contains("scripts/stamp-legacy-db.sh"), "{error}");
-        assert_eq!(user_version(&opened).unwrap(), 0);
         let legacy: i64 = opened
             .query_row("SELECT COUNT(*) FROM legacy", [], |row| row.get(0))
             .unwrap();
@@ -347,7 +452,7 @@ mod tests {
 
         let error = upgrade(&path).unwrap_err().to_string();
         assert!(
-            error.contains("non-empty database at user_version 0"),
+            error.contains("non-empty database without schema_migrations"),
             "{error}"
         );
         let backup = pre_upgrade_backup_path(&path, LATEST);
@@ -355,20 +460,21 @@ mod tests {
     }
 
     #[test]
-    fn ensure_current_does_not_upgrade_a_populated_database() {
+    fn ensure_current_neither_upgrades_nor_verifies_checksums() {
         let conn = Connection::open_in_memory().unwrap();
-        let migrations = &[
-            "CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT NOT NULL);",
-            "ALTER TABLE notes ADD COLUMN body TEXT;",
-        ];
-        conn.execute_batch(migrations[0]).unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
+        conn.execute_batch(SCHEMA_MIGRATIONS_DDL).unwrap();
+        conn.execute_batch(TEST_MIGRATIONS[0].sql).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations(version, checksum) VALUES (1, ?1)",
+            ["0".repeat(64)],
+        )
+        .unwrap();
         conn.execute("INSERT INTO notes(title) VALUES('keep')", [])
             .unwrap();
 
-        let error = ensure_with(&conn, migrations).unwrap_err().to_string();
+        let error = ensure_with(&conn, TEST_MIGRATIONS).unwrap_err().to_string();
         assert!(error.contains("Restart the daemon to upgrade"), "{error}");
-        assert_eq!(user_version(&conn).unwrap(), 1);
+        assert_eq!(migration_rows(&conn), vec![(1, "0".repeat(64))]);
         let title: String = conn
             .query_row("SELECT title FROM notes", [], |row| row.get(0))
             .unwrap();
@@ -381,22 +487,26 @@ mod tests {
             .map(|name| name.unwrap())
             .collect();
         assert_eq!(columns, vec!["id".to_string(), "title".to_string()]);
+
+        conn.execute_batch(TEST_MIGRATIONS[1].sql).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations(version, checksum) VALUES (2, ?1)",
+            ["0".repeat(64)],
+        )
+        .unwrap();
+        ensure_with(&conn, TEST_MIGRATIONS).unwrap();
     }
 
     #[test]
     fn upgrade_backs_up_database_that_has_data() {
         let (_dir, path) = temp_db();
-        let migrations = &[
-            "CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT NOT NULL);",
-            "ALTER TABLE notes ADD COLUMN body TEXT;",
-        ];
         {
-            let conn = seed_version(&path, migrations[0], 1);
+            let conn = seed_applied(&path, TEST_MIGRATIONS, 1);
             conn.execute("INSERT INTO notes(title) VALUES('keep')", [])
                 .unwrap();
         }
 
-        upgrade_with(&path, migrations).unwrap();
+        upgrade_with(&path, TEST_MIGRATIONS).unwrap();
 
         let backup = pre_upgrade_backup_path(&path, 2);
         assert_eq!(
@@ -404,7 +514,7 @@ mod tests {
             "audetic.db.pre-v2.sqlite3"
         );
         let saved = Connection::open(&backup).unwrap();
-        assert_eq!(user_version(&saved).unwrap(), 1);
+        assert_eq!(migration_rows(&saved).len(), 1);
         let title: String = saved
             .query_row("SELECT title FROM notes", [], |row| row.get(0))
             .unwrap();
@@ -419,7 +529,7 @@ mod tests {
         assert_eq!(saved_columns, 0);
 
         let live = Connection::open(&path).unwrap();
-        assert_eq!(user_version(&live).unwrap(), 2);
+        assert_eq!(migration_rows(&live).len(), 2);
         let row: (String, Option<String>) = live
             .query_row("SELECT title, body FROM notes", [], |row| {
                 Ok((row.get(0)?, row.get(1)?))
@@ -429,14 +539,52 @@ mod tests {
     }
 
     #[test]
+    fn checksum_mismatch_is_refused_without_changes_or_backup() {
+        let (_dir, path) = temp_db();
+        {
+            let conn = seed_applied(&path, TEST_MIGRATIONS, 1);
+            conn.execute("INSERT INTO notes(title) VALUES('keep')", [])
+                .unwrap();
+            conn.execute(
+                "UPDATE schema_migrations SET checksum = ?1 WHERE version = 1",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        }
+
+        let error = upgrade_with(&path, TEST_MIGRATIONS)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(
+                "migration 1 (0001_notes.sql) changed after it was applied to this database"
+            ),
+            "{error}"
+        );
+        assert!(!pre_upgrade_backup_path(&path, 2).exists());
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(migration_rows(&conn), vec![(1, "0".repeat(64))]);
+        let title: String = conn
+            .query_row("SELECT title FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "keep");
+    }
+
+    #[test]
     fn failing_step_rolls_back_and_leaves_version_unchanged() {
         let (_dir, path) = temp_db();
         let migrations = &[
-            "CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT NOT NULL);",
-            "ALTER TABLE missing_table ADD COLUMN body TEXT;",
+            Migration {
+                name: "0001_notes.sql",
+                sql: "CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT NOT NULL);",
+            },
+            Migration {
+                name: "0002_broken.sql",
+                sql: "ALTER TABLE missing_table ADD COLUMN body TEXT;",
+            },
         ];
         {
-            let conn = seed_version(&path, migrations[0], 1);
+            let conn = seed_applied(&path, migrations, 1);
             conn.execute("INSERT INTO notes(title) VALUES('keep')", [])
                 .unwrap();
         }
@@ -458,7 +606,7 @@ mod tests {
         );
 
         let conn = Connection::open(&path).unwrap();
-        assert_eq!(user_version(&conn).unwrap(), 1);
+        assert_eq!(migration_rows(&conn).len(), 1);
         let title: String = conn
             .query_row("SELECT title FROM notes", [], |row| row.get(0))
             .unwrap();
@@ -482,22 +630,18 @@ mod tests {
     #[test]
     fn preexisting_junk_backup_is_replaced_with_a_valid_database() {
         let (_dir, path) = temp_db();
-        let migrations = &[
-            "CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT NOT NULL);",
-            "ALTER TABLE notes ADD COLUMN body TEXT;",
-        ];
         {
-            let conn = seed_version(&path, migrations[0], 1);
+            let conn = seed_applied(&path, TEST_MIGRATIONS, 1);
             conn.execute("INSERT INTO notes(title) VALUES('keep')", [])
                 .unwrap();
         }
         let backup = pre_upgrade_backup_path(&path, 2);
         fs::write(&backup, b"not a database").unwrap();
 
-        upgrade_with(&path, migrations).unwrap();
+        upgrade_with(&path, TEST_MIGRATIONS).unwrap();
 
         let saved = Connection::open(&backup).unwrap();
-        assert_eq!(user_version(&saved).unwrap(), 1);
+        assert_eq!(migration_rows(&saved).len(), 1);
         let title: String = saved
             .query_row("SELECT title FROM notes", [], |row| row.get(0))
             .unwrap();

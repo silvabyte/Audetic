@@ -32,11 +32,11 @@
 
 ## Database migrations
 
-Schema changes are forward-only SQL files. `PRAGMA user_version` is the version:
-migration N is `MIGRATIONS[N - 1]` in `crates/audetic/src/db/migrations/mod.rs`,
-and `LATEST` is the length of that list. Fresh databases replay the same chain.
-Existing databases are upgraded only when the daemon starts, under the instance
-lock, after a `VACUUM INTO` backup.
+Schema changes are forward-only SQL files. The runner records each applied
+version and SHA-256 checksum in `schema_migrations`; migration N is
+`MIGRATIONS[N - 1]` in `crates/audetic/src/db/migrations/mod.rs`. Fresh
+databases replay the same chain. Existing databases are upgraded only when the
+daemon starts, under the instance lock, after a `VACUUM INTO` backup.
 
 To change the schema:
 
@@ -44,7 +44,8 @@ To change the schema:
 2. Append it to `MIGRATIONS`.
 3. Run `cargo test`.
 
-Never edit a released migration. Schema and core types stay provider-agnostic.
+Never edit an applied migration: checksum verification will refuse daemon
+startup. Schema and core types stay provider-agnostic.
 
 ## Frontend (apps/web-ui)
 

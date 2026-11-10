@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 #
-# One-time move of a pre-`user_version` Audetic database onto the numbered
-# migration chain. Run it after `git pull` and before `make install`.
+# One-time move of a legacy Audetic database onto the checksummed migration
+# chain. Run it after `git pull` and before `make install`.
 #
 # It stops the daemon, checks that the database is legacy schema version 3 and
-# matches migration 0001, backs it up, then drops the old marker tables and sets
-# `PRAGMA user_version = 1`. The next daemon start applies migration 2 onward.
+# matches migration 0001, backs it up, then drops the old marker tables and
+# records migration 1. The next daemon start applies migration 2 onward.
 #
 # Usage: scripts/stamp-legacy-db.sh [--dry-run] [DB_PATH]
 #
@@ -49,6 +49,16 @@ read_db() {
   sqlite3 -readonly -bail "$db" "$@"
 }
 
+checksum_file() {
+  if command -v shasum >/dev/null; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    die "Neither shasum nor sha256sum is installed"
+  fi
+}
+
 command -v sqlite3 >/dev/null || die "sqlite3 is not installed"
 [[ -f "$baseline" ]] || die "Missing $baseline"
 if [[ ! -f "$db" ]]; then
@@ -56,9 +66,9 @@ if [[ ! -f "$db" ]]; then
   exit 0
 fi
 
-version=$(read_db "PRAGMA user_version;")
-if ((version > 0)); then
-  echo "$db is already at user_version $version; nothing to do."
+has_migrations=$(read_db "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations';")
+if [[ "$has_migrations" == 1 ]]; then
+  echo "$db already has schema_migrations; nothing to do."
   exit 0
 fi
 
@@ -71,7 +81,7 @@ shape_sql="
 SELECT m.name, p.name, p.type, p.\"notnull\", ifnull(p.dflt_value, ''), p.pk
 FROM sqlite_master m JOIN pragma_table_info(m.name) p
 WHERE m.type = 'table' AND m.name NOT LIKE 'sqlite_%'
-  AND m.name NOT IN ('audio_notes_schema', 'audio_note_migration_sources')
+  AND m.name NOT IN ('audio_notes_schema', 'audio_note_migration_sources', 'schema_migrations')
 ORDER BY 1, 2;
 SELECT 'index', name, tbl_name FROM sqlite_master
 WHERE type = 'index' AND sql IS NOT NULL
@@ -85,9 +95,10 @@ if ! diff <(read_db "$shape_sql") <(sqlite3 -readonly "$work/expected.db" "$shap
   die "Schema does not match migration 0001 (< this database, > 0001_baseline.sql)"
 fi
 [[ "$(read_db "PRAGMA integrity_check;")" == ok ]] || die "integrity_check failed on $db"
+baseline_checksum=$(checksum_file "$baseline")
 
 if ((dry_run)); then
-  echo "Dry run: $db is legacy version 3, matches migration 0001, and would be stamped at user_version 1."
+  echo "Dry run: $db is legacy version 3, matches migration 0001, and would record checksum $baseline_checksum."
   exit 0
 fi
 
@@ -116,11 +127,17 @@ sqlite3 -bail "$db" "
 BEGIN IMMEDIATE;
 DROP TABLE audio_notes_schema;
 DROP TABLE IF EXISTS audio_note_migration_sources;
-PRAGMA user_version = 1;
+CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY CHECK(version > 0),
+    checksum TEXT NOT NULL CHECK(length(checksum) = 64),
+    applied_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO schema_migrations(version, checksum) VALUES (1, '$baseline_checksum');
 COMMIT;"
-[[ "$(read_db "PRAGMA user_version;")" == 1 ]] || die "Stamp did not take; restore from $backup"
+stamped=$(read_db "SELECT version || ' ' || checksum FROM schema_migrations;")
+[[ "$stamped" == "1 $baseline_checksum" ]] || die "Stamp did not take; restore from $backup"
 
-echo "Stamped $db at user_version 1."
+echo "Stamped $db with migration 1."
 if ((stopped)); then
   echo "Next: make install. The new daemon applies migration 2 and writes audetic.db.pre-v2.sqlite3."
 fi
