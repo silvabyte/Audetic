@@ -1,33 +1,11 @@
-//! Provider-agnostic recording sources.
-//!
-//! The database stores the delivery mode and provider configuration. This
-//! module resolves the poll implementation for each configured source.
+//! Recording source polling helpers.
 
-use anyhow::{bail, Result};
-use async_trait::async_trait;
+use anyhow::Result;
 
 use crate::db::integrations::RecordingSource as RecordingSourceRecord;
 
 #[cfg(test)]
 use crate::db::integrations::SyncMode;
-
-use super::plaud::PlaudSource;
-use super::IntegrationService;
-
-#[async_trait]
-pub trait RecordingSource: Send + Sync {
-    fn provider(&self) -> &str;
-    fn source_instance(&self) -> &str;
-
-    async fn poll(&self, service: &IntegrationService, backfill: bool) -> Result<()>;
-}
-
-pub fn resolve(provider: &str, source_instance: &str) -> Result<Box<dyn RecordingSource>> {
-    if provider == PlaudSource::PROVIDER && source_instance == PlaudSource::SOURCE_INSTANCE {
-        return Ok(Box::new(PlaudSource));
-    }
-    bail!("No recording source implementation for {provider}/{source_instance}")
-}
 
 /// Automatic polling waits for `interval_minutes`. A missing interval is never due.
 pub fn poll_is_due(source: &RecordingSourceRecord) -> bool {
@@ -65,14 +43,6 @@ mod tests {
             last_completed_at: None,
             last_error: None,
         }
-    }
-
-    #[test]
-    fn plaud_resolves_and_an_unknown_provider_does_not() {
-        let source = resolve(PlaudSource::PROVIDER, PlaudSource::SOURCE_INSTANCE).unwrap();
-        assert_eq!(source.provider(), "plaud");
-        assert_eq!(source.source_instance(), "default");
-        assert!(resolve("other", "default").is_err());
     }
 
     #[test]

@@ -26,9 +26,6 @@ use crate::db::integrations::{
     ExternalImport, ImportClaim, IngressAccessKey, IntegrationRepository, RecordingSource,
 };
 
-use self::plaud::PlaudSource;
-use self::recording_source::RecordingSource as RecordingSourceDriver;
-
 const ACCESS_KEY_PREFIX: &str = "audetic_ingress_";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, Serialize, ToSchema)]
@@ -416,7 +413,7 @@ impl IntegrationService {
 
     pub async fn plaud_status(&self) -> Result<PlaudStatus> {
         let state = self
-            .recording_source(PlaudSource::PROVIDER, PlaudSource::SOURCE_INSTANCE)
+            .recording_source(plaud::PROVIDER, plaud::SOURCE_INSTANCE)
             .await?;
         let Some(cli) = plaud::PlaudCli::discover() else {
             return PlaudStatus::from_state(state, false, false, None);
@@ -429,11 +426,18 @@ impl IntegrationService {
     /// Claim the source, then run its poll entry point off the request thread.
     pub async fn schedule_poll(
         &self,
-        source: Box<dyn RecordingSourceDriver>,
+        provider: &str,
+        source_instance: &str,
         backfill: bool,
     ) -> Result<bool> {
-        let provider = source.provider().to_string();
-        let source_instance = source.source_instance().to_string();
+        match (provider, source_instance) {
+            (plaud::PROVIDER, plaud::SOURCE_INSTANCE) => {}
+            _ => {
+                anyhow::bail!("No recording source implementation for {provider}/{source_instance}")
+            }
+        }
+        let provider = provider.to_string();
+        let source_instance = source_instance.to_string();
         let start_provider = provider.clone();
         let start_instance = source_instance.clone();
         let claimed = self
@@ -446,7 +450,7 @@ impl IntegrationService {
         }
         let service = self.clone();
         tokio::spawn(async move {
-            let result = source.poll(&service, backfill).await;
+            let result = plaud::poll(&service, backfill).await;
             if let Err(error) = &result {
                 tracing::error!(%error, "Recording source synchronization failed");
             }
@@ -482,17 +486,10 @@ impl IntegrationService {
                     if record.running || !recording_source::poll_is_due(&record) {
                         continue;
                     }
-                    let Ok(source) =
-                        recording_source::resolve(&record.provider, &record.source_instance)
-                    else {
-                        tracing::error!(
-                            provider = %record.provider,
-                            source_instance = %record.source_instance,
-                            "Configured poll source has no implementation"
-                        );
-                        continue;
-                    };
-                    if let Err(error) = service.schedule_poll(source, false).await {
+                    if let Err(error) = service
+                        .schedule_poll(&record.provider, &record.source_instance, false)
+                        .await
+                    {
                         tracing::error!(
                             provider = %record.provider,
                             %error,
@@ -629,8 +626,8 @@ mod tests {
 
     fn recording_source(interval_minutes: Option<i64>) -> RecordingSource {
         RecordingSource {
-            provider: PlaudSource::PROVIDER.to_string(),
-            source_instance: PlaudSource::SOURCE_INSTANCE.to_string(),
+            provider: plaud::PROVIDER.to_string(),
+            source_instance: plaud::SOURCE_INSTANCE.to_string(),
             sync_mode: crate::db::integrations::SyncMode::Poll,
             enabled: true,
             interval_minutes,

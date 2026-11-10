@@ -10,7 +10,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::api::error::{ApiError, ApiErrorResponse, ApiResult};
 use crate::integrations::ingress::{GENERIC_AUDIO_PATH, INDEX_PATH};
-use crate::integrations::plaud::PlaudSource;
+use crate::integrations::plaud;
 use crate::integrations::{
     AccessKeyInfo, AccessKeyScope, ExternalImportInfo, IntegrationService, IssuedAccessKey,
     PlaudStatus, PlaudSyncAccepted, PUBLIC_INGRESS_BASE_URL,
@@ -219,7 +219,7 @@ pub async fn update_plaud_settings(
     }
     let current = state
         .service
-        .recording_source(PlaudSource::PROVIDER, PlaudSource::SOURCE_INSTANCE)
+        .recording_source(plaud::PROVIDER, plaud::SOURCE_INSTANCE)
         .await
         .map_err(ApiError::from)?;
     let import_after = current.import_after.or_else(|| {
@@ -230,8 +230,8 @@ pub async fn update_plaud_settings(
     state
         .service
         .update_recording_source(
-            PlaudSource::PROVIDER,
-            PlaudSource::SOURCE_INSTANCE,
+            plaud::PROVIDER,
+            plaud::SOURCE_INSTANCE,
             request.enabled,
             Some(request.interval_minutes),
             import_after,
@@ -280,7 +280,7 @@ async fn schedule_plaud(
     backfill: bool,
 ) -> ApiResult<(StatusCode, Json<PlaudSyncAccepted>)> {
     if !service
-        .schedule_poll(Box::new(PlaudSource), backfill)
+        .schedule_poll(plaud::PROVIDER, plaud::SOURCE_INSTANCE, backfill)
         .await
         .map_err(ApiError::from)?
     {

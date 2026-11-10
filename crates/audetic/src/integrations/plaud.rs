@@ -1,7 +1,6 @@
-//! Plaud CLI adapter. This is one poll implementation of [`RecordingSource`].
+//! Plaud CLI adapter.
 
 use anyhow::{bail, Context, Result};
-use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -9,20 +8,14 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use super::recording_source::{parse_db_timestamp, RecordingSource};
+use super::recording_source::parse_db_timestamp;
 use super::{ExternalImportRequest, IntegrationService};
 
 const MAX_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
-/// The single Plaud CLI installation on this machine. `SOURCE_INSTANCE` is the
-/// same identity migration 0002 writes and `external_imports` already uses.
-pub struct PlaudSource;
-
-impl PlaudSource {
-    pub const PROVIDER: &'static str = "plaud";
-    pub const SOURCE_INSTANCE: &'static str = "default";
-}
+pub const PROVIDER: &str = "plaud";
+pub const SOURCE_INSTANCE: &str = "default";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaudRecording {
@@ -155,91 +148,77 @@ fn parse_file_details(output: &str) -> Result<PlaudRecording> {
     })
 }
 
-#[async_trait]
-impl RecordingSource for PlaudSource {
-    fn provider(&self) -> &str {
-        Self::PROVIDER
+pub(crate) async fn poll(service: &IntegrationService, backfill: bool) -> Result<()> {
+    let cli = PlaudCli::discover()
+        .context("Plaud CLI is not installed; install @plaud-ai/cli and run `plaud login`")?;
+    if !cli.authenticated().await {
+        anyhow::bail!("Plaud CLI is not authenticated; run `plaud login`");
     }
+    let state = service.recording_source(PROVIDER, SOURCE_INSTANCE).await?;
+    let import_after = if backfill {
+        None
+    } else {
+        state
+            .import_after
+            .as_deref()
+            .map(parse_db_timestamp)
+            .transpose()?
+    };
+    let import_boundary = import_boundary(backfill, import_after, chrono::Utc::now());
 
-    fn source_instance(&self) -> &str {
-        Self::SOURCE_INSTANCE
-    }
-
-    async fn poll(&self, service: &IntegrationService, backfill: bool) -> Result<()> {
-        let cli = PlaudCli::discover()
-            .context("Plaud CLI is not installed; install @plaud-ai/cli and run `plaud login`")?;
-        if !cli.authenticated().await {
-            anyhow::bail!("Plaud CLI is not authenticated; run `plaud login`");
+    for page in 1..=1000 {
+        let ids = cli.list_ids(page).await?;
+        if ids.is_empty() {
+            break;
         }
-        let state = service
-            .recording_source(Self::PROVIDER, Self::SOURCE_INSTANCE)
-            .await?;
-        let import_after = if backfill {
-            None
-        } else {
-            state
-                .import_after
-                .as_deref()
-                .map(parse_db_timestamp)
-                .transpose()?
-        };
-        let import_boundary = import_boundary(backfill, import_after, chrono::Utc::now());
-
-        for page in 1..=1000 {
-            let ids = cli.list_ids(page).await?;
-            if ids.is_empty() {
-                break;
+        let page_len = ids.len();
+        let mut reached_boundary = false;
+        for id in ids {
+            let recording = cli.file(&id).await?;
+            let recorded_at = recording.start_at.as_ref().unwrap_or(&recording.created_at);
+            let recorded_at = parse_timestamp(recorded_at)
+                .with_context(|| format!("Plaud recording {id} has an invalid timestamp"))?;
+            if import_boundary.is_some_and(|boundary| recorded_at < boundary) {
+                reached_boundary = true;
+                continue;
             }
-            let page_len = ids.len();
-            let mut reached_boundary = false;
-            for id in ids {
-                let recording = cli.file(&id).await?;
-                let recorded_at = recording.start_at.as_ref().unwrap_or(&recording.created_at);
-                let recorded_at = parse_timestamp(recorded_at)
-                    .with_context(|| format!("Plaud recording {id} has an invalid timestamp"))?;
-                if import_boundary.is_some_and(|boundary| recorded_at < boundary) {
-                    reached_boundary = true;
-                    continue;
-                }
-                if service
-                    .external_imported(Self::PROVIDER, Self::SOURCE_INSTANCE, &id)
-                    .await?
-                {
-                    continue;
-                }
-                let url = cli.audio_url(&id).await?;
-                let (staged_path, filename) =
-                    download_audio(service.uploads_dir(), &id, url).await?;
-                service
-                    .import_external(ExternalImportRequest {
-                        provider: Self::PROVIDER.to_string(),
-                        source_instance: Self::SOURCE_INSTANCE.to_string(),
-                        external_id: id,
-                        recorded_at: Some(recorded_at.format("%Y-%m-%d %H:%M:%S").to_string()),
-                        source_filename: Some(filename),
-                        title: Some(recording.name),
-                        staged_path,
-                    })
-                    .await?;
+            if service
+                .external_imported(PROVIDER, SOURCE_INSTANCE, &id)
+                .await?
+            {
+                continue;
             }
-            if reached_boundary || page_len < 100 {
-                break;
-            }
-            if page == 1000 {
-                anyhow::bail!("Plaud synchronization exceeded the 100,000-recording safety limit");
-            }
-        }
-        if let Some(next_cursor) = import_boundary {
+            let url = cli.audio_url(&id).await?;
+            let (staged_path, filename) = download_audio(service.uploads_dir(), &id, url).await?;
             service
-                .update_import_cursor(
-                    Self::PROVIDER,
-                    Self::SOURCE_INSTANCE,
-                    &next_cursor.format("%Y-%m-%d %H:%M:%S").to_string(),
-                )
+                .import_external(ExternalImportRequest {
+                    provider: PROVIDER.to_string(),
+                    source_instance: SOURCE_INSTANCE.to_string(),
+                    external_id: id,
+                    recorded_at: Some(recorded_at.format("%Y-%m-%d %H:%M:%S").to_string()),
+                    source_filename: Some(filename),
+                    title: Some(recording.name),
+                    staged_path,
+                })
                 .await?;
         }
-        Ok(())
+        if reached_boundary || page_len < 100 {
+            break;
+        }
+        if page == 1000 {
+            anyhow::bail!("Plaud synchronization exceeded the 100,000-recording safety limit");
+        }
     }
+    if let Some(next_cursor) = import_boundary {
+        service
+            .update_import_cursor(
+                PROVIDER,
+                SOURCE_INSTANCE,
+                &next_cursor.format("%Y-%m-%d %H:%M:%S").to_string(),
+            )
+            .await?;
+    }
+    Ok(())
 }
 
 async fn download_audio(
