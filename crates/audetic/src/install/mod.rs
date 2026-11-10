@@ -288,6 +288,7 @@ impl UninstallPlan {
     /// Record a supervisor action that has no on-disk artifact. This keeps
     /// registered legacy services visible in the confirmation plan and makes
     /// confirmation happen before stop/disable side effects.
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn action(&mut self, description: impl Into<String>) {
         self.actions.push(description.into());
     }
