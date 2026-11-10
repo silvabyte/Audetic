@@ -18,18 +18,19 @@ const MIGRATIONS: &[&str] = &[
     include_str!("0001_baseline.sql"),
     include_str!("0002_recording_sources.sql"),
 ];
-pub const LATEST: i64 = MIGRATIONS.len() as i64;
+#[cfg(test)]
+const LATEST: i64 = MIGRATIONS.len() as i64;
 
 pub fn ensure_current(conn: &Connection) -> Result<()> {
-    ensure_with(conn, MIGRATIONS, LATEST)
+    ensure_with(conn, MIGRATIONS)
 }
 
 pub(crate) fn upgrade(db_path: &Path) -> Result<()> {
-    upgrade_with(db_path, MIGRATIONS, LATEST)
+    upgrade_with(db_path, MIGRATIONS)
 }
 
-fn ensure_with(conn: &Connection, migrations: &[&str], latest: i64) -> Result<()> {
-    debug_assert_eq!(latest, migrations.len() as i64);
+fn ensure_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
+    let latest = migrations.len() as i64;
     conn.pragma_update(None, "foreign_keys", true)
         .context("Failed to enable foreign keys")?;
     let version = user_version(conn)?;
@@ -42,7 +43,7 @@ fn ensure_with(conn: &Connection, migrations: &[&str], latest: i64) -> Result<()
     }
     match plan(version, latest, empty)? {
         Plan::Ready => Ok(()),
-        Plan::Create => apply_pending(conn, version, migrations, latest),
+        Plan::Create => apply_pending(conn, version, migrations),
         Plan::Upgrade => bail!(
             "Database is at user_version {version} and this build supports {latest}. \
              Restart the daemon to upgrade"
@@ -50,8 +51,8 @@ fn ensure_with(conn: &Connection, migrations: &[&str], latest: i64) -> Result<()
     }
 }
 
-fn upgrade_with(db_path: &Path, migrations: &[&str], latest: i64) -> Result<()> {
-    debug_assert_eq!(latest, migrations.len() as i64);
+fn upgrade_with(db_path: &Path, migrations: &[&str]) -> Result<()> {
+    let latest = migrations.len() as i64;
     if !db_path.exists() {
         return Ok(());
     }
@@ -65,15 +66,15 @@ fn upgrade_with(db_path: &Path, migrations: &[&str], latest: i64) -> Result<()> 
     if let Some(legacy_version) = legacy_adoption::version_for_adoption(&conn, version, empty)? {
         let backup = pre_upgrade_backup_path(db_path, latest);
         write_backup(&conn, &backup, version)?;
-        return adopt_legacy_and_apply_pending(&conn, legacy_version, migrations, latest);
+        return adopt_legacy_and_apply_pending(&conn, legacy_version, migrations);
     }
     match plan(version, latest, empty)? {
         Plan::Ready => Ok(()),
-        Plan::Create => apply_pending(&conn, version, migrations, latest),
+        Plan::Create => apply_pending(&conn, version, migrations),
         Plan::Upgrade => {
             let backup = pre_upgrade_backup_path(db_path, latest);
             write_backup(&conn, &backup, version)?;
-            apply_pending(&conn, version, migrations, latest)
+            apply_pending(&conn, version, migrations)
         }
     }
 }
@@ -111,17 +112,16 @@ fn plan(version: i64, latest: i64, empty: bool) -> Result<Plan> {
     Ok(Plan::Upgrade)
 }
 
-fn apply_pending(conn: &Connection, from: i64, migrations: &[&str], latest: i64) -> Result<()> {
-    apply_migration_transaction(conn, from, None, migrations, latest)
+fn apply_pending(conn: &Connection, from: i64, migrations: &[&str]) -> Result<()> {
+    apply_migration_transaction(conn, from, None, migrations)
 }
 
 fn adopt_legacy_and_apply_pending(
     conn: &Connection,
     legacy_version: i64,
     migrations: &[&str],
-    latest: i64,
 ) -> Result<()> {
-    apply_migration_transaction(conn, 1, Some(legacy_version), migrations, latest)
+    apply_migration_transaction(conn, 1, Some(legacy_version), migrations)
 }
 
 fn apply_migration_transaction(
@@ -129,8 +129,8 @@ fn apply_migration_transaction(
     from: i64,
     legacy_version: Option<i64>,
     migrations: &[&str],
-    latest: i64,
 ) -> Result<()> {
+    let latest = migrations.len() as i64;
     if from >= latest && legacy_version.is_none() {
         return Ok(());
     }
@@ -140,7 +140,7 @@ fn apply_migration_transaction(
         if let Some(version) = legacy_version {
             legacy_adoption::apply_in_open_transaction(conn, version)?;
         }
-        apply_in_open_transaction(conn, from, migrations, latest)
+        apply_in_open_transaction(conn, from, migrations)
     })();
     match applied {
         Ok(versions) => {
@@ -167,8 +167,8 @@ fn apply_in_open_transaction(
     conn: &Connection,
     from: i64,
     migrations: &[&str],
-    latest: i64,
 ) -> Result<Vec<i64>> {
+    let latest = migrations.len() as i64;
     let mut applied = Vec::new();
     for version in (from + 1)..=latest {
         let sql = migrations[(version - 1) as usize];
@@ -694,9 +694,7 @@ mod tests {
         conn.execute("INSERT INTO notes(title) VALUES('keep')", [])
             .unwrap();
 
-        let error = ensure_with(&conn, migrations, migrations.len() as i64)
-            .unwrap_err()
-            .to_string();
+        let error = ensure_with(&conn, migrations).unwrap_err().to_string();
         assert!(error.contains("Restart the daemon to upgrade"), "{error}");
         assert_eq!(user_version(&conn).unwrap(), 1);
         let title: String = conn
@@ -726,7 +724,7 @@ mod tests {
                 .unwrap();
         }
 
-        upgrade_with(&path, migrations, migrations.len() as i64).unwrap();
+        upgrade_with(&path, migrations).unwrap();
 
         let backup = pre_upgrade_backup_path(&path, 2);
         assert_eq!(
@@ -771,7 +769,7 @@ mod tests {
                 .unwrap();
         }
 
-        let error = upgrade_with(&path, migrations, migrations.len() as i64).unwrap_err();
+        let error = upgrade_with(&path, migrations).unwrap_err();
         assert!(
             error.to_string().contains("Failed to apply migration 2"),
             "{error:#}"
@@ -781,7 +779,7 @@ mod tests {
             conn.execute("UPDATE notes SET title = 'newer'", [])
                 .unwrap();
         }
-        let retried = upgrade_with(&path, migrations, migrations.len() as i64).unwrap_err();
+        let retried = upgrade_with(&path, migrations).unwrap_err();
         assert!(
             retried.to_string().contains("Failed to apply migration 2"),
             "{retried:#}"
@@ -824,7 +822,7 @@ mod tests {
         let backup = pre_upgrade_backup_path(&path, 2);
         fs::write(&backup, b"not a database").unwrap();
 
-        upgrade_with(&path, migrations, migrations.len() as i64).unwrap();
+        upgrade_with(&path, migrations).unwrap();
 
         let saved = Connection::open(&backup).unwrap();
         assert_eq!(user_version(&saved).unwrap(), 1);
