@@ -31,17 +31,14 @@ pub(crate) fn upgrade(db_path: &Path) -> Result<()> {
 
 fn ensure_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
     let latest = migrations.len() as i64;
-    conn.pragma_update(None, "foreign_keys", true)
-        .context("Failed to enable foreign keys")?;
-    let version = user_version(conn)?;
-    let empty = database_is_empty(conn)?;
-    if let Some(legacy_version) = legacy_adoption::version_for_adoption(conn, version, empty)? {
+    let (version, legacy_version, pending) = migration_plan(conn, latest)?;
+    if let Some(legacy_version) = legacy_version {
         bail!(
             "Database uses legacy schema version {legacy_version}. \
              Restart the daemon to upgrade"
         );
     }
-    match plan(version, latest, empty)? {
+    match pending {
         Plan::Ready => Ok(()),
         Plan::Create => apply_pending(conn, version, migrations),
         Plan::Upgrade => bail!(
@@ -59,16 +56,13 @@ fn upgrade_with(db_path: &Path, migrations: &[&str]) -> Result<()> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.pragma_update(None, "foreign_keys", true)
-        .context("Failed to enable foreign keys")?;
-    let version = user_version(&conn)?;
-    let empty = database_is_empty(&conn)?;
-    if let Some(legacy_version) = legacy_adoption::version_for_adoption(&conn, version, empty)? {
+    let (version, legacy_version, pending) = migration_plan(&conn, latest)?;
+    if let Some(legacy_version) = legacy_version {
         let backup = pre_upgrade_backup_path(db_path, latest);
         write_backup(&conn, &backup, version)?;
         return adopt_legacy_and_apply_pending(&conn, legacy_version, migrations);
     }
-    match plan(version, latest, empty)? {
+    match pending {
         Plan::Ready => Ok(()),
         Plan::Create => apply_pending(&conn, version, migrations),
         Plan::Upgrade => {
@@ -77,6 +71,17 @@ fn upgrade_with(db_path: &Path, migrations: &[&str]) -> Result<()> {
             apply_pending(&conn, version, migrations)
         }
     }
+}
+
+fn migration_plan(conn: &Connection, latest: i64) -> Result<(i64, Option<i64>, Plan)> {
+    conn.pragma_update(None, "foreign_keys", true)
+        .context("Failed to enable foreign keys")?;
+    let version = user_version(conn)?;
+    let empty = database_is_empty(conn)?;
+    if let Some(legacy_version) = legacy_adoption::version_for_adoption(conn, version, empty)? {
+        return Ok((version, Some(legacy_version), Plan::Upgrade));
+    }
+    Ok((version, None, plan(version, latest, empty)?))
 }
 
 /// What opening or startup may do with this file.
