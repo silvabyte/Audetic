@@ -8,6 +8,7 @@ use anyhow::{Context, Result};
 use audetic_core::url::HOST;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use rusqlite::Connection;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
@@ -159,19 +160,30 @@ impl IntegrationService {
         self.ingress_slots.clone().try_acquire_owned().ok()
     }
 
+    async fn with_conn<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+    {
+        let db_path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = crate::db::init_db_at(&db_path)?;
+            f(&conn)
+        })
+        .await?
+    }
+
     pub async fn recover_interrupted_work(&self) -> Result<()> {
         match tokio::fs::remove_dir_all(self.uploads_dir()).await {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("Failed to remove interrupted uploads"),
         }
-        let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::sweep_interrupted_imports(&conn)?;
-            IntegrationRepository::sweep_interrupted_syncs(&conn)
+        self.with_conn(|conn| {
+            IntegrationRepository::sweep_interrupted_imports(conn)?;
+            IntegrationRepository::sweep_interrupted_syncs(conn)
         })
-        .await??;
+        .await?;
         Ok(())
     }
 
@@ -186,14 +198,19 @@ impl IntegrationService {
             .map_err(|error| anyhow::anyhow!("Failed to generate ingress access key: {error}"))?;
         let secret = format!("{ACCESS_KEY_PREFIX}{id}_{}", URL_SAFE_NO_PAD.encode(random));
         let hash: [u8; 32] = Sha256::digest(secret.as_bytes()).into();
-        let db_path = self.db_path.clone();
         let id_for_db = id.clone();
         let scope_text = scope.as_str().to_string();
-        let key = tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::insert_access_key(&conn, &id_for_db, &name, &scope_text, &hash)
-        })
-        .await??;
+        let key = self
+            .with_conn(move |conn| {
+                IntegrationRepository::insert_access_key(
+                    conn,
+                    &id_for_db,
+                    &name,
+                    &scope_text,
+                    &hash,
+                )
+            })
+            .await?;
         Ok(IssuedAccessKey {
             info: key.try_into()?,
             secret,
@@ -201,26 +218,22 @@ impl IntegrationService {
     }
 
     pub async fn list_access_keys(&self) -> Result<Vec<AccessKeyInfo>> {
-        let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::list_access_keys(&conn)?
+        self.with_conn(|conn| {
+            IntegrationRepository::list_access_keys(conn)?
                 .into_iter()
                 .map(TryInto::try_into)
                 .collect()
         })
-        .await?
+        .await
     }
 
     pub async fn revoke_access_key(&self, id: String) -> Result<Option<AccessKeyInfo>> {
-        let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::revoke_access_key(&conn, &id)?
+        self.with_conn(move |conn| {
+            IntegrationRepository::revoke_access_key(conn, &id)?
                 .map(TryInto::try_into)
                 .transpose()
         })
-        .await?
+        .await
     }
 
     pub async fn authenticate(
@@ -232,25 +245,24 @@ impl IntegrationService {
             return Ok(None);
         };
         let candidate: [u8; 32] = Sha256::digest(token.as_bytes()).into();
-        let db_path = self.db_path.clone();
         let id_for_db = id.clone();
         let scope_text = scope.as_str().to_string();
-        let authenticated = tokio::task::spawn_blocking(move || -> Result<bool> {
-            let conn = crate::db::init_db_at(&db_path)?;
-            let Some(stored) =
-                IntegrationRepository::active_access_key_hash(&conn, &id_for_db, &scope_text)?
-            else {
-                return Ok(false);
-            };
-            if stored.len() != candidate.len()
-                || stored.ct_eq(candidate.as_slice()).unwrap_u8() != 1
-            {
-                return Ok(false);
-            }
-            IntegrationRepository::touch_access_key(&conn, &id_for_db)?;
-            Ok(true)
-        })
-        .await??;
+        let authenticated = self
+            .with_conn(move |conn| {
+                let Some(stored) =
+                    IntegrationRepository::active_access_key_hash(conn, &id_for_db, &scope_text)?
+                else {
+                    return Ok(false);
+                };
+                if stored.len() != candidate.len()
+                    || stored.ct_eq(candidate.as_slice()).unwrap_u8() != 1
+                {
+                    return Ok(false);
+                }
+                IntegrationRepository::touch_access_key(conn, &id_for_db)?;
+                Ok(true)
+            })
+            .await?;
         Ok(authenticated.then_some(AuthenticatedAccessKey { id, scope }))
     }
 
@@ -268,24 +280,23 @@ impl IntegrationService {
             staged_path,
         } = request;
         let _staged_cleanup = StagedPathCleanup(staged_path.clone());
-        let db_path = self.db_path.clone();
         let claim_provider = provider.clone();
         let claim_instance = source_instance.clone();
         let claim_external_id = external_id.clone();
         let claim_recorded_at = recorded_at.clone();
         let claim_filename = source_filename.clone();
-        let claim = tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::claim_external_import(
-                &conn,
-                &claim_provider,
-                &claim_instance,
-                &claim_external_id,
-                claim_recorded_at.as_deref(),
-                claim_filename.as_deref(),
-            )
-        })
-        .await??;
+        let claim = self
+            .with_conn(move |conn| {
+                IntegrationRepository::claim_external_import(
+                    conn,
+                    &claim_provider,
+                    &claim_instance,
+                    &claim_external_id,
+                    claim_recorded_at.as_deref(),
+                    claim_filename.as_deref(),
+                )
+            })
+            .await?;
 
         let import_id = match claim {
             ImportClaim::Accepted { note_id, .. } => {
@@ -314,7 +325,6 @@ impl IntegrationService {
         })
         .await;
 
-        let db_path = self.db_path.clone();
         match result {
             Ok(result) => {
                 let note_id = result.note_id;
@@ -324,28 +334,23 @@ impl IntegrationService {
                 remove_staged(&staged_path_for_cleanup).await;
                 let public_error = error.to_string();
                 let persisted_error = public_error.clone();
-                tokio::task::spawn_blocking(move || {
-                    let conn = crate::db::init_db_at(&db_path)?;
-                    IntegrationRepository::fail_external_import(&conn, import_id, &persisted_error)
+                self.with_conn(move |conn| {
+                    IntegrationRepository::fail_external_import(conn, import_id, &persisted_error)
                 })
-                .await??;
+                .await?;
                 Err(error)
             }
         }
     }
 
     pub async fn recent_imports(&self, limit: usize) -> Result<Vec<ExternalImportInfo>> {
-        let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            Ok(
-                IntegrationRepository::recent_external_imports(&conn, limit)?
-                    .into_iter()
-                    .map(Into::into)
-                    .collect(),
-            )
+        self.with_conn(move |conn| {
+            Ok(IntegrationRepository::recent_external_imports(conn, limit)?
+                .into_iter()
+                .map(Into::into)
+                .collect())
         })
-        .await?
+        .await
     }
 
     pub async fn recording_source(
@@ -353,23 +358,17 @@ impl IntegrationService {
         provider: &str,
         source_instance: &str,
     ) -> Result<RecordingSource> {
-        let db_path = self.db_path.clone();
         let provider = provider.to_string();
         let source_instance = source_instance.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::recording_source(&conn, &provider, &source_instance)
+        self.with_conn(move |conn| {
+            IntegrationRepository::recording_source(conn, &provider, &source_instance)
         })
-        .await?
+        .await
     }
 
     pub async fn enabled_poll_sources(&self) -> Result<Vec<RecordingSource>> {
-        let db_path = self.db_path.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::enabled_poll_sources(&conn)
-        })
-        .await?
+        self.with_conn(IntegrationRepository::enabled_poll_sources)
+            .await
     }
 
     pub async fn update_recording_source(
@@ -380,13 +379,11 @@ impl IntegrationService {
         interval_minutes: Option<i64>,
         import_after: Option<String>,
     ) -> Result<()> {
-        let db_path = self.db_path.clone();
         let provider = provider.to_string();
         let source_instance = source_instance.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
+        self.with_conn(move |conn| {
             IntegrationRepository::update_recording_source_settings(
-                &conn,
+                conn,
                 &provider,
                 &source_instance,
                 enabled,
@@ -394,7 +391,7 @@ impl IntegrationService {
                 import_after.as_deref(),
             )
         })
-        .await?
+        .await
     }
 
     pub(crate) async fn update_import_cursor(
@@ -403,20 +400,18 @@ impl IntegrationService {
         source_instance: &str,
         import_after: &str,
     ) -> Result<()> {
-        let db_path = self.db_path.clone();
         let provider = provider.to_string();
         let source_instance = source_instance.to_string();
         let import_after = import_after.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
+        self.with_conn(move |conn| {
             IntegrationRepository::update_import_cursor(
-                &conn,
+                conn,
                 &provider,
                 &source_instance,
                 &import_after,
             )
         })
-        .await?
+        .await
     }
 
     pub async fn plaud_status(&self) -> Result<PlaudStatus> {
@@ -439,14 +434,13 @@ impl IntegrationService {
     ) -> Result<bool> {
         let provider = source.provider().to_string();
         let source_instance = source.source_instance().to_string();
-        let db_path = self.db_path.clone();
         let start_provider = provider.clone();
         let start_instance = source_instance.clone();
-        let claimed = tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
-            IntegrationRepository::start_sync(&conn, &start_provider, &start_instance)
-        })
-        .await??;
+        let claimed = self
+            .with_conn(move |conn| {
+                IntegrationRepository::start_sync(conn, &start_provider, &start_instance)
+            })
+            .await?;
         if !claimed {
             return Ok(false);
         }
@@ -456,26 +450,19 @@ impl IntegrationService {
             if let Err(error) = &result {
                 tracing::error!(%error, "Recording source synchronization failed");
             }
-            let db_path = service.db_path.clone();
             let error = result.as_ref().err().map(|error| error.to_string());
-            let finish_result = tokio::task::spawn_blocking(move || -> Result<()> {
-                let conn = crate::db::init_db_at(&db_path)?;
-                IntegrationRepository::finish_sync(
-                    &conn,
-                    &provider,
-                    &source_instance,
-                    error.as_deref(),
-                )
-            })
-            .await;
-            match finish_result {
-                Ok(Ok(())) => {}
-                Ok(Err(finish_error)) => {
-                    tracing::error!(%finish_error, "failed to persist recording source completion");
-                }
-                Err(finish_error) => {
-                    tracing::error!(%finish_error, "recording source completion task panicked");
-                }
+            let finish_result = service
+                .with_conn(move |conn| {
+                    IntegrationRepository::finish_sync(
+                        conn,
+                        &provider,
+                        &source_instance,
+                        error.as_deref(),
+                    )
+                })
+                .await;
+            if let Err(finish_error) = finish_result {
+                tracing::error!(%finish_error, "failed to persist recording source completion");
             }
         });
         Ok(true)
@@ -523,21 +510,19 @@ impl IntegrationService {
         source_instance: &str,
         external_id: &str,
     ) -> Result<bool> {
-        let db_path = self.db_path.clone();
         let provider = provider.to_string();
         let source_instance = source_instance.to_string();
         let external_id = external_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            let conn = crate::db::init_db_at(&db_path)?;
+        self.with_conn(move |conn| {
             Ok(IntegrationRepository::accepted_external_import_note_id(
-                &conn,
+                conn,
                 &provider,
                 &source_instance,
                 &external_id,
             )?
             .is_some())
         })
-        .await?
+        .await
     }
 }
 
