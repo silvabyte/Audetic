@@ -14,6 +14,8 @@ use tracing::info;
 
 use std::path::{Path, PathBuf};
 
+use self::legacy_adoption::LegacyVersion;
+
 const MIGRATIONS: &[&str] = &[
     include_str!("0001_baseline.sql"),
     include_str!("0002_recording_sources.sql"),
@@ -39,6 +41,7 @@ fn ensure_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
     }
     let (legacy_version, pending) = migration_plan_for_version(conn, version, latest)?;
     if let Some(legacy_version) = legacy_version {
+        let legacy_version = legacy_version.number();
         bail!(
             "Database uses legacy schema version {legacy_version}. \
              Restart the daemon to upgrade"
@@ -79,7 +82,7 @@ fn upgrade_with(db_path: &Path, migrations: &[&str]) -> Result<()> {
     }
 }
 
-fn migration_plan(conn: &Connection, latest: i64) -> Result<(i64, Option<i64>, Plan)> {
+fn migration_plan(conn: &Connection, latest: i64) -> Result<(i64, Option<LegacyVersion>, Plan)> {
     conn.pragma_update(None, "foreign_keys", true)
         .context("Failed to enable foreign keys")?;
     let version = user_version(conn)?;
@@ -91,7 +94,7 @@ fn migration_plan_for_version(
     conn: &Connection,
     version: i64,
     latest: i64,
-) -> Result<(Option<i64>, Plan)> {
+) -> Result<(Option<LegacyVersion>, Plan)> {
     let empty = database_is_empty(conn)?;
     if let Some(legacy_version) = legacy_adoption::version_for_adoption(conn, version, empty)? {
         return Ok((Some(legacy_version), Plan::Upgrade));
@@ -138,7 +141,7 @@ fn apply_pending(conn: &Connection, from: i64, migrations: &[&str]) -> Result<()
 
 fn adopt_legacy_and_apply_pending(
     conn: &Connection,
-    legacy_version: i64,
+    legacy_version: LegacyVersion,
     migrations: &[&str],
 ) -> Result<()> {
     apply_migration_transaction(conn, 1, Some(legacy_version), migrations)
@@ -147,7 +150,7 @@ fn adopt_legacy_and_apply_pending(
 fn apply_migration_transaction(
     conn: &Connection,
     from: i64,
-    legacy_version: Option<i64>,
+    legacy_version: Option<LegacyVersion>,
     migrations: &[&str],
 ) -> Result<()> {
     let latest = migrations.len() as i64;
@@ -167,6 +170,7 @@ fn apply_migration_transaction(
             conn.execute_batch("COMMIT")
                 .context("Failed to commit database migration")?;
             if let Some(version) = legacy_version {
+                let version = version.number();
                 info!("Adopted legacy schema version {version} as migration 1");
             }
             for version in versions {

@@ -72,11 +72,28 @@ const V2_TO_V3: &str = "
     );
 ";
 
+#[derive(Clone, Copy)]
+pub(super) enum LegacyVersion {
+    V1,
+    V2,
+    V3,
+}
+
+impl LegacyVersion {
+    pub(super) fn number(self) -> i64 {
+        match self {
+            Self::V1 => 1,
+            Self::V2 => 2,
+            Self::V3 => 3,
+        }
+    }
+}
+
 pub(super) fn version_for_adoption(
     conn: &Connection,
     user_version: i64,
     empty: bool,
-) -> Result<Option<i64>> {
+) -> Result<Option<LegacyVersion>> {
     if user_version != 0 || empty || !table_exists(conn, "audio_notes_schema")? {
         return Ok(None);
     }
@@ -87,27 +104,29 @@ pub(super) fn version_for_adoption(
             |row| row.get(0),
         )
         .context("Failed to read legacy schema version")?;
-    if !(1..=BASELINE_VERSION).contains(&version) {
-        bail!(
+    let version = match version {
+        1 => LegacyVersion::V1,
+        2 => LegacyVersion::V2,
+        BASELINE_VERSION => LegacyVersion::V3,
+        _ => bail!(
             "Unsupported legacy schema version {version}; expected a version from 1 to {BASELINE_VERSION}"
-        );
-    }
+        ),
+    };
     Ok(Some(version))
 }
 
-pub(super) fn apply_in_open_transaction(conn: &Connection, version: i64) -> Result<()> {
+pub(super) fn apply_in_open_transaction(conn: &Connection, version: LegacyVersion) -> Result<()> {
     match version {
-        1 => {
+        LegacyVersion::V1 => {
             conn.execute_batch(V1_TO_V2)
                 .context("Failed to migrate legacy schema from version 1 to 2")?;
             conn.execute_batch(V2_TO_V3)
                 .context("Failed to migrate legacy schema from version 2 to 3")?;
         }
-        2 => conn
+        LegacyVersion::V2 => conn
             .execute_batch(V2_TO_V3)
             .context("Failed to migrate legacy schema from version 2 to 3")?,
-        BASELINE_VERSION => {}
-        _ => bail!("Unsupported legacy schema version {version}"),
+        LegacyVersion::V3 => {}
     }
     conn.execute_batch(
         "DROP TABLE IF EXISTS audio_notes_schema;
