@@ -285,7 +285,6 @@ impl IntegrationRepository {
         provider: &str,
         source_instance: &str,
     ) -> Result<RecordingSource> {
-        validate_recording_identity(provider, source_instance)?;
         conn.query_row(
             &format!("SELECT {RECORDING_SOURCE_COLUMNS} FROM recording_sources WHERE provider = ?1 AND source_instance = ?2"),
             params![provider, source_instance],
@@ -317,7 +316,6 @@ impl IntegrationRepository {
         interval_minutes: Option<i64>,
         import_after: Option<&str>,
     ) -> Result<RecordingSource> {
-        validate_recording_identity(provider, source_instance)?;
         if interval_minutes.is_some_and(|minutes| minutes <= 0) {
             bail!("Recording source poll interval must be greater than zero");
         }
@@ -338,7 +336,6 @@ impl IntegrationRepository {
     }
 
     pub fn start_sync(conn: &Connection, provider: &str, source_instance: &str) -> Result<bool> {
-        validate_recording_identity(provider, source_instance)?;
         Ok(conn.execute(
             "UPDATE recording_sources
              SET running = 1, last_started_at = CURRENT_TIMESTAMP,
@@ -354,7 +351,6 @@ impl IntegrationRepository {
         source_instance: &str,
         import_after: &str,
     ) -> Result<()> {
-        validate_recording_identity(provider, source_instance)?;
         let changed = conn.execute(
             "UPDATE recording_sources
              SET import_after = ?1, updated_at = CURRENT_TIMESTAMP
@@ -373,7 +369,6 @@ impl IntegrationRepository {
         source_instance: &str,
         error: Option<&str>,
     ) -> Result<()> {
-        validate_recording_identity(provider, source_instance)?;
         let changed = conn.execute(
             "UPDATE recording_sources
              SET running = 0,
@@ -480,13 +475,6 @@ fn row_to_recording_source(row: &Row<'_>) -> rusqlite::Result<RecordingSource> {
         last_error: row.get(10)?,
         updated_at: row.get(11)?,
     })
-}
-
-fn validate_recording_identity(provider: &str, source_instance: &str) -> Result<()> {
-    if provider.trim().is_empty() || source_instance.trim().is_empty() {
-        bail!("Recording source provider and source instance must not be empty");
-    }
-    Ok(())
 }
 
 fn validate_scope(scope: &str) -> Result<()> {
