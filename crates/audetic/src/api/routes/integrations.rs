@@ -233,7 +233,7 @@ pub async fn update_plaud_settings(
             plaud::PROVIDER,
             plaud::SOURCE_INSTANCE,
             request.enabled,
-            Some(request.interval_minutes),
+            request.interval_minutes,
             import_after,
         )
         .await

@@ -8,8 +8,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use super::recording_source::parse_db_timestamp;
-use super::{ExternalImportRequest, IntegrationService};
+use super::{parse_db_timestamp, ExternalImportRequest, IntegrationService};
 
 const MAX_AUDIO_BYTES: u64 = 1024 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(30 * 60);

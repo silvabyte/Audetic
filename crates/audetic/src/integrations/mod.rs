@@ -2,7 +2,6 @@
 
 pub mod ingress;
 pub mod plaud;
-pub mod recording_source;
 
 use anyhow::{Context, Result};
 use audetic_core::url::HOST;
@@ -363,9 +362,8 @@ impl IntegrationService {
         .await
     }
 
-    pub async fn enabled_poll_sources(&self) -> Result<Vec<RecordingSource>> {
-        self.with_conn(IntegrationRepository::enabled_poll_sources)
-            .await
+    pub async fn enabled_sources(&self) -> Result<Vec<RecordingSource>> {
+        self.with_conn(IntegrationRepository::enabled_sources).await
     }
 
     pub async fn update_recording_source(
@@ -373,7 +371,7 @@ impl IntegrationService {
         provider: &str,
         source_instance: &str,
         enabled: bool,
-        interval_minutes: Option<i64>,
+        interval_minutes: i64,
         import_after: Option<String>,
     ) -> Result<()> {
         let provider = provider.to_string();
@@ -416,11 +414,16 @@ impl IntegrationService {
             .recording_source(plaud::PROVIDER, plaud::SOURCE_INSTANCE)
             .await?;
         let Some(cli) = plaud::PlaudCli::discover() else {
-            return PlaudStatus::from_state(state, false, false, None);
+            return Ok(PlaudStatus::from_state(state, false, false, None));
         };
         let (version, authenticated) =
             tokio::join!(cli.version(), async { cli.authenticated().await });
-        PlaudStatus::from_state(state, true, authenticated, version.ok())
+        Ok(PlaudStatus::from_state(
+            state,
+            true,
+            authenticated,
+            version.ok(),
+        ))
     }
 
     /// Claim the source, then run its poll entry point off the request thread.
@@ -479,11 +482,13 @@ impl IntegrationService {
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 interval.tick().await;
-                let Ok(sources) = service.enabled_poll_sources().await else {
+                let Ok(sources) = service.enabled_sources().await else {
                     continue;
                 };
                 for record in sources {
-                    if record.running || !recording_source::poll_is_due(&record) {
+                    if record.running
+                        || !poll_is_due(record.interval_minutes, record.last_started_at.as_deref())
+                    {
                         continue;
                     }
                     if let Err(error) = service
@@ -521,6 +526,21 @@ impl IntegrationService {
         })
         .await
     }
+}
+
+fn poll_is_due(interval_minutes: i64, last_started_at: Option<&str>) -> bool {
+    let Some(last_started_at) = last_started_at else {
+        return true;
+    };
+    let Ok(last_started_at) = parse_db_timestamp(last_started_at) else {
+        return true;
+    };
+    chrono::Utc::now() - last_started_at >= chrono::Duration::minutes(interval_minutes)
+}
+
+pub(crate) fn parse_db_timestamp(value: &str) -> Result<chrono::DateTime<chrono::Utc>> {
+    let naive = chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S")?;
+    Ok(naive.and_utc())
 }
 
 fn token_id(token: &str) -> Option<String> {
@@ -601,22 +621,19 @@ impl PlaudStatus {
         available: bool,
         authenticated: bool,
         version: Option<String>,
-    ) -> Result<Self> {
-        let interval_minutes = state
-            .interval_minutes
-            .context("Configured Plaud recording source has no poll interval")?;
-        Ok(Self {
+    ) -> Self {
+        Self {
             available,
             authenticated,
             version,
             enabled: state.enabled,
-            interval_minutes,
+            interval_minutes: state.interval_minutes,
             import_after: state.import_after,
             running: state.running,
             last_started_at: state.last_started_at,
             last_completed_at: state.last_completed_at,
             last_error: state.last_error,
-        })
+        }
     }
 }
 
@@ -624,11 +641,10 @@ impl PlaudStatus {
 mod tests {
     use super::*;
 
-    fn recording_source(interval_minutes: Option<i64>) -> RecordingSource {
+    fn recording_source(interval_minutes: i64) -> RecordingSource {
         RecordingSource {
             provider: plaud::PROVIDER.to_string(),
             source_instance: plaud::SOURCE_INSTANCE.to_string(),
-            sync_mode: crate::db::integrations::SyncMode::Poll,
             enabled: true,
             interval_minutes,
             import_after: None,
@@ -657,9 +673,13 @@ mod tests {
 
     #[test]
     fn plaud_status_uses_the_stored_interval() {
-        let status =
-            PlaudStatus::from_state(recording_source(Some(30)), false, false, None).unwrap();
+        let status = PlaudStatus::from_state(recording_source(30), false, false, None);
         assert_eq!(status.interval_minutes, 30);
-        assert!(PlaudStatus::from_state(recording_source(None), false, false, None).is_err());
+    }
+
+    #[test]
+    fn source_polling_respects_the_stored_interval() {
+        assert!(poll_is_due(15, None));
+        assert!(!poll_is_due(15, Some("2999-01-01 00:00:00")));
     }
 }

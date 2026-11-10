@@ -36,32 +36,13 @@ pub enum ImportClaim {
     InProgress { import_id: i64 },
 }
 
-/// How a recording source delivers audio. A later provider picks one of these;
-/// the table already stores both.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncMode {
-    Poll,
-    Webhook,
-}
-
-impl SyncMode {
-    pub fn parse(value: &str) -> Result<Self> {
-        match value {
-            "poll" => Ok(Self::Poll),
-            "webhook" => Ok(Self::Webhook),
-            other => bail!("Unknown recording source sync mode {other}"),
-        }
-    }
-}
-
 /// One configured recording source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordingSource {
     pub provider: String,
     pub source_instance: String,
-    pub sync_mode: SyncMode,
     pub enabled: bool,
-    pub interval_minutes: Option<i64>,
+    pub interval_minutes: i64,
     pub import_after: Option<String>,
     pub running: bool,
     pub last_started_at: Option<String>,
@@ -286,10 +267,10 @@ impl IntegrationRepository {
         .with_context(|| format!("Recording source {provider}/{source_instance} is not configured"))
     }
 
-    pub fn enabled_poll_sources(conn: &Connection) -> Result<Vec<RecordingSource>> {
+    pub fn enabled_sources(conn: &Connection) -> Result<Vec<RecordingSource>> {
         let mut statement = conn.prepare(&format!(
             "SELECT {RECORDING_SOURCE_COLUMNS} FROM recording_sources
-             WHERE sync_mode = 'poll' AND enabled = 1
+             WHERE enabled = 1
              ORDER BY provider, source_instance"
         ))?;
         let sources = statement
@@ -304,7 +285,7 @@ impl IntegrationRepository {
         provider: &str,
         source_instance: &str,
         enabled: bool,
-        interval_minutes: Option<i64>,
+        interval_minutes: i64,
         import_after: Option<&str>,
     ) -> Result<()> {
         let changed = conn.execute(
@@ -398,8 +379,7 @@ impl IntegrationRepository {
     }
 }
 
-const RECORDING_SOURCE_COLUMNS: &str =
-    "provider, source_instance, sync_mode, enabled, interval_minutes, \
+const RECORDING_SOURCE_COLUMNS: &str = "provider, source_instance, enabled, interval_minutes, \
      import_after, running, last_started_at, last_completed_at, last_error";
 
 fn external_import_by_identity(
@@ -449,20 +429,16 @@ fn row_to_external_import(row: &Row<'_>) -> rusqlite::Result<ExternalImport> {
 }
 
 fn row_to_recording_source(row: &Row<'_>) -> rusqlite::Result<RecordingSource> {
-    let sync_mode: String = row.get(2)?;
     Ok(RecordingSource {
         provider: row.get(0)?,
         source_instance: row.get(1)?,
-        sync_mode: SyncMode::parse(&sync_mode).map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, error.into())
-        })?,
-        enabled: row.get(3)?,
-        interval_minutes: row.get(4)?,
-        import_after: row.get(5)?,
-        running: row.get(6)?,
-        last_started_at: row.get(7)?,
-        last_completed_at: row.get(8)?,
-        last_error: row.get(9)?,
+        enabled: row.get(2)?,
+        interval_minutes: row.get(3)?,
+        import_after: row.get(4)?,
+        running: row.get(5)?,
+        last_started_at: row.get(6)?,
+        last_completed_at: row.get(7)?,
+        last_error: row.get(8)?,
     })
 }
 
@@ -604,7 +580,6 @@ mod tests {
         assert_eq!(import.status, "failed");
         assert!(import.error.unwrap().contains("daemon stopped"));
         let state = IntegrationRepository::recording_source(&conn, "plaud", "default").unwrap();
-        assert_eq!(state.sync_mode, SyncMode::Poll);
         assert!(!state.running);
         assert!(state.last_error.unwrap().contains("daemon stopped"));
     }
