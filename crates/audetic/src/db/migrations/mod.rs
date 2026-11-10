@@ -143,21 +143,27 @@ fn apply_in_open_transaction(
 }
 
 fn write_backup(conn: &Connection, backup: &Path, version: i64) -> Result<()> {
-    if backup.exists() {
-        info!(
-            "Keeping existing pre-upgrade backup at {} (database is still at user_version {version})",
-            backup.display()
-        );
-        return Ok(());
+    let mut temp = backup.as_os_str().to_os_string();
+    temp.push(".tmp");
+    let temp = PathBuf::from(temp);
+    match std::fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to remove stale backup at {}", temp.display()));
+        }
     }
-    let text = backup.to_str().context("Backup path is not valid UTF-8")?;
+    let text = temp.to_str().context("Backup path is not valid UTF-8")?;
     let literal = text.replace('\'', "''");
     info!(
         "Backing up database at user_version {version} to {}",
         backup.display()
     );
     conn.execute_batch(&format!("VACUUM INTO '{literal}'"))
-        .with_context(|| format!("Failed to back up database to {}", backup.display()))
+        .with_context(|| format!("Failed to back up database to {}", backup.display()))?;
+    std::fs::rename(&temp, backup)
+        .with_context(|| format!("Failed to install database backup at {}", backup.display()))
 }
 
 fn pre_upgrade_backup_path(db_path: &Path, target_version: i64) -> PathBuf {
@@ -463,8 +469,11 @@ mod tests {
             error.to_string().contains("Failed to apply migration 2"),
             "{error:#}"
         );
-        // The pre-upgrade backup is already on disk. A retry must not die
-        // trying to overwrite it; the failed step still rolls back.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute("UPDATE notes SET title = 'newer'", [])
+                .unwrap();
+        }
         let retried = upgrade_with(&path, migrations, migrations.len() as i64).unwrap_err();
         assert!(
             retried.to_string().contains("Failed to apply migration 2"),
@@ -476,7 +485,7 @@ mod tests {
         let title: String = conn
             .query_row("SELECT title FROM notes", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(title, "keep");
+        assert_eq!(title, "newer");
         let tables: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'notes'",
@@ -485,6 +494,37 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 1);
+
+        let backup = Connection::open(pre_upgrade_backup_path(&path, 2)).unwrap();
+        let backed_up_title: String = backup
+            .query_row("SELECT title FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(backed_up_title, "newer");
+    }
+
+    #[test]
+    fn preexisting_junk_backup_is_replaced_with_a_valid_database() {
+        let (_dir, path) = temp_db();
+        let migrations = &[
+            "CREATE TABLE notes(id INTEGER PRIMARY KEY, title TEXT NOT NULL);",
+            "ALTER TABLE notes ADD COLUMN body TEXT;",
+        ];
+        {
+            let conn = seed_version(&path, migrations[0], 1);
+            conn.execute("INSERT INTO notes(title) VALUES('keep')", [])
+                .unwrap();
+        }
+        let backup = pre_upgrade_backup_path(&path, 2);
+        fs::write(&backup, b"not a database").unwrap();
+
+        upgrade_with(&path, migrations, migrations.len() as i64).unwrap();
+
+        let saved = Connection::open(&backup).unwrap();
+        assert_eq!(user_version(&saved).unwrap(), 1);
+        let title: String = saved
+            .query_row("SELECT title FROM notes", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(title, "keep");
     }
 
     #[test]
