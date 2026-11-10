@@ -379,7 +379,7 @@ impl IntegrationService {
         enabled: bool,
         interval_minutes: Option<i64>,
         import_after: Option<String>,
-    ) -> Result<RecordingSource> {
+    ) -> Result<()> {
         let db_path = self.db_path.clone();
         let provider = provider.to_string();
         let source_instance = source_instance.to_string();

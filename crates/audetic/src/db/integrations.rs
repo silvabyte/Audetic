@@ -315,11 +315,11 @@ impl IntegrationRepository {
         enabled: bool,
         interval_minutes: Option<i64>,
         import_after: Option<&str>,
-    ) -> Result<RecordingSource> {
+    ) -> Result<()> {
         if interval_minutes.is_some_and(|minutes| minutes <= 0) {
             bail!("Recording source poll interval must be greater than zero");
         }
-        conn.execute(
+        let changed = conn.execute(
             "UPDATE recording_sources
              SET enabled = ?1, interval_minutes = ?2, import_after = ?3,
                  updated_at = CURRENT_TIMESTAMP
@@ -332,7 +332,10 @@ impl IntegrationRepository {
                 source_instance
             ],
         )?;
-        Self::recording_source(conn, provider, source_instance)
+        if changed != 1 {
+            bail!("Recording source {provider}/{source_instance} is not configured");
+        }
+        Ok(())
     }
 
     pub fn start_sync(conn: &Connection, provider: &str, source_instance: &str) -> Result<bool> {
