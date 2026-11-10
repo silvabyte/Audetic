@@ -424,16 +424,11 @@ impl IntegrationService {
             .recording_source(PlaudSource::PROVIDER, PlaudSource::SOURCE_INSTANCE)
             .await?;
         let Some(cli) = plaud::PlaudCli::discover() else {
-            return Ok(PlaudStatus::from_state(state, false, false, None));
+            return PlaudStatus::from_state(state, false, false, None);
         };
         let (version, authenticated) =
             tokio::join!(cli.version(), async { cli.authenticated().await });
-        Ok(PlaudStatus::from_state(
-            state,
-            true,
-            authenticated,
-            version.ok(),
-        ))
+        PlaudStatus::from_state(state, true, authenticated, version.ok())
     }
 
     /// Claim the source, then run its poll entry point off the request thread.
@@ -624,27 +619,45 @@ impl PlaudStatus {
         available: bool,
         authenticated: bool,
         version: Option<String>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let interval_minutes = state
+            .interval_minutes
+            .context("Configured Plaud recording source has no poll interval")?;
+        Ok(Self {
             available,
             authenticated,
             version,
             enabled: state.enabled,
-            interval_minutes: state
-                .interval_minutes
-                .unwrap_or(PlaudSource::DEFAULT_INTERVAL_MINUTES),
+            interval_minutes,
             import_after: state.import_after,
             running: state.running,
             last_started_at: state.last_started_at,
             last_completed_at: state.last_completed_at,
             last_error: state.last_error,
-        }
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn recording_source(interval_minutes: Option<i64>) -> RecordingSource {
+        RecordingSource {
+            provider: PlaudSource::PROVIDER.to_string(),
+            source_instance: PlaudSource::SOURCE_INSTANCE.to_string(),
+            sync_mode: crate::db::integrations::SyncMode::Poll,
+            enabled: true,
+            interval_minutes,
+            import_after: None,
+            config: None,
+            running: false,
+            last_started_at: None,
+            last_completed_at: None,
+            last_error: None,
+            updated_at: "2026-01-01 00:00:00".to_string(),
+        }
+    }
 
     #[test]
     fn token_parser_accepts_only_the_issued_shape() {
@@ -660,5 +673,13 @@ mod tests {
         ] {
             assert!(token_id(invalid).is_none(), "{invalid}");
         }
+    }
+
+    #[test]
+    fn plaud_status_uses_the_stored_interval() {
+        let status =
+            PlaudStatus::from_state(recording_source(Some(30)), false, false, None).unwrap();
+        assert_eq!(status.interval_minutes, 30);
+        assert!(PlaudStatus::from_state(recording_source(None), false, false, None).is_err());
     }
 }

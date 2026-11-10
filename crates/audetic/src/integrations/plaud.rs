@@ -22,8 +22,6 @@ pub struct PlaudSource;
 impl PlaudSource {
     pub const PROVIDER: &'static str = "plaud";
     pub const SOURCE_INSTANCE: &'static str = "default";
-    /// Shown when a poll row has no interval. The migrated Plaud row always has one.
-    pub const DEFAULT_INTERVAL_MINUTES: i64 = 15;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
