@@ -39,21 +39,20 @@ fn ensure_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
     if version == latest {
         return Ok(());
     }
-    let (legacy_version, pending) = migration_plan_for_version(conn, version, latest)?;
-    if let Some(legacy_version) = legacy_version {
-        let legacy_version = legacy_version.number();
-        bail!(
-            "Database uses legacy schema version {legacy_version}. \
-             Restart the daemon to upgrade"
-        );
-    }
-    match pending {
+    match migration_plan_for_version(conn, version, latest)? {
         Plan::Ready => Ok(()),
-        Plan::Create => apply_pending(conn, version, migrations),
+        Plan::Create => apply_migration_transaction(conn, version, None, migrations),
         Plan::Upgrade => bail!(
             "Database is at user_version {version} and this build supports {latest}. \
              Restart the daemon to upgrade"
         ),
+        Plan::Adopt(legacy_version) => {
+            let legacy_version = legacy_version.number();
+            bail!(
+                "Database uses legacy schema version {legacy_version}. \
+             Restart the daemon to upgrade"
+            )
+        }
     }
 }
 
@@ -65,41 +64,31 @@ fn upgrade_with(db_path: &Path, migrations: &[&str]) -> Result<()> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    let (version, legacy_version, pending) = migration_plan(&conn, latest)?;
-    if let Some(legacy_version) = legacy_version {
-        let backup = pre_upgrade_backup_path(db_path, latest);
-        write_backup(&conn, &backup, version)?;
-        return adopt_legacy_and_apply_pending(&conn, legacy_version, migrations);
-    }
-    match pending {
-        Plan::Ready => Ok(()),
-        Plan::Create => apply_pending(&conn, version, migrations),
-        Plan::Upgrade => {
-            let backup = pre_upgrade_backup_path(db_path, latest);
-            write_backup(&conn, &backup, version)?;
-            apply_pending(&conn, version, migrations)
-        }
-    }
+    let (version, pending) = migration_plan(&conn, latest)?;
+    let (from, legacy_version) = match pending {
+        Plan::Ready => return Ok(()),
+        Plan::Create => return apply_migration_transaction(&conn, version, None, migrations),
+        Plan::Upgrade => (version, None),
+        Plan::Adopt(legacy_version) => (1, Some(legacy_version)),
+    };
+    let backup = pre_upgrade_backup_path(db_path, latest);
+    write_backup(&conn, &backup, version)?;
+    apply_migration_transaction(&conn, from, legacy_version, migrations)
 }
 
-fn migration_plan(conn: &Connection, latest: i64) -> Result<(i64, Option<LegacyVersion>, Plan)> {
+fn migration_plan(conn: &Connection, latest: i64) -> Result<(i64, Plan)> {
     conn.pragma_update(None, "foreign_keys", true)
         .context("Failed to enable foreign keys")?;
     let version = user_version(conn)?;
-    let (legacy_version, pending) = migration_plan_for_version(conn, version, latest)?;
-    Ok((version, legacy_version, pending))
+    Ok((version, migration_plan_for_version(conn, version, latest)?))
 }
 
-fn migration_plan_for_version(
-    conn: &Connection,
-    version: i64,
-    latest: i64,
-) -> Result<(Option<LegacyVersion>, Plan)> {
+fn migration_plan_for_version(conn: &Connection, version: i64, latest: i64) -> Result<Plan> {
     let empty = database_is_empty(conn)?;
     if let Some(legacy_version) = legacy_adoption::version_for_adoption(conn, version, empty)? {
-        return Ok((Some(legacy_version), Plan::Upgrade));
+        return Ok(Plan::Adopt(legacy_version));
     }
-    Ok((None, plan(version, latest, empty)?))
+    plan(version, latest, empty)
 }
 
 /// What opening or startup may do with this file.
@@ -110,6 +99,7 @@ enum Plan {
     Create,
     /// User tables exist at an older version. Only `upgrade` may rewrite them.
     Upgrade,
+    Adopt(LegacyVersion),
 }
 
 fn plan(version: i64, latest: i64, empty: bool) -> Result<Plan> {
@@ -133,18 +123,6 @@ fn plan(version: i64, latest: i64, empty: bool) -> Result<Plan> {
         );
     }
     Ok(Plan::Upgrade)
-}
-
-fn apply_pending(conn: &Connection, from: i64, migrations: &[&str]) -> Result<()> {
-    apply_migration_transaction(conn, from, None, migrations)
-}
-
-fn adopt_legacy_and_apply_pending(
-    conn: &Connection,
-    legacy_version: LegacyVersion,
-    migrations: &[&str],
-) -> Result<()> {
-    apply_migration_transaction(conn, 1, Some(legacy_version), migrations)
 }
 
 fn apply_migration_transaction(
