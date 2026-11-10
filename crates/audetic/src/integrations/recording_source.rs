@@ -6,7 +6,10 @@
 use anyhow::{bail, Result};
 use async_trait::async_trait;
 
-use crate::db::integrations::{RecordingSource as RecordingSourceRecord, SyncMode};
+use crate::db::integrations::RecordingSource as RecordingSourceRecord;
+
+#[cfg(test)]
+use crate::db::integrations::SyncMode;
 
 use super::plaud::PlaudSource;
 use super::IntegrationService;
@@ -26,12 +29,8 @@ pub fn resolve(provider: &str, source_instance: &str) -> Result<Box<dyn Recordin
     bail!("No recording source implementation for {provider}/{source_instance}")
 }
 
-/// Automatic polling waits for `interval_minutes`. A missing interval, or a
-/// webhook source, is never due: webhook deliveries arrive on their own.
+/// Automatic polling waits for `interval_minutes`. A missing interval is never due.
 pub fn poll_is_due(source: &RecordingSourceRecord) -> bool {
-    if source.sync_mode != SyncMode::Poll {
-        return false;
-    }
     let Some(interval) = source.interval_minutes else {
         return false;
     };
@@ -53,15 +52,11 @@ pub(crate) fn parse_db_timestamp(value: &str) -> Result<chrono::DateTime<chrono:
 mod tests {
     use super::*;
 
-    fn source(
-        mode: SyncMode,
-        interval: Option<i64>,
-        last_started_at: Option<&str>,
-    ) -> RecordingSourceRecord {
+    fn source(interval: Option<i64>, last_started_at: Option<&str>) -> RecordingSourceRecord {
         RecordingSourceRecord {
             provider: "example".to_string(),
             source_instance: "one".to_string(),
-            sync_mode: mode,
+            sync_mode: SyncMode::Poll,
             enabled: true,
             interval_minutes: interval,
             import_after: None,
@@ -81,14 +76,11 @@ mod tests {
     }
 
     #[test]
-    fn only_poll_sources_with_an_interval_become_due() {
-        assert!(poll_is_due(&source(SyncMode::Poll, Some(15), None)));
-        assert!(!poll_is_due(&source(SyncMode::Poll, None, None)));
-        assert!(!poll_is_due(&source(SyncMode::Webhook, None, None)));
-        assert!(!poll_is_due(&source(
-            SyncMode::Poll,
-            Some(15),
-            Some("2999-01-01 00:00:00"),
-        )));
+    fn sources_without_an_interval_are_never_due() {
+        assert!(poll_is_due(&source(Some(15), None)));
+        assert!(!poll_is_due(&source(None, None)));
+        assert!(!poll_is_due(
+            &source(Some(15), Some("2999-01-01 00:00:00"),)
+        ));
     }
 }
