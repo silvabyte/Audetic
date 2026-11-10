@@ -153,8 +153,11 @@ disk. Historical records with missing audio retain their transcripts.
 
 ## Development and upgrades
 
-The daemon upgrades its database on startup. Old `/meetings`, `/history`, `/toggle`,
-and `/transcribe` API routes and meeting/history/transcribe CLI commands are removed.
+The daemon upgrades its database on startup after writing a backup. For a
+database from before `PRAGMA user_version`, run `scripts/stamp-legacy-db.sh`
+with `--dry-run` first after pulling and before `make install`; see the
+[README](../README.md). Old `/meetings`, `/history`, `/toggle`, and `/transcribe`
+API routes and meeting/history/transcribe CLI commands are removed.
 
 For an isolated Linux development instance, set separate `XDG_CONFIG_HOME` and
 `XDG_DATA_HOME`, and set `AUDETIC_PORT=3837` for both daemon and CLI. Set

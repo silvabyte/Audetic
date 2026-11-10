@@ -30,12 +30,10 @@ For ordinary upgrades:
 git pull && make install
 ```
 
-**Upgrading an existing install:** `git pull && make install` restarts the
-daemon, which upgrades its database on startup and writes a backup first.
-Databases from releases that predate `PRAGMA user_version` are adopted
-automatically when their legacy schema marker is recognized. Other non-empty,
-unstamped databases are refused. The old meeting/dictation importer has been
-removed.
+For a database from before `PRAGMA user_version`, run
+`scripts/stamp-legacy-db.sh --dry-run` and then `scripts/stamp-legacy-db.sh`
+after `git pull` and before `make install`. The daemon then upgrades it on
+startup after writing a backup.
 
 ### Linux
 

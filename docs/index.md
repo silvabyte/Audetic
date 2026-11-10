@@ -27,7 +27,10 @@ audetic provider test        # Validate provider without recording
 
 Audetic is installed from source and has no auto-updater — `git pull && make
 install` is the ordinary upgrade path. The daemon upgrades its database on
-startup. See [ADR 0001](./adr/0001-source-only-distribution.md).
+startup. For a database from before `PRAGMA user_version`, run
+`scripts/stamp-legacy-db.sh --dry-run` and then `scripts/stamp-legacy-db.sh`
+after pulling and before installing; see the [README](../README.md). See
+[ADR 0001](./adr/0001-source-only-distribution.md).
 
 See the [Configuration Guide](./configuration.md#provider-cli-helpers) for detailed provider command documentation.
 
