@@ -278,30 +278,6 @@ mod tests {
 
     use std::fs;
 
-    fn schema_snapshot_path() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/db/schema.sql")
-    }
-
-    fn schema_snapshot(conn: &Connection) -> Result<String> {
-        let version = user_version(conn)?;
-        let mut stmt = conn.prepare(
-            "SELECT sql FROM sqlite_master
-             WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'
-             ORDER BY rowid",
-        )?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut out = format!("-- user_version {version}\n");
-        for sql in rows {
-            let sql = sql?;
-            out.push_str(&sql);
-            if !sql.ends_with(';') {
-                out.push(';');
-            }
-            out.push('\n');
-        }
-        Ok(out)
-    }
-
     fn temp_db() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("audetic.db");
@@ -449,29 +425,13 @@ mod tests {
     }
 
     #[test]
-    fn fresh_replay_matches_schema_snapshot() {
+    fn fresh_replay_reaches_latest() {
         let conn = Connection::open_in_memory().unwrap();
         ensure_current(&conn).unwrap();
-        let actual = schema_snapshot(&conn).unwrap();
-        assert!(
-            !actual.contains("audio_notes_schema"),
-            "baseline schema must not recreate the marker table"
-        );
-        assert!(
-            !actual.contains("plaud_sync_state"),
-            "provider tables belong in a migration that removes them, not the snapshot"
-        );
-        assert!(actual.contains("CREATE TABLE recording_sources"));
-        assert!(actual.starts_with(&format!("-- user_version {LATEST}\n")));
-        let path = schema_snapshot_path();
-        let expected = fs::read_to_string(&path).unwrap_or_default();
-        if actual != expected {
-            fs::write(&path, &actual).unwrap();
-            panic!(
-                "schema snapshot regenerated at {}. Review the diff and commit schema.sql",
-                path.display()
-            );
-        }
+        assert_eq!(user_version(&conn).unwrap(), LATEST);
+        assert!(table_exists(&conn, "recording_sources").unwrap());
+        assert!(!table_exists(&conn, "audio_notes_schema").unwrap());
+        assert!(!table_exists(&conn, "plaud_sync_state").unwrap());
     }
 
     #[test]

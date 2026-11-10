@@ -42,8 +42,7 @@ To change the schema:
 
 1. Add `crates/audetic/src/db/migrations/000N_description.sql`.
 2. Append it to `MIGRATIONS`.
-3. Run `cargo test` to regenerate `crates/audetic/src/db/schema.sql`.
-4. Commit the migration and the snapshot together.
+3. Run `cargo test`.
 
 Never edit a released migration. Schema and core types stay provider-agnostic;
 provider specifics live in config JSON and provider modules.
