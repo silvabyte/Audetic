@@ -358,10 +358,13 @@ mod tests {
 
     fn seed_legacy(path: &Path, version: i64) -> Connection {
         let conn = Connection::open(path).unwrap();
-        if version == 1 {
-            conn.execute_batch(LEGACY_V1_SCHEMA).unwrap();
-        } else {
-            conn.execute_batch(MIGRATIONS[0]).unwrap();
+        match version {
+            1 => conn.execute_batch(LEGACY_V1_SCHEMA).unwrap(),
+            2 => {
+                conn.execute_batch(LEGACY_V1_SCHEMA).unwrap();
+                conn.execute_batch(legacy_adoption::V1_TO_V2).unwrap();
+            }
+            _ => conn.execute_batch(MIGRATIONS[0]).unwrap(),
         }
         conn.execute_batch(LEGACY_MARKER_SCHEMA).unwrap();
         conn.execute(
@@ -421,11 +424,55 @@ mod tests {
         assert_eq!(saved_title, "Keep me");
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct CarriedSource {
+        provider: String,
+        source_instance: String,
+        sync_mode: String,
+        enabled: i64,
+        interval_minutes: i64,
+        import_after: String,
+        running: i64,
+        last_started_at: String,
+        last_completed_at: String,
+        last_error: String,
+        updated_at: String,
+        config: Option<String>,
+    }
+
+    fn carried_source(conn: &Connection) -> CarriedSource {
+        conn.query_row(
+            "SELECT provider, source_instance, sync_mode, enabled, interval_minutes,
+                    import_after, running, last_started_at, last_completed_at, last_error,
+                    updated_at, config
+             FROM recording_sources",
+            [],
+            |row| {
+                Ok(CarriedSource {
+                    provider: row.get(0)?,
+                    source_instance: row.get(1)?,
+                    sync_mode: row.get(2)?,
+                    enabled: row.get(3)?,
+                    interval_minutes: row.get(4)?,
+                    import_after: row.get(5)?,
+                    running: row.get(6)?,
+                    last_started_at: row.get(7)?,
+                    last_completed_at: row.get(8)?,
+                    last_error: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    config: row.get(11)?,
+                })
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn fresh_replay_reaches_latest() {
-        let conn = Connection::open_in_memory().unwrap();
-        ensure_current(&conn).unwrap();
+        let (_dir, path) = temp_db();
+        let conn = crate::db::init_db_at(&path).unwrap();
         assert_eq!(user_version(&conn).unwrap(), LATEST);
+        assert!(table_exists(&conn, "audio_notes").unwrap());
         assert!(table_exists(&conn, "recording_sources").unwrap());
         assert!(!table_exists(&conn, "audio_notes_schema").unwrap());
         assert!(!table_exists(&conn, "plaud_sync_state").unwrap());
@@ -526,7 +573,11 @@ mod tests {
             let conn = seed_legacy(&path, 3);
             conn.execute(
                 "UPDATE plaud_sync_state
-                 SET enabled = 1, interval_minutes = 30, last_error = 'keep me'
+                 SET enabled = 1, interval_minutes = 30,
+                     import_after = '2026-01-02 03:04:05',
+                     running = 1, last_started_at = '2026-01-02 03:00:00',
+                     last_completed_at = '2026-01-01 00:00:00',
+                     last_error = 'keep me', updated_at = '2026-01-02 03:00:01'
                  WHERE singleton = 1",
                 [],
             )
@@ -537,14 +588,23 @@ mod tests {
 
         assert_legacy_upgrade(&path, 3, 1);
         let live = Connection::open(&path).unwrap();
-        let state: (i64, String) = live
-            .query_row(
-                "SELECT interval_minutes, last_error FROM recording_sources",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .unwrap();
-        assert_eq!(state, (30, "keep me".into()));
+        assert_eq!(
+            carried_source(&live),
+            CarriedSource {
+                provider: "plaud".into(),
+                source_instance: "default".into(),
+                sync_mode: "poll".into(),
+                enabled: 1,
+                interval_minutes: 30,
+                import_after: "2026-01-02 03:04:05".into(),
+                running: 1,
+                last_started_at: "2026-01-02 03:00:00".into(),
+                last_completed_at: "2026-01-01 00:00:00".into(),
+                last_error: "keep me".into(),
+                updated_at: "2026-01-02 03:00:01".into(),
+                config: None,
+            }
+        );
     }
 
     #[test]
@@ -566,6 +626,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(override_value, None);
+    }
+
+    #[test]
+    fn upgrades_legacy_v2_database_through_old_and_numbered_chains() {
+        let (_dir, path) = temp_db();
+        drop(seed_legacy(&path, 2));
+
+        upgrade(&path).unwrap();
+
+        assert_legacy_upgrade(&path, 2, 0);
+        let live = Connection::open(&path).unwrap();
+        live.execute(
+            "UPDATE audio_notes SET classification_kind_override = 'custom-kind' WHERE id = 1",
+            [],
+        )
+        .unwrap();
+        let override_value: String = live
+            .query_row(
+                "SELECT classification_kind_override FROM audio_notes WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(override_value, "custom-kind");
     }
 
     #[test]
@@ -795,139 +879,9 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_moves_plaud_sync_state_into_recording_sources_and_writes_a_backup() {
-        let (_dir, path) = temp_db();
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(MIGRATIONS[0]).unwrap();
-            conn.pragma_update(None, "user_version", 1).unwrap();
-            conn.execute(
-                "UPDATE plaud_sync_state
-                 SET enabled = 1, interval_minutes = 30,
-                     import_after = '2026-01-02 03:04:05',
-                     running = 1, last_started_at = '2026-01-02 03:00:00',
-                     last_completed_at = '2026-01-01 00:00:00',
-                     last_error = 'keep me', updated_at = '2026-01-02 03:00:01'
-                 WHERE singleton = 1",
-                [],
-            )
-            .unwrap();
-        }
-
-        upgrade(&path).unwrap();
-
-        let backup = pre_upgrade_backup_path(&path, LATEST);
-        assert!(backup.exists(), "pre-upgrade backup was not written");
-        let saved = Connection::open(&backup).unwrap();
-        assert_eq!(user_version(&saved).unwrap(), 1);
-        let saved_row: (i64, i64, String) = saved
-            .query_row(
-                "SELECT enabled, interval_minutes, last_error
-                 FROM plaud_sync_state WHERE singleton = 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert_eq!(saved_row, (1, 30, "keep me".into()));
-        let saved_sources: i64 = saved
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'recording_sources'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(saved_sources, 0);
-
-        let live = Connection::open(&path).unwrap();
-        assert_eq!(user_version(&live).unwrap(), LATEST);
-        let old_table: i64 = live
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'plaud_sync_state'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(old_table, 0);
-        #[derive(Debug, PartialEq, Eq)]
-        struct Carried {
-            provider: String,
-            source_instance: String,
-            sync_mode: String,
-            enabled: i64,
-            interval_minutes: i64,
-            import_after: String,
-            running: i64,
-            last_started_at: String,
-            last_completed_at: String,
-            last_error: String,
-            updated_at: String,
-            config: Option<String>,
-        }
-        let row = live
-            .query_row(
-                "SELECT provider, source_instance, sync_mode, enabled, interval_minutes,
-                        import_after, running, last_started_at, last_completed_at, last_error,
-                        updated_at, config
-                 FROM recording_sources",
-                [],
-                |row| {
-                    Ok(Carried {
-                        provider: row.get(0)?,
-                        source_instance: row.get(1)?,
-                        sync_mode: row.get(2)?,
-                        enabled: row.get(3)?,
-                        interval_minutes: row.get(4)?,
-                        import_after: row.get(5)?,
-                        running: row.get(6)?,
-                        last_started_at: row.get(7)?,
-                        last_completed_at: row.get(8)?,
-                        last_error: row.get(9)?,
-                        updated_at: row.get(10)?,
-                        config: row.get(11)?,
-                    })
-                },
-            )
-            .unwrap();
-        assert_eq!(
-            row,
-            Carried {
-                provider: "plaud".into(),
-                source_instance: "default".into(),
-                sync_mode: "poll".into(),
-                enabled: 1,
-                interval_minutes: 30,
-                import_after: "2026-01-02 03:04:05".into(),
-                running: 1,
-                last_started_at: "2026-01-02 03:00:00".into(),
-                last_completed_at: "2026-01-01 00:00:00".into(),
-                last_error: "keep me".into(),
-                updated_at: "2026-01-02 03:00:01".into(),
-                config: None,
-            }
-        );
-    }
-
-    #[test]
     fn upgrade_of_a_missing_database_does_not_create_one() {
         let (_dir, path) = temp_db();
         upgrade(&path).unwrap();
         assert!(!path.exists());
-    }
-
-    #[test]
-    fn init_db_at_creates_an_empty_database_at_latest() {
-        let (_dir, path) = temp_db();
-        let conn = crate::db::init_db_at(&path).unwrap();
-        assert_eq!(user_version(&conn).unwrap(), LATEST);
-        let notes: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'audio_notes'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(notes, 1);
     }
 }

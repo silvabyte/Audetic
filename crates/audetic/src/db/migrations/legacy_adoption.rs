@@ -7,7 +7,7 @@ use super::table_exists;
 // steps only bridge that schema to numbered migration 1; they are not new
 // numbered migrations and must run only during daemon startup.
 const BASELINE_VERSION: i64 = 3;
-const V1_TO_V2: &str = "
+pub(super) const V1_TO_V2: &str = "
     ALTER TABLE audio_notes ADD COLUMN source_provider TEXT;
     ALTER TABLE audio_notes ADD COLUMN source_external_id TEXT;
     ALTER TABLE audio_notes ADD COLUMN source_recorded_at TIMESTAMP;
