@@ -9,8 +9,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use uuid::Uuid;
 
-use crate::db::integrations::SyncMode;
-
 use super::recording_source::{parse_db_timestamp, RecordingSource};
 use super::{ExternalImportRequest, IntegrationService};
 
@@ -167,10 +165,6 @@ impl RecordingSource for PlaudSource {
 
     fn source_instance(&self) -> &str {
         Self::SOURCE_INSTANCE
-    }
-
-    fn sync_mode(&self) -> SyncMode {
-        SyncMode::Poll
     }
 
     async fn poll(&self, service: &IntegrationService, backfill: bool) -> Result<()> {

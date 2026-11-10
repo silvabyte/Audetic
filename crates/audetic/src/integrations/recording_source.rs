@@ -1,9 +1,7 @@
 //! Provider-agnostic recording sources.
 //!
-//! A source either polls or accepts webhooks. The database already stores both
-//! modes and a JSON `config` column, so another provider does not need a new
-//! table. This module only builds the seam: Plaud is the poll implementation,
-//! and no webhook provider is registered yet.
+//! The database stores the delivery mode and provider configuration. This
+//! module resolves the poll implementation for each configured source.
 
 use anyhow::{bail, Result};
 use async_trait::async_trait;
@@ -17,18 +15,8 @@ use super::IntegrationService;
 pub trait RecordingSource: Send + Sync {
     fn provider(&self) -> &str;
     fn source_instance(&self) -> &str;
-    fn sync_mode(&self) -> SyncMode;
 
     async fn poll(&self, service: &IntegrationService, backfill: bool) -> Result<()>;
-
-    /// Webhook providers override this. The default keeps the entry point
-    /// available without a second schema.
-    async fn accept_webhook(&self, _service: &IntegrationService, _payload: &[u8]) -> Result<()> {
-        bail!(
-            "Recording source {} does not accept webhooks",
-            self.provider()
-        )
-    }
 }
 
 pub fn resolve(provider: &str, source_instance: &str) -> Result<Box<dyn RecordingSource>> {
@@ -91,7 +79,6 @@ mod tests {
         let source = resolve(PlaudSource::PROVIDER, PlaudSource::SOURCE_INSTANCE).unwrap();
         assert_eq!(source.provider(), "plaud");
         assert_eq!(source.source_instance(), "default");
-        assert_eq!(source.sync_mode(), SyncMode::Poll);
         assert!(resolve("other", "default").is_err());
     }
 
