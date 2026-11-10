@@ -31,7 +31,13 @@ pub(crate) fn upgrade(db_path: &Path) -> Result<()> {
 
 fn ensure_with(conn: &Connection, migrations: &[&str]) -> Result<()> {
     let latest = migrations.len() as i64;
-    let (version, legacy_version, pending) = migration_plan(conn, latest)?;
+    conn.pragma_update(None, "foreign_keys", true)
+        .context("Failed to enable foreign keys")?;
+    let version = user_version(conn)?;
+    if version == latest {
+        return Ok(());
+    }
+    let (legacy_version, pending) = migration_plan_for_version(conn, version, latest)?;
     if let Some(legacy_version) = legacy_version {
         bail!(
             "Database uses legacy schema version {legacy_version}. \
@@ -77,11 +83,20 @@ fn migration_plan(conn: &Connection, latest: i64) -> Result<(i64, Option<i64>, P
     conn.pragma_update(None, "foreign_keys", true)
         .context("Failed to enable foreign keys")?;
     let version = user_version(conn)?;
+    let (legacy_version, pending) = migration_plan_for_version(conn, version, latest)?;
+    Ok((version, legacy_version, pending))
+}
+
+fn migration_plan_for_version(
+    conn: &Connection,
+    version: i64,
+    latest: i64,
+) -> Result<(Option<i64>, Plan)> {
     let empty = database_is_empty(conn)?;
     if let Some(legacy_version) = legacy_adoption::version_for_adoption(conn, version, empty)? {
-        return Ok((version, Some(legacy_version), Plan::Upgrade));
+        return Ok((Some(legacy_version), Plan::Upgrade));
     }
-    Ok((version, None, plan(version, latest, empty)?))
+    Ok((None, plan(version, latest, empty)?))
 }
 
 /// What opening or startup may do with this file.
