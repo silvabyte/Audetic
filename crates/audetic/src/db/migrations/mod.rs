@@ -12,7 +12,6 @@ use rusqlite::{params, Connection};
 use sha2::{Digest, Sha256};
 use tracing::info;
 
-use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 const SCHEMA_MIGRATIONS_DDL: &str = "CREATE TABLE schema_migrations (
@@ -49,24 +48,16 @@ pub(crate) fn upgrade(db_path: &Path) -> Result<()> {
 }
 
 fn ensure_with(conn: &Connection, migrations: &[Migration]) -> Result<()> {
-    conn.pragma_update(None, "foreign_keys", true)
-        .context("Failed to enable foreign keys")?;
-    match applied_count(conn)? {
-        Some(applied) if applied == migrations.len() => Ok(()),
-        Some(applied) if applied > migrations.len() => bail!(
-            "Database was written by a newer build ({applied} migrations applied; this build supports {})",
-            migrations.len()
-        ),
-        Some(applied) => bail!(
+    let Some(applied) = applied_or_create(conn, migrations)? else {
+        return Ok(());
+    };
+    match applied.cmp(&migrations.len()) {
+        std::cmp::Ordering::Equal => Ok(()),
+        std::cmp::Ordering::Greater => Err(newer_build(applied, migrations)),
+        std::cmp::Ordering::Less => bail!(
             "Database has {applied} migrations applied and this build requires {}. \
              Restart the daemon to upgrade",
             migrations.len()
-        ),
-        None if database_is_empty(conn)? => {
-            apply_migration_transaction(conn, 0, true, migrations)
-        }
-        None => bail!(
-            "Refusing to open a non-empty database without schema_migrations; run scripts/stamp-legacy-db.sh."
         ),
     }
 }
@@ -78,16 +69,9 @@ fn upgrade_with(db_path: &Path, migrations: &[Migration]) -> Result<()> {
     let conn = Connection::open(db_path)
         .with_context(|| format!("Failed to open database at {}", db_path.display()))?;
     conn.busy_timeout(std::time::Duration::from_secs(5))?;
-    conn.pragma_update(None, "foreign_keys", true)
-        .context("Failed to enable foreign keys")?;
-    let Some(_) = applied_count(&conn)? else {
-        if database_is_empty(&conn)? {
-            return apply_migration_transaction(&conn, 0, true, migrations);
-        }
-        bail!(
-            "Refusing to open a non-empty database without schema_migrations; run scripts/stamp-legacy-db.sh."
-        );
-    };
+    if applied_or_create(&conn, migrations)?.is_none() {
+        return Ok(());
+    }
     let applied = verify_applied_migrations(&conn, migrations)?;
     if applied == migrations.len() {
         return Ok(());
@@ -103,9 +87,6 @@ fn apply_migration_transaction(
     create_tracking_table: bool,
     migrations: &[Migration],
 ) -> Result<()> {
-    if from >= migrations.len() && !create_tracking_table {
-        return Ok(());
-    }
     conn.execute_batch("BEGIN EXCLUSIVE")
         .context("Failed to begin exclusive migration transaction")?;
     let applied = apply_in_open_transaction(conn, from, create_tracking_table, migrations);
@@ -155,29 +136,34 @@ fn apply_in_open_transaction(
     Ok(applied)
 }
 
-fn applied_count(conn: &Connection) -> Result<Option<usize>> {
+/// Enables foreign keys and returns the applied migration count. An empty
+/// database is migrated to the latest version in place and returns `None`.
+fn applied_or_create(conn: &Connection, migrations: &[Migration]) -> Result<Option<usize>> {
+    conn.pragma_update(None, "foreign_keys", true)
+        .context("Failed to enable foreign keys")?;
     match conn.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
-        row.get::<_, i64>(0)
+        row.get::<_, usize>(0)
     }) {
-        Ok(count) => Ok(Some(
-            usize::try_from(count).context("schema_migrations row count is negative")?,
-        )),
-        Err(error) if missing_schema_migrations_error(&error) => {
-            if table_exists(conn, "schema_migrations")? {
-                Err(error).context("Failed to count applied migrations")
-            } else {
-                Ok(None)
+        Ok(applied) => Ok(Some(applied)),
+        Err(rusqlite::Error::SqliteFailure(_, Some(message)))
+            if message.contains("no such table: schema_migrations") =>
+        {
+            if !database_is_empty(conn)? {
+                bail!(
+                    "Refusing to open a non-empty database without schema_migrations; run scripts/stamp-legacy-db.sh."
+                );
             }
+            apply_migration_transaction(conn, 0, true, migrations)?;
+            Ok(None)
         }
         Err(error) => Err(error).context("Failed to count applied migrations"),
     }
 }
 
-fn missing_schema_migrations_error(error: &rusqlite::Error) -> bool {
-    matches!(
-        error,
-        rusqlite::Error::SqliteFailure(_, Some(message))
-            if message.contains("no such table: schema_migrations")
+fn newer_build(applied: usize, migrations: &[Migration]) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Database was written by a newer build ({applied} migrations applied; this build supports {})",
+        migrations.len()
     )
 }
 
@@ -190,11 +176,7 @@ fn verify_applied_migrations(conn: &Connection, migrations: &[Migration]) -> Res
     })?;
     let applied = rows.collect::<rusqlite::Result<Vec<_>>>()?;
     if applied.len() > migrations.len() {
-        bail!(
-            "Database was written by a newer build ({} migrations applied; this build supports {})",
-            applied.len(),
-            migrations.len()
-        );
+        return Err(newer_build(applied.len(), migrations));
     }
     for (index, (version, checksum)) in applied.iter().enumerate() {
         let expected_version = index + 1;
@@ -215,12 +197,7 @@ fn verify_applied_migrations(conn: &Connection, migrations: &[Migration]) -> Res
 }
 
 fn migration_checksum(migration: &Migration) -> String {
-    let digest = Sha256::digest(migration.sql.as_bytes());
-    let mut checksum = String::with_capacity(64);
-    for byte in digest {
-        write!(&mut checksum, "{byte:02x}").expect("writing to a String cannot fail");
-    }
-    checksum
+    format!("{:x}", Sha256::digest(migration.sql.as_bytes()))
 }
 
 fn write_backup(conn: &Connection, backup: &Path, applied: usize) -> Result<()> {
@@ -263,14 +240,6 @@ fn database_is_empty(conn: &Connection) -> Result<bool> {
         |row| row.get(0),
     )?;
     Ok(tables == 0)
-}
-
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
-        [name],
-        |row| row.get(0),
-    )?)
 }
 
 fn integrity_check(conn: &Connection) -> Result<()> {
@@ -318,6 +287,14 @@ mod tests {
             sql: "ALTER TABLE notes ADD COLUMN body TEXT;",
         },
     ];
+
+    fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [name],
+            |row| row.get(0),
+        )?)
+    }
 
     fn temp_db() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();

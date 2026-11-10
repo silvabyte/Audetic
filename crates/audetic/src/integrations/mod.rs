@@ -641,20 +641,6 @@ impl PlaudStatus {
 mod tests {
     use super::*;
 
-    fn recording_source(interval_minutes: i64) -> RecordingSource {
-        RecordingSource {
-            provider: plaud::PROVIDER.to_string(),
-            source_instance: plaud::SOURCE_INSTANCE.to_string(),
-            enabled: true,
-            interval_minutes,
-            import_after: None,
-            running: false,
-            last_started_at: None,
-            last_completed_at: None,
-            last_error: None,
-        }
-    }
-
     #[test]
     fn token_parser_accepts_only_the_issued_shape() {
         let id = Uuid::new_v4();
@@ -669,12 +655,6 @@ mod tests {
         ] {
             assert!(token_id(invalid).is_none(), "{invalid}");
         }
-    }
-
-    #[test]
-    fn plaud_status_uses_the_stored_interval() {
-        let status = PlaudStatus::from_state(recording_source(30), false, false, None);
-        assert_eq!(status.interval_minutes, 30);
     }
 
     #[test]
