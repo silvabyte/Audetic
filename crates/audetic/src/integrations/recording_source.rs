@@ -65,12 +65,10 @@ mod tests {
             enabled: true,
             interval_minutes: interval,
             import_after: None,
-            config: None,
             running: false,
             last_started_at: last_started_at.map(str::to_string),
             last_completed_at: None,
             last_error: None,
-            updated_at: "2026-01-01 00:00:00".to_string(),
         }
     }
 

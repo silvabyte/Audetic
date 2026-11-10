@@ -45,13 +45,6 @@ pub enum SyncMode {
 }
 
 impl SyncMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Poll => "poll",
-            Self::Webhook => "webhook",
-        }
-    }
-
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "poll" => Ok(Self::Poll),
@@ -61,7 +54,7 @@ impl SyncMode {
     }
 }
 
-/// One configured recording source. Provider-specific settings live in `config`.
+/// One configured recording source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordingSource {
     pub provider: String,
@@ -70,12 +63,10 @@ pub struct RecordingSource {
     pub enabled: bool,
     pub interval_minutes: Option<i64>,
     pub import_after: Option<String>,
-    pub config: Option<String>,
     pub running: bool,
     pub last_started_at: Option<String>,
     pub last_completed_at: Option<String>,
     pub last_error: Option<String>,
-    pub updated_at: String,
 }
 
 pub struct IntegrationRepository;
@@ -412,7 +403,7 @@ impl IntegrationRepository {
 
 const RECORDING_SOURCE_COLUMNS: &str =
     "provider, source_instance, sync_mode, enabled, interval_minutes, \
-     import_after, config, running, last_started_at, last_completed_at, last_error, updated_at";
+     import_after, running, last_started_at, last_completed_at, last_error";
 
 fn external_import_by_identity(
     conn: &Connection,
@@ -471,12 +462,10 @@ fn row_to_recording_source(row: &Row<'_>) -> rusqlite::Result<RecordingSource> {
         enabled: row.get(3)?,
         interval_minutes: row.get(4)?,
         import_after: row.get(5)?,
-        config: row.get(6)?,
-        running: row.get(7)?,
-        last_started_at: row.get(8)?,
-        last_completed_at: row.get(9)?,
-        last_error: row.get(10)?,
-        updated_at: row.get(11)?,
+        running: row.get(6)?,
+        last_started_at: row.get(7)?,
+        last_completed_at: row.get(8)?,
+        last_error: row.get(9)?,
     })
 }
 
