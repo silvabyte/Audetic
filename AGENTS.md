@@ -44,8 +44,7 @@ To change the schema:
 2. Append it to `MIGRATIONS`.
 3. Run `cargo test`.
 
-Never edit a released migration. Schema and core types stay provider-agnostic;
-provider specifics live in config JSON and provider modules.
+Never edit a released migration. Schema and core types stay provider-agnostic.
 
 ## Frontend (apps/web-ui)
 

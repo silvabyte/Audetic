@@ -1,7 +1,6 @@
 -- One configured recording source per provider instance. `sync_mode` is either
--- `poll` or `webhook`; provider-specific settings belong in `config`, not in
--- new columns. The INSERT below only moves the previous singleton row onto
--- this table. `source_instance` is the same identity `external_imports` uses.
+-- `poll` or `webhook`. The INSERT below only moves the previous singleton row
+-- onto this table. `source_instance` is the same identity `external_imports` uses.
 CREATE TABLE recording_sources (
     provider TEXT NOT NULL CHECK(trim(provider) <> ''),
     source_instance TEXT NOT NULL CHECK(trim(source_instance) <> ''),
@@ -9,7 +8,6 @@ CREATE TABLE recording_sources (
     enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
     interval_minutes INTEGER CHECK(interval_minutes IS NULL OR interval_minutes > 0),
     import_after TIMESTAMP,
-    config TEXT CHECK(config IS NULL OR json_valid(config)),
     running INTEGER NOT NULL DEFAULT 0 CHECK(running IN (0, 1)),
     last_started_at TIMESTAMP,
     last_completed_at TIMESTAMP,
