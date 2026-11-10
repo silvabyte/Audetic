@@ -32,8 +32,10 @@ git pull && make install
 
 **Upgrading an existing install:** `git pull && make install` restarts the
 daemon, which upgrades its database on startup and writes a backup first.
-The old meeting/dictation importer has been removed. A non-empty database
-that was never stamped with `PRAGMA user_version` is refused.
+Databases from releases that predate `PRAGMA user_version` are adopted
+automatically when their legacy schema marker is recognized. Other non-empty,
+unstamped databases are refused. The old meeting/dictation importer has been
+removed.
 
 ### Linux
 
