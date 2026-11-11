@@ -17,7 +17,8 @@ jobs:
       matrix:
         include:
           - platform: linux
-            runner: ubuntu-latest
+            # Self-hosted Linux runner (silvabytebee64).
+            runner: [self-hosted, Linux]
           - platform: macos
             # Self-hosted runner registered on a maintainer's Mac.
             # See: https://docs.github.com/en/actions/hosting-your-own-runners
@@ -32,7 +33,15 @@ jobs:
         # ffmpeg is needed by the compression pipeline that the meeting and
         # transcribe integration tests exercise; Ubuntu's package is built
         # with libmp3lame so `-codec:a libmp3lame` works.
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev ffmpeg
+        # Self-hosted: skip apt when the packages are already installed, and
+        # bound the step so a stuck mirror fails fast instead of hanging.
+        timeout-minutes: 10
+        run: |
+          if dpkg -s libasound2-dev libxkbcommon-dev ffmpeg >/dev/null 2>&1; then
+            echo "system deps already installed"
+          else
+            sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev ffmpeg
+          fi
 
       - name: Ensure ffmpeg (macOS — Homebrew)
         if: matrix.platform == 'macos'
