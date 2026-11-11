@@ -23,6 +23,11 @@ enum Daemon {
         URL(string: "http://\(host):\(port)/")!
     }
 
+    /// The web UI's settings section — provider, capture, post-processing, etc.
+    static var webSettingsURL: URL {
+        webUIURL.appendingPathComponent("settings")
+    }
+
     static func apiURL(_ path: String) -> URL {
         apiBase.appendingPathComponent(path.hasPrefix("/") ? String(path.dropFirst()) : path)
     }
