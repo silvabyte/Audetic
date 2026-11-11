@@ -1194,12 +1194,14 @@ export interface components {
         };
         /** @description Persisted capture defaults. Changing this does not alter an active note. */
         AudioNoteSettings: {
-            auto_paste: boolean;
+            /** @description Automatic paste for each capture source. Missing sources are off. */
+            auto_paste: components["schemas"]["AutoPastePreferences"];
         };
         /** @description Request body for start/toggle endpoints. */
         AudioNoteStartRequest: {
             /**
-             * @description Omitted/null uses the persisted capture preference; false overrides it.
+             * @description Omitted/null uses the persisted preference for this request's capture
+             *     source. An explicit value applies only to this recording.
              * @default null
              */
             auto_paste: boolean | null;
@@ -1317,6 +1319,26 @@ export interface components {
         /** @description Paginated list of Audio Note summaries. */
         AudioNotesListResponse: {
             notes: components["schemas"]["AudioNoteSummary"][];
+        };
+        /**
+         * @description Automatic paste for each capture source.
+         *
+         *     Keys match `AudioNoteCaptureSource` (`microphone`, `microphone_and_system`).
+         *     A source that is missing — including one added later — stays off.
+         *     A legacy boolean loads as that value for every source and is rewritten as
+         *     this table the next time the file is saved.
+         */
+        AutoPastePreferences: {
+            /**
+             * @description Microphone-only notes (dictation).
+             * @default false
+             */
+            microphone: boolean;
+            /**
+             * @description Microphone plus system-audio notes.
+             * @default false
+             */
+            microphone_and_system: boolean;
         };
         CreateAccessKeyRequest: {
             name: string;

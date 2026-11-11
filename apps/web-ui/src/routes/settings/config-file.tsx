@@ -87,7 +87,7 @@ function SettingsConfigFile() {
             <dd>Provider, model, language, API key, endpoint.</dd>
 
             <dt className="font-mono text-xs text-muted-foreground">[behavior]</dt>
-            <dd>auto_paste (off by default), preserve_clipboard, audio_feedback. Capture &amp; delivery saves the automatic-paste preference here; the recording bar also offers a one-recording override.</dd>
+            <dd>auto_paste per capture source (off by default), preserve_clipboard, audio_feedback. Capture &amp; delivery saves each source's automatic-paste preference here; the recording bar also offers a one-recording override.</dd>
 
             <dt className="font-mono text-xs text-muted-foreground">[wayland]</dt>
             <dd>input_method (e.g. wtype, ydotool).</dd>

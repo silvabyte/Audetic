@@ -52,7 +52,8 @@ struct DaemonClient {
 
     // MARK: - Toggles
 
-    /// Source is acquisition, not classification. Delivery remains opt-in.
+    /// Source is acquisition, not classification. Omitting auto_paste lets the
+    /// daemon apply the saved preference for this capture source.
     func toggleNote(source: CaptureSource) async throws {
         try await postJSON(Daemon.apiURL("/audio-notes/toggle"), body: [
             "capture_source": source.rawValue,

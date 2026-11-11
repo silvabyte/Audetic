@@ -141,6 +141,7 @@ use super::routes::{
         // AudioNotes
         audio_notes::AudioNoteStartRequest,
         audio_notes::AudioNoteSettings,
+        crate::config::AutoPastePreferences,
         audio_notes::AudioNoteImportRequest,
         crate::audio_notes::AudioNoteCaptureSource,
         audio_notes::AudioNoteStartResponse,
@@ -437,5 +438,14 @@ mod tests {
         let required =
             spec["components"]["schemas"]["AudioNoteStartRequest"]["required"].as_array();
         assert!(required.is_none_or(|fields| !fields.iter().any(|field| field == "auto_paste")));
+        let settings = &spec["components"]["schemas"]["AudioNoteSettings"]["properties"];
+        assert_eq!(
+            settings["auto_paste"]["$ref"],
+            "#/components/schemas/AutoPastePreferences"
+        );
+        let preferences = &spec["components"]["schemas"]["AutoPastePreferences"]["properties"];
+        assert_eq!(preferences["microphone"]["type"], "boolean");
+        assert_eq!(preferences["microphone_and_system"]["type"], "boolean");
+        assert!(preferences.get("dictation").is_none());
     }
 }

@@ -221,7 +221,8 @@ pub struct CaptureArgs {
     pub capture_source: CaptureSource,
     #[arg(long)]
     pub review_before_processing: bool,
-    /// Override the configured paste preference (off by default)
+    /// Override automatic paste for this recording. Omit to use the saved
+    /// preference for the selected capture source.
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub auto_paste: Option<bool>,
     #[arg(long)]

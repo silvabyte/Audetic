@@ -29,9 +29,12 @@ Choose **Record note** or **Import audio / video** in `/audio-notes`. Capture
 options select sources, review, and delivery behavior; they do not preselect the
 note's meaning. Review lets you play, trim, confirm, or discard a recording.
 
-Automatic paste is **off by default**. Settings → Capture & delivery saves the
-daemon preference, also represented by `[behavior].auto_paste` in config.toml.
-Each capture can override it. If enabled, the persisted raw transcript is pasted
+Automatic paste is **off by default for every capture source**. Settings →
+Capture & delivery saves one daemon preference for microphone notes and another
+for microphone + system audio notes, represented by `[behavior.auto_paste]` in
+config.toml. An older `[behavior] auto_paste = true` or `false` still loads as
+that value for every source. Each capture can override its source's preference.
+If enabled, the persisted raw transcript is pasted
 immediately; later AI results never replace it or get pasted into another window.
 Clipboard copying is a separate opt-in capture option or explicit note action.
 

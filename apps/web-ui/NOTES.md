@@ -50,12 +50,14 @@ Routes / surface:
   static (no rotation or pulse), decorative, and always accompanied by textual state feedback.
   Microphone capture is the default; optional system audio and review/trim are acquisition options,
   not a choice of meaning. Automatic paste and clipboard copying default off. Settings → Capture &
-  delivery reads/writes the daemon-persisted preference through `GET`/`PUT /audio-notes/settings`.
-  `AudioNoteSettingsStore` stays safely off until that preference loads; load/save errors are visible.
-  Capture options use `auto_paste: null` to inherit a loaded preference, or explicit `false`/`true` to
-  override it for one recording. Overrides reset after capture starts; source/review/clipboard
-  options last for the app session. Saves never change an active capture. Delivery is raw text before
-  asynchronous AI processing, never generated output. No delivery setting is stored in localStorage.
+  delivery reads/writes one daemon-persisted automatic-paste preference per capture source through
+  `GET`/`PUT /audio-notes/settings` (`auto_paste.microphone` and `auto_paste.microphone_and_system`).
+  `AudioNoteSettingsStore` stays off for every source until that preference loads; load/save errors
+  are visible. Capture options use `auto_paste: null` to inherit the loaded preference for the
+  selected source, or explicit `false`/`true` to override it for one recording. Overrides reset after
+  capture starts; source/review/clipboard options last for the app session. Saves never change an
+  active capture. Delivery is raw text before asynchronous AI processing, never generated output.
+  No delivery setting is stored in localStorage.
 - `components/audio-review-panel.tsx`, `transcript-player.tsx`, `note-title-header.tsx`, and
   `note-artifacts-panel.tsx` are reusable note components. There are no separate dictation/meeting
   stores, routes, or status polls, and background completions do not unexpectedly change routes.

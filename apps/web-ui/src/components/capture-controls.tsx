@@ -45,7 +45,9 @@ export function CaptureControls({ onStarted }: { onStarted?: () => void }) {
     const unavailable = store.audioNotes.active || store.audioNotes.phase === "review";
     const pending = store.audioNotes.commandPending;
     const disabled = !store.daemonReachable || pending || unavailable || store.noteSettings.saving;
-    const autoPaste = autoPasteOverride ?? store.noteSettings.effectiveDefault;
+    const captureSource = systemAudio ? "microphone_and_system" : "microphone";
+    const savedAutoPaste = store.noteSettings.savedAutoPaste(captureSource);
+    const autoPaste = autoPasteOverride ?? savedAutoPaste;
     const source = systemAudio ? "Mic + system" : "Microphone";
     const summary = [autoPaste && "Auto-paste on", review && "Review first", copy && "Copy on"].filter(Boolean).join(" · ");
     return <div className="flex min-w-0 items-center gap-2 sm:gap-3" role="group" aria-label="New recording">
@@ -97,11 +99,11 @@ export function CaptureControls({ onStarted }: { onStarted?: () => void }) {
                   <div className="space-y-2">
                     <Label htmlFor="capture-paste" className="text-xs">Automatic paste</Label>
                     <select id="capture-paste" className="h-10 w-full rounded-md border border-input bg-background px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" value={autoPasteOverride === null ? "default" : autoPasteOverride ? "on" : "off"} onChange={(event) => setAutoPasteOverride(event.target.value === "default" ? null : event.target.value === "on")} aria-describedby="capture-paste-help">
-                      <option value="default">Saved preference ({store.noteSettings.effectiveDefault ? "on" : "off"}{store.noteSettings.state !== "loaded" ? " until loaded" : ""})</option>
+                      <option value="default">Saved preference ({savedAutoPaste ? "on" : "off"}{store.noteSettings.state !== "loaded" ? " until loaded" : ""})</option>
                       <option value="off">Off for this recording</option>
                       <option value="on">On for this recording</option>
                     </select>
-                    <p id="capture-paste-help" className="text-xs leading-relaxed text-muted-foreground">Paste the raw transcript into the focused app. One-time overrides reset when recording starts.</p>
+                    <p id="capture-paste-help" className="text-xs leading-relaxed text-muted-foreground">Paste the raw transcript into the focused app. The saved preference follows the selected audio source. One-time overrides reset when recording starts.</p>
                     {store.noteSettings.loadError && <p role="alert" className="text-xs text-destructive">Couldn't load your preference. Auto-paste stays off unless you enable it here. <Button variant="ghost" size="sm" onClick={() => void store.noteSettings.load()}>Retry</Button></p>}
                   </div>
                   <CaptureOption id="capture-copy" label="Copy to clipboard" description="Copy the raw transcript, not AI output." checked={copy} onChange={setCopy} />

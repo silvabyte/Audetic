@@ -9,6 +9,11 @@ import { Switch } from "@/components/ui/switch";
 import { getRootStore } from "@/stores/singleton";
 import { useStore } from "@/stores/root-store";
 
+const AUTO_PASTE_SOURCES = [
+  { source: "microphone", id: "saved-auto-paste-microphone", label: "Microphone notes (dictation)" },
+  { source: "microphone_and_system", id: "saved-auto-paste-microphone-and-system", label: "Microphone + system audio notes" },
+] as const;
+
 export const settingsCaptureRoute: RouteObject = {
   path: "capture",
   loader: async () => { const store = getRootStore(); await Promise.all([store.noteSettings.load(), store.noteArtifacts.loadPrerequisites()]); return null; },
@@ -22,14 +27,15 @@ export function SettingsCapture() {
     return <div className="flex flex-col gap-5">
       <header><h2 className="text-xl font-semibold">Capture & delivery</h2><p className="mt-1 text-sm text-muted-foreground">Choose what happens to your original words after transcription.</p></header>
       <Card>
-        <CardHeader><CardTitle>Automatic paste</CardTitle><CardDescription>Off by default. This preference is saved by the daemon and persists across app and daemon restarts.</CardDescription></CardHeader>
+        <CardHeader><CardTitle>Automatic paste</CardTitle><CardDescription>Off by default for every capture source. Each preference is saved by the daemon and persists across app and daemon restarts.</CardDescription></CardHeader>
         <CardContent className="flex flex-col gap-4">
-          <div className="flex items-start justify-between gap-4">
-            <div className="flex flex-col gap-1.5"><Label htmlFor="saved-auto-paste">Automatically paste raw transcripts</Label><p id="saved-auto-paste-help" className="text-sm text-muted-foreground">When enabled, the saved raw transcript is pasted into the focused app immediately. AI classification and artifacts arrive later and are never pasted automatically.</p></div>
-            <Switch id="saved-auto-paste" checked={settings.effectiveDefault} disabled={settings.state !== "loaded" || settings.saving} aria-describedby="saved-auto-paste-help" onCheckedChange={async (checked) => { if (await settings.saveAutoPaste(checked)) toast.success("Delivery preference saved"); else toast.error(settings.saveError ?? "Couldn't save delivery preference"); }} />
-          </div>
-          <p className="text-xs text-muted-foreground">Applies to future captures that use the saved preference. An active recording keeps its original delivery choice. Capture options can explicitly turn automatic paste on or off for one recording.</p>
-          <p role="status" className="text-sm text-muted-foreground">{settings.saving ? "Saving preference…" : settings.state === "loading" || settings.state === "idle" ? "Loading saved preference… Automatic paste is off until it loads." : settings.state === "error" ? "Saved preference unavailable. Browser captures default to automatic paste off." : `Saved preference: ${settings.settings.auto_paste ? "on" : "off"}`}</p>
+          <p id="saved-auto-paste-help" className="text-sm text-muted-foreground">When enabled for a source, that source's saved raw transcript is pasted into the focused app immediately. AI classification and artifacts arrive later and are never pasted automatically.</p>
+          {AUTO_PASTE_SOURCES.map((item) => <div key={item.source} className="flex items-start justify-between gap-4">
+            <Label htmlFor={item.id}>{item.label}</Label>
+            <Switch id={item.id} checked={settings.savedAutoPaste(item.source)} disabled={settings.state !== "loaded" || settings.saving} aria-describedby="saved-auto-paste-help" onCheckedChange={async (checked) => { if (await settings.saveAutoPaste(item.source, checked)) toast.success("Delivery preference saved"); else toast.error(settings.saveError ?? "Couldn't save delivery preference"); }} />
+          </div>)}
+          <p className="text-xs text-muted-foreground">Applies to future captures of that source that use the saved preference. An active recording keeps its original delivery choice. Capture options can explicitly turn automatic paste on or off for one recording.</p>
+          <p role="status" className="text-sm text-muted-foreground">{settings.saving ? "Saving preference…" : settings.state === "loading" || settings.state === "idle" ? "Loading saved preference… Automatic paste is off until it loads." : settings.state === "error" ? "Saved preference unavailable. Browser captures default to automatic paste off." : `Saved preference: ${AUTO_PASTE_SOURCES.map((item) => `${item.label} ${settings.savedAutoPaste(item.source) ? "on" : "off"}`).join(", ")}.`}</p>
           {settings.loadError && <p role="alert" className="text-sm text-destructive">Couldn't load settings: {settings.loadError}</p>}
           {settings.saveError && <p role="alert" className="text-sm text-destructive">Couldn't confirm the save: {settings.saveError}. Automatic paste stays off in browser captures until the saved preference is reloaded.</p>}
           <Button variant="outline" className="self-start" disabled={settings.saving || settings.state === "loading"} onClick={() => void settings.load()}><RefreshCcw data-icon="inline-start" />{settings.loadError ? "Retry loading" : "Reload saved preference"}</Button>

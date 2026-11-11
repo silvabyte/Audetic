@@ -17,7 +17,7 @@ final class AudioNotesTests: XCTestCase {
                 XCTAssertEqual(body["capture_source"] as? String, source.rawValue)
                 XCTAssertEqual(body["copy_to_clipboard"] as? Bool, false)
                 XCTAssertEqual(body["review_before_processing"] as? Bool, false)
-                XCTAssertNil(body["auto_paste"], "Honor the daemon preference (off by default)")
+                XCTAssertNil(body["auto_paste"], "Daemon applies the saved preference for this capture source")
                 return Data("{}".utf8)
             }
             try await client().toggleNote(source: source)
