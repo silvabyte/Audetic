@@ -31,16 +31,20 @@ jobs:
       - name: Install system deps (Linux — ALSA headers + ffmpeg)
         if: matrix.platform == 'linux'
         # ffmpeg is needed by the compression pipeline that the meeting and
-        # transcribe integration tests exercise; Ubuntu's package is built
-        # with libmp3lame so `-codec:a libmp3lame` works.
-        # Self-hosted: skip apt when the packages are already installed, and
-        # bound the step so a stuck mirror fails fast instead of hanging.
+        # transcribe integration tests exercise. The self-hosted runner is
+        # Arch, so check for the deps distro-agnostically and only install
+        # (pacman or apt) when something is missing. Bounded so a stuck
+        # mirror fails fast instead of hanging.
         timeout-minutes: 10
         run: |
-          if dpkg -s libasound2-dev libxkbcommon-dev ffmpeg >/dev/null 2>&1; then
-            echo "system deps already installed"
+          if pkg-config --exists alsa xkbcommon && command -v ffmpeg >/dev/null 2>&1; then
+            echo "system deps present: alsa $(pkg-config --modversion alsa), xkbcommon $(pkg-config --modversion xkbcommon), $(ffmpeg -version | head -1)"
+          elif command -v pacman >/dev/null 2>&1; then
+            sudo -n pacman -S --needed --noconfirm alsa-lib libxkbcommon ffmpeg
+          elif command -v apt-get >/dev/null 2>&1; then
+            sudo -n apt-get update && sudo -n apt-get install -y libasound2-dev libxkbcommon-dev ffmpeg
           else
-            sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev ffmpeg
+            echo "::error::missing alsa/xkbcommon/ffmpeg and no known package manager"; exit 1
           fi
 
       - name: Ensure ffmpeg (macOS — Homebrew)
