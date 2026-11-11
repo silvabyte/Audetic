@@ -181,9 +181,12 @@ language = "en"
 input_method = "ydotool"  # Recommended (auto-detected first)
 
 [behavior]
-auto_paste = false
 preserve_clipboard = false
 audio_feedback = true
+
+[behavior.auto_paste]
+microphone = false
+microphone_and_system = false
 ```
 
 ### Advanced: Local Processing
@@ -201,9 +204,12 @@ language = "en"
 input_method = "ydotool"  # Recommended (auto-detected first)
 
 [behavior]
-auto_paste = false
 preserve_clipboard = false
 audio_feedback = true
+
+[behavior.auto_paste]
+microphone = false
+microphone_and_system = false
 ```
 
 #### For Optimized Whisper.cpp
@@ -220,9 +226,12 @@ model_path = "/home/user/.local/share/audetic/whisper/models/ggml-large-v3-turbo
 input_method = "ydotool"  # Recommended (auto-detected first)
 
 [behavior]
-auto_paste = false
 preserve_clipboard = false
 audio_feedback = true
+
+[behavior.auto_paste]
+microphone = false
+microphone_and_system = false
 ```
 
 ## Systemd Service (Linux)

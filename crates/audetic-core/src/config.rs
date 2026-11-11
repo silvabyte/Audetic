@@ -48,10 +48,56 @@ pub struct WaylandConfig {
     pub input_method: String,
 }
 
+/// Automatic paste for each capture source.
+///
+/// Keys match `AudioNoteCaptureSource` (`microphone`, `microphone_and_system`).
+/// A source that is missing — including one added later — stays off.
+/// A legacy boolean loads as that value for every source and is rewritten as
+/// this table the next time the file is saved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[serde(default, deny_unknown_fields)]
+pub struct AutoPastePreferences {
+    /// Microphone-only notes (dictation).
+    pub microphone: bool,
+    /// Microphone plus system-audio notes.
+    pub microphone_and_system: bool,
+}
+
+impl AutoPastePreferences {
+    /// Legacy `auto_paste = true|false` applies this value to every source.
+    /// A newly added source must be set here so a legacy file still covers it.
+    pub fn for_every_source(enabled: bool) -> Self {
+        Self {
+            microphone: enabled,
+            microphone_and_system: enabled,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AutoPasteConfig {
+    Legacy(bool),
+    PerSource(AutoPastePreferences),
+}
+
+fn deserialize_auto_paste<'de, D>(deserializer: D) -> Result<AutoPastePreferences, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match AutoPasteConfig::deserialize(deserializer)? {
+        AutoPasteConfig::Legacy(enabled) => Ok(AutoPastePreferences::for_every_source(enabled)),
+        AutoPasteConfig::PerSource(preferences) => Ok(preferences),
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BehaviorConfig {
-    pub auto_paste: bool,
+    /// Per capture source. Legacy boolean values still load; see [`AutoPastePreferences`].
+    #[serde(default, deserialize_with = "deserialize_auto_paste")]
+    pub auto_paste: AutoPastePreferences,
     pub preserve_clipboard: bool,
     #[serde(default = "default_audio_feedback")]
     pub audio_feedback: bool,
@@ -106,7 +152,7 @@ impl Default for WaylandConfig {
 impl Default for BehaviorConfig {
     fn default() -> Self {
         Self {
-            auto_paste: false,
+            auto_paste: AutoPastePreferences::default(),
             preserve_clipboard: false,
             audio_feedback: true,
         }
@@ -159,15 +205,57 @@ mod tests {
     use super::*;
 
     #[test]
-    fn delivery_is_opt_in_and_legacy_explicit_preference_is_preserved() {
-        assert!(!Config::default().behavior.auto_paste);
+    fn legacy_auto_paste_bool_applies_to_every_capture_source() {
+        assert_eq!(
+            Config::default().behavior.auto_paste,
+            AutoPastePreferences::default()
+        );
         let empty: Config = toml::from_str("").unwrap();
-        assert!(!empty.behavior.auto_paste);
-        let legacy: Config =
-            toml::from_str("[behavior]\nauto_paste = true\ndelete_audio_files = true\n").unwrap();
-        assert!(legacy.behavior.auto_paste);
-        assert!(!toml::to_string(&legacy)
-            .unwrap()
-            .contains("delete_audio_files"));
+        assert_eq!(empty.behavior.auto_paste, AutoPastePreferences::default());
+        let untouched: Config = toml::from_str("[behavior]\npreserve_clipboard = true\n").unwrap();
+        assert_eq!(
+            untouched.behavior.auto_paste,
+            AutoPastePreferences::default()
+        );
+        assert!(untouched.behavior.preserve_clipboard);
+
+        for (literal, enabled) in [("true", true), ("false", false)] {
+            let legacy: Config = toml::from_str(&format!(
+                "[behavior]\nauto_paste = {literal}\ndelete_audio_files = true\n"
+            ))
+            .unwrap();
+            assert_eq!(
+                legacy.behavior.auto_paste,
+                AutoPastePreferences::for_every_source(enabled)
+            );
+            let written = toml::to_string(&legacy).unwrap();
+            assert!(!written.contains("delete_audio_files"));
+            assert!(!written.contains("auto_paste = true"));
+            assert!(!written.contains("auto_paste = false"));
+            assert!(written.contains("microphone"));
+            assert!(written.contains("microphone_and_system"));
+            let reloaded: Config = toml::from_str(&written).unwrap();
+            assert_eq!(reloaded.behavior.auto_paste, legacy.behavior.auto_paste);
+        }
+    }
+
+    #[test]
+    fn auto_paste_preferences_round_trip_per_capture_source() {
+        let mixed: Config = toml::from_str(
+            "[behavior.auto_paste]\nmicrophone = true\nmicrophone_and_system = false\n",
+        )
+        .unwrap();
+        assert!(mixed.behavior.auto_paste.microphone);
+        assert!(!mixed.behavior.auto_paste.microphone_and_system);
+        let reloaded: Config = toml::from_str(&toml::to_string(&mixed).unwrap()).unwrap();
+        assert_eq!(reloaded.behavior.auto_paste, mixed.behavior.auto_paste);
+
+        // A source omitted from the table stays off, including sources added later.
+        let microphone_only: Config =
+            toml::from_str("[behavior.auto_paste]\nmicrophone = true\n").unwrap();
+        assert!(microphone_only.behavior.auto_paste.microphone);
+        assert!(!microphone_only.behavior.auto_paste.microphone_and_system);
+
+        assert!(toml::from_str::<Config>("[behavior.auto_paste]\ndictation = true\n").is_err());
     }
 }

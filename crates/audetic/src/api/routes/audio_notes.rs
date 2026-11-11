@@ -60,18 +60,22 @@ pub struct AudioNoteStartRequest {
     pub title: Option<String>,
     pub capture_source: crate::audio_notes::AudioNoteCaptureSource,
     pub review_before_processing: bool,
-    /// Omitted/null uses the persisted capture preference; false overrides it.
+    /// Omitted/null uses the persisted preference for this request's capture
+    /// source. An explicit value applies only to this recording.
     pub auto_paste: Option<bool>,
     pub copy_to_clipboard: bool,
 }
 
 impl AudioNoteStartRequest {
-    fn resolve(self, persisted_auto_paste: bool) -> AudioNoteStartOptions {
+    fn resolve(self, persisted: crate::config::AutoPastePreferences) -> AudioNoteStartOptions {
+        let capture_source = self.capture_source;
         AudioNoteStartOptions {
             title: self.title,
-            capture_source: self.capture_source,
+            capture_source,
             review_before_processing: self.review_before_processing,
-            auto_paste: self.auto_paste.unwrap_or(persisted_auto_paste),
+            auto_paste: self.auto_paste.unwrap_or_else(|| {
+                crate::audio_notes::settings::auto_paste_enabled(persisted, capture_source)
+            }),
             copy_to_clipboard: self.copy_to_clipboard,
         }
     }
@@ -92,23 +96,24 @@ fn optional_start_options(
     };
     // An explicit request remains usable even if the preferences file cannot
     // be read. Omitted preference must not silently turn configured paste off.
-    let default = match request.auto_paste.or((!starting).then_some(false)) {
-        Some(value) => value,
-        None => {
-            crate::audio_notes::settings::load_config(config_path)
-                .map_err(|error| ApiError::from(error).into_response())?
-                .behavior
-                .auto_paste
-        }
+    // Stopping an active recording ignores these options and does not read them.
+    let persisted = if request.auto_paste.is_some() || !starting {
+        crate::config::AutoPastePreferences::default()
+    } else {
+        crate::audio_notes::settings::load_config(config_path)
+            .map_err(|error| ApiError::from(error).into_response())?
+            .behavior
+            .auto_paste
     };
-    Ok(Some(request.resolve(default)))
+    Ok(Some(request.resolve(persisted)))
 }
 
 /// Persisted capture defaults. Changing this does not alter an active note.
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AudioNoteSettings {
-    pub auto_paste: bool,
+    /// Automatic paste for each capture source. Missing sources are off.
+    pub auto_paste: crate::config::AutoPastePreferences,
 }
 
 #[utoipa::path(get, path = "/audio-notes/settings", tag = "audio_notes",
@@ -1757,26 +1762,32 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(json_response(response).await, json!({"auto_paste": false}));
+        assert_eq!(
+            json_response(response).await,
+            json!({"auto_paste": {"microphone": false, "microphone_and_system": false}})
+        );
         let config_path = dir.path().join("config.toml");
         let mut config = crate::config::Config::default();
         config.whisper.provider = Some("openai-api".into());
         config.behavior.audio_feedback = false;
         std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
+        let saved_paste =
+            json!({"auto_paste": {"microphone": true, "microphone_and_system": false}});
         let response = router
             .clone()
             .oneshot(
                 Request::put("/audio-notes/settings")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"auto_paste":true}"#))
+                    .body(Body::from(saved_paste.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(json_response(response).await, json!({"auto_paste": true}));
+        assert_eq!(json_response(response).await, saved_paste);
         let saved = crate::audio_notes::settings::load_config(&config_path).unwrap();
-        assert!(saved.behavior.auto_paste);
+        assert!(saved.behavior.auto_paste.microphone);
+        assert!(!saved.behavior.auto_paste.microphone_and_system);
         assert!(!saved.behavior.audio_feedback);
         assert_eq!(saved.whisper.provider.as_deref(), Some("openai-api"));
         let response = router
@@ -1788,30 +1799,37 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(json_response(response).await, json!({"auto_paste": true}));
-        let response = router
-            .oneshot(
-                Request::put("/audio-notes/settings")
-                    .header("content-type", "application/json")
-                    .body(Body::from("{}"))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        assert!(
-            crate::audio_notes::settings::load_config(&config_path)
-                .unwrap()
-                .behavior
-                .auto_paste
-        );
+        assert_eq!(json_response(response).await, saved_paste);
+        for rejected in [r#"{}"#, r#"{"auto_paste":true}"#] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::put("/audio-notes/settings")
+                        .header("content-type", "application/json")
+                        .body(Body::from(rejected))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let unchanged = crate::audio_notes::settings::load_config(&config_path).unwrap();
+            assert!(unchanged.behavior.auto_paste.microphone);
+            assert!(!unchanged.behavior.auto_paste.microphone_and_system);
+        }
     }
 
     #[tokio::test]
-    async fn start_and_toggle_resolve_saved_defaults_and_respect_explicit_false() {
+    async fn start_and_toggle_resolve_auto_paste_per_capture_source() {
         let directory = tempfile::tempdir().unwrap();
         let config_path = directory.path().join("config.toml");
-        crate::audio_notes::settings::save_auto_paste(&config_path, true).unwrap();
+        crate::audio_notes::settings::save_auto_paste(
+            &config_path,
+            crate::config::AutoPastePreferences {
+                microphone: true,
+                microphone_and_system: false,
+            },
+        )
+        .unwrap();
         let (tx, mut rx) = mpsc::channel(4);
         let transcription = Arc::new(UnusedTranscription);
         let status = AudioNoteStatusHandle::default();
@@ -1825,10 +1843,29 @@ mod tests {
             audio_notes_dir: directory.path().to_path_buf(),
         };
         let app = router(state);
-        for (endpoint, body, expected) in [
-            ("start", None, true),
-            ("toggle", Some(r#"{"auto_paste":false}"#), false),
-            ("start", Some("{}"), true),
+        // Microphone is on and microphone + system audio is off. An explicit
+        // request value still wins. The active recording is unchanged below.
+        for (endpoint, body, source, expected) in [
+            ("start", None, "microphone", true),
+            (
+                "start",
+                Some(r#"{"capture_source":"microphone_and_system"}"#),
+                "microphone_and_system",
+                false,
+            ),
+            (
+                "start",
+                Some(r#"{"capture_source":"microphone_and_system","auto_paste":true}"#),
+                "microphone_and_system",
+                true,
+            ),
+            (
+                "toggle",
+                Some(r#"{"auto_paste":false}"#),
+                "microphone",
+                false,
+            ),
+            ("start", Some("{}"), "microphone", true),
         ] {
             let app = app.clone();
             let mut request = Request::post(format!("/audio-notes/{endpoint}"));
@@ -1839,9 +1876,8 @@ mod tests {
                 .body(body.map_or_else(Body::empty, Body::from))
                 .unwrap();
             let response = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
-            match rx.recv().await.unwrap() {
+            let options = match rx.recv().await.unwrap() {
                 ApiCommand::AudioNoteStart { options, reply } => {
-                    assert_eq!(options.unwrap().auto_paste, expected);
                     reply
                         .send(Ok(crate::audio_notes::AudioNoteStartResult {
                             note_id: 42,
@@ -1849,9 +1885,9 @@ mod tests {
                             capture_state: crate::audio_notes::CaptureState::MicOnly,
                         }))
                         .unwrap();
+                    options
                 }
                 ApiCommand::AudioNoteToggle { options, reply } => {
-                    assert_eq!(options.unwrap().auto_paste, expected);
                     assert!(reply
                         .send(Ok(crate::audio_notes::ToggleOutcome::Started(
                             crate::audio_notes::AudioNoteStartResult {
@@ -1861,9 +1897,13 @@ mod tests {
                             }
                         )))
                         .is_ok());
+                    options
                 }
                 _ => panic!("unexpected daemon command"),
-            }
+            };
+            let options = options.expect("start options");
+            assert_eq!(options.capture_source.as_str(), source);
+            assert_eq!(options.auto_paste, expected);
             assert_eq!(response.await.unwrap().status(), StatusCode::OK);
         }
         status
@@ -1874,7 +1914,9 @@ mod tests {
             .oneshot(
                 Request::put("/audio-notes/settings")
                     .header("content-type", "application/json")
-                    .body(Body::from(r#"{"auto_paste":false}"#))
+                    .body(Body::from(
+                        r#"{"auto_paste":{"microphone":false,"microphone_and_system":false}}"#,
+                    ))
                     .unwrap(),
             )
             .await

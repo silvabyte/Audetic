@@ -199,9 +199,14 @@ input_method = "clipboard"  # Use clipboard + paste only, no direct injection
 
 ### Disable auto-paste
 ```toml
-[behavior]
-auto_paste = false  # Default: neither paste nor clipboard copy
+[behavior.auto_paste]
+microphone = false              # Microphone notes (dictation)
+microphone_and_system = false   # Microphone + system audio notes
 ```
+
+Both sources are off by default, so nothing is pasted automatically.
+An older `auto_paste = false` (or `true`) under `[behavior]` still loads as that
+value for every source.
 
 Clipboard delivery is separately opt-in per capture: use
 `audetic notes start --copy-to-clipboard`, or copy an existing transcript with

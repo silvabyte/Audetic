@@ -66,9 +66,12 @@ recording_tooltip = "Recording... Press Super+R to stop"     # Tooltip for recor
 input_method = "wtype"          # Text injection method
 
 [behavior]
-auto_paste = false              # Opt in to pasting the persisted raw transcript
 preserve_clipboard = false      # Keep clipboard content after pasting
 audio_feedback = true           # Play audio feedback sounds
+
+[behavior.auto_paste]
+microphone = false              # Microphone notes (dictation)
+microphone_and_system = false   # Microphone + system audio notes
 ```
 
 ## Configuration Sections
@@ -178,12 +181,16 @@ Configures integration with Wayland desktop environments.
 
 Controls how Audetic delivers persisted raw transcripts. Audio Notes retain audio
 durably; the obsolete `delete_audio_files` setting is ignored when loading old
-configuration and removed when it is saved. Explicit `auto_paste = true`
-preferences are preserved, but new configurations never paste automatically.
+configuration and removed when it is saved. Automatic paste is stored per capture
+source and stays off until that source is enabled. An older
+`[behavior] auto_paste = true` or `auto_paste = false` still loads as that value
+for every source; the next save rewrites it as the table below. A source that is
+not listed, including one added later, stays off.
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `auto_paste` | bool | `false` | Opt in to pasting the persisted raw transcript before asynchronous AI processing |
+| `auto_paste.microphone` | bool | `false` | Opt in to pasting the persisted raw transcript of microphone notes (dictation) before asynchronous AI processing |
+| `auto_paste.microphone_and_system` | bool | `false` | Opt in to pasting the persisted raw transcript of microphone + system audio notes before asynchronous AI processing |
 | `preserve_clipboard` | bool | `false` | Keep existing clipboard content when using clipboard injection |
 | `audio_feedback` | bool | `true` | Play audio feedback sounds (start/stop recording) |
 
@@ -251,8 +258,9 @@ provider = "openai-cli"
 model = "tiny"       # Smallest, fastest model
 language = "en"
 
-[behavior]
-auto_paste = false
+[behavior.auto_paste]
+microphone = false
+microphone_and_system = false
 ```
 
 ### For High Accuracy Transcription

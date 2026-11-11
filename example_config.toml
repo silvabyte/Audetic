@@ -32,6 +32,11 @@ recording_tooltip = "Recording... Press Super+R to stop"
 input_method = "ydotool"  # Recommended: works on KDE, GNOME, Sway, Hyprland (auto-detected first)
 
 [behavior]
-auto_paste = false # Opt in to pasting the persisted raw transcript
 preserve_clipboard = false
 audio_feedback = true
+
+# Per capture source. Off until enabled. A legacy `auto_paste = true|false`
+# still loads as that value for every source.
+[behavior.auto_paste]
+microphone = false
+microphone_and_system = false
