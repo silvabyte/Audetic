@@ -295,6 +295,11 @@ macos-menubar:
 	@mkdir -p "$(MENUBAR_APP_DIR)/Contents/Resources"
 	@cp $(MENUBAR_DIR)/macos/Info.plist "$(MENUBAR_APP_DIR)/Contents/Info.plist"
 	@cp $(MENUBAR_DIR)/.build/release/AudeticMenuBar "$(MENUBAR_APP_DIR)/Contents/MacOS/AudeticMenuBar"
+	@# SwiftPM resource bundles (e.g. KeyboardShortcuts' localizations). The
+	@# generated `Bundle.module` accessor fatalErrors if they're missing.
+	@for b in $(MENUBAR_DIR)/.build/release/*.bundle; do \
+		if [ -d "$$b" ]; then cp -R "$$b" "$(MENUBAR_APP_DIR)/Contents/Resources/"; fi; \
+	done
 	@printf 'APPL????' > "$(MENUBAR_APP_DIR)/Contents/PkgInfo"
 	@echo "→ codesign ($(SIGN_IDENTITY)) $(MENUBAR_APP_DIR)"
 	codesign --force --sign "$(SIGN_IDENTITY)" \
