@@ -6,6 +6,10 @@ Welcome to the Audetic documentation. This directory contains detailed guides fo
 
 - [Audio Notes](./audio-notes.md) — unified capture, classification, processors, API, and CLI
 
+### Specifications
+
+- [Notebook and remote access](./specs/notebook-and-remote-access.md) — Planned. A server-side Note, a passkey-secured PWA, and an optional Markdown export
+
 ### Installation & Setup
 
 - [Installation Guide](./installation.md) - Complete installation instructions for all platforms
