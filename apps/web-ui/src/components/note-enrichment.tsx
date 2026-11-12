@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import type { AudioNoteDetail } from "@/stores/audio-notes-store";
 import { useStore } from "@/stores/root-store";
-import { BUILT_IN_CLASSIFICATION_KINDS, classificationFields, classificationKind, effectiveClassificationKind, enrichmentLabel, isClassificationSlug, kindLabel } from "@/lib/audio-notes";
+import { automaticProcessingSkipped, BUILT_IN_CLASSIFICATION_KINDS, classificationFields, classificationKind, effectiveClassificationKind, enrichmentLabel, isClassificationSlug, kindLabel } from "@/lib/audio-notes";
 
 export function NoteEnrichment({ note }: { note: AudioNoteDetail }) {
   const store = useStore();
@@ -19,7 +19,8 @@ export function NoteEnrichment({ note }: { note: AudioNoteDetail }) {
     const aiKind = classificationKind(note.classification);
     const effectiveKind = effectiveClassificationKind(note);
     const manualKind = note.classification_kind_override?.trim() || null;
-    const busy = ["pending", "running"].includes(note.enrichment_status);
+    const skipped = automaticProcessingSkipped(note);
+    const busy = !skipped && ["pending", "running"].includes(note.enrichment_status);
     const saving = store.audioNotes.classificationMutationStatus[note.id] === "saving";
     const confidence = fields?.confidence;
     const topics = Array.isArray(fields?.topics) ? fields.topics.filter((value): value is string => typeof value === "string") : [];
@@ -28,8 +29,8 @@ export function NoteEnrichment({ note }: { note: AudioNoteDetail }) {
     const normalizedInput = classificationInput.trim();
     return <section aria-labelledby="note-understanding-heading" className="py-2">
       <div className="flex flex-wrap items-start justify-between gap-3"><div><h2 id="note-understanding-heading" className="font-semibold">Note details</h2><p className="mt-1 text-sm text-muted-foreground">AI suggestions remain visible when you organize a note yourself.</p></div>{note.enrichment_status !== "completed" ? <Button size="sm" variant="outline" disabled={!note.transcript_text || note.status !== "completed" || store.audioNotes.processing[note.id] || note.enrichment_status === "running"} onClick={() => void store.audioNotes.processNote(note.id)}><RefreshCcw data-icon="inline-start" />{note.enrichment_status === "error" ? "Retry AI processing" : "Process note"}</Button> : null}</div>
-      <p className={note.enrichment_status === "error" ? "mt-5 flex items-center gap-2 text-sm text-destructive" : "mt-5 flex items-center gap-2 text-sm text-muted-foreground"} role="status">{busy ? <Loader2 className="size-4 animate-spin" /> : null}{enrichmentLabel(note.enrichment_status)}</p>
-      {note.enrichment_error ? <div role="alert" className="mt-3 flex flex-col gap-2"><p className="text-sm">AI processing failed, not transcription. You can still copy and use the original transcript.</p><pre className="whitespace-pre-wrap text-xs text-destructive">{note.enrichment_error}</pre></div> : null}
+      {skipped ? null : <p className={note.enrichment_status === "error" ? "mt-5 flex items-center gap-2 text-sm text-destructive" : "mt-5 flex items-center gap-2 text-sm text-muted-foreground"} role="status">{busy ? <Loader2 className="size-4 animate-spin" /> : null}{enrichmentLabel(note.enrichment_status)}</p>}
+      {!skipped && note.enrichment_error ? <div role="alert" className="mt-3 flex flex-col gap-2"><p className="text-sm">AI processing failed, not transcription. You can still copy and use the original transcript.</p><pre className="whitespace-pre-wrap text-xs text-destructive">{note.enrichment_error}</pre></div> : null}
 
       <dl className="mt-5 grid gap-x-5 gap-y-2 text-sm sm:grid-cols-[8rem_1fr]">
         <dt className="text-muted-foreground">Classification</dt><dd className="capitalize">{effectiveKind ? kindLabel(effectiveKind) : "Not classified yet"}{manualKind ? <span className="ml-2 text-xs normal-case text-muted-foreground">set manually</span> : null}</dd>

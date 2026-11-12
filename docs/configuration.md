@@ -72,6 +72,9 @@ audio_feedback = true           # Play audio feedback sounds
 [behavior.auto_paste]
 microphone = false              # Microphone notes (dictation)
 microphone_and_system = false   # Microphone + system audio notes
+
+[behavior.ai_processing]
+enabled = true                  # Classify new notes and generate their outputs
 ```
 
 ## Configuration Sections
@@ -191,6 +194,7 @@ not listed, including one added later, stays off.
 |--------|------|---------|-------------|
 | `auto_paste.microphone` | bool | `false` | Opt in to pasting the persisted raw transcript of microphone notes (dictation) before asynchronous AI processing |
 | `auto_paste.microphone_and_system` | bool | `false` | Opt in to pasting the persisted raw transcript of microphone + system audio notes before asynchronous AI processing |
+| `ai_processing.enabled` | bool | `true` | Classify new notes and generate their outputs after the raw transcript is saved. Off keeps the audio and transcript, still pastes when that source is enabled, and does not enqueue an agent. A missing key stays on. Manual processing of one note still works. |
 | `preserve_clipboard` | bool | `false` | Keep existing clipboard content when using clipboard injection |
 | `audio_feedback` | bool | `true` | Play audio feedback sounds (start/stop recording) |
 

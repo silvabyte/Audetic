@@ -84,6 +84,14 @@ checks cannot prove authentication: agent execution errors remain visible on the
 note. The default agent is used for automatic processing; manual artifacts can
 choose another agent/template.
 
+Automatic processing is a separate switch on that same card, stored as
+`[behavior.ai_processing] enabled` (on when the key is missing). Turning it off
+does not change the selected agent. New notes still keep their audio and raw
+transcript, and automatic paste still follows the per-source preference, but no
+agent run is enqueued. Those notes do not show a pending or failed AI state.
+**Process note** on a single note still runs classification for that note.
+Notes that already have artifacts are left as they are.
+
 ## Classification and processors
 
 `note_intelligence/classification.rs` validates a version-1 JSON contract with

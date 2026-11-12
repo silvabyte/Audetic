@@ -142,6 +142,7 @@ use super::routes::{
         audio_notes::AudioNoteStartRequest,
         audio_notes::AudioNoteSettings,
         crate::config::AutoPastePreferences,
+        crate::config::AiProcessingPreferences,
         audio_notes::AudioNoteImportRequest,
         crate::audio_notes::AudioNoteCaptureSource,
         audio_notes::AudioNoteStartResponse,
@@ -447,5 +448,11 @@ mod tests {
         assert_eq!(preferences["microphone"]["type"], "boolean");
         assert_eq!(preferences["microphone_and_system"]["type"], "boolean");
         assert!(preferences.get("dictation").is_none());
+        assert_eq!(
+            settings["ai_processing"]["$ref"],
+            "#/components/schemas/AiProcessingPreferences"
+        );
+        let processing = &spec["components"]["schemas"]["AiProcessingPreferences"]["properties"];
+        assert_eq!(processing["enabled"]["type"], "boolean");
     }
 }

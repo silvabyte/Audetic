@@ -21,8 +21,12 @@ export function isClassificationSlug(value: string): boolean {
   return /^[a-z][a-z0-9_-]{0,63}$/.test(value);
 }
 export function kindLabel(kind: string): string { return kind.replace(/[-_]/g, " "); }
-export function noteNeedsRefresh(note: { status: string; enrichment_status: string }): boolean {
-  return !["completed", "error", "cancelled"].includes(note.status) || (note.status === "completed" && ["pending", "running"].includes(note.enrichment_status));
+/** Pending only because automatic processing was not enqueued. Not a job, and not a failure. */
+export function automaticProcessingSkipped(note: { enrichment_status: string; enrichment_skipped?: boolean }): boolean {
+  return note.enrichment_skipped === true && note.enrichment_status === "pending";
+}
+export function noteNeedsRefresh(note: { status: string; enrichment_status: string; enrichment_skipped?: boolean }): boolean {
+  return !["completed", "error", "cancelled"].includes(note.status) || (note.status === "completed" && ["pending", "running"].includes(note.enrichment_status) && !automaticProcessingSkipped(note));
 }
 export function enrichmentLabel(status: string): string {
   switch (status) {

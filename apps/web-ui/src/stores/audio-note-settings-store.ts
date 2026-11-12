@@ -11,9 +11,17 @@ const AUTO_PASTE_OFF: AudioNoteSettings["auto_paste"] = {
   microphone_and_system: false,
 };
 
+function normalizeSettings(data: AudioNoteSettings): AudioNoteSettings {
+  return {
+    auto_paste: data.auto_paste,
+    // A response that predates the key keeps today's behavior: processing on.
+    ai_processing: data.ai_processing ?? { enabled: true },
+  };
+}
+
 /** Daemon-persisted defaults, separate from the options fixed for an active capture. */
 export class AudioNoteSettingsStore {
-  settings: AudioNoteSettings = { auto_paste: { ...AUTO_PASTE_OFF } };
+  settings: AudioNoteSettings = { auto_paste: { ...AUTO_PASTE_OFF }, ai_processing: { enabled: true } };
   state: "idle" | "loading" | "loaded" | "error" = "idle";
   saving = false;
   loadError: string | null = null;
@@ -35,6 +43,11 @@ export class AudioNoteSettingsStore {
     return this.settings.auto_paste[source] ?? false;
   }
 
+  /** On only after a confirmed load. Unloaded and failed loads do not claim the switch is on. */
+  automaticProcessingEnabled(): boolean {
+    return this.state === "loaded" && this.settings.ai_processing.enabled;
+  }
+
   async load(): Promise<void> {
     if (this.state === "loading" || this.saving) return;
     this.state = "loading";
@@ -42,7 +55,7 @@ export class AudioNoteSettingsStore {
     try {
       const { data, error } = await this.client.GET("/audio-notes/settings");
       if (error || !data) throw new Error(errorMessage(error ?? "Capture settings unavailable"));
-      runInAction(() => { this.settings = data; this.state = "loaded"; this.saveError = null; });
+      runInAction(() => { this.settings = normalizeSettings(data); this.state = "loaded"; this.saveError = null; });
     } catch (error) {
       runInAction(() => { this.state = "error"; this.loadError = errorMessage(error); });
     }
@@ -50,14 +63,23 @@ export class AudioNoteSettingsStore {
 
   async saveAutoPaste(source: CaptureSource, enabled: boolean): Promise<boolean> {
     if (this.saving || this.state !== "loaded") return false;
+    const auto_paste = { ...this.settings.auto_paste, [source]: enabled };
+    return this.persist({ auto_paste, ai_processing: this.settings.ai_processing });
+  }
+
+  async saveAiProcessing(enabled: boolean): Promise<boolean> {
+    if (this.saving || this.state !== "loaded") return false;
+    return this.persist({ auto_paste: this.settings.auto_paste, ai_processing: { enabled } });
+  }
+
+  private async persist(body: AudioNoteSettings): Promise<boolean> {
     this.saving = true;
     this.saveError = null;
-    const auto_paste = { ...this.settings.auto_paste, [source]: enabled };
     try {
-      const { data, error } = await this.client.PUT("/audio-notes/settings", { body: { auto_paste } });
+      const { data, error } = await this.client.PUT("/audio-notes/settings", { body });
       if (error || !data) throw new Error(errorMessage(error ?? "Capture settings were not saved"));
       // Reflect only the server-confirmed value, never an optimistic preference.
-      runInAction(() => { this.settings = data; });
+      runInAction(() => { this.settings = normalizeSettings(data); });
       return true;
     } catch (error) {
       runInAction(() => {

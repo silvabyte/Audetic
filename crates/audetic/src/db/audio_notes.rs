@@ -40,6 +40,8 @@ pub struct AudioNoteRecord {
     pub classification_kind_override: Option<String>,
     pub enrichment_status: String,
     pub enrichment_error: Option<String>,
+    /// Automatic classification was not enqueued. The note can still be processed by hand.
+    pub enrichment_skipped: bool,
 }
 
 impl AudioNoteRecord {
@@ -56,7 +58,8 @@ impl AudioNoteRecord {
 const COLUMNS: &str = "id, title, title_source, title_version, status, audio_path, source_filename, \
     transcript_path, transcript_text, transcript_segments, duration_seconds, started_at, completed_at, \
     error, created_at, deleted_at, capture_source, source_provider, source_external_id, \
-    source_recorded_at, classification, classification_kind_override, enrichment_status, enrichment_error";
+    source_recorded_at, classification, classification_kind_override, enrichment_status, enrichment_error, \
+    enrichment_skipped";
 
 // SQLite trim() defaults to ASCII space only. Match Rust's Unicode White_Space
 // trimming so the atomic claim rejects the same blank transcripts as domain validation.
@@ -95,6 +98,7 @@ fn decode_row(row: &Row<'_>) -> rusqlite::Result<AudioNoteRecord> {
         classification_kind_override: row.get(21)?,
         enrichment_status: row.get(22)?,
         enrichment_error: row.get(23)?,
+        enrichment_skipped: row.get(24)?,
     })
 }
 
@@ -255,7 +259,8 @@ impl AudioNoteRepository {
     pub fn claim_enrichment(conn: &Connection, id: i64) -> Result<bool> {
         Ok(conn
             .execute(
-                "UPDATE audio_notes SET enrichment_status='running',enrichment_error=NULL \
+                "UPDATE audio_notes SET enrichment_status='running',enrichment_error=NULL, \
+             enrichment_skipped=0 \
              WHERE id=?1 AND deleted_at IS NULL AND status='completed' \
              AND transcript_text IS NOT NULL AND trim(transcript_text,?2)<>'' \
              AND enrichment_status IN ('pending','error')",
@@ -263,6 +268,18 @@ impl AudioNoteRepository {
             )
             .context("Failed to claim Audio Note enrichment")?
             > 0)
+    }
+
+    /// Record that automatic processing was not enqueued. Only a still-pending
+    /// completed transcript is marked, so a manual run that already claimed the
+    /// note is left alone.
+    pub fn mark_enrichment_skipped(conn: &Connection, id: i64) -> Result<bool> {
+        Ok(conn.execute(
+            "UPDATE audio_notes SET enrichment_skipped=1 \
+             WHERE id=?1 AND deleted_at IS NULL AND status='completed' \
+             AND enrichment_status='pending'",
+            [id],
+        )? > 0)
     }
 
     /// Call once at service startup, before admitting work, not per connection.

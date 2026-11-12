@@ -35,6 +35,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_recording_sources.sql",
         sql: include_str!("0002_recording_sources.sql"),
     },
+    Migration {
+        name: "0003_enrichment_skipped.sql",
+        sql: include_str!("0003_enrichment_skipped.sql"),
+    },
 ];
 #[cfg(test)]
 const LATEST: usize = MIGRATIONS.len();
@@ -376,18 +380,18 @@ mod tests {
         let (_dir, path) = temp_db();
         let file = seed_applied(&path, MIGRATIONS, LATEST);
         file.execute(
-            "UPDATE schema_migrations SET version = 3 WHERE version = 2",
+            "UPDATE schema_migrations SET version = 4 WHERE version = 3",
             [],
         )
         .unwrap();
         drop(file);
         let error = upgrade(&path).unwrap_err().to_string();
-        assert!(error.contains("expected version 2, found 3"), "{error}");
+        assert!(error.contains("expected version 3, found 4"), "{error}");
 
         let (_dir, path) = temp_db();
         let file = seed_applied(&path, MIGRATIONS, LATEST);
         file.execute(
-            "INSERT INTO schema_migrations(version, checksum) VALUES (3, ?1)",
+            "INSERT INTO schema_migrations(version, checksum) VALUES (4, ?1)",
             ["0".repeat(64)],
         )
         .unwrap();
@@ -398,6 +402,30 @@ mod tests {
         drop(opened);
         let error = upgrade(&path).unwrap_err().to_string();
         assert!(error.contains("written by a newer build"), "{error}");
+    }
+
+    #[test]
+    fn upgrade_marks_existing_notes_as_not_skipped() {
+        let (_dir, path) = temp_db();
+        {
+            let conn = seed_applied(&path, MIGRATIONS, LATEST - 1);
+            conn.execute(
+                "INSERT INTO audio_notes(title, audio_path, enrichment_status) \
+                 VALUES ('keep', 'a.wav', 'completed')",
+                [],
+            )
+            .unwrap();
+        }
+        upgrade(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        let row: (String, String, i64) = conn
+            .query_row(
+                "SELECT title, enrichment_status, enrichment_skipped FROM audio_notes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("keep".into(), "completed".into(), 0));
     }
 
     #[test]

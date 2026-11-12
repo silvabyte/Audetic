@@ -1061,6 +1061,17 @@ export interface components {
         AgentProfilesResponse: {
             profiles: components["schemas"]["AgentProfile"][];
         };
+        /**
+         * @description Whether new notes are classified and given artifacts automatically.
+         *
+         *     This is about processing, not about a particular agent. A missing table or
+         *     a missing `enabled` key stays on so older config files keep today's behavior.
+         *     The chosen default agent is stored separately and is left untouched.
+         */
+        AiProcessingPreferences: {
+            /** @default true */
+            enabled: boolean;
+        };
         ApiErrorResponse: {
             error: boolean;
             message: string;
@@ -1145,6 +1156,8 @@ export interface components {
             /** Format: int64 */
             duration_seconds?: number | null;
             enrichment_error?: string | null;
+            /** @description Automatic processing was not enqueued. Pending here is not a running job. */
+            enrichment_skipped: boolean;
             enrichment_status: string;
             error?: string | null;
             /** Format: int64 */
@@ -1194,6 +1207,8 @@ export interface components {
         };
         /** @description Persisted capture defaults. Changing this does not alter an active note. */
         AudioNoteSettings: {
+            /** @description Automatic classification and artifacts for notes transcribed after this save. */
+            ai_processing: components["schemas"]["AiProcessingPreferences"];
             /** @description Automatic paste for each capture source. Missing sources are off. */
             auto_paste: components["schemas"]["AutoPastePreferences"];
         };
@@ -1267,6 +1282,8 @@ export interface components {
             /** Format: int64 */
             duration_seconds?: number | null;
             enrichment_error?: string | null;
+            /** @description Automatic processing was not enqueued. Pending here is not a running job. */
+            enrichment_skipped: boolean;
             enrichment_status: string;
             /** Format: int64 */
             id: number;

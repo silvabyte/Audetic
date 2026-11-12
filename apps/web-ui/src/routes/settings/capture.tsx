@@ -42,15 +42,24 @@ export function SettingsCapture() {
         </CardContent>
       </Card>
       <Card>
-        <CardHeader><CardTitle>AI processing agent</CardTitle><CardDescription>Automatically classify new notes and generate their useful outputs with this local agent. Sign in using the agent's own CLI first.</CardDescription></CardHeader>
+        <CardHeader><CardTitle>AI processing agent</CardTitle><CardDescription>Classify new notes and generate their useful outputs with a local agent. Sign in using the agent's own CLI first.</CardDescription></CardHeader>
         <CardContent className="flex flex-col gap-3">
-          <Label htmlFor="default-note-agent">Default agent</Label>
-          <select id="default-note-agent" className="rounded-md border bg-background p-2 text-sm" disabled={store.noteArtifacts.selectingDefault || store.noteArtifacts.prerequisitesState !== "loaded"} value={store.noteArtifacts.profiles.find((profile) => profile.default_profile)?.id ?? ""} onChange={async (event) => { if (await store.noteArtifacts.selectDefaultAgent(Number(event.target.value))) toast.success("Default agent saved"); else toast.error("Could not save default agent"); }}>
-            <option value="" disabled>Choose an agent</option>
-            {store.noteArtifacts.profiles.map((profile) => <option key={profile.id} value={profile.id} disabled={!profile.available}>{profile.name}{profile.available ? "" : " (not installed)"}</option>)}
-          </select>
-          {store.noteArtifacts.prerequisitesError && <p role="alert" className="text-sm text-destructive">{store.noteArtifacts.prerequisitesError}</p>}
-          <p className="text-xs text-muted-foreground">Agent failures are shown on the note and can be retried. They never remove its saved audio or transcript.</p>
+          <div className="flex items-start justify-between gap-4">
+            <div>
+              <Label htmlFor="ai-processing-enabled">Automatic AI processing</Label>
+              <p id="ai-processing-help" className="mt-1 text-sm text-muted-foreground">When off, new notes keep their audio and raw transcript. Nothing is classified or generated until you process that note.</p>
+            </div>
+            <Switch id="ai-processing-enabled" checked={settings.automaticProcessingEnabled()} disabled={settings.state !== "loaded" || settings.saving} aria-describedby="ai-processing-help" onCheckedChange={async (checked) => { if (await settings.saveAiProcessing(checked)) toast.success("AI processing preference saved"); else toast.error(settings.saveError ?? "Couldn't save AI processing preference"); }} />
+          </div>
+          {settings.automaticProcessingEnabled() ? <>
+            <Label htmlFor="default-note-agent">Default agent</Label>
+            <select id="default-note-agent" className="rounded-md border bg-background p-2 text-sm" disabled={store.noteArtifacts.selectingDefault || store.noteArtifacts.prerequisitesState !== "loaded"} value={store.noteArtifacts.profiles.find((profile) => profile.default_profile)?.id ?? ""} onChange={async (event) => { if (await store.noteArtifacts.selectDefaultAgent(Number(event.target.value))) toast.success("Default agent saved"); else toast.error("Could not save default agent"); }}>
+              <option value="" disabled>Choose an agent</option>
+              {store.noteArtifacts.profiles.map((profile) => <option key={profile.id} value={profile.id} disabled={!profile.available}>{profile.name}{profile.available ? "" : " (not installed)"}</option>)}
+            </select>
+          </> : settings.state === "loaded" ? <p className="text-sm text-muted-foreground">The saved agent is unchanged. Use Process note on a note when you want classification or a generated output.</p> : null}
+          {store.noteArtifacts.prerequisitesError && settings.automaticProcessingEnabled() && <p role="alert" className="text-sm text-destructive">{store.noteArtifacts.prerequisitesError}</p>}
+          <p className="text-xs text-muted-foreground">Agent failures are shown on the note and can be retried. They never remove its saved audio or transcript. Existing notes keep their outputs.</p>
         </CardContent>
       </Card>
     </div>;

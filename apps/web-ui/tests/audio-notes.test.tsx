@@ -15,7 +15,7 @@ import { AudioTransport } from "../src/components/audio-transport";
 import { ArtifactCard, artifactKindLabel, NoteArtifactsPanel } from "../src/components/note-artifacts-panel";
 import type { AudioNoteArtifact } from "../src/stores/note-artifacts-store";
 import { RootStore, RootStoreProvider } from "../src/stores/root-store";
-import { classificationKind, effectiveClassificationKind, isClassificationSlug, noteNeedsRefresh } from "../src/lib/audio-notes";
+import { automaticProcessingSkipped, classificationKind, effectiveClassificationKind, isClassificationSlug, noteNeedsRefresh } from "../src/lib/audio-notes";
 import { parseTalkingPoints } from "../src/lib/talking-points";
 
 const note: AudioNoteSummary = {
@@ -23,7 +23,7 @@ const note: AudioNoteSummary = {
   status: "completed", duration_seconds: 65, started_at: "2026-09-25T10:00:00Z",
   audio_path: "/isolated/7.wav", transcript_path: "/isolated/7.txt", transcript_text: "Buy basil and tomatoes.",
   capture_source: "microphone", classification: { kind: "shopping-list", confidence: 0.91 }, classification_kind: "shopping-list", classification_kind_override: null,
-  enrichment_status: "error", enrichment_error: "Local agent is not configured",
+  enrichment_status: "error", enrichment_error: "Local agent is not configured", enrichment_skipped: false,
 };
 const detail: AudioNoteDetail = { ...note, completed_at: "2026-09-25T10:02:00Z", created_at: note.started_at, error: null, transcript_segments: null };
 function testStore(handler: (request: Request) => Response | Promise<Response>): AudioNotesStore {
@@ -74,6 +74,23 @@ test("raw transcript remains in the stream when enrichment fails", () => {
   assert.match(html, /shopping list/);
   assert.match(html, /AI processing needs attention/);
   assert.match(html, /href="\/audio-notes\/7"/);
+});
+
+test("a note saved with automatic processing off is not shown as pending or failed", () => {
+  const skipped = { ...note, enrichment_status: "pending", enrichment_error: null, enrichment_skipped: true, classification: null, classification_kind: null };
+  const row = renderToStaticMarkup(<MemoryRouter><AudioNoteRow note={skipped} /></MemoryRouter>);
+  assert.match(row, /Buy basil and tomatoes/);
+  assert.doesNotMatch(row, /Ready for AI processing/);
+  assert.doesNotMatch(row, /AI processing needs attention/);
+  assert.doesNotMatch(row, /AI processing/);
+  const root = new RootStore();
+  const html = renderToStaticMarkup(<RootStoreProvider value={root}><NoteEnrichment note={{ ...detail, ...skipped }} /></RootStoreProvider>);
+  assert.match(html, /Process note/);
+  assert.doesNotMatch(html, /Ready for AI processing/);
+  assert.doesNotMatch(html, /AI processing needs attention/);
+  assert.doesNotMatch(html, /AI processing failed/);
+  assert.equal(automaticProcessingSkipped(skipped), true);
+  assert.equal(noteNeedsRefresh(skipped), false);
 });
 
 test("detail explains retryable AI error without treating the transcript as failed", () => {
