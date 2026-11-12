@@ -9,6 +9,7 @@ Welcome to the Audetic documentation. This directory contains detailed guides fo
 ### Specifications
 
 - [Notebook and remote access](./specs/notebook-and-remote-access.md) — Planned. A server-side Note, a passkey-secured PWA, and an optional Markdown export
+- [Explicit state machines](./specs/explicit-state-machines.md) — Proposed. Inventory of implicit lifecycles and a PR-sized plan to close them
 
 ### Installation & Setup
 
