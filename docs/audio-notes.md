@@ -88,7 +88,7 @@ Automatic processing is a separate switch on that same card, stored as
 `[behavior.ai_processing] enabled` (on when the key is missing). Turning it off
 does not change the selected agent. New notes still keep their audio and raw
 transcript, and automatic paste still follows the per-source preference, but no
-agent run is enqueued. Those notes do not show a pending or failed AI state.
+agent run is enqueued. Their `enrichment_status` is `skipped`, so they do not show a pending or failed AI state and are not polled.
 **Process note** on a single note still runs classification for that note.
 Notes that already have artifacts are left as they are.
 

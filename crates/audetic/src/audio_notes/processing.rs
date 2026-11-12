@@ -255,6 +255,7 @@ fn persist_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::audio_notes::EnrichmentStatus;
     use crate::transcription::job_service::TranscriptionJobResult;
     use std::sync::Mutex;
 
@@ -423,7 +424,7 @@ mod tests {
         .await;
         assert_eq!(outcome.events, ["completed", "enrichment"]);
         let note = outcome.note.expect("note");
-        assert!(!note.enrichment_skipped);
+        assert_eq!(note.enrichment_status, EnrichmentStatus::Pending);
         assert_eq!(
             note.transcript_text.as_deref(),
             Some("Raw transcript before AI")
@@ -447,9 +448,8 @@ mod tests {
             note.transcript_text.as_deref(),
             Some("Raw transcript before AI")
         );
-        assert_eq!(note.enrichment_status, "pending");
+        assert_eq!(note.enrichment_status, EnrichmentStatus::Skipped);
         assert!(note.enrichment_error.is_none());
-        assert!(note.enrichment_skipped);
         assert!(note.classification.is_none());
     }
     #[tokio::test]
@@ -465,8 +465,7 @@ mod tests {
         let id = outcome.note.expect("note").id;
         assert!(AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
         let claimed = AudioNoteRepository::get(&conn, id).unwrap().unwrap();
-        assert_eq!(claimed.enrichment_status, "running");
-        assert!(!claimed.enrichment_skipped);
+        assert_eq!(claimed.enrichment_status, EnrichmentStatus::Running);
         assert!(claimed.enrichment_error.is_none());
     }
     #[tokio::test]

@@ -9,13 +9,14 @@ use crate::audio_note_artifacts::{
     checked_output, generate_with_runner, prepare_agent_request, resolve_profile, run_with_timeout,
     AgentRunner, GenerateArtifactRequest, LocalAgent,
 };
-use crate::db::audio_notes::AudioNoteRepository;
+use crate::db::audio_notes::{AudioNoteRepository, EnrichmentStatus};
 use crate::post_processing::{AudioNoteCompletedPayload, Event, PostProcessingService};
 use classification::Classification;
 use registry::ProcessorRegistry;
 
-/// Atomically claim pending/error work. Running/completed requests are no-ops,
-/// so retries do not duplicate artifacts or dispatch downstream jobs twice.
+/// Atomically claim pending, skipped, or failed work. Running and completed
+/// requests are no-ops, so retries do not duplicate artifacts or dispatch
+/// downstream jobs twice.
 /// Startup recovery must reset interrupted running work to error, once before
 /// accepting new work (never on every DB connection).
 ///
@@ -56,8 +57,9 @@ async fn enrich_with_runner(
             note.status == "completed",
             "only completed audio notes can be enriched"
         );
-        if matches!(note.enrichment_status.as_str(), "running" | "completed") {
-            return Ok(());
+        match note.enrichment_status {
+            EnrichmentStatus::Running | EnrichmentStatus::Completed => return Ok(()),
+            EnrichmentStatus::Pending | EnrichmentStatus::Error | EnrichmentStatus::Skipped => {}
         }
         if note
             .transcript_text
@@ -67,7 +69,7 @@ async fn enrich_with_runner(
             AudioNoteRepository::set_enrichment_state(
                 &tx,
                 note_id,
-                "error",
+                EnrichmentStatus::Error,
                 Some("audio note has no saved transcript"),
             )?;
             tx.commit()?;
@@ -85,7 +87,7 @@ async fn enrich_with_runner(
         let note = AudioNoteRepository::get(&tx, note_id)?
             .filter(|n| n.deleted_at.is_none())
             .context("audio note removed during enrichment")?;
-        AudioNoteRepository::set_enrichment_state(&tx, note_id, "completed", None)?;
+        AudioNoteRepository::set_enrichment_state(&tx, note_id, EnrichmentStatus::Completed, None)?;
         tx.commit()?;
         Ok(note)
     }
@@ -110,7 +112,7 @@ async fn enrich_with_runner(
             AudioNoteRepository::set_enrichment_state(
                 &conn,
                 note_id,
-                "error",
+                EnrichmentStatus::Error,
                 Some(&format!("{error:#}")),
             )?;
             Err(error)

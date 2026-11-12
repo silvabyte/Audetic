@@ -2,10 +2,63 @@
 
 use anyhow::{bail, Context, Result};
 use audetic_core::jobs_client::Segment;
+use rusqlite::types::{FromSql, FromSqlResult, ValueRef};
 use rusqlite::{params, Connection, OptionalExtension, Row};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use utoipa::ToSchema;
 
 use crate::audio_notes::AudioNotePhase;
+
+/// AI processing state for one note. `skipped` means automatic processing was not enqueued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrichmentStatus {
+    Pending,
+    Running,
+    Completed,
+    Error,
+    Skipped,
+}
+
+impl EnrichmentStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Running => "running",
+            Self::Completed => "completed",
+            Self::Error => "error",
+            Self::Skipped => "skipped",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "pending" => Ok(Self::Pending),
+            "running" => Ok(Self::Running),
+            "completed" => Ok(Self::Completed),
+            "error" => Ok(Self::Error),
+            "skipped" => Ok(Self::Skipped),
+            other => bail!("unknown enrichment status `{other}`"),
+        }
+    }
+
+    /// Manual processing may take over these states. Running and completed stay put.
+    pub fn is_claimable(self) -> bool {
+        match self {
+            Self::Pending | Self::Error | Self::Skipped => true,
+            Self::Running | Self::Completed => false,
+        }
+    }
+}
+
+impl FromSql for EnrichmentStatus {
+    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+        value.as_str().and_then(|text| {
+            Self::parse(text).map_err(|error| rusqlite::types::FromSqlError::Other(error.into()))
+        })
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SoftDeleteOutcome {
@@ -38,10 +91,8 @@ pub struct AudioNoteRecord {
     pub source_recorded_at: Option<String>,
     pub classification: Option<Value>,
     pub classification_kind_override: Option<String>,
-    pub enrichment_status: String,
+    pub enrichment_status: EnrichmentStatus,
     pub enrichment_error: Option<String>,
-    /// Automatic classification was not enqueued. The note can still be processed by hand.
-    pub enrichment_skipped: bool,
 }
 
 impl AudioNoteRecord {
@@ -58,8 +109,7 @@ impl AudioNoteRecord {
 const COLUMNS: &str = "id, title, title_source, title_version, status, audio_path, source_filename, \
     transcript_path, transcript_text, transcript_segments, duration_seconds, started_at, completed_at, \
     error, created_at, deleted_at, capture_source, source_provider, source_external_id, \
-    source_recorded_at, classification, classification_kind_override, enrichment_status, enrichment_error, \
-    enrichment_skipped";
+    source_recorded_at, classification, classification_kind_override, enrichment_status, enrichment_error";
 
 // SQLite trim() defaults to ASCII space only. Match Rust's Unicode White_Space
 // trimming so the atomic claim rejects the same blank transcripts as domain validation.
@@ -98,7 +148,6 @@ fn decode_row(row: &Row<'_>) -> rusqlite::Result<AudioNoteRecord> {
         classification_kind_override: row.get(21)?,
         enrichment_status: row.get(22)?,
         enrichment_error: row.get(23)?,
-        enrichment_skipped: row.get(24)?,
     })
 }
 
@@ -240,30 +289,28 @@ impl AudioNoteRepository {
     pub fn set_enrichment_state(
         conn: &Connection,
         id: i64,
-        status: &str,
+        status: EnrichmentStatus,
         error: Option<&str>,
     ) -> Result<()> {
-        if !matches!(status, "pending" | "running" | "completed" | "error") {
-            bail!("Invalid enrichment status: {status}");
-        }
         conn.execute(
             "UPDATE audio_notes SET enrichment_status=?1,enrichment_error=?2 WHERE id=?3",
-            params![status, error, id],
+            params![status.as_str(), error, id],
         )?;
         Ok(())
     }
 
     /// One guarded statement prevents simultaneous retries from spawning
-    /// duplicate agent runs. Only pending/failed enrichment on a completed raw
-    /// transcript is eligible; completed enrichment is never implicitly rerun.
+    /// duplicate agent runs. Pending, skipped, and failed enrichment on a
+    /// completed raw transcript are eligible; running and completed enrichment
+    /// are never implicitly rerun. Keep this predicate aligned with
+    /// [`EnrichmentStatus::is_claimable`].
     pub fn claim_enrichment(conn: &Connection, id: i64) -> Result<bool> {
         Ok(conn
             .execute(
-                "UPDATE audio_notes SET enrichment_status='running',enrichment_error=NULL, \
-             enrichment_skipped=0 \
+                "UPDATE audio_notes SET enrichment_status='running',enrichment_error=NULL \
              WHERE id=?1 AND deleted_at IS NULL AND status='completed' \
              AND transcript_text IS NOT NULL AND trim(transcript_text,?2)<>'' \
-             AND enrichment_status IN ('pending','error')",
+             AND enrichment_status IN ('pending','error','skipped')",
                 params![id, TRANSCRIPT_WHITESPACE],
             )
             .context("Failed to claim Audio Note enrichment")?
@@ -275,7 +322,7 @@ impl AudioNoteRepository {
     /// note is left alone.
     pub fn mark_enrichment_skipped(conn: &Connection, id: i64) -> Result<bool> {
         Ok(conn.execute(
-            "UPDATE audio_notes SET enrichment_skipped=1 \
+            "UPDATE audio_notes SET enrichment_status='skipped' \
              WHERE id=?1 AND deleted_at IS NULL AND status='completed' \
              AND enrichment_status='pending'",
             [id],
@@ -638,14 +685,45 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .enrichment_status,
-            "running"
+            EnrichmentStatus::Running
         );
         assert_eq!(
             AudioNoteRepository::sweep_interrupted_enrichment(&conn).unwrap(),
             1
         );
         assert!(AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
-        AudioNoteRepository::set_enrichment_state(&conn, id, "completed", None).unwrap();
+        AudioNoteRepository::set_enrichment_state(&conn, id, EnrichmentStatus::Completed, None)
+            .unwrap();
+    }
+
+    #[test]
+    fn skipped_enrichment_is_claimable_and_survives_the_startup_sweep() {
+        let conn = db();
+        let id = completed(&conn, "Skipped");
+        assert!(AudioNoteRepository::mark_enrichment_skipped(&conn, id).unwrap());
+        assert_eq!(
+            AudioNoteRepository::get(&conn, id)
+                .unwrap()
+                .unwrap()
+                .enrichment_status,
+            EnrichmentStatus::Skipped
+        );
+        assert_eq!(
+            AudioNoteRepository::sweep_interrupted_enrichment(&conn).unwrap(),
+            0
+        );
+        assert!(AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
+        assert_eq!(
+            AudioNoteRepository::get(&conn, id)
+                .unwrap()
+                .unwrap()
+                .enrichment_status,
+            EnrichmentStatus::Running
+        );
+        assert!(!AudioNoteRepository::mark_enrichment_skipped(&conn, id).unwrap());
+        assert!(EnrichmentStatus::Skipped.is_claimable());
+        assert!(!EnrichmentStatus::Running.is_claimable());
+        assert!(!EnrichmentStatus::Completed.is_claimable());
     }
 
     #[test]
@@ -676,7 +754,7 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .enrichment_status,
-            "running"
+            EnrichmentStatus::Running
         );
     }
 
@@ -686,9 +764,16 @@ mod tests {
         let id = completed(&conn, "Eligible");
         assert!(AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
         assert!(!AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
-        AudioNoteRepository::set_enrichment_state(&conn, id, "completed", None).unwrap();
+        AudioNoteRepository::set_enrichment_state(&conn, id, EnrichmentStatus::Completed, None)
+            .unwrap();
         assert!(!AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
-        AudioNoteRepository::set_enrichment_state(&conn, id, "error", Some("retry me")).unwrap();
+        AudioNoteRepository::set_enrichment_state(
+            &conn,
+            id,
+            EnrichmentStatus::Error,
+            Some("retry me"),
+        )
+        .unwrap();
         assert!(AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
         assert!(AudioNoteRepository::get(&conn, id)
             .unwrap()

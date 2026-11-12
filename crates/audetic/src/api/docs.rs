@@ -188,6 +188,7 @@ use super::routes::{
         crate::summary_templates::SummaryTemplateSection,
         summary_templates::SummaryTemplatesResponse,
         crate::db::audio_note_artifacts::ArtifactStatus,
+        crate::db::audio_notes::EnrichmentStatus,
         crate::db::audio_note_artifacts::AudioNoteArtifact,
         crate::audio_note_artifacts::GenerateArtifactRequest,
         crate::audio_note_artifacts::GenerateArtifactResponse,
@@ -393,6 +394,21 @@ mod tests {
                 "transcript_text",
             ] {
                 assert!(properties[field].is_object(), "{schema_name} lacks {field}");
+            }
+            assert!(properties.get("enrichment_skipped").is_none());
+            let status = &properties["enrichment_status"];
+            let status_schema = status["$ref"].as_str().map_or(status, |reference| {
+                let name = reference.rsplit('/').next().unwrap();
+                &spec["components"]["schemas"][name]
+            });
+            let variants = status_schema["enum"]
+                .as_array()
+                .expect("enrichment status is an enum");
+            for value in ["pending", "running", "completed", "error", "skipped"] {
+                assert!(
+                    variants.iter().any(|variant| variant == value),
+                    "{schema_name} enrichment status lacks {value}"
+                );
             }
         }
     }

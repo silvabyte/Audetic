@@ -23,7 +23,7 @@ const note: AudioNoteSummary = {
   status: "completed", duration_seconds: 65, started_at: "2026-09-25T10:00:00Z",
   audio_path: "/isolated/7.wav", transcript_path: "/isolated/7.txt", transcript_text: "Buy basil and tomatoes.",
   capture_source: "microphone", classification: { kind: "shopping-list", confidence: 0.91 }, classification_kind: "shopping-list", classification_kind_override: null,
-  enrichment_status: "error", enrichment_error: "Local agent is not configured", enrichment_skipped: false,
+  enrichment_status: "error", enrichment_error: "Local agent is not configured",
 };
 const detail: AudioNoteDetail = { ...note, completed_at: "2026-09-25T10:02:00Z", created_at: note.started_at, error: null, transcript_segments: null };
 function testStore(handler: (request: Request) => Response | Promise<Response>): AudioNotesStore {
@@ -77,7 +77,7 @@ test("raw transcript remains in the stream when enrichment fails", () => {
 });
 
 test("a note saved with automatic processing off is not shown as pending or failed", () => {
-  const skipped = { ...note, enrichment_status: "pending", enrichment_error: null, enrichment_skipped: true, classification: null, classification_kind: null };
+  const skipped = { ...note, enrichment_status: "skipped" as const, enrichment_error: null, classification: null, classification_kind: null };
   const row = renderToStaticMarkup(<MemoryRouter><AudioNoteRow note={skipped} /></MemoryRouter>);
   assert.match(row, /Buy basil and tomatoes/);
   assert.doesNotMatch(row, /Ready for AI processing/);
@@ -122,6 +122,7 @@ test("unknown classifications stay usable and async enrichment remains refreshab
   assert.equal(classificationKind(["invalid"]), null);
   assert.equal(classificationKind({ kind: 4 }), null);
   assert.equal(noteNeedsRefresh({ status: "completed", enrichment_status: "running" }), true);
+  assert.equal(noteNeedsRefresh({ status: "completed", enrichment_status: "skipped" }), false);
   assert.equal(noteNeedsRefresh({ status: "completed", enrichment_status: "error" }), false);
   assert.equal(noteNeedsRefresh({ status: "cancelled", enrichment_status: "pending" }), false);
   assert.equal(noteNeedsRefresh({ status: "error", enrichment_status: "pending" }), false);

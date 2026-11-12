@@ -26,6 +26,7 @@ use crate::audio_notes::{
     import_audio_note_file, AudioNotePhase, AudioNoteStartOptions, AudioNoteStatusHandle,
     ImportArgs, MediaInspector, ProcessingServices,
 };
+use crate::db::audio_notes::EnrichmentStatus;
 
 /// Shared state for Audio Note routes.
 #[derive(Clone)]
@@ -221,10 +222,8 @@ pub struct AudioNoteSummary {
     pub classification: Option<Value>,
     pub classification_kind: Option<String>,
     pub classification_kind_override: Option<String>,
-    pub enrichment_status: String,
+    pub enrichment_status: EnrichmentStatus,
     pub enrichment_error: Option<String>,
-    /// Automatic processing was not enqueued. Pending here is not a running job.
-    pub enrichment_skipped: bool,
     /// Persisted raw transcript, not enriched output.
     pub transcript_text: Option<String>,
     pub id: i64,
@@ -254,10 +253,8 @@ pub struct AudioNoteDetailResponse {
     pub classification: Option<Value>,
     pub classification_kind: Option<String>,
     pub classification_kind_override: Option<String>,
-    pub enrichment_status: String,
+    pub enrichment_status: EnrichmentStatus,
     pub enrichment_error: Option<String>,
-    /// Automatic processing was not enqueued. Pending here is not a running job.
-    pub enrichment_skipped: bool,
     pub id: i64,
     pub title: Option<String>,
     pub title_source: Option<AudioNoteTitleSource>,
@@ -452,7 +449,7 @@ pub async fn process_audio_note(
             .transcript_text
             .as_deref()
             .is_none_or(|t| t.trim().is_empty())
-        || !matches!(note.enrichment_status.as_str(), "pending" | "error")
+        || !note.enrichment_status.is_claimable()
     {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -848,7 +845,6 @@ pub async fn list_audio_notes(
                 classification_kind_override: m.classification_kind_override,
                 enrichment_status: m.enrichment_status,
                 enrichment_error: m.enrichment_error,
-                enrichment_skipped: m.enrichment_skipped,
                 transcript_text: m.transcript_text,
                 id: m.id,
                 title: m.title,
@@ -1119,7 +1115,6 @@ pub async fn get_audio_note(
                 classification_kind_override: m.classification_kind_override,
                 enrichment_status: m.enrichment_status,
                 enrichment_error: m.enrichment_error,
-                enrichment_skipped: m.enrichment_skipped,
                 id: m.id,
                 title: m.title,
                 title_source: AudioNoteTitleSource::from_stored(m.title_source.as_deref()),
@@ -1997,7 +1992,7 @@ mod tests {
         assert!(body["notes"][0]["classification_kind_override"].is_null());
         assert_eq!(body["notes"][0]["capture_source"], "microphone");
         assert_eq!(body["notes"][0]["enrichment_status"], "pending");
-        assert_eq!(body["notes"][0]["enrichment_skipped"], false);
+        assert!(body["notes"][0].get("enrichment_skipped").is_none());
         assert!(body["notes"][0].get("enrichment_error").is_some());
     }
 

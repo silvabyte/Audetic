@@ -1156,9 +1156,7 @@ export interface components {
             /** Format: int64 */
             duration_seconds?: number | null;
             enrichment_error?: string | null;
-            /** @description Automatic processing was not enqueued. Pending here is not a running job. */
-            enrichment_skipped: boolean;
-            enrichment_status: string;
+            enrichment_status: components["schemas"]["EnrichmentStatus"];
             error?: string | null;
             /** Format: int64 */
             id: number;
@@ -1282,9 +1280,7 @@ export interface components {
             /** Format: int64 */
             duration_seconds?: number | null;
             enrichment_error?: string | null;
-            /** @description Automatic processing was not enqueued. Pending here is not a running job. */
-            enrichment_skipped: boolean;
-            enrichment_status: string;
+            enrichment_status: components["schemas"]["EnrichmentStatus"];
             /** Format: int64 */
             id: number;
             source_external_id?: string | null;
@@ -1387,6 +1383,11 @@ export interface components {
             /** @enum {string} */
             state: "error";
         };
+        /**
+         * @description AI processing state for one note. `skipped` means automatic processing was not enqueued.
+         * @enum {string}
+         */
+        EnrichmentStatus: "pending" | "running" | "completed" | "error" | "skipped";
         /** @description One supported event in the `events` listing. */
         EventDescriptor: {
             /** @description What the JSON `data` shape contains when this event fires. */
