@@ -35,6 +35,10 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_recording_sources.sql",
         sql: include_str!("0002_recording_sources.sql"),
     },
+    Migration {
+        name: "0003_enrichment_status_skipped.sql",
+        sql: include_str!("0003_enrichment_status_skipped.sql"),
+    },
 ];
 #[cfg(test)]
 const LATEST: usize = MIGRATIONS.len();
@@ -376,18 +380,18 @@ mod tests {
         let (_dir, path) = temp_db();
         let file = seed_applied(&path, MIGRATIONS, LATEST);
         file.execute(
-            "UPDATE schema_migrations SET version = 3 WHERE version = 2",
+            "UPDATE schema_migrations SET version = 4 WHERE version = 3",
             [],
         )
         .unwrap();
         drop(file);
         let error = upgrade(&path).unwrap_err().to_string();
-        assert!(error.contains("expected version 2, found 3"), "{error}");
+        assert!(error.contains("expected version 3, found 4"), "{error}");
 
         let (_dir, path) = temp_db();
         let file = seed_applied(&path, MIGRATIONS, LATEST);
         file.execute(
-            "INSERT INTO schema_migrations(version, checksum) VALUES (3, ?1)",
+            "INSERT INTO schema_migrations(version, checksum) VALUES (4, ?1)",
             ["0".repeat(64)],
         )
         .unwrap();
@@ -398,6 +402,73 @@ mod tests {
         drop(opened);
         let error = upgrade(&path).unwrap_err().to_string();
         assert!(error.contains("written by a newer build"), "{error}");
+    }
+
+    #[test]
+    fn upgrade_keeps_existing_notes_and_allows_skipped_enrichment() {
+        let (_dir, path) = temp_db();
+        {
+            let conn = seed_applied(&path, MIGRATIONS, LATEST - 1);
+            conn.execute(
+                "INSERT INTO audio_notes(title, audio_path, status, transcript_text, enrichment_status) \
+                 VALUES ('keep', 'a.wav', 'completed', 'hello', 'completed')",
+                [],
+            )
+            .unwrap();
+            let note_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO agent_profiles(name, kind, executable, args_json) \
+                 VALUES ('Claude', 'claude', 'claude', '[]')",
+                [],
+            )
+            .unwrap();
+            let profile_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO audio_note_artifacts(note_id, kind, title, status, agent_profile_id, content_markdown) \
+                 VALUES (?1, 'summary', 'Kept', 'completed', ?2, 'body')",
+                params![note_id, profile_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO external_imports(provider, source_instance, external_id, status, audio_note_id) \
+                 VALUES ('plaud', 'default', 'ext-1', 'accepted', ?1)",
+                [note_id],
+            )
+            .unwrap();
+        }
+        upgrade(&path).unwrap();
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        let row: (String, String, String) = conn
+            .query_row(
+                "SELECT title, status, enrichment_status FROM audio_notes",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, ("keep".into(), "completed".into(), "completed".into()));
+        conn.execute("UPDATE audio_notes SET enrichment_status='skipped'", [])
+            .unwrap();
+        assert!(conn
+            .execute("UPDATE audio_notes SET enrichment_status='bogus'", [])
+            .is_err());
+        let joined: (String, String, String) = conn
+            .query_row(
+                "SELECT n.enrichment_status, a.content_markdown, e.external_id \
+                 FROM audio_notes n \
+                 JOIN audio_note_artifacts a ON a.note_id = n.id \
+                 JOIN external_imports e ON e.audio_note_id = n.id",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(joined, ("skipped".into(), "body".into(), "ext-1".into()));
+        conn.execute(
+            "INSERT INTO audio_notes(title, audio_path) VALUES ('next', 'b.wav')",
+            [],
+        )
+        .unwrap();
+        assert!(conn.last_insert_rowid() > 1);
     }
 
     #[test]

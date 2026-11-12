@@ -1,5 +1,9 @@
+import type { components } from "@/api/schema";
+
 /** JSON classifications are extensible. Never assume a known kind or well-formed metadata. */
 export const BUILT_IN_CLASSIFICATION_KINDS = ["meeting", "dictation", "conversation", "request", "shopping-list", "general"] as const;
+
+type EnrichmentStatus = components["schemas"]["EnrichmentStatus"];
 
 export function classificationFields(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === "object" && !Array.isArray(value) ? Object.fromEntries(Object.entries(value)) : null;
@@ -21,16 +25,30 @@ export function isClassificationSlug(value: string): boolean {
   return /^[a-z][a-z0-9_-]{0,63}$/.test(value);
 }
 export function kindLabel(kind: string): string { return kind.replace(/[-_]/g, " "); }
-export function noteNeedsRefresh(note: { status: string; enrichment_status: string }): boolean {
-  return !["completed", "error", "cancelled"].includes(note.status) || (note.status === "completed" && ["pending", "running"].includes(note.enrichment_status));
+/** Automatic processing was not enqueued. Not a job, and not a failure. */
+export function automaticProcessingSkipped(note: { enrichment_status: EnrichmentStatus }): boolean {
+  return note.enrichment_status === "skipped";
 }
-export function enrichmentLabel(status: string): string {
+export function noteNeedsRefresh(note: { status: string; enrichment_status: EnrichmentStatus }): boolean {
+  if (!["completed", "error", "cancelled"].includes(note.status)) return true;
+  if (note.status !== "completed") return false;
+  switch (note.enrichment_status) {
+    case "pending":
+    case "running":
+      return true;
+    case "completed":
+    case "error":
+    case "skipped":
+      return false;
+  }
+}
+export function enrichmentLabel(status: EnrichmentStatus): string {
   switch (status) {
     case "pending": return "Ready for AI processing";
     case "running": return "AI processing";
     case "completed": return "AI processing complete";
     case "error": return "AI processing needs attention";
-    default: return "AI status unknown";
+    case "skipped": return "Automatic AI processing is off";
   }
 }
 export function errorMessage(error: unknown): string {

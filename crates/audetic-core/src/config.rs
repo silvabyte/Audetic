@@ -92,6 +92,29 @@ where
     }
 }
 
+/// Whether new notes are classified and given artifacts automatically.
+///
+/// This is about processing, not about a particular agent. A missing table or
+/// a missing `enabled` key stays on so older config files keep today's behavior.
+/// The chosen default agent is stored separately and is left untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(utoipa::ToSchema))]
+#[serde(default, deny_unknown_fields)]
+pub struct AiProcessingPreferences {
+    #[serde(default = "default_ai_processing_enabled")]
+    pub enabled: bool,
+}
+
+fn default_ai_processing_enabled() -> bool {
+    true
+}
+
+impl Default for AiProcessingPreferences {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BehaviorConfig {
@@ -101,6 +124,9 @@ pub struct BehaviorConfig {
     pub preserve_clipboard: bool,
     #[serde(default = "default_audio_feedback")]
     pub audio_feedback: bool,
+    /// Automatic classification and artifact generation for new notes.
+    #[serde(default)]
+    pub ai_processing: AiProcessingPreferences,
 }
 
 fn default_audio_feedback() -> bool {
@@ -155,6 +181,7 @@ impl Default for BehaviorConfig {
             auto_paste: AutoPastePreferences::default(),
             preserve_clipboard: false,
             audio_feedback: true,
+            ai_processing: AiProcessingPreferences::default(),
         }
     }
 }
@@ -257,5 +284,31 @@ mod tests {
         assert!(!microphone_only.behavior.auto_paste.microphone_and_system);
 
         assert!(toml::from_str::<Config>("[behavior.auto_paste]\ndictation = true\n").is_err());
+    }
+
+    #[test]
+    fn missing_ai_processing_key_stays_enabled() {
+        assert!(Config::default().behavior.ai_processing.enabled);
+        for source in [
+            "",
+            "[behavior]\npreserve_clipboard = true\n",
+            "[behavior.ai_processing]\n",
+        ] {
+            let config: Config = toml::from_str(source).unwrap();
+            assert!(
+                config.behavior.ai_processing.enabled,
+                "processing should stay on for {source:?}"
+            );
+        }
+
+        let disabled: Config =
+            toml::from_str("[behavior.ai_processing]\nenabled = false\n").unwrap();
+        assert!(!disabled.behavior.ai_processing.enabled);
+        let reloaded: Config = toml::from_str(&toml::to_string(&disabled).unwrap()).unwrap();
+        assert_eq!(
+            reloaded.behavior.ai_processing,
+            disabled.behavior.ai_processing
+        );
+        assert!(toml::from_str::<Config>("[behavior.ai_processing]\nagent = \"none\"\n").is_err());
     }
 }

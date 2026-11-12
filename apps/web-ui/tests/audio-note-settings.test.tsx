@@ -12,6 +12,7 @@ import { DEFAULT_CAPTURE_OPTIONS } from "../src/lib/capture-options";
 
 const OFF = { microphone: false, microphone_and_system: false };
 const MIC_ONLY = { microphone: true, microphone_and_system: false };
+const PROCESSING_ON = { enabled: true };
 
 function clientWith(handler: (request: Request) => Response | Promise<Response>) {
   return createClient<paths>({ baseUrl: "http://audetic.test/api", fetch: async (request) => handler(request) });
@@ -43,7 +44,7 @@ test("saving uses the real settings API and a fresh store reads each source's pr
     requests.push(`${request.method} ${new URL(request.url).pathname}`);
     if (request.method === "PUT") {
       const body: unknown = await request.json();
-      assert.deepEqual(body, { auto_paste: MIC_ONLY });
+      assert.deepEqual(body, { auto_paste: MIC_ONLY, ai_processing: PROCESSING_ON });
       persisted = { ...MIC_ONLY };
     }
     return Response.json({ auto_paste: persisted });
@@ -99,8 +100,11 @@ test("failed settings loads report the error and cannot silently enable delivery
   assert.match(html, /Retry loading/);
   assert.match(html, /Microphone notes \(dictation\)/);
   assert.match(html, /Microphone \+ system audio notes/);
-  assert.equal(html.match(/aria-checked="false"/g)?.length, 2);
+  assert.equal(html.match(/aria-checked="false"/g)?.length, 3);
   assert.equal(html.match(/aria-checked="true"/g)?.length, undefined);
+  assert.match(html, /Automatic AI processing/);
+  assert.doesNotMatch(html, /id="default-note-agent"/);
+  assert.doesNotMatch(html, /The saved agent is unchanged/);
 });
 
 test("the settings page shows the saved automatic-paste preference for each capture source", async () => {
@@ -132,6 +136,27 @@ test("a failed save is not shown as confirmed and reload recovers the actual pre
   assert.equal(settings.saveError, null);
   assert.equal(settings.savedAutoPaste("microphone"), false);
   assert.equal(settings.savedAutoPaste("microphone_and_system"), false);
+});
+
+test("turning automatic processing off persists the switch and hides the agent select", async () => {
+  let persisted = { auto_paste: OFF, ai_processing: PROCESSING_ON };
+  const settings = new AudioNoteSettingsStore(clientWith(async (request) => {
+    if (request.method === "PUT") persisted = await request.json() as typeof persisted;
+    return Response.json(persisted);
+  }));
+  await settings.load();
+  assert.equal(settings.automaticProcessingEnabled(), true);
+  assert.equal(await settings.saveAiProcessing(false), true);
+  assert.equal(settings.automaticProcessingEnabled(), false);
+  assert.deepEqual(persisted.ai_processing, { enabled: false });
+  assert.deepEqual(persisted.auto_paste, OFF);
+  const root = new RootStore();
+  runInAction(() => { root.noteSettings = settings; });
+  const html = renderToStaticMarkup(<RootStoreProvider value={root}><SettingsCapture /></RootStoreProvider>);
+  assert.match(html, /id="ai-processing-enabled"[^>]*aria-checked="false"|aria-checked="false"[^>]*id="ai-processing-enabled"/);
+  assert.doesNotMatch(html, /id="default-note-agent"/);
+  assert.match(html, /The saved agent is unchanged/);
+  assert.match(html, /Process note/);
 });
 
 test("changing the saved preference does not send capture lifecycle commands", async () => {

@@ -1061,6 +1061,17 @@ export interface components {
         AgentProfilesResponse: {
             profiles: components["schemas"]["AgentProfile"][];
         };
+        /**
+         * @description Whether new notes are classified and given artifacts automatically.
+         *
+         *     This is about processing, not about a particular agent. A missing table or
+         *     a missing `enabled` key stays on so older config files keep today's behavior.
+         *     The chosen default agent is stored separately and is left untouched.
+         */
+        AiProcessingPreferences: {
+            /** @default true */
+            enabled: boolean;
+        };
         ApiErrorResponse: {
             error: boolean;
             message: string;
@@ -1145,7 +1156,7 @@ export interface components {
             /** Format: int64 */
             duration_seconds?: number | null;
             enrichment_error?: string | null;
-            enrichment_status: string;
+            enrichment_status: components["schemas"]["EnrichmentStatus"];
             error?: string | null;
             /** Format: int64 */
             id: number;
@@ -1194,6 +1205,8 @@ export interface components {
         };
         /** @description Persisted capture defaults. Changing this does not alter an active note. */
         AudioNoteSettings: {
+            /** @description Automatic classification and artifacts for notes transcribed after this save. */
+            ai_processing: components["schemas"]["AiProcessingPreferences"];
             /** @description Automatic paste for each capture source. Missing sources are off. */
             auto_paste: components["schemas"]["AutoPastePreferences"];
         };
@@ -1267,7 +1280,7 @@ export interface components {
             /** Format: int64 */
             duration_seconds?: number | null;
             enrichment_error?: string | null;
-            enrichment_status: string;
+            enrichment_status: components["schemas"]["EnrichmentStatus"];
             /** Format: int64 */
             id: number;
             source_external_id?: string | null;
@@ -1370,6 +1383,11 @@ export interface components {
             /** @enum {string} */
             state: "error";
         };
+        /**
+         * @description AI processing state for one note. `skipped` means automatic processing was not enqueued.
+         * @enum {string}
+         */
+        EnrichmentStatus: "pending" | "running" | "completed" | "error" | "skipped";
         /** @description One supported event in the `events` listing. */
         EventDescriptor: {
             /** @description What the JSON `data` shape contains when this event fires. */

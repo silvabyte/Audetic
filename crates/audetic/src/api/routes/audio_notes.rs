@@ -26,6 +26,7 @@ use crate::audio_notes::{
     import_audio_note_file, AudioNotePhase, AudioNoteStartOptions, AudioNoteStatusHandle,
     ImportArgs, MediaInspector, ProcessingServices,
 };
+use crate::db::audio_notes::EnrichmentStatus;
 
 /// Shared state for Audio Note routes.
 #[derive(Clone)]
@@ -114,6 +115,8 @@ fn optional_start_options(
 pub struct AudioNoteSettings {
     /// Automatic paste for each capture source. Missing sources are off.
     pub auto_paste: crate::config::AutoPastePreferences,
+    /// Automatic classification and artifacts for notes transcribed after this save.
+    pub ai_processing: crate::config::AiProcessingPreferences,
 }
 
 #[utoipa::path(get, path = "/audio-notes/settings", tag = "audio_notes",
@@ -130,6 +133,7 @@ pub async fn get_audio_note_settings(
     .map_err(ApiError::from)?;
     Ok(Json(AudioNoteSettings {
         auto_paste: config.behavior.auto_paste,
+        ai_processing: config.behavior.ai_processing,
     }))
 }
 
@@ -141,8 +145,13 @@ pub async fn set_audio_note_settings(
     Json(settings): Json<AudioNoteSettings>,
 ) -> ApiResult<Json<AudioNoteSettings>> {
     let auto_paste = settings.auto_paste;
+    let ai_processing = settings.ai_processing;
     tokio::task::spawn_blocking(move || {
-        crate::audio_notes::settings::save_auto_paste(&state.config_path, auto_paste)
+        crate::audio_notes::settings::save_audio_note_settings(
+            &state.config_path,
+            auto_paste,
+            ai_processing,
+        )
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
@@ -213,7 +222,7 @@ pub struct AudioNoteSummary {
     pub classification: Option<Value>,
     pub classification_kind: Option<String>,
     pub classification_kind_override: Option<String>,
-    pub enrichment_status: String,
+    pub enrichment_status: EnrichmentStatus,
     pub enrichment_error: Option<String>,
     /// Persisted raw transcript, not enriched output.
     pub transcript_text: Option<String>,
@@ -244,7 +253,7 @@ pub struct AudioNoteDetailResponse {
     pub classification: Option<Value>,
     pub classification_kind: Option<String>,
     pub classification_kind_override: Option<String>,
-    pub enrichment_status: String,
+    pub enrichment_status: EnrichmentStatus,
     pub enrichment_error: Option<String>,
     pub id: i64,
     pub title: Option<String>,
@@ -440,7 +449,7 @@ pub async fn process_audio_note(
             .transcript_text
             .as_deref()
             .is_none_or(|t| t.trim().is_empty())
-        || !matches!(note.enrichment_status.as_str(), "pending" | "error")
+        || !note.enrichment_status.is_claimable()
     {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1764,15 +1773,20 @@ mod tests {
             .unwrap();
         assert_eq!(
             json_response(response).await,
-            json!({"auto_paste": {"microphone": false, "microphone_and_system": false}})
+            json!({
+                "auto_paste": {"microphone": false, "microphone_and_system": false},
+                "ai_processing": {"enabled": true}
+            })
         );
         let config_path = dir.path().join("config.toml");
         let mut config = crate::config::Config::default();
         config.whisper.provider = Some("openai-api".into());
         config.behavior.audio_feedback = false;
         std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
-        let saved_paste =
-            json!({"auto_paste": {"microphone": true, "microphone_and_system": false}});
+        let saved_paste = json!({
+            "auto_paste": {"microphone": true, "microphone_and_system": false},
+            "ai_processing": {"enabled": false}
+        });
         let response = router
             .clone()
             .oneshot(
@@ -1788,6 +1802,7 @@ mod tests {
         let saved = crate::audio_notes::settings::load_config(&config_path).unwrap();
         assert!(saved.behavior.auto_paste.microphone);
         assert!(!saved.behavior.auto_paste.microphone_and_system);
+        assert!(!saved.behavior.ai_processing.enabled);
         assert!(!saved.behavior.audio_feedback);
         assert_eq!(saved.whisper.provider.as_deref(), Some("openai-api"));
         let response = router
@@ -1800,7 +1815,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(json_response(response).await, saved_paste);
-        for rejected in [r#"{}"#, r#"{"auto_paste":true}"#] {
+        for rejected in [
+            r#"{}"#,
+            r#"{"auto_paste":true}"#,
+            r#"{"auto_paste":{"microphone":true,"microphone_and_system":false}}"#,
+        ] {
             let response = router
                 .clone()
                 .oneshot(
@@ -1815,6 +1834,7 @@ mod tests {
             let unchanged = crate::audio_notes::settings::load_config(&config_path).unwrap();
             assert!(unchanged.behavior.auto_paste.microphone);
             assert!(!unchanged.behavior.auto_paste.microphone_and_system);
+            assert!(!unchanged.behavior.ai_processing.enabled);
         }
     }
 
@@ -1915,7 +1935,7 @@ mod tests {
                 Request::put("/audio-notes/settings")
                     .header("content-type", "application/json")
                     .body(Body::from(
-                        r#"{"auto_paste":{"microphone":false,"microphone_and_system":false}}"#,
+                        r#"{"auto_paste":{"microphone":false,"microphone_and_system":false},"ai_processing":{"enabled":true}}"#,
                     ))
                     .unwrap(),
             )
@@ -1972,6 +1992,7 @@ mod tests {
         assert!(body["notes"][0]["classification_kind_override"].is_null());
         assert_eq!(body["notes"][0]["capture_source"], "microphone");
         assert_eq!(body["notes"][0]["enrichment_status"], "pending");
+        assert!(body["notes"][0].get("enrichment_skipped").is_none());
         assert!(body["notes"][0].get("enrichment_error").is_some());
     }
 

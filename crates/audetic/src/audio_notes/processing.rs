@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use audetic_core::compression::{cleanup_temp_file, prepare_for_upload};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use super::progress::AudioNoteProgressObserver;
 use super::status::AudioNotePhase;
@@ -72,6 +72,8 @@ pub struct ProcessingServices {
     pub db_path: PathBuf,
     pub delivery: Arc<dyn TranscriptDelivery>,
     pub enrichment: Arc<dyn AudioNoteEnrichment>,
+    /// Daemon config read at enqueue time. An empty path leaves processing on.
+    pub config_path: PathBuf,
 }
 
 impl ProcessingServices {
@@ -81,6 +83,21 @@ impl ProcessingServices {
             db_path,
             delivery: Arc::new(DesktopDelivery),
             enrichment: Arc::new(BackgroundEnrichment),
+            config_path: crate::global::config_file().unwrap_or_default(),
+        }
+    }
+}
+
+/// Missing config, a missing key, and an unreadable file all keep processing on.
+fn automatic_processing_enabled(config_path: &Path) -> bool {
+    if config_path.as_os_str().is_empty() {
+        return true;
+    }
+    match super::settings::load_config(config_path) {
+        Ok(config) => config.behavior.ai_processing.enabled,
+        Err(error) => {
+            warn!("Could not read automatic AI processing setting; leaving it on: {error:#}");
+            true
         }
     }
 }
@@ -108,12 +125,32 @@ pub async fn process_audio_note(args: ProcessingArgs) {
             args.observer.on_complete(&text).await;
             let note_id = args.note_id;
             let db_path = args.services.db_path.clone();
-            let enrichment = args.services.enrichment.clone();
-            tokio::spawn(async move {
-                if let Err(error) = enrichment.enrich(note_id, db_path).await {
-                    warn!(note_id, "Audio note enrichment failed: {error:#}");
+            if !automatic_processing_enabled(&args.services.config_path) {
+                info!(
+                    note_id,
+                    "Automatic AI processing is off; transcript saved without an agent run"
+                );
+                match db::init_db_at(&db_path)
+                    .and_then(|conn| AudioNoteRepository::mark_enrichment_skipped(&conn, note_id))
+                {
+                    Ok(true) => {}
+                    Ok(false) => warn!(
+                        note_id,
+                        "Automatic AI processing was not enqueued, but the note was not pending"
+                    ),
+                    Err(error) => warn!(
+                        note_id,
+                        "Could not record that automatic AI processing was skipped: {error:#}"
+                    ),
                 }
-            });
+            } else {
+                let enrichment = args.services.enrichment.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = enrichment.enrich(note_id, db_path).await {
+                        warn!(note_id, "Audio note enrichment failed: {error:#}");
+                    }
+                });
+            }
         }
         Err(error) => {
             let message = format!("{error:#}");
@@ -218,6 +255,7 @@ fn persist_transcript(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::audio_notes::EnrichmentStatus;
     use crate::transcription::job_service::TranscriptionJobResult;
     use std::sync::Mutex;
 
@@ -291,9 +329,26 @@ mod tests {
         }
     }
 
-    async fn run_fixture(delete: bool, delivery: AudioNoteDeliveryOptions) -> Vec<String> {
+    struct Outcome {
+        events: Vec<String>,
+        note: Option<crate::db::audio_notes::AudioNoteRecord>,
+        db_path: PathBuf,
+        _directory: tempfile::TempDir,
+    }
+
+    /// `config` is written beside the database. `None` leaves the file missing,
+    /// which must keep automatic processing on.
+    async fn run_fixture(
+        delete: bool,
+        delivery: AudioNoteDeliveryOptions,
+        config: Option<&str>,
+    ) -> Outcome {
         let directory = tempfile::tempdir().unwrap();
         let db_path = directory.path().join("isolated.db");
+        let config_path = directory.path().join("config.toml");
+        if let Some(config) = config {
+            std::fs::write(&config_path, config).unwrap();
+        }
         let audio = directory.path().join("recording.mp3");
         std::fs::write(&audio, b"test audio").unwrap();
         let conn = db::init_db_at(&db_path).unwrap();
@@ -312,6 +367,7 @@ mod tests {
         );
         services.delivery = probe.clone();
         services.enrichment = probe.clone();
+        services.config_path = config_path;
         process_audio_note(ProcessingArgs {
             note_id: id,
             audio_path: audio,
@@ -323,7 +379,16 @@ mod tests {
         .await;
         tokio::task::yield_now().await;
         let events = probe.events.lock().unwrap().clone();
-        events
+        let note = {
+            let conn = db::init_db_at(&probe.db_path).unwrap();
+            AudioNoteRepository::get(&conn, id).unwrap()
+        };
+        Outcome {
+            events,
+            note,
+            db_path: probe.db_path.clone(),
+            _directory: directory,
+        }
     }
 
     #[tokio::test]
@@ -334,18 +399,74 @@ mod tests {
                 AudioNoteDeliveryOptions {
                     auto_paste: true,
                     copy_to_clipboard: false
-                }
+                },
+                None,
             )
-            .await,
+            .await
+            .events,
             ["delivery", "completed", "enrichment"]
         );
     }
     #[tokio::test]
     async fn default_capture_does_not_deliver_text() {
         assert_eq!(
-            run_fixture(false, Default::default()).await,
+            run_fixture(false, Default::default(), None).await.events,
             ["completed", "enrichment"]
         );
+    }
+    #[tokio::test]
+    async fn missing_config_key_still_enqueues_processing() {
+        let outcome = run_fixture(
+            false,
+            Default::default(),
+            Some("[behavior]\npreserve_clipboard = true\n"),
+        )
+        .await;
+        assert_eq!(outcome.events, ["completed", "enrichment"]);
+        let note = outcome.note.expect("note");
+        assert_eq!(note.enrichment_status, EnrichmentStatus::Pending);
+        assert_eq!(
+            note.transcript_text.as_deref(),
+            Some("Raw transcript before AI")
+        );
+    }
+    #[tokio::test]
+    async fn disabled_processing_saves_the_transcript_without_an_agent_run() {
+        let outcome = run_fixture(
+            false,
+            AudioNoteDeliveryOptions {
+                auto_paste: true,
+                copy_to_clipboard: false,
+            },
+            Some("[behavior.ai_processing]\nenabled = false\n"),
+        )
+        .await;
+        assert_eq!(outcome.events, ["delivery", "completed"]);
+        let note = outcome.note.expect("note");
+        assert_eq!(note.status, "completed");
+        assert_eq!(
+            note.transcript_text.as_deref(),
+            Some("Raw transcript before AI")
+        );
+        assert_eq!(note.enrichment_status, EnrichmentStatus::Skipped);
+        assert!(note.enrichment_error.is_none());
+        assert!(note.classification.is_none());
+    }
+    #[tokio::test]
+    async fn skipped_note_can_still_be_claimed_for_manual_processing() {
+        let outcome = run_fixture(
+            false,
+            Default::default(),
+            Some("[behavior.ai_processing]\nenabled = false\n"),
+        )
+        .await;
+        assert!(outcome.events.iter().all(|event| event != "enrichment"));
+        let conn = db::init_db_at(&outcome.db_path).unwrap();
+        let id = outcome.note.expect("note").id;
+        assert!(AudioNoteRepository::claim_enrichment(&conn, id).unwrap());
+        let claimed = AudioNoteRepository::get(&conn, id).unwrap().unwrap();
+        assert_eq!(claimed.enrichment_status, EnrichmentStatus::Running);
+        assert!(claimed.enrichment_error.is_none());
     }
     #[tokio::test]
     async fn missing_row_cannot_announce_success_deliver_or_enrich() {
@@ -355,9 +476,11 @@ mod tests {
                 AudioNoteDeliveryOptions {
                     auto_paste: true,
                     copy_to_clipboard: true
-                }
+                },
+                None,
             )
-            .await,
+            .await
+            .events,
             ["error"]
         );
     }

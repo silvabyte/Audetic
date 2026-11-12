@@ -10,7 +10,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { getRootStore } from "@/stores/singleton";
 import { useStore } from "@/stores/root-store";
 import type { AudioNoteSummary } from "@/stores/audio-notes-store";
-import { BUILT_IN_CLASSIFICATION_KINDS, effectiveClassificationKind, enrichmentLabel, formatDuration, kindLabel } from "@/lib/audio-notes";
+import { automaticProcessingSkipped, BUILT_IN_CLASSIFICATION_KINDS, effectiveClassificationKind, enrichmentLabel, formatDuration, kindLabel } from "@/lib/audio-notes";
 import { noteDisplayTitle } from "@/lib/note-title";
 import { groupNotesByDate, transcriptExcerpt } from "@/lib/audio-note-list";
 import { cn } from "@/lib/utils";
@@ -162,8 +162,9 @@ export function AudioNoteRow({ note, query = "" }: { note: AudioNoteSummary; que
   return <Observer>{() => {
     const kind = effectiveClassificationKind(note);
     const title = noteDisplayTitle({ title: note.title, sourceFilename: note.source_filename, startedAt: note.started_at });
-    const needsAttention = note.status === "error" || (note.status === "completed" && note.enrichment_status === "error");
-    const status = note.status === "completed" ? note.enrichment_status === "completed" ? null : enrichmentLabel(note.enrichment_status) : note.status === "error" ? "Transcription needs attention" : kindLabel(note.status);
+    const skipped = automaticProcessingSkipped(note);
+    const needsAttention = !skipped && (note.status === "error" || (note.status === "completed" && note.enrichment_status === "error"));
+    const status = note.status === "completed" ? note.enrichment_status === "completed" || skipped ? null : enrichmentLabel(note.enrichment_status) : note.status === "error" ? "Transcription needs attention" : kindLabel(note.status);
     const processing = !["completed", "error", "cancelled"].includes(note.status) || (note.status === "completed" && note.enrichment_status === "running");
     const source = note.capture_source === "microphone_and_system" ? "Mic + system" : note.capture_source === "import" ? "Imported" : "Microphone";
     return <Link to={`/audio-notes/${note.id}`} className="group -mx-2 grid items-center gap-x-5 gap-y-2 rounded-md px-2 py-3.5 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring lg:grid-cols-[minmax(0,1fr)_9rem_4rem_5.5rem_1rem]" title={title}>

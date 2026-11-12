@@ -40,3 +40,8 @@ audio_feedback = true
 [behavior.auto_paste]
 microphone = false
 microphone_and_system = false
+
+# Automatic classification and artifacts for new notes. On when this table
+# or `enabled` is omitted. Turning it off does not change the default agent.
+[behavior.ai_processing]
+enabled = true

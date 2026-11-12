@@ -35,10 +35,27 @@ pub fn auto_paste_enabled(
 pub fn save_auto_paste(path: &Path, auto_paste: AutoPastePreferences) -> Result<()> {
     let mut config = load_config(path)?;
     config.behavior.auto_paste = auto_paste;
+    write_config(path, &config)
+}
+
+/// Save capture delivery and automatic AI processing together so one write
+/// cannot drop the other preference.
+pub fn save_audio_note_settings(
+    path: &Path,
+    auto_paste: AutoPastePreferences,
+    ai_processing: crate::config::AiProcessingPreferences,
+) -> Result<()> {
+    let mut config = load_config(path)?;
+    config.behavior.auto_paste = auto_paste;
+    config.behavior.ai_processing = ai_processing;
+    write_config(path, &config)
+}
+
+fn write_config(path: &Path, config: &Config) -> Result<()> {
     let parent = path.parent().context("Configuration path has no parent")?;
     std::fs::create_dir_all(parent).context("Failed to create configuration directory")?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-    temporary.write_all(toml::to_string_pretty(&config)?.as_bytes())?;
+    temporary.write_all(toml::to_string_pretty(config)?.as_bytes())?;
     temporary.as_file().sync_all()?;
     temporary
         .persist(path)

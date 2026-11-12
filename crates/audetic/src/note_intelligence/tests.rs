@@ -121,7 +121,7 @@ async fn successful_enrichment_routes_and_dispatches_once_under_concurrency() {
     let conn = crate::db::init_db_at(&path).unwrap();
     let note = AudioNoteRepository::get(&conn, id).unwrap().unwrap();
     assert_eq!(note.status, "completed");
-    assert_eq!(note.enrichment_status, "completed");
+    assert_eq!(note.enrichment_status, EnrichmentStatus::Completed);
     assert_eq!(note.title.as_deref(), Some("Generated title"));
     assert_eq!(
         note.transcript_text.as_deref(),
@@ -153,7 +153,7 @@ async fn no_profile_is_retryable_without_losing_raw_note() {
     let conn = crate::db::init_db_at(&path).unwrap();
     let note = AudioNoteRepository::get(&conn, id).unwrap().unwrap();
     assert_eq!(note.status, "completed");
-    assert_eq!(note.enrichment_status, "error");
+    assert_eq!(note.enrichment_status, EnrichmentStatus::Error);
     assert!(note.enrichment_error.unwrap().contains("agent profile"));
     assert_eq!(
         note.transcript_text.as_deref(),
@@ -192,7 +192,7 @@ async fn invalid_classification_and_timeout_are_retryable() {
                 .unwrap()
                 .unwrap()
                 .enrichment_status,
-            "error"
+            EnrichmentStatus::Error
         );
         assert!(AudioNoteArtifactRepository::list_for_note(&conn, id)
             .unwrap()
@@ -203,7 +203,7 @@ async fn invalid_classification_and_timeout_are_retryable() {
         let note = AudioNoteRepository::get(&conn, id).unwrap().unwrap();
         assert_eq!(note.title.as_deref(), Some("Manual title"));
         assert_eq!(note.classification.unwrap()["kind"], "unknown-taxonomy");
-        assert_eq!(note.enrichment_status, "completed");
+        assert_eq!(note.enrichment_status, EnrichmentStatus::Completed);
         assert!(note.enrichment_error.is_none());
         assert_eq!(
             runner.templates.lock().unwrap().last().unwrap(),
@@ -232,7 +232,7 @@ async fn processor_failure_is_durable_and_never_dispatches() {
     let conn = crate::db::init_db_at(&path).unwrap();
     let note = AudioNoteRepository::get(&conn, id).unwrap().unwrap();
     assert_eq!(note.status, "completed");
-    assert_eq!(note.enrichment_status, "error");
+    assert_eq!(note.enrichment_status, EnrichmentStatus::Error);
     assert_eq!(note.classification.unwrap()["kind"], "request");
     let artifacts = AudioNoteArtifactRepository::list_for_note(&conn, id).unwrap();
     assert_eq!(artifacts.len(), 1);
@@ -394,7 +394,7 @@ async fn hung_agent_interaction_becomes_visible_error() {
     let conn = crate::db::init_db_at(&path).unwrap();
     let note = AudioNoteRepository::get(&conn, id).unwrap().unwrap();
     assert_eq!(note.status, "completed");
-    assert_eq!(note.enrichment_status, "error");
+    assert_eq!(note.enrichment_status, EnrichmentStatus::Error);
     assert!(note.enrichment_error.unwrap().contains("timed out"));
 }
 
@@ -475,7 +475,7 @@ async fn unavailable_executable_is_visible_without_running_a_fallback_heuristic(
     .is_err());
     let note = AudioNoteRepository::get(&conn, id).unwrap().unwrap();
     assert_eq!(note.status, "completed");
-    assert_eq!(note.enrichment_status, "error");
+    assert_eq!(note.enrichment_status, EnrichmentStatus::Error);
     assert!(note.classification.is_none());
     assert_eq!(runner.calls.load(Ordering::SeqCst), 0);
 }

@@ -15,7 +15,7 @@ import { AudioTransport } from "../src/components/audio-transport";
 import { ArtifactCard, artifactKindLabel, NoteArtifactsPanel } from "../src/components/note-artifacts-panel";
 import type { AudioNoteArtifact } from "../src/stores/note-artifacts-store";
 import { RootStore, RootStoreProvider } from "../src/stores/root-store";
-import { classificationKind, effectiveClassificationKind, isClassificationSlug, noteNeedsRefresh } from "../src/lib/audio-notes";
+import { automaticProcessingSkipped, classificationKind, effectiveClassificationKind, isClassificationSlug, noteNeedsRefresh } from "../src/lib/audio-notes";
 import { parseTalkingPoints } from "../src/lib/talking-points";
 
 const note: AudioNoteSummary = {
@@ -76,6 +76,23 @@ test("raw transcript remains in the stream when enrichment fails", () => {
   assert.match(html, /href="\/audio-notes\/7"/);
 });
 
+test("a note saved with automatic processing off is not shown as pending or failed", () => {
+  const skipped = { ...note, enrichment_status: "skipped" as const, enrichment_error: null, classification: null, classification_kind: null };
+  const row = renderToStaticMarkup(<MemoryRouter><AudioNoteRow note={skipped} /></MemoryRouter>);
+  assert.match(row, /Buy basil and tomatoes/);
+  assert.doesNotMatch(row, /Ready for AI processing/);
+  assert.doesNotMatch(row, /AI processing needs attention/);
+  assert.doesNotMatch(row, /AI processing/);
+  const root = new RootStore();
+  const html = renderToStaticMarkup(<RootStoreProvider value={root}><NoteEnrichment note={{ ...detail, ...skipped }} /></RootStoreProvider>);
+  assert.match(html, /Process note/);
+  assert.doesNotMatch(html, /Ready for AI processing/);
+  assert.doesNotMatch(html, /AI processing needs attention/);
+  assert.doesNotMatch(html, /AI processing failed/);
+  assert.equal(automaticProcessingSkipped(skipped), true);
+  assert.equal(noteNeedsRefresh(skipped), false);
+});
+
 test("detail explains retryable AI error without treating the transcript as failed", () => {
   const root = new RootStore();
   const html = renderToStaticMarkup(<RootStoreProvider value={root}><NoteEnrichment note={detail} /></RootStoreProvider>);
@@ -105,6 +122,7 @@ test("unknown classifications stay usable and async enrichment remains refreshab
   assert.equal(classificationKind(["invalid"]), null);
   assert.equal(classificationKind({ kind: 4 }), null);
   assert.equal(noteNeedsRefresh({ status: "completed", enrichment_status: "running" }), true);
+  assert.equal(noteNeedsRefresh({ status: "completed", enrichment_status: "skipped" }), false);
   assert.equal(noteNeedsRefresh({ status: "completed", enrichment_status: "error" }), false);
   assert.equal(noteNeedsRefresh({ status: "cancelled", enrichment_status: "pending" }), false);
   assert.equal(noteNeedsRefresh({ status: "error", enrichment_status: "pending" }), false);

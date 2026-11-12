@@ -53,7 +53,10 @@ Routes / surface:
   delivery reads/writes one daemon-persisted automatic-paste preference per capture source through
   `GET`/`PUT /audio-notes/settings` (`auto_paste.microphone` and `auto_paste.microphone_and_system`).
   `AudioNoteSettingsStore` stays off for every source until that preference loads; load/save errors
-  are visible. Capture options use `auto_paste: null` to inherit the loaded preference for the
+  are visible. The same settings document stores `[behavior.ai_processing].enabled` (on when the
+  key is missing). The Capture & delivery card's switch turns automatic classification and artifact
+  generation off for new notes; the agent select stays the default agent and is hidden while
+  processing is off. Capture options use `auto_paste: null` to inherit the loaded preference for the
   selected source, or explicit `false`/`true` to override it for one recording. Overrides reset after
   capture starts; source/review/clipboard options last for the app session. Saves never change an
   active capture. Delivery is raw text before asynchronous AI processing, never generated output.
