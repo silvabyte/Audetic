@@ -78,3 +78,13 @@ jobs:
         # Audio tests gate themselves on $CI to avoid blocking on absent
         # devices / unprompted TCC dialogs; see audio_stream_manager::tests.
         run: cargo test --verbose
+
+      - name: Characterization suite
+        # Black-box HTTP contract against the daemon just built. The suite
+        # spawns audeticd on a temp database (never the live file) and does
+        # not open capture devices, download models, or call providers.
+        # AUDETIC_BIN lets a later replacement binary run the same tests.
+        run: |
+          cd characterization
+          bun install --frozen-lockfile
+          AUDETIC_BIN="$GITHUB_WORKSPACE/target/debug/audeticd" bun test
