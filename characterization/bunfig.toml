@@ -1,0 +1,3 @@
+[test]
+# Daemon startup and the journal read can exceed bun's 5s default.
+timeout = 30000

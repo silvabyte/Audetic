@@ -1,0 +1,13 @@
+{
+  "name": "@audetic/characterization",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Black-box HTTP contract for audeticd. A replacement binary must pass the same suite.",
+  "scripts": {
+    "test": "bun test"
+  },
+  "dependencies": {
+    "effect": "4.1.4"
+  }
+}
